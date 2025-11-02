@@ -5,6 +5,45 @@ Todas as mudanças notáveis neste projeto serão documentadas neste arquivo.
 O formato é baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.0.0/),
 e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
+## [v2.1.0] - 2025-11-02
+
+### ✨ Adicionado
+- **Argumentos de linha de comando**: Suporte completo para parâmetros CLI
+- **--max-streams N**: Definir limite de streams para testar (1-1000)
+- **--fast / --high-performance**: Modo alta performance (20 conexões paralelas)
+- **--help / -h**: Sistema de ajuda integrado
+- **Configuração flexível**: Limite padrão aumentado para 500 streams
+- **Parsing inteligente**: Separação correta entre termo de pesquisa e opções
+- **Scripts auxiliares**: test_simple.ps1 e run_advanced.bat
+- **Detecção automática**: Console interativo vs linha de comando
+
+### 🔧 Melhorado
+- **UX drasticamente melhorada**: Interface muito mais amigável
+- **Performance configurável**: 10-20 conexões paralelas conforme modo
+- **Validação robusta**: Tratamento de argumentos malformados
+- **Documentação expandida**: Exemplos práticos e casos de uso
+- **Flexibilidade total**: De 5 streams (teste) até 1000 (produção)
+
+### 🔧 Corrigido
+- **Console.ReadKey**: Não bloqueia quando entrada é redirecionada
+- **Argumentos CLI**: Parsing correto de termos vs opções
+- **Timeout melhorado**: Redução de falsos negativos
+
+### 📖 Exemplos de Uso
+```bash
+# Teste rápido
+dotnet run -- "demo test" --max-streams 5
+
+# Uso normal
+dotnet run -- "iptv portugal" --max-streams 200
+
+# Alta performance
+dotnet run -- "worldwide streams" --fast --max-streams 1000
+
+# Ajuda
+dotnet run -- --help
+```
+
 ## [v1.1.0] - 2025-11-02
 
 ### ✨ Adicionado

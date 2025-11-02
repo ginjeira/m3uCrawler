@@ -1,8 +1,14 @@
-# Script para executar o m3uCrawler
-# Uso: .\run.ps1 "termo de pesquisa"
+# Script para executar o m3uCrawler v2.1
+# Uso: .\run.ps1 "termo de pesquisa" [--max-streams N] [--fast]
+# Exemplos:
+#   .\run.ps1 "iptv portugal"
+#   .\run.ps1 "tv streams" --max-streams 500
+#   .\run.ps1 "canais" --fast --max-streams 1000
+#   .\run.ps1 --help
 
 param(
-    [string]$SearchTerm = ""
+    [string]$SearchTerm = "",
+    [string[]]$AdditionalArgs = @()
 )
 
 Write-Host "=== m3uCrawler Launcher ===" -ForegroundColor Cyan
@@ -25,11 +31,21 @@ if (!(Test-Path "output")) {
 }
 
 # Executar o programa
+Write-Host "Executando m3uCrawler..." -ForegroundColor Green
+
+# Construir argumentos
+$allArgs = @()
 if ($SearchTerm -ne "") {
-    Write-Host "Executando com termo: $SearchTerm" -ForegroundColor Green
-    dotnet run -- $SearchTerm
+    $allArgs += $SearchTerm
+}
+$allArgs += $AdditionalArgs
+
+# Mostrar comando que será executado
+if ($allArgs.Count -gt 0) {
+    Write-Host "Comando: dotnet run -- $($allArgs -join ' ')" -ForegroundColor Cyan
+    dotnet run -- @allArgs
 } else {
-    Write-Host "Executando modo interativo..." -ForegroundColor Green
+    Write-Host "Modo interativo (sem argumentos)" -ForegroundColor Cyan
     dotnet run
 }
 

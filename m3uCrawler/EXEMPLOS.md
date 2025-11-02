@@ -1,23 +1,58 @@
-# Exemplo de uso do m3uCrawler
+# 📖 Exemplos de Uso - m3uCrawler v2.1
 
-## Como testar o projeto
+## 🚀 Uso Básico
 
-### 1. Teste simples
+### 1. Execução Simples
 ```powershell
-# Executar o script PowerShell
-.\run.ps1 "sports"
-
-# Ou executar diretamente
-dotnet run -- "sports"
-```
-
-### 2. Teste interativo
-```powershell
-# Executar sem argumentos para modo interativo
+# Modo interativo
 .\run.ps1
 
-# Ou
-dotnet run
+# Via linha de comando com termo de pesquisa
+dotnet run -- "iptv portugal"
+```
+
+### 2. Ajuda e Informações
+```powershell
+# Mostrar todas as opções disponíveis
+dotnet run -- --help
+```
+
+## ⚙️ Opções de Linha de Comando
+
+### 3. Limitando Número de Streams
+```powershell
+# Testar apenas 50 streams (rápido)
+dotnet run -- "iptv" --max-streams 50
+
+# Testar 1000 streams (máximo permitido)  
+dotnet run -- "tv channels" --max-streams 1000
+
+# Configuração balanceada
+dotnet run -- "streaming" --max-streams 300
+```
+
+### 4. Modo Alta Performance
+```powershell
+# Modo rápido - 20 conexões paralelas
+dotnet run -- "iptv portugal" --fast
+
+# Equivalente ao --fast
+dotnet run -- "tv brasil" --high-performance
+
+# Combinando opções para máxima eficiência
+dotnet run -- "canais tv" --fast --max-streams 500
+```
+
+### 5. Exemplos Práticos Completos
+```powershell
+# Busca rápida para desenvolvimento/teste
+dotnet run -- "demo test" --max-streams 10
+
+# Busca média para uso pessoal
+dotnet run -- "iptv free" --max-streams 200
+
+# Busca extensa para coleção completa
+dotnet run -- "worldwide iptv" --fast --max-streams 1000
 ```
 
 ### 3. Estrutura dos arquivos gerados

@@ -29,7 +29,7 @@ namespace m3uCrawler.Services
             _m3u8Regex = new Regex(@"https?://[^\s<>""']+\.m3u8(?:\?[^\s<>""']*)?", RegexOptions.IgnoreCase);
         }
 
-        public async Task<List<string>> SearchM3u8Files(string searchTerm, int maxResults = 50)
+        public async Task<List<string>> SearchM3u8Files(string searchTerm, int maxResults = 200)
         {
             var foundUrls = new HashSet<string>();
             
