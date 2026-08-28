@@ -1,0 +1,8 @@
+FROM mcr.microsoft.com/dotnet/runtime:9.0 AS runtime
+WORKDIR /data
+
+# Copy the pre-published app produced by the CI runner
+COPY m3uCrawler/published /app
+
+# The application is executed from /app but reads/writes runtime data from /data
+ENTRYPOINT ["dotnet", "/app/m3uCrawler.dll"]

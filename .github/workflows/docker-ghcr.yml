@@ -1,0 +1,78 @@
+name: Docker GHCR Publish
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/m3ucrawler
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v3
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Restore and publish
+        working-directory: ./m3uCrawler
+        run: |
+          echo "=== dotnet --info ==="
+          dotnet --info
+          echo "=== listing repo files (top) ==="
+          ls -la
+          echo "=== restoring ==="
+          dotnet restore m3uCrawler.csproj
+          echo "=== publishing (detailed verbosity) ==="
+          dotnet publish m3uCrawler.csproj -c Release -o published /p:UseAppHost=false -v:detailed 2>&1 | tee publish.log || true
+
+      - name: Upload publish artifacts and logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: publish-output-and-logs
+          path: |
+            m3uCrawler/published
+            m3uCrawler/publish.log
+            m3uCrawler/**/bin/**/msbuild-*.log
+
+      - name: Build and push image (from published output)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./m3uCrawler/Dockerfile.publish
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

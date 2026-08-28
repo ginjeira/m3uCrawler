@@ -1,0 +1,9 @@
+# Exemplo de configuração para WTelegram.
+# Copie este ficheiro para wtelegram.config e preencha os seus valores.
+# Este ficheiro não deve ser commitado com dados reais.
+api_id =
+api_hash =
+phone_number =
+verification_code = ask
+password = ask
+session_pathname = session.dat

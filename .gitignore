@@ -1,0 +1,13 @@
+wtelegram.config
+**/wtelegram.config
+session.dat
+**/session.dat
+
+bin/
+obj/
+output/
+**/output/
+m3uCrawler/test.txt
+
+m3uCrawler/runtime-data/*
+!m3uCrawler/runtime-data/.gitkeep
