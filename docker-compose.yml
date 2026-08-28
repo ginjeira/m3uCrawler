@@ -1,0 +1,15 @@
+services:
+  m3ucrawler:
+    image: ghcr.io/${GHCR_OWNER:-your-github-user}/m3ucrawler:latest
+    build:
+      context: ./m3uCrawler
+      dockerfile: Dockerfile
+    working_dir: /data
+    stdin_open: true
+    tty: true
+    command: ["--telegram", "portugal", "--telegram-maintain", "--loop-hours", "24", "--max-streams", "500", "--output-dir", "/opt/playlists", "--web", "--web-port", "5000"]
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./m3uCrawler/runtime-data:/data
+      - ./m3uCrawler/runtime-data/playlists:/opt/playlists
