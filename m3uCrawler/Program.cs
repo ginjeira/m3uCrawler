@@ -14,10 +14,12 @@ namespace m3uCrawler
             Console.WriteLine();
 
             var domainFilter = GetOptionValue(args, "--domain");
+            var countryCode = GetOptionValue(args, "--country") ?? "pt";
             if (!string.IsNullOrWhiteSpace(domainFilter))
             {
                 Console.WriteLine($"🌐 Filtro de domínio ativo: {domainFilter}");
             }
+            Console.WriteLine($"🇵🇹 País em validação: {countryCode}");
 
             if (args.Contains("--telegram"))
             {
@@ -93,13 +95,14 @@ namespace m3uCrawler
                 var outputDir = GetOptionValue(args, "--output-dir") ?? "output";
                 telegramPlaylistManager.CreateOutputDirectory(outputDir);
                 var importHistoryService = new ImportHistoryService(outputDir);
+                var countryChannelValidator = new CountryChannelValidator(Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries"));
                 Console.WriteLine($"📂 Pasta de saída das playlists: {Path.GetFullPath(outputDir)}");
 
                 Task? webTask = null;
                 if (webEnabled)
                 {
                     webTask = WebDashboardService.RunDashboardAsync(outputDir, webPort, importHistoryService, CancellationToken.None);
-                    webTask.ContinueWith(t =>
+                    _ = webTask.ContinueWith(t =>
                     {
                         if (t.IsFaulted && t.Exception != null)
                         {
@@ -145,6 +148,13 @@ namespace m3uCrawler
                         foreach (var stream in workingStreams)
                         {
                             Console.WriteLine($"  • {stream.Title} ({stream.ResponseTime}ms) :: {stream.Url}");
+                        }
+
+                        var countryMatches = countryChannelValidator.ValidateStreams(workingStreams, countryCode);
+                        Console.WriteLine($"📡 Validação por canais {countryCode.ToUpperInvariant()}: {countryMatches.Count} stream(s) correspondentes.");
+                        foreach (var match in countryMatches.Take(10))
+                        {
+                            Console.WriteLine($"  • {countryCode.ToUpperInvariant()} match: {match.Stream.Title} -> {string.Join(", ", match.MatchedAliases)}");
                         }
 
                         var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
@@ -434,6 +444,7 @@ namespace m3uCrawler
             Console.WriteLine("OPÇÕES:");
             Console.WriteLine("  --max-streams N   Número máximo de streams para testar (1-1000)");
             Console.WriteLine("  --domain DOMINIO  Filtra resultados por domínio (ex: cdn.exemplo.com)");
+            Console.WriteLine("  --country CODE    Valida playlists contra canais de um país (ex: pt, es, br) ");
             Console.WriteLine("  --output-dir PATH  Diretório onde guardar playlists e relatórios (padrão: output)");
             Console.WriteLine("  --web             Ativa uma interface web para ver histórico e playlist");
             Console.WriteLine("  --web-port N      Porta do servidor web (padrão: 5000)");
