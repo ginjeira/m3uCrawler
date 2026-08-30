@@ -9,9 +9,10 @@
 - **Aplicação funcional** com pipeline Telegram completo: descoberta independente de keyword → detecção M3U → parser → validação por país (threshold 3, matching por tokens) → extracção e teste de streams → relatório detalhado.
 - **Dashboard web** (`--web`) com gestão de listas de canais por país, diagnóstico da última execução, últimas playlists descobertas e pré-visualização sanitizada das playlists. Protecção opcional por token (`--web-token`).
 - **Modo manutenção** (`--telegram-maintain`) preserva `playlist.m3u` quando não há novos candidatos.
+- **Sincronização Dispatcharr** (opt-in via `dispatcharr_enabled=true` em `wtelegram.config`): pós-playlist, o pipeline pode agora gerar um `MatchPlan` (matching puro, determinístico, com normalização + aliases + fuzzy + numeric-sibling guard + source ordering por provider/qualidade/reliability) e aplicá-lo ao Dispatcharr. Default `dispatcharr_dry_run=true` — primeiro rollout escreve apenas `output/dispatcharr_plan_<ts>.json` e `output/dispatcharr_report_<ts>.json`. Ver "Limitações" abaixo.
 - **Deployment** migrado para **Docker Compose** com imagem publicada em `ghcr.io/ginjeira/m3ucrawler:latest` e bind mounts absolutos para `/opt/m3ucrawler/runtime-data`. Ver `DEPLOYMENT.md`.
-- **Cobertura de testes**: 153 testes unitários, 0 warnings em `dotnet build m3uCrawler.sln --configuration Release` (snapshot em 2026-08-30).
-- **Sanitização de credenciais** em logs, relatórios JSON, `RunReport`, preview do dashboard e mensagens de erro. A playlist M3U funcional preserva URLs Xtream reais, como esperado.
+- **Cobertura de testes**: 314 testes unitários, 0 warnings em `dotnet build m3uCrawler.sln --configuration Release` (snapshot em 2026-08-30).
+- **Sanitização de credenciais** em logs, relatórios JSON, `RunReport`, preview do dashboard e mensagens de erro. A playlist M3U funcional preserva URLs Xtream reais, como esperado. O `MatchPlanSerializer` re-aplica `CredentialSanitizer.SanitizeUrl` ao campo `streamUrl` antes de escrever.
 
 ---
 
@@ -45,6 +46,7 @@
 - **Proteger o dashboard em produção** activando `--web-token` no comando Compose. Implicação: passar a exigir `Authorization: Bearer <token>` para `/api/playlist*`. (Hoje a porta `5000` está exposta sem autenticação.)
 - **Limpar e remover documentação obsoleta** (`EXEMPLOS.md`, `STREAM_LIMIT_GUIDE.md`) que descreve o comportamento pré-pipeline. Substituir por apontadores para `m3uCrawler/README.md`.
 - **Documentar formalmente a API do `RunReport`** e os endpoints do dashboard num único sítio (provavelmente uma secção adicional em `m3uCrawler/README.md` ou um `API.md` — decisão pendente).
+- **Dispatcharr sync**: iterações seguintes (não no primeiro incremento) — visibilidade de canais em `ChannelProfile`, gestão de `auto_channel_sync` na conta M3U hospedada, fallback para o fluxo auto-sync quando o utilizador preferir refresh assíncrono, EPG matching.
 
 ---
 

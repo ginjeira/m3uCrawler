@@ -11,3 +11,4 @@ m3uCrawler/test.txt
 
 m3uCrawler/runtime-data/*
 !m3uCrawler/runtime-data/.gitkeep
+!m3uCrawler/runtime-data/channel-indicators.json

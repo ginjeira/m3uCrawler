@@ -191,12 +191,29 @@ namespace m3uCrawler.Services
 
                     if (groupMatchesCategory)
                     {
-                        // Aceita o canal como pertencente ao país-alvo pelo simples facto
-                        // de estar explicitamente agrupado sob uma categoria PT. Não tenta
-                        // casar aliases dentro do group-title. Marca MatchedViaGroup para
-                        // permitir auditoria posterior.
-                        matchedAliases.Add("group-title");
-                        matchedViaGroup = true;
+                        // Segurança contra canais estrangeiros mal categorizados pelo fornecedor:
+                        // o fallback só é activado se o TÍTULO também contiver pelo menos um token
+                        // da categoria PT (portugal, pt, 🇵🇹). Isto significa que um stream cujo
+                        // nome não tem qualquer sinal PT (ex.: "Sky TG24" listado num grupo
+                        // "Portugal") é rejeitado, mesmo que o group-title seja PT.
+                        //
+                        // Casos legítimos que continuam a funcionar:
+                        //   - "PT || JimJam"     -> título contém "PT"       -> aceite
+                        //   - "Canal Portugal"   -> título contém "Portugal" -> aceite
+                        //   - "RTP1" com group="Portugal" -> título já bate por alias (matchedAliases.Count > 0)
+                        //
+                        // Casos bloqueados:
+                        //   - "Sky TG24" com group-title="Portugal"   -> título sem token PT -> rejeitado
+                        //   - "RandomChannel" com group-title="Portugal" -> título sem token PT -> rejeitado
+                        var titleTokenSet = Tokenize(NormalizeText(stream.Title ?? string.Empty));
+                        var titleHasCountryToken = titleTokenSet.Count > 0
+                            && titleTokenSet.Any(tt => groupTokens.Contains(tt, StringComparer.OrdinalIgnoreCase));
+
+                        if (titleHasCountryToken)
+                        {
+                            matchedAliases.Add("group-title");
+                            matchedViaGroup = true;
+                        }
                     }
                 }
 

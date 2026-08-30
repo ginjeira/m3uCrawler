@@ -180,6 +180,8 @@ namespace m3uCrawler
                             Console.WriteLine("❌ Nenhum stream funcional encontrado no Telegram.");
                         }
 
+                        await TrySyncToDispatcharrAsync(playlistPath, outputDir);
+
                         await importHistoryService.RecordImportAsync(new ImportHistoryEntry
                         {
                             Timestamp = DateTime.UtcNow,
@@ -600,6 +602,8 @@ namespace m3uCrawler
             await playlistManager.SaveToJsonReport(finalStreams, reportPath);
             await SaveRunReportAsync(outputDir, runReport);
 
+            await TrySyncToDispatcharrAsync(mainPath, outputDir);
+
             var historyEntry = new ImportHistoryEntry
             {
                 Timestamp = DateTime.UtcNow,
@@ -647,6 +651,21 @@ namespace m3uCrawler
             catch (Exception ex)
             {
                 Console.WriteLine($"⚠️ Não foi possível guardar o relatório de execução: {ex.Message}");
+            }
+        }
+
+        static async Task TrySyncToDispatcharrAsync(string playlistPath, string outputDir)
+        {
+            var cfg = DispatcharrConfigLoader.Load();
+            if (!cfg.Enabled) return;
+            try
+            {
+                var sync = new m3uCrawler.Services.Sync.DispatcharrSyncService(cfg, outputDir);
+                await sync.RunAsync(playlistPath);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"⚠️ Falha na sincronização Dispatcharr: {ex.Message}");
             }
         }
     }

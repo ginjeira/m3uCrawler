@@ -345,9 +345,10 @@ public class CountryChannelPerStreamTests
     public void CaseD_group_title_UNRELATED_to_PT_does_NOT_match_JimJam()
     {
         var validator = CreateValidator();
+        // Título sem token PT E group-title irrelevante -> rejeitado (nenhum sinal PT).
         var streams = StreamsFromContent(
             "#EXTM3U\n" +
-            "#EXTINF:-1 tvg-name=\"JimJam\" group-title=\"UK || Kids\",PT || JimJam\nhttp://x/jimjam\n");
+            "#EXTINF:-1 tvg-name=\"JimJam\" group-title=\"UK || Kids\",JimJam\nhttp://x/jimjam\n");
 
         var matches = validator.ValidateStreams(streams, "pt");
 
@@ -371,18 +372,47 @@ public class CountryChannelPerStreamTests
     }
 
     [Fact]
-    public void CaseD_group_title_exact_country_token_LOWER_matches()
+    public void CaseD_group_title_exact_country_token_LOWER_matches_when_title_also_has_PT_token()
     {
+        var validator = CreateValidator();
+        // O fallback por group-title="portugal" só é activado se o TÍTULO também contiver
+        // pelo menos um token da categoria PT (portugal, pt, 🇵🇹). Aqui o título tem "PT"
+        // explícito, pelo que o fallback funciona.
+        var streams = StreamsFromContent(
+            "#EXTM3U\n" +
+            "#EXTINF:-1 tvg-name=\"Patati Patata\" group-title=\"portugal regional\",PT | Patati Patata\nhttp://x/pp\n");
+
+        var matches = validator.ValidateStreams(streams, "pt");
+        var m = Assert.Single(matches);
+        Assert.True(m.MatchedViaGroup);
+    }
+
+    [Fact]
+    public void CaseD_group_title_PT_alone_is_NOT_enough_when_title_has_no_PT_token()
+    {
+        // Segurança contra canais estrangeiros mal categorizados: um fornecedor pode
+        // colocar group-title="Portugal" num canal cujo nome não tem qualquer sinal PT.
+        // Esta é a nova regra: o título tem de conter pelo menos um token PT.
         var validator = CreateValidator();
         var streams = StreamsFromContent(
             "#EXTM3U\n" +
-            "#EXTINF:-1 tvg-name=\"Patati Patata\" group-title=\"portugal regional\",Patati Patata\nhttp://x/pp\n");
+            "#EXTINF:-1 tvg-name=\"Sky TG24\" group-title=\"Portugal\",Sky TG24\nhttp://x/sky\n");
 
         var matches = validator.ValidateStreams(streams, "pt");
+        Assert.Empty(matches);
+    }
 
-        // "portugal" minúsculo é o token exacto. Aceita via fallback.
-        var m = Assert.Single(matches);
-        Assert.True(m.MatchedViaGroup);
+    [Fact]
+    public void CaseD_group_title_UNRELATED_to_PT_does_NOT_match_when_title_also_has_no_PT_token()
+    {
+        // Título sem token PT E group-title irrelevante -> rejeitado.
+        var validator = CreateValidator();
+        var streams = StreamsFromContent(
+            "#EXTM3U\n" +
+            "#EXTINF:-1 tvg-name=\"JimJam\" group-title=\"UK || Kids\",JimJam\nhttp://x/jimjam\n");
+
+        var matches = validator.ValidateStreams(streams, "pt");
+        Assert.Empty(matches);
     }
 
     [Fact]
@@ -495,16 +525,33 @@ public class CountryChannelPerStreamTests
     }
 
     [Fact]
-    public void CaseF_intra_word_dots_match_via_group_title_fallback()
+    public void CaseF_intra_word_dots_match_via_group_title_fallback_when_title_also_has_PT_token()
     {
+        var validator = CreateValidator();
+        // O título contém "PT" explícito (além de "S.I.C.") — o fallback por group-title é
+        // activado porque o título tem pelo menos um token PT. Esta é a nova regra segura:
+        // o group-title sozinho nunca basta.
+        var streams = StreamsFromContent(
+            "#EXTM3U\n" +
+            "#EXTINF:-1 tvg-name=\"S.I.C.\" group-title=\"Portugal\",PT | S.I.C.\nhttp://x/sic\n");
+
+        var matches = validator.ValidateStreams(streams, "pt");
+        var m = Assert.Single(matches);
+        Assert.True(m.MatchedViaGroup);
+    }
+
+    [Fact]
+    public void CaseF_intra_word_dots_with_only_group_PT_is_NOT_accepted_anymore()
+    {
+        // Comportamento seguro: um canal cujo título não tem qualquer sinal PT (S.I.C.
+        // tokeniza para ["s", "i", "c"]) NÃO é aceite só porque o group-title diz "Portugal".
         var validator = CreateValidator();
         var streams = StreamsFromContent(
             "#EXTM3U\n" +
             "#EXTINF:-1 tvg-name=\"S.I.C.\" group-title=\"Portugal\",S.I.C.\nhttp://x/sic\n");
 
         var matches = validator.ValidateStreams(streams, "pt");
-        var m = Assert.Single(matches);
-        Assert.True(m.MatchedViaGroup);
+        Assert.Empty(matches);
     }
 
     [Fact]

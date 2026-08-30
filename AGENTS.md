@@ -34,7 +34,19 @@ Para tarefas triviais (typo numa doc, mudança de uma flag) o plano pode ser dis
   → `CountryChannelValidator.ValidateStreams` (gate per-stream)
   → `M3uTesterService.TestM3u8Stream`
   → `RunReport`
-  → `PlaylistManagerService.SaveToM3uPlaylist` / `SaveToJsonReport`.
+  → `PlaylistManagerService.SaveToM3uPlaylist` / `SaveToJsonReport`
+  → `DispatcharrSyncService.RunAsync` (opcional, gated por `dispatcharr_enabled=true` em `wtelegram.config`).
+
+### Dispatcharr sync (camada opcional)
+
+- A integração com **Dispatcharr** é uma extensão pós-playlist e é **opt-in**: lê `dispatcharr_enabled` do `wtelegram.config`. Quando ausente ou `false`, é um no-op (zero HTTP, zero ficheiros extra).
+- Quando activa, **default `dispatcharr_dry_run=true`**: o fluxo `Generate → Validate → Apply` produz `output/dispatcharr_plan_<ts>.json` e `output/dispatcharr_report_<ts>.json` sem chamadas HTTP de escrita. Só passa a mutar o Dispatcharr quando o utilizador coloca `dispatcharr_dry_run=false`.
+- A camada de **matching** (`Services/Matching/*`) é **pura**: não tem dependências HTTP e é totalmente testável sem Dispatcharr. `IChannelMatcher.BuildPlan(...)` aceita listas de DTOs e devolve um `MatchPlan` determinístico (mesmo input → JSON byte-idêntico, controlado por `nowUtc` injetável).
+- O `MatchPlan` é o **contrato intermédio** entre matching e apply: pode ser revisto, serializado (`MatchPlanSerializer`) e aplicado independentemente (`DispatcharrSyncService.ApplyAsync`).
+- Casos ambíguos (`MatchBand.Ambiguous`) **nunca são aplicados automaticamente**: ficam `SyncOutcome.Ambiguous` no plano e contam em `report.AmbiguousDecisions`.
+- Credenciais: `dispatcharr_api_key`, `dispatcharr_username` e `dispatcharr_password` vivem **apenas** em `wtelegram.config`, que está fora do artefacto `package.yml` e do git (já invariant). Nunca passam por `JsonSerializer.Serialize` directo — o `MatchPlanSerializer.SanitizeForSerialization` aplica `CredentialSanitizer.SanitizeUrl` ao campo `streamUrl`.
+- Streams criadas pelo crawler usam `is_custom=true` no Dispatcharr, para que os campos `name/url/tvg_id` fiquem editáveis e não sejam varridos pelo `stale_stream_days` da conta M3U externa.
+- Streams em modo leitura (`is_custom=false`, com `m3u_account` definido) têm `name/url/tvg_id/channel_group` **read-only** no Dispatcharr — não tentamos editá-las.
 
 ### Invariantes que **não** devem ser quebradas sem aprovação explícita
 
@@ -76,6 +88,7 @@ Estes ficheiros **nunca** devem ser editados, versionados, logados ou incluídos
 - `session.dat`
 - `WTelegram.session`
 - Quaisquer ficheiros com tokens, API keys, passwords reais.
+- **Chaves Dispatcharr** (`dispatcharr_api_key`, `dispatcharr_username`, `dispatcharr_password`) adicionadas em `wtelegram.config` continuam a partilhar o mesmo invariante: nunca versionadas, nunca no artefacto `package.yml`, nunca em logs.
 
 São já cobertos por `m3uCrawler/.dockerignore`. A pasta `m3uCrawler/runtime-data/` no repositório é apenas um placeholder; em produção é substituída por um bind mount.
 
