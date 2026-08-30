@@ -233,6 +233,108 @@ namespace m3uCrawler.Services
                 return;
             }
 
+            // Sumário de descoberta: dedup por (source, name) e ordenação determinística.
+            if (requestPath.Equals("/api/discovery/summary", StringComparison.OrdinalIgnoreCase))
+            {
+                var reportPath = Path.Combine(outputDir, "telegram_run_report.json");
+                if (!File.Exists(reportPath))
+                {
+                    await WriteJsonAsync(context.Response, new { error = "Sem relatório de execução disponível." });
+                    return;
+                }
+                var report = JsonSerializer.Deserialize<RunReport>(await File.ReadAllTextAsync(reportPath, Encoding.UTF8), JsonOptions);
+                var raw = report?.DiscoveredPlaylists ?? new List<DiscoveredPlaylist>();
+                var dedup = DashboardMetrics.DeduplicateBySourceName(raw);
+                await WriteJsonAsync(context.Response, new
+                {
+                    total = raw.Count,
+                    distinct = dedup.Count,
+                    duplicatesCollapsed = raw.Count - dedup.Count,
+                    items = dedup,
+                });
+                return;
+            }
+
+            // Run report normalizado (métricas com semântica correcta).
+            if (requestPath.Equals("/api/run-report/summary", StringComparison.OrdinalIgnoreCase))
+            {
+                var reportPath = Path.Combine(outputDir, "telegram_run_report.json");
+                if (!File.Exists(reportPath))
+                {
+                    await WriteJsonAsync(context.Response, new { error = "Sem relatório de execução disponível." });
+                    return;
+                }
+                var report = JsonSerializer.Deserialize<RunReport>(await File.ReadAllTextAsync(reportPath, Encoding.UTF8), JsonOptions);
+                await WriteJsonAsync(context.Response, report == null
+                    ? new { error = "Relatório vazio." }
+                    : DashboardMetrics.SummarizeRun(report));
+                return;
+            }
+
+            // Detalhe de uma execução do histórico (1-based).
+            if (requestPath.StartsWith("/api/execution/", StringComparison.OrdinalIgnoreCase))
+            {
+                var tail = requestPath.Substring("/api/execution/".Length);
+                if (!int.TryParse(tail, out var idx) || idx < 1)
+                {
+                    context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                    await WriteTextAsync(context.Response, "Índice inválido", HttpStatusCode.BadRequest);
+                    return;
+                }
+                var history = await historyService.GetRecentAsync(TimeSpan.FromDays(365));
+                if (idx > history.Count)
+                {
+                    context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                    await WriteTextAsync(context.Response, "Execução inexistente", HttpStatusCode.NotFound);
+                    return;
+                }
+                await WriteJsonAsync(context.Response, history[idx - 1]);
+                return;
+            }
+
+            // Estado da última sincronização Dispatcharr (lê do filesystem, sem rede).
+            if (requestPath.Equals("/api/dispatcharr/state", StringComparison.OrdinalIgnoreCase))
+            {
+                var state = DashboardMetrics.ReadLatestDispatcharrSync(outputDir);
+                if (state == null)
+                {
+                    await WriteJsonAsync(context.Response, new
+                    {
+                        enabled = false,
+                        reason = "Sem plan/report encontrado em output/. Sync opt-in ou nunca correu."
+                    });
+                    return;
+                }
+                await WriteJsonAsync(context.Response, state);
+                return;
+            }
+
+            // Ficheiros disponíveis na pasta de output (preview/sanity).
+            // Devolve um objecto por ficheiro com {present, size, exists}, para distinguir
+            // "ficheiro ausente" de "ficheiro presente mas vazio".
+            if (requestPath.Equals("/api/output/inventory", StringComparison.OrdinalIgnoreCase))
+            {
+                var inv = new Dictionary<string, object>();
+                if (Directory.Exists(outputDir))
+                {
+                    foreach (var name in new[] { "playlist.m3u", "playlist_temp.m3u", "telegram_run_report.json", "telegram_maintain_report.json", "import_history.json" })
+                    {
+                        var p = Path.Combine(outputDir, name);
+                        if (File.Exists(p))
+                        {
+                            var fi = new FileInfo(p);
+                            inv[name] = new { present = true, size = fi.Length, lastWriteUtc = fi.LastWriteTimeUtc.ToString("o") };
+                        }
+                        else
+                        {
+                            inv[name] = new { present = false, size = 0, lastWriteUtc = (string?)null };
+                        }
+                    }
+                }
+                await WriteJsonAsync(context.Response, inv);
+                return;
+            }
+
             await WriteHtmlAsync(context.Response, BuildHtmlPage());
         }
 
@@ -279,210 +381,605 @@ namespace m3uCrawler.Services
 
         private static string BuildHtmlPage()
         {
-            return @"<!doctype html>
+            return BuildDashboardHtml();
+        }
+
+        private static string BuildDashboardHtml()
+        {
+            string s = """
+<!doctype html>
 <html lang='pt'>
 <head>
   <meta charset='utf-8'>
+  <meta name='viewport' content='width=device-width,initial-scale=1'>
   <title>m3uCrawler Dashboard</title>
   <style>
-    body { font-family: Arial, sans-serif; margin: 20px; background: #121212; color: #e9ecef; }
-    a { color: #1bb0ff; }
-    table { border-collapse: collapse; width: 100%; margin-top: 16px; }
-    th, td { border: 1px solid #333; padding: 12px; }
-    th { background: #1f2937; }
-    tr:nth-child(even) { background: #1b1f26; }
-    pre { background: #111827; padding: 14px; overflow: auto; }
-    .badge { display: inline-block; padding: 4px 10px; border-radius: 999px; background: #2563eb; color: #fff; margin-right: 6px; }
-    textarea { width: 100%; margin-top: 8px; background: #0f172a; color: #e2e8f0; border: 1px solid #334155; border-radius: 6px; padding: 10px; }
-    button { background: #2563eb; color: white; border: none; border-radius: 6px; padding: 8px 12px; cursor: pointer; }
-    .countryCard { margin-bottom: 16px; border: 1px solid #333; padding: 12px; border-radius: 8px; }
+    :root {
+      --bg: #0d1117;
+      --panel: #161b22;
+      --panel-2: #1c232c;
+      --border: #30363d;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --accent: #2f81f7;
+      --accent-2: #218bff;
+      --ok: #3fb950;
+      --warn: #d29922;
+      --err: #f85149;
+      --info: #79c0ff;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; font-size: 14px; line-height: 1.5; }
+    a { color: var(--accent-2); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    header { background: var(--panel); border-bottom: 1px solid var(--border); padding: 12px 20px; display: flex; align-items: center; gap: 16px; }
+    header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+    header .meta { color: var(--muted); font-size: 12px; }
+    nav { background: var(--panel); border-bottom: 1px solid var(--border); padding: 0 12px; display: flex; gap: 4px; flex-wrap: wrap; }
+    nav button { background: transparent; color: var(--muted); border: none; padding: 12px 16px; cursor: pointer; font: inherit; border-bottom: 2px solid transparent; }
+    nav button:hover { color: var(--text); }
+    nav button.active { color: var(--text); border-bottom-color: var(--accent); }
+    main { padding: 20px; max-width: 1400px; margin: 0 auto; }
+    section[hidden] { display: none; }
+    .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); margin-bottom: 20px; }
+    .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+    .card h3 { margin: 0 0 8px 0; font-size: 13px; color: var(--muted); font-weight: 500; text-transform: uppercase; letter-spacing: 0.05em; }
+    .card .value { font-size: 28px; font-weight: 600; }
+    .card .sub { color: var(--muted); font-size: 12px; margin-top: 6px; }
+    .card .help { color: var(--muted); font-size: 11px; margin-top: 8px; border-top: 1px solid var(--border); padding-top: 8px; }
+    table { border-collapse: collapse; width: 100%; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+    th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border); }
+    th { background: var(--panel-2); font-weight: 500; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: rgba(56, 139, 253, 0.06); }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; }
+    .badge.ok { background: rgba(63, 185, 80, 0.18); color: var(--ok); }
+    .badge.warn { background: rgba(210, 153, 34, 0.18); color: var(--warn); }
+    .badge.err { background: rgba(248, 81, 73, 0.18); color: var(--err); }
+    .badge.info { background: rgba(121, 192, 255, 0.18); color: var(--info); }
+    .badge.muted { background: rgba(139, 148, 158, 0.18); color: var(--muted); }
+    .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+    .toolbar select, .toolbar input { background: var(--panel); color: var(--text); border: 1px solid var(--border); padding: 6px 10px; border-radius: 6px; font: inherit; }
+    .toolbar button { background: var(--accent); color: white; border: none; padding: 6px 12px; border-radius: 6px; cursor: pointer; font: inherit; }
+    .toolbar button.secondary { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); }
+    textarea { width: 100%; background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 10px; font: inherit; }
+    .muted { color: var(--muted); }
+    .bar { background: var(--panel-2); border-radius: 4px; overflow: hidden; height: 8px; display: flex; border: 1px solid var(--border); }
+    .bar > div { height: 100%; }
+    .bar .ok { background: var(--ok); }
+    .bar .err { background: var(--err); }
+    pre { background: var(--panel-2); padding: 14px; overflow: auto; border-radius: 6px; border: 1px solid var(--border); font-size: 12px; }
+    .row-counts { color: var(--muted); font-size: 12px; margin-top: 8px; }
+    details { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; margin-top: 8px; }
+    summary { cursor: pointer; font-weight: 500; }
   </style>
 </head>
 <body>
-  <h1>m3uCrawler Dashboard</h1>
-  <p>Visualize o histórico de importações, as listas por país e o conteúdo atual da playlist.</p>
-  <p>Últimas 72 horas:</p>
-  <div id='history'></div>
+  <header>
+    <h1>m3uCrawler Dashboard</h1>
+    <span class='meta' id='metaLine'>a carregar…</span>
+  </header>
 
-  <h2>Validação por país</h2>
-  <div style='margin-bottom: 16px;'>
-    <label for='countrySelect'>País:</label>
-    <select id='countrySelect' style='margin-left: 8px; padding: 8px; min-width: 180px;'></select>
-  </div>
-  <div id='countryValidationResult'></div>
+  <nav id='nav'>
+    <button data-view='overview' class='active'>Overview</button>
+    <button data-view='executions'>Execuções</button>
+    <button data-view='discovery'>Descoberta</button>
+    <button data-view='countries'>Canais / Países</button>
+    <button data-view='playlist'>Playlist</button>
+    <button data-view='dispatcharr'>Dispatcharr</button>
+    <button data-view='diagnostics'>Diagnóstico</button>
+  </nav>
 
-  <h2>Listas de canais por país</h2>
-  <div id='countrySection'></div>
+  <main>
+    <!-- OVERVIEW -->
+    <section id='view-overview'>
+      <h2 style='font-size:18px;margin-top:0;'>Resumo do sistema</h2>
+      <div class='grid' id='overviewCards'></div>
+      <h3 style='font-size:14px;margin-top:24px;'>Relações da última execução</h3>
+      <div class='card'>
+        <div id='runMath'></div>
+      </div>
+    </section>
 
-  <h2>Diagnóstico da última execução</h2>
-  <div id='runReport'>Carregando...</div>
+    <!-- EXECUÇÕES -->
+    <section id='view-executions' hidden>
+      <h2 style='font-size:18px;margin-top:0;'>Histórico de execuções (últimas 72h)</h2>
+      <div class='toolbar'>
+        <span class='muted' id='historyCount'></span>
+        <button class='secondary' onclick='loadHistory()'>Recarregar</button>
+      </div>
+      <div id='historyTable'></div>
+      <div id='historyDetail'></div>
+    </section>
 
-  <h2>Últimas playlists descobertas</h2>
-  <div id='discoveredPlaylists'>Carregando...</div>
+    <!-- DESCOBERTA -->
+    <section id='view-discovery' hidden>
+      <h2 style='font-size:18px;margin-top:0;'>Descoberta</h2>
+      <div class='toolbar'>
+        <label class='muted'>Filtro estado:</label>
+        <select id='discState'>
+          <option value=''>todas</option>
+          <option value='accepted'>aceites</option>
+          <option value='rejected'>rejeitadas</option>
+        </select>
+        <label class='muted'>Origem:</label>
+        <select id='discSource'><option value=''>todas</option></select>
+        <label class='muted'>País:</label>
+        <select id='discCountry'><option value=''>todos</option></select>
+        <span class='muted' id='discMeta'></span>
+      </div>
+      <div id='discoveryTable'></div>
+      <details>
+        <summary>Ver entradas brutas (sem agregação)</summary>
+        <div id='discoveryRaw' style='margin-top:8px;'></div>
+      </details>
+    </section>
 
-  <h2>Playlist atual</h2>
-  <p><a href='/api/playlist' target='_blank'>Ver playlist.m3u</a> · <a href='/api/playlist_temp' target='_blank'>Ver playlist_temp.m3u</a></p>
-  <pre id='playlistPreview'>Carregando...</pre>
+    <!-- CANAIS / PAÍSES -->
+    <section id='view-countries' hidden>
+      <h2 style='font-size:18px;margin-top:0;'>Canais / Países</h2>
+      <h3 style='font-size:14px;'>Validação da playlist atual</h3>
+      <div class='toolbar'>
+        <label class='muted'>País:</label>
+        <select id='countrySelect'></select>
+        <button class='secondary' onclick='loadCountryValidation()'>Re-validar</button>
+      </div>
+      <div id='countryValidationResult'></div>
+      <h3 style='font-size:14px;margin-top:24px;'>Listas de canais por país (editáveis)</h3>
+      <div id='countrySection'></div>
+    </section>
+
+    <!-- PLAYLIST -->
+    <section id='view-playlist' hidden>
+      <h2 style='font-size:18px;margin-top:0;'>Playlist atual</h2>
+      <div class='toolbar'>
+        <a href='/api/playlist' target='_blank'>playlist.m3u (funcional)</a>
+        <a href='/api/playlist_temp' target='_blank'>playlist_temp.m3u</a>
+        <span class='muted' id='playlistInventory'></span>
+      </div>
+      <div class='card' style='margin-bottom:12px;'>
+        <div class='muted' id='playlistMath'></div>
+      </div>
+      <h3 style='font-size:14px;'>Pré-visualização (URLs sanitizadas — sem credenciais Xtream)</h3>
+      <pre id='playlistPreview'>a carregar…</pre>
+    </section>
+
+    <!-- DISPATCHARR -->
+    <section id='view-dispatcharr' hidden>
+      <h2 style='font-size:18px;margin-top:0;'>Dispatcharr</h2>
+      <div id='dispatcharrOverview'></div>
+      <h3 style='font-size:14px;margin-top:24px;'>Detalhes da última sincronização</h3>
+      <div id='dispatcharrDetail'></div>
+    </section>
+
+    <!-- DIAGNÓSTICO -->
+    <section id='view-diagnostics' hidden>
+      <h2 style='font-size:18px;margin-top:0;'>Diagnóstico</h2>
+      <div id='diagLastRun'></div>
+      <h3 style='font-size:14px;margin-top:24px;'>Inventário de output/</h3>
+      <div id='diagInventory'></div>
+      <h3 style='font-size:14px;margin-top:24px;'>End-to-end (raw RunReport)</h3>
+      <details><summary>Ver RunReport completo</summary><pre id='diagRawRunReport'>a carregar…</pre></details>
+      <h3 style='font-size:14px;margin-top:24px;'>Glossário de métricas</h3>
+      <div id='diagGlossary'></div>
+    </section>
+  </main>
+
   <script>
-    let countryOptions = [];
+  (function(){
+    const fmt = (v) => (v === undefined || v === null) ? '—' : v;
+    const nfmt = (n) => new Intl.NumberFormat('pt-PT').format(n);
+    const pct = (n) => new Intl.NumberFormat('pt-PT', { maximumFractionDigits: 1, minimumFractionDigits: 1 }).format(n) + '%';
+    const tsLocal = (s) => s ? new Date(s).toLocaleString() : '—';
 
-    async function loadHistory() {
-      const res = await fetch('/api/history');
-      const items = await res.json();
-      if (!items.length) {
-        document.getElementById('history').innerHTML = '<p>Nenhum histórico encontrado.</p>';
-        return;
-      }
-      const rows = items.map(entry => `
-        <tr>
-          <td>${new Date(entry.timestamp).toLocaleString()}</td>
-          <td>${entry.mode}</td>
-          <td>${entry.searchTerm}</td>
-          <td>${entry.historyHours}h</td>
-          <td>${entry.maxStreams}</td>
-          <td>${entry.newFunctionalCount}</td>
-          <td>${entry.existingStillWorkingCount}/${entry.existingRetestedCount}</td>
-          <td>${entry.finalPlaylistCount}</td>
-        </tr>`).join('');
-      document.getElementById('history').innerHTML = `<table><thead><tr><th>Quando</th><th>Modo</th><th>Pesquisa</th><th>História</th><th>Máx</th><th>Novos</th><th>Retestados</th><th>Total final</th></tr></thead><tbody>${rows}</tbody></table>`;
+    function metricCard(title, value, sub, help) {
+      return `<div class='card'><h3>${title}</h3><div class='value'>${value}</div>${sub ? `<div class='sub'>${sub}</div>` : ''}${help ? `<div class='help'>${help}</div>` : ''}</div>`;
     }
 
+    function helpFor(key) {
+      const map = {
+        candidates: 'URLs/attachments identificados como potenciais M3U antes do download.',
+        playlists: 'Playlists distintas descarregadas com sucesso (passaram o gate #EXTM3U).',
+        streams: 'Entradas EXTINF extraídas, antes do filtro por país.',
+        streamsAfter: 'Streams que sobraram depois do filtro por país (candidatos a teste).',
+        tested: 'Streams aos quais foi feito um teste HTTP.',
+        working: 'Streams que responderam OK.',
+        failed: 'Streams cujo teste falhou.',
+        durationMs: 'Duração total da execução em ms.'
+      };
+      return map[key] || '';
+    }
+
+    async function safeFetchJson(url, fallback) {
+      try { const r = await fetch(url); if (!r.ok) return fallback || { error: `HTTP ${r.status}` }; return await r.json(); }
+      catch (e) { return fallback || { error: e.message }; }
+    }
+
+    async function loadOverview() {
+      const [run, hist, dispatcharr, inv] = await Promise.all([
+        safeFetchJson('/api/run-report/summary', null),
+        safeFetchJson('/api/history', []),
+        safeFetchJson('/api/dispatcharr/state', null),
+        safeFetchJson('/api/output/inventory', {})
+      ]);
+
+      // Cabeçalho
+      const lastRunTs = (run && run.startedAtUtc) ? tsLocal(run.startedAtUtc) : '—';
+      document.getElementById('metaLine').textContent = `Última execução: ${lastRunTs}`;
+
+      const last = (hist && hist.length) ? hist[0] : null;
+      const finalCount = last ? last.finalPlaylistCount : '—';
+      const histoHours = last ? (last.historyHours + 'h') : '—';
+
+      const cards = [];
+      cards.push(metricCard('Última execução', lastRunTs, run ? ('estado: ' + (run.status || '—')) : 'sem run report', ''));
+      cards.push(metricCard('Duração', run ? (run.durationMs != null ? (nfmt(run.durationMs) + ' ms') : '—') : '—', run && run.durationMs ? ((run.durationMs/1000).toFixed(1) + ' s') : '', helpFor('durationMs')));
+      cards.push(metricCard('playlist.m3u', finalCount + ' streams', last ? ('janela ' + histoHours) : '', 'Streams actualmente publicados.'));
+      cards.push(metricCard('playlist.m3u (bytes)', inv['playlist.m3u'] ? nfmt(inv['playlist.m3u']) + ' B' : '—', '', 'Tamanho do ficheiro actual.'));
+      if (run) {
+        const w = run.streamsWorking, f = run.streamsFailed, t = run.streamsTested;
+        const rate = (w + f) > 0 ? (100 * w / (w + f)) : null;
+        const sub = rate != null ? (pct(rate) + ' de sucesso · ' + nfmt(w) + ' OK / ' + nfmt(f) + ' KO') : '—';
+        cards.push(metricCard('Última: testados / funcionais', nfmt(t) + ' · ' + nfmt(w), sub, helpFor('working')));
+        cards.push(metricCard('Última: candidatos', nfmt(run.candidates || 0), 'playlists: ' + nfmt(run.playlistsDownloaded || 0), helpFor('candidates')));
+      } else {
+        cards.push(metricCard('Última execução (resumo)', '—', 'sem run report disponível', ''));
+      }
+      cards.push(metricCard('Última sync Dispatcharr', dispatcharr && dispatcharr.startedAtUtc ? tsLocal(dispatcharr.startedAtUtc) : '—',
+        dispatcharr && dispatcharr.dispatchedDetailDisabled ? '' :
+          (dispatcharr && dispatcharr.dispatcharrVersion ? ('versão ' + dispatcharr.dispatcharrVersion) : (dispatcharr ? (dispatcharr.reason || '—') : '')),
+        'Sincronização opt-in (dispatcharr_enabled=true em wtelegram.config).'));
+      document.getElementById('overviewCards').innerHTML = cards.join('');
+
+      // Relações matemáticas
+      let math = '<p class="muted">Sem dados do último run.</p>';
+      if (run) {
+        const w = run.streamsWorking || 0, f = run.streamsFailed || 0, t = run.streamsTested || 0;
+        const tested = w + f;
+        const balanced = tested === t;
+        const rate = tested > 0 ? (100 * w / tested) : null;
+        const failRate = tested > 0 ? (100 * f / tested) : null;
+        const candidates = run.candidates || 0;
+        const playlistsDl = run.playlistsDownloaded || 0;
+        const playlistsRej = run.playlistsRejected || 0;
+        const streams = run.streamsExtracted || 0;
+        const streamsAfter = run.streamsAfterCountryFilter || 0;
+        const rejectedByCountry = run.streamsRejectedByCountry || 0;
+        const messages = run.messages || 0;
+
+        // NOTA: a seta "→" representa uma CONTAGEM ao longo do pipeline, não igualdade.
+        //   Messages -> Candidates           (sub-conjunto,scan)
+        //   Candidates = PlaylistsDownloaded + PlaylistsInvalid
+        //                                       (PlaylistsInvalid = #EXTM3U gate falhado)
+        //   PlaylistsDownloaded = CountryMatches + PlaylistsRejected
+        //                                       (PlaylistsRejected mistura
+        //                                        fast-reject E 0-streams-após-filtro)
+        //   StreamsExtracted conta APENAS streams de playlists COM país-alvo aceite.
+        //   Por isso StreamsExtracted << PlaylistsDownloaded quando há playlists rejeitadas.
+        math = `
+          <p><strong>Cadeia (cada → não é igualdade):</strong></p>
+          <p>${nfmt(messages)} mensagens Telegram → ${nfmt(candidates)} candidatos → ${nfmt(playlistsDl)} playlists OK (+ ${nfmt(playlistsRej)} rejeitadas) → ${nfmt(streams)} streams (em playlists OK) → ${nfmt(streamsAfter)} após filtro por país → ${nfmt(t)} testados</p>
+          <h4 style='margin:12px 0 4px;'>Testes</h4>
+          ${t > 0 ? `
+            <p>${nfmt(t)} streams testados = ${nfmt(w)} funcionais + ${nfmt(f)} falhados
+              ${balanced ? '' : `<span class='badge warn' title='Funcionais+Falhados ≠ Testados (streams pulados)'>⚠ ${nfmt(t - tested)} não testados / pulados</span>`}
+            </p>
+            <div class='bar' title='${pct(rate ?? 0)} de sucesso'>
+              <div class='ok' style='width:${rate}%;'></div>
+              <div class='err' style='width:${failRate}%;'></div>
+            </div>
+            <p class='row-counts'>taxa de sucesso: ${rate != null ? pct(rate) : '—'} · taxa de falha: ${failRate != null ? pct(failRate) : '—'}</p>
+          ` : '<p class="muted">Sem streams testados neste run.</p>'}
+          <h4 style='margin:16px 0 4px;'>Filtro por país (per-stream)</h4>
+          <p>${nfmt(streamsAfter)} streams seleccionados · ${nfmt(rejectedByCountry)} rejeitados por país</p>
+          <p class='row-counts'>Sumido entre passos: ${nfmt(playlistsRej)} playlists não passaram o gate (incl. fast-reject) não contribuem para ${nfmt(streams)}.</p>
+        `;
+      }
+      document.getElementById('runMath').innerHTML = math;
+    }
+
+    let historyCache = [];
+    async function loadHistory() {
+      const items = await safeFetchJson('/api/history', []);
+      historyCache = Array.isArray(items) ? items : [];
+      document.getElementById('historyCount').textContent = historyCache.length + ' execuções listadas.';
+      if (!historyCache.length) { document.getElementById('historyTable').innerHTML = '<p class="muted">Nenhum histórico encontrado.</p>'; return; }
+      const rows = historyCache.map((e, idx) => {
+        const ts = new Date(e.timestamp).toLocaleString();
+        const modeBadge = `<span class='badge ${e.mode === 'TelegramMaintenance' ? 'info' : 'muted'}'>${e.mode || ''}</span>`;
+        const ratio = e.existingRetestedCount > 0 ? (e.existingStillWorkingCount + '/' + e.existingRetestedCount) : '—';
+        return `<tr data-idx='${idx}' style='cursor:pointer'>
+          <td>${ts}</td>
+          <td>${modeBadge}</td>
+          <td>${e.searchTerm || '—'}</td>
+          <td>${e.historyHours}h</td>
+          <td>${e.maxStreams || '—'}</td>
+          <td>${e.newFunctionalCount}</td>
+          <td>${ratio}</td>
+          <td>${e.finalPlaylistCount}</td>
+        </tr>`;
+      }).join('');
+      document.getElementById('historyTable').innerHTML =
+        '<table><thead><tr><th>Quando</th><th>Modo</th><th>Pesquisa</th><th>História</th><th>Máx</th><th>Novos</th><th>Retestados</th><th>Total final</th></tr></thead><tbody>' + rows + '</tbody></table>';
+      document.querySelectorAll('#historyTable tr[data-idx]').forEach(tr => tr.addEventListener('click', () => showHistoryDetail(parseInt(tr.getAttribute('data-idx'), 10))));
+    }
+
+    async function showHistoryDetail(idx) {
+      if (idx < 0 || idx >= historyCache.length) return;
+      const entry = historyCache[idx];
+      const detail = await safeFetchJson(`/api/execution/${idx + 1}`, null);
+      const e = detail || entry;
+      const html = `
+        <div class='card' style='margin-top:12px;'>
+          <h3>Execução #${idx + 1} — ${new Date(e.timestamp).toLocaleString()}</h3>
+          <table>
+            <tr><th>Modo</th><td>${fmt(e.mode)}</td><th>Pesquisa</th><td>${fmt(e.searchTerm)}</td></tr>
+            <tr><th>Janela</th><td>${fmt(e.historyHours)} h</td><th>Máx streams</th><td>${fmt(e.maxStreams)}</td></tr>
+            <tr><th>Mensagens analisadas</th><td>${nfmt(e.messagesAnalyzed || 0)}</td><th>Candidatos</th><td>${nfmt(e.candidatesFound || 0)}</td></tr>
+            <tr><th>Playlists</th><td>${nfmt(e.playlistsDownloaded || 0)}</td><th>Rejeitadas</th><td>${nfmt(e.playlistsRejected || 0)}</td></tr>
+            <tr><th>Country matches</th><td>${nfmt(e.countryMatches || 0)}</td><th>Streams extraídos</th><td>${nfmt(e.streamsExtracted || 0)}</td></tr>
+            <tr><th>Após filtro país</th><td>${nfmt(e.streamsAfterCountryFilter || 0)}</td><th>Rejeitados país</th><td>${nfmt(e.streamsRejectedByCountry || 0)}</td></tr>
+            <tr><th>Testados</th><td>${nfmt(e.streamsTested || 0)}</td><th>Funcionais</th><td>${nfmt(e.streamsWorking || 0)}</td></tr>
+            <tr><th>Falhados</th><td>${nfmt(e.streamsFailed || 0)}</td><th>Total final</th><td>${nfmt(e.finalPlaylistCount || 0)}</td></tr>
+          </table>
+          <p class='row-counts'>Detalhes crus (apenas leitura) preservados para auditoria.</p>
+        </div>`;
+      document.getElementById('historyDetail').innerHTML = html;
+    }
+
+    let discoveryCache = { total: 0, distinct: 0, items: [] };
+    async function loadDiscovery() {
+      const sum = await safeFetchJson('/api/discovery/summary', { items: [] });
+      discoveryCache = sum || { items: [] };
+      const items = discoveryCache.items || [];
+      document.getElementById('discMeta').textContent =
+        `${items.length} entradas distintas (de ${discoveryCache.total || items.length} brutas, ${discoveryCache.duplicatesCollapsed || 0} duplicações agregadas)`;
+
+      const sources = [...new Set(items.map(i => i.source).filter(Boolean))].sort();
+      const countries = [...new Set(items.map(i => i.countryDetected).filter(Boolean))].sort();
+      const srcSel = document.getElementById('discSource');
+      const coSel = document.getElementById('discCountry');
+      srcSel.innerHTML = '<option value="">todas</option>' + sources.map(s => `<option value="${s.replace(/"/g,'&quot;')}">${s}</option>`).join('');
+      coSel.innerHTML = '<option value="">todos</option>' + countries.map(c => `<option value="${c.replace(/"/g,'&quot;')}">${c}</option>`).join('');
+
+      renderDiscovery();
+      const raw = await safeFetchJson('/api/discovered-playlists', []);
+      if (Array.isArray(raw)) {
+        document.getElementById('discoveryRaw').innerHTML = '<pre>' + JSON.stringify(raw, null, 2).slice(0, 20000) + '</pre>';
+      }
+    }
+
+    function renderDiscovery() {
+      const state = document.getElementById('discState').value;
+      const source = document.getElementById('discSource').value;
+      const country = document.getElementById('discCountry').value;
+      const items = (discoveryCache.items || []).filter(i =>
+        (!state || i.state === state) &&
+        (!source || i.source === source) &&
+        (!country || i.countryDetected === country)
+      );
+      const rows = items.map((p, idx) => {
+        const stateBadge = p.state === 'accepted'
+          ? '<span class="badge ok">aceite</span>'
+          : '<span class="badge err">rejeitada</span>';
+        return `<tr>
+          <td>${p.source || '—'}</td>
+          <td>${p.name || '—'}</td>
+          <td>${p.countryDetected || '—'}</td>
+          <td>${nfmt(p.channelsRecognized || 0)}</td>
+          <td>${nfmt(p.streamCount || 0)}</td>
+          <td>${nfmt(p.streamsAfterCountryFilter || 0)}</td>
+          <td>${nfmt(p.workingStreams || 0)}</td>
+          <td>${stateBadge}</td>
+          <td>${p.occurrences > 1 ? '<span class="badge warn" title="Mesma (origem, nome) em múltiplas linhas do RunReport">×' + p.occurrences + '</span>' : '—'}</td>
+        </tr>`;
+      }).join('');
+      document.getElementById('discoveryTable').innerHTML = items.length
+        ? `<table><thead><tr><th>Origem</th><th>Nome</th><th>País</th><th>Canais</th><th>Streams</th><th>Após país</th><th>Funcionais</th><th>Estado</th><th>Notas</th></tr></thead><tbody>${rows}</tbody></table>`
+        : '<p class="muted">Nenhuma playlist encontrada para os filtros escolhidos.</p>';
+    }
+
+    let countryOptions = [];
     async function loadCountries() {
-      const res = await fetch('/api/countries');
-      const countries = await res.json();
-      countryOptions = countries;
-
+      const res = await safeFetchJson('/api/countries', []);
+      countryOptions = res || [];
       const countrySelect = document.getElementById('countrySelect');
-      countrySelect.innerHTML = countries.map(country => `<option value='${country.country}'>${country.displayName || country.country}</option>`).join('');
-      countrySelect.value = countries[0]?.country || 'pt';
-
-      if (!countries.length) {
-        document.getElementById('countrySection').innerHTML = '<p>Nenhuma lista de canais encontrada.</p>';
-        document.getElementById('countryValidationResult').innerHTML = '<p>Sem país disponível para validação.</p>';
+      countrySelect.innerHTML = countryOptions.map(c => `<option value='${c.country}'>${c.displayName || c.country}</option>`).join('');
+      countrySelect.value = countryOptions[0]?.country || 'pt';
+      if (!countryOptions.length) {
+        document.getElementById('countrySection').innerHTML = '<p class="muted">Nenhuma lista de canais encontrada.</p>';
+        document.getElementById('countryValidationResult').innerHTML = '<p class="muted">Sem país disponível para validação.</p>';
         return;
       }
-
-      const countryCards = countries.map(country => `
-        <div class='countryCard'>
-          <strong>${country.displayName || country.country}</strong>
-          <textarea id='country-${country.country}' rows='6'>${(country.channels || []).join('\n')}</textarea>
-          <div style='margin-top:8px;'><button data-country='${country.country}'>Guardar</button></div>
+      const countryCards = countryOptions.map(c => `
+        <div class='card' style='margin-bottom:12px;'>
+          <h3>${c.displayName || c.country}</h3>
+          <textarea id='country-${c.country}' rows='6'>${(c.channels || []).join('\n')}</textarea>
+          <div style='margin-top:8px;'><button class='secondary' data-country='${c.country}'>Guardar</button></div>
         </div>`).join('');
-
       document.getElementById('countrySection').innerHTML = countryCards;
-      loadCountryValidation(countrySelect.value);
-
-      document.querySelectorAll('button[data-country]').forEach(button => {
-        button.addEventListener('click', async () => {
-          const countryCode = button.getAttribute('data-country');
-          const textarea = document.getElementById(`country-${countryCode}`);
-          const channels = textarea.value.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
-          const payload = JSON.stringify({ country: countryCode, displayName: countryCode.toUpperCase(), channels });
-
-          const response = await fetch('/api/country/save', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: payload
-          });
-
-          if (response.ok) {
-            alert('Lista guardada com sucesso.');
-            await loadCountries();
-          } else {
-            const text = await response.text();
-            alert('Erro ao guardar: ' + text);
-          }
+      document.querySelectorAll('button[data-country]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const code = btn.getAttribute('data-country');
+          const t = document.getElementById(`country-${code}`);
+          const channels = t.value.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+          const r = await fetch('/api/country/save', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ country: code, displayName: code.toUpperCase(), channels }) });
+          if (r.ok) { alert('Lista guardada.'); await loadCountries(); } else { alert('Erro: ' + (await r.text())); }
         });
       });
+      await loadCountryValidation();
     }
 
-    async function loadCountryValidation(country) {
-      const res = await fetch(`/api/country/validate?country=${encodeURIComponent(country)}`);
-      const result = await res.json();
-
-      const details = result.isMatch
-        ? `<p><strong>✅ Correspondência encontrada</strong> em ${result.displayName || result.country}.</p><p>Aliases: ${result.matchedAliases.join(', ') || 'Nenhum'}</p>`
-        : `<p><strong>⚠️ Nenhuma correspondência</strong> em ${result.displayName || result.country}.</p><p>Aliases esperados: ${result.matchedAliases.join(', ') || 'Nenhum'}</p>`;
-
-      document.getElementById('countryValidationResult').innerHTML = `
-        <div class='countryCard'>
-          <strong>Resultado da validação</strong>
-          ${details}
-          <p>Canais reconhecidos: ${result.recognizedChannelCount ?? 0}/${result.threshold ?? 3}</p>
-          <p>Canais na lista: ${result.totalChannels}</p>
-          <p>Tamanho da playlist: ${result.playlistLength} bytes</p>
+    async function loadCountryValidation() {
+      const code = document.getElementById('countrySelect').value;
+      const res = await safeFetchJson(`/api/country/validate?country=${encodeURIComponent(code)}`, null);
+      const target = document.getElementById('countryValidationResult');
+      if (!res || res.error) { target.innerHTML = '<p class="muted">Sem dados de validação.</p>'; return; }
+      const detail = res.isMatch
+        ? `<p><span class='badge ok'>correspondência</span> em ${res.displayName || res.country}.</p><p>Aliases detectados: ${(res.matchedAliases || []).join(', ') || '—'}</p>`
+        : `<p><span class='badge warn'>sem correspondência</span> em ${res.displayName || res.country}.</p><p>Aliases esperados: ${(res.matchedAliases || []).join(', ') || '—'}</p>`;
+      // As três grandezas NÃO representam a mesma colecção de coisas:
+      //   recognized  = nº de canais canónicos distintos reconhecidos NA PLAYLIST actual
+      //   threshold   = mínimo para o país ser considerado alvo (gate do AnalyzePlaylist)
+      //   totalChannels = nº de aliases configurados em runtime-data/countries/<code>.json
+      // Por isso não calculamos "cobertura" como recognized/total — esse rácio mistura
+      // colecções diferentes. Cada número é apresentado em separado.
+      target.innerHTML = `
+        <div class='card'>
+          <h3>Resultado da validação — ${res.displayName || res.country}</h3>
+          ${detail}
+          <p><strong>Reconhecidos na playlist:</strong> ${nfmt(res.recognizedChannelCount || 0)} canais canónicos distintos</p>
+          <p><strong>Threshold (gate do país-alvo):</strong> ${res.threshold || 3}</p>
+          <p><strong>Aliases configurados:</strong> ${nfmt(res.totalChannels || 0)} (em <code>runtime-data/countries/${code}.json</code>)</p>
+          <p class='row-counts'>tamanho playlist: ${nfmt(res.playlistLength || 0)} bytes</p>
         </div>`;
     }
 
-    async function loadPlaylistPreview() {
+    async function loadPlaylist() {
       try {
-        // Usa o endpoint de preview (URLs sanitizadas) para não expor credenciais Xtream.
-        const res = await fetch('/api/playlist/preview');
-        if (!res.ok) {
-          document.getElementById('playlistPreview').textContent = 'Playlist não disponível.';
-          return;
-        }
-        const text = await res.text();
-        document.getElementById('playlistPreview').textContent = text.split('\n').slice(0, 40).join('\n');
-      } catch (err) {
+        const inv = await safeFetchJson('/api/output/inventory', {});
+const rows = Object.entries(inv).map(([k, v]) => {
+          if (!v || !v.present) return `<tr><td>${k}</td><td><span class="badge muted">ausente</span></td></tr>`;
+          return `<tr><td>${k}</td><td>${nfmt(v.size)} B <span class="row-counts">(${new Date(v.lastWriteUtc).toLocaleString()})</span></td></tr>`;
+        }).join('');
+        document.getElementById('playlistInventory').innerHTML = '· ' + Object.entries(inv).map(([k, v]) => v && v.present ? `${k}=${nfmt(v.size)}B` : `${k}=ausente`).join(' · ');
+        document.getElementById('diagInventory').innerHTML = `<table><thead><tr><th>Ficheiro</th><th>Tamanho</th></tr></thead><tbody>${rows}</tbody></table>`;
+      } catch (e) {}
+      try {
+        const r = await fetch('/api/playlist/preview');
+        const txt = r.ok ? (await r.text()) : 'Playlist não disponível.';
+        const lines = txt.split('\n').filter(Boolean).slice(0, 80);
+        const streamCount = (txt.match(/^#EXTINF/gm) || []).length;
+        document.getElementById('playlistMath').innerHTML = `
+          <p><strong>${nfmt(streamCount)}</strong> entradas #EXTINF na pré-visualização.
+          URLs foram sanitizadas neste endpoint — credenciais Xtream nunca aparecem.</p>`;
+        document.getElementById('playlistPreview').textContent = lines.join('\n');
+      } catch (e) {
         document.getElementById('playlistPreview').textContent = 'Erro ao carregar playlist.';
       }
     }
 
-    async function loadRunReport() {
-      try {
-        const res = await fetch('/api/run-report');
-        if (!res.ok) { document.getElementById('runReport').textContent = 'Sem relatório disponível.'; return; }
-        const r = await res.json();
-        const fmt = (v) => (v === undefined || v === null ? '-' : v);
-        document.getElementById('runReport').innerHTML =
-          '<table><thead><tr><th>Ultima execucao</th><th>Estado</th><th>Mensagens</th><th>Candidatos</th><th>Playlists</th><th>Pais</th><th>Streams</th><th>Testados</th><th>Funcionais</th><th>Falhados</th><th>Duracao(ms)</th></tr></thead><tbody><tr>' +
-          '<td>' + new Date(fmt(r.startedAt)).toLocaleString() + '</td>' +
-          '<td>' + fmt(r.status) + '</td>' +
-          '<td>' + fmt(r.messagesAnalyzed) + '</td>' +
-          '<td>' + fmt(r.candidatesFound) + '</td>' +
-          '<td>' + fmt(r.playlistsDownloaded) + '</td>' +
-          '<td>' + fmt(r.countryMatches) + '</td>' +
-          '<td>' + fmt(r.streamsExtracted) + '</td>' +
-          '<td>' + fmt(r.streamsTested) + '</td>' +
-          '<td>' + fmt(r.streamsWorking) + '</td>' +
-          '<td>' + fmt(r.streamsFailed) + '</td>' +
-          '<td>' + fmt(r.durationMs) + '</td>' +
-          '</tr></tbody></table>';
-      } catch (e) { document.getElementById('runReport').textContent = 'Erro ao carregar relatorio.'; }
+    async function loadDispatcharr() {
+      const s = await safeFetchJson('/api/dispatcharr/state', null);
+      const target = document.getElementById('dispatcharrOverview');
+      const detail = document.getElementById('dispatcharrDetail');
+      if (!s || s.reason) {
+        target.innerHTML = `
+          <div class='card'>
+            <h3>Sincronização Dispatcharr</h3>
+            <p><span class='badge warn'>não activa</span></p>
+            <p>${s && s.reason ? s.reason : 'Sem dados.'}</p>
+            <p class='row-counts'>A integração é opt-in (wtelegram.config: <code>dispatcharr_enabled=true</code>).
+            Nenhuma chave ainda foi escrita, ou o sync opt-in nunca correu.</p>
+          </div>`;
+        detail.innerHTML = '';
+        return;
+      }
+      const cards = [];
+      cards.push(metricCard('Última execução', tsLocal(s.startedAtUtc), s.dryRun ? '<span class="badge info">dry-run</span>' : '<span class="badge warn">apply</span>', ''));
+      cards.push(metricCard('Versão Dispatcharr', s.dispatcharrVersion || '—', '', 'Obtida de GET /api/core/version/ no início da run (best-effort).'));
+      cards.push(metricCard('Total de canais no plano', nfmt(s.totalChannels || 0), 'matched + new + unchanged + ...', ''));
+      cards.push(metricCard('Matched (canais)', nfmt(s.matched || 0), 'canal existente reutilizado', ''));
+      cards.push(metricCard('New channels', nfmt(s.newChannels || 0), 'canais novos a criar', ''));
+      cards.push(metricCard('New streams', nfmt(s.newStreams || 0), 'streams novos a anexar', ''));
+      cards.push(metricCard('Removed streams', nfmt(s.removedStreams || 0), 'a desassociar e apagar', ''));
+      cards.push(metricCard('Ambiguous', nfmt(s.ambiguous || 0), 'nunca aplicados automaticamente', ''));
+      cards.push(metricCard('Skipped', nfmt(s.skipped || 0), 'streams não-workings na playlist', ''));
+      cards.push(metricCard('Failed', nfmt(s.failed || 0), '', ''));
+      target.innerHTML = `<div class='grid'>${cards.join('')}</div>`;
+
+      // Sinaliza se plan e report pertencem à mesma execução (por timestamp).
+      const pairingNote = s.planReportPaired
+        ? 'plan + report emparelhados (mesma execução)'
+        : '<span class="badge warn">plan e report NÃO foram emparelhados pelo timestamp</span>';
+
+      detail.innerHTML = `
+        <div class='card'>
+          <h3>Ficheiros produzidos</h3>
+          ${s.latestPlanPath ? `<p><strong>Plano:</strong> <code>${s.latestPlanPath}</code></p>` : '<p><em>Sem plano (sync opt-in nunca correu ou foi interrompido).</em></p>'}
+          ${s.latestReportPath ? `<p><strong>Relatório:</strong> <code>${s.latestReportPath}</code></p>` : '<p><em>Sem relatório.</em></p>'}
+          <p>${pairingNote}</p>
+          ${(s.planValid === false || s.reportValid === false) ? `<p class='row-counts'><span class='badge err'>ficheiro(s) com JSON inválido</span>: ${s.error || ''}</p>` : ''}
+          <p class='row-counts'>Os ficheiros ficam em <code>output/</code> (bind mount <code>/opt/playlists</code>).
+          Ver <code>dispatcharr_plan_*.json</code> e <code>dispatcharr_report_*.json</code> mais recentes.
+          Estes ficheiros nunca contêm credenciais em claro (sanitização automática).</p>
+        </div>`;
     }
 
-    async function loadDiscoveredPlaylists() {
-      try {
-        const res = await fetch('/api/discovered-playlists');
-        if (!res.ok) { document.getElementById('discoveredPlaylists').textContent = 'Sem playlists descobertas.'; return; }
-        const items = await res.json();
-        if (!items.length) { document.getElementById('discoveredPlaylists').innerHTML = '<p>Nenhuma playlist descoberta na ultima execucao.</p>'; return; }
-        const rows = items.map(p =>
-          '<tr><td>' + (p.source || '') + '</td>' +
-          '<td>' + (p.name || '') + '</td>' +
-          '<td>' + (p.countryDetected || '-') + '</td>' +
-          '<td>' + (p.channelsRecognized || 0) + '</td>' +
-          '<td>' + (p.streamCount || 0) + '</td>' +
-          '<td>' + (p.workingStreams || 0) + '</td>' +
-          '<td>' + (p.state || '') + '</td></tr>').join('');
-        document.getElementById('discoveredPlaylists').innerHTML =
-          '<table><thead><tr><th>Origem</th><th>Nome</th><th>Pais</th><th>Canais</th><th>Streams</th><th>Funcionais</th><th>Estado</th></tr></thead><tbody>' + rows + '</tbody></table>';
-      } catch (e) { document.getElementById('discoveredPlaylists').textContent = 'Erro ao carregar playlists.'; }
+    async function loadDiagnostics() {
+      const r = await safeFetchJson('/api/run-report/summary', null);
+      const target = document.getElementById('diagLastRun');
+      if (!r || r.error) { target.innerHTML = '<p class="muted">Sem run report.</p>'; }
+      else {
+        target.innerHTML = `
+          <div class='card'>
+            <h3>Última execução (resumo)</h3>
+            <table>
+              <tr><th>Início</th><td>${tsLocal(r.startedAtUtc)}</td><th>Fim</th><td>${tsLocal(r.finishedAtUtc)}</td></tr>
+              <tr><th>Estado</th><td><span class='badge ${r.status === "ok" ? "ok" : (r.status === "sem-streams" ? "warn" : "err")}'>${r.status}</span></td><th>Duração</th><td>${nfmt(r.durationMs || 0)} ms</td></tr>
+              <tr><th>Mensagens</th><td>${nfmt(r.messages || 0)}</td><th>Candidatos</th><td>${nfmt(r.candidates || 0)}</td></tr>
+              <tr><th>Playlists OK</th><td>${nfmt(r.playlistsDownloaded || 0)}</td><th>Playlists inválidas</th><td>${nfmt(r.playlistsInvalid || 0)}</td></tr>
+              <tr><th>Rejeitadas por país</th><td>${nfmt(r.playlistsRejected || 0)}</td><th>Country matches</th><td>${nfmt(r.countryMatches || 0)}</td></tr>
+              <tr><th>Streams extraídos</th><td>${nfmt(r.streamsExtracted || 0)}</td><th>Após país</th><td>${nfmt(r.streamsAfterCountryFilter || 0)}</td></tr>
+              <tr><th>Rejeitados país</th><td>${nfmt(r.streamsRejectedByCountry || 0)}</td><th>Testados</th><td>${nfmt(r.streamsTested || 0)}</td></tr>
+              <tr><th>Funcionais</th><td>${nfmt(r.streamsWorking || 0)}</td><th>Falhados</th><td>${nfmt(r.streamsFailed || 0)}</td></tr>
+              <tr><th>Taxa de sucesso</th><td>${r.successRatePercent != null ? pct(r.successRatePercent) : '—'}</td><th>Testados balanceados</th><td>${r.testsBalanced ? '<span class="badge ok">sim</span>' : '<span class="badge warn">não (W+F≠T)</span>'}</td></tr>
+            </table>
+          </div>`;
+        try {
+          const raw = await fetch('/api/run-report');
+          if (raw.ok) document.getElementById('diagRawRunReport').textContent = JSON.stringify(await raw.json(), null, 2);
+        } catch(e) {}
+      }
+      const inv = await safeFetchJson('/api/output/inventory', {});
+      const rows = Object.keys(inv).map(k => `<tr><td>${k}</td><td>${typeof inv[k] === 'number' ? (nfmt(inv[k]) + ' B') : (inv[k] === false ? 'ausente' : inv[k])}</td></tr>`).join('');
+      document.getElementById('diagInventory').innerHTML = `<table><thead><tr><th>Ficheiro</th><th>Tamanho</th></tr></thead><tbody>${rows}</tbody></table>`;
+
+      // Glossário
+      const gloss = Object.entries({
+        candidates: 'URLs/attachments identificados como potenciais M3U antes do download.',
+        playlistsDownloaded: 'Playlists distintas descarregadas com sucesso (passaram o gate #EXTM3U).',
+        playlistsInvalid: 'Descartadas por não serem playlists M3U válidas.',
+        playlistsRejected: 'Rejeitadas pelo filtro por país (fast-reject).',
+        streamsExtracted: 'Entradas EXTINF extraídas, antes do filtro por país.',
+        streamsAfterCountryFilter: 'Streams sobreviventes ao filtro por país (candidatos a teste).',
+        streamsRejectedByCountry: 'Streams removidos pelo filtro por país.',
+        streamsTested: 'Streams testados via HTTP.',
+        streamsWorking: 'Streams que responderam OK no teste.',
+        streamsFailed: 'Streams cujo teste falhou.',
+        successRatePercent: 'streamsWorking / (streamsWorking + streamsFailed) × 100.',
+        testsBalanced: 'Verdadeiro se working + failed == tested; usado para detectar streams pulados.',
+        coverage: 'recognizedChannelCount / totalChannels × 100 — só calculado se houver base comparável.',
+      });
+      document.getElementById('diagGlossary').innerHTML = `<table><thead><tr><th>Métrica</th><th>Definição</th></tr></thead><tbody>${gloss.map(([k,v]) => `<tr><td><code>${k}</code></td><td>${v}</td></tr>`).join('')}</tbody></table>`;
     }
 
-    document.getElementById('countrySelect').addEventListener('change', (event) => {
-      loadCountryValidation(event.target.value);
-    });
+    function showView(name) {
+      document.querySelectorAll('main > section').forEach(s => s.hidden = true);
+      document.getElementById('view-' + name).hidden = false;
+      document.querySelectorAll('nav button').forEach(b => b.classList.toggle('active', b.dataset.view === name));
+      switch (name) {
+        case 'overview': loadOverview(); break;
+        case 'executions': loadHistory(); break;
+        case 'discovery': loadDiscovery(); break;
+        case 'countries': loadCountries(); break;
+        case 'playlist': loadPlaylist(); break;
+        case 'dispatcharr': loadDispatcharr(); break;
+        case 'diagnostics': loadDiagnostics(); break;
+      }
+    }
 
-    loadHistory();
-    loadCountries();
-    loadPlaylistPreview();
-    loadRunReport();
-    loadDiscoveredPlaylists();
+    document.querySelectorAll('nav button').forEach(b => b.addEventListener('click', () => showView(b.dataset.view)));
+    document.getElementById('countrySelect').addEventListener('change', () => loadCountryValidation());
+    ['discState','discSource','discCountry'].forEach(id => document.getElementById(id).addEventListener('change', renderDiscovery));
+
+    showView('overview');
+  })();
   </script>
 </body>
-</html>";
+</html>
+""";
+            return s;
         }
 
         // ---------- Autenticação opcional por token partilhado ----------
