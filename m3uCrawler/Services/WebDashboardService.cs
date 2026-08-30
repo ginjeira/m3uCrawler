@@ -214,7 +214,7 @@ namespace m3uCrawler.Services
                     return;
                 }
 
-                var report = JsonSerializer.Deserialize<RunReport>(await File.ReadAllTextAsync(reportPath, Encoding.UTF8));
+                var report = JsonSerializer.Deserialize<RunReport>(await File.ReadAllTextAsync(reportPath, Encoding.UTF8), JsonOptions);
                 await WriteJsonAsync(context.Response, report ?? new RunReport());
                 return;
             }
@@ -228,7 +228,7 @@ namespace m3uCrawler.Services
                     return;
                 }
 
-                var report = JsonSerializer.Deserialize<RunReport>(await File.ReadAllTextAsync(reportPath, Encoding.UTF8));
+                var report = JsonSerializer.Deserialize<RunReport>(await File.ReadAllTextAsync(reportPath, Encoding.UTF8), JsonOptions);
                 await WriteJsonAsync(context.Response, report?.DiscoveredPlaylists ?? new List<DiscoveredPlaylist>());
                 return;
             }
@@ -236,9 +236,21 @@ namespace m3uCrawler.Services
             await WriteHtmlAsync(context.Response, BuildHtmlPage());
         }
 
+        // Opções JSON partilhadas por todos os endpoints do dashboard: serializam
+        // com camelCase (alinhado com o que o JavaScript inlined lê) e permitem
+        // deserializar JSON camelCase (como o telegram_run_report.json escrito
+        // por Program.cs com a mesma política). Sem isto o frontend recebe
+        // PascalCase e renderiza "undefined" / "Invalid Date".
+        private static readonly JsonSerializerOptions JsonOptions = new()
+        {
+            WriteIndented = true,
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+            PropertyNameCaseInsensitive = true
+        };
+
         private static async Task WriteJsonAsync(HttpListenerResponse response, object data)
         {
-            var json = JsonSerializer.Serialize(data, new JsonSerializerOptions { WriteIndented = true });
+            var json = JsonSerializer.Serialize(data, JsonOptions);
             response.ContentType = "application/json; charset=utf-8";
             var buffer = Encoding.UTF8.GetBytes(json);
             response.ContentLength64 = buffer.Length;
