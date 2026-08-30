@@ -200,7 +200,28 @@ namespace m3uCrawler.Services
                     discovered.StreamCount = streams.Count;
                     rep.StreamsExtracted += streams.Count;
 
-                    var tested = await TestStreamsAsync(tester, streams, maxConcurrency, maxUrlsToTest);
+                    // Gate per-stream (pipeline per-canal/per-stream, desde 2026-08-30).
+                    // AnalyzePlaylist actua apenas como fast-reject acima; a aprovação final
+                    // dos streams exige que cada um seja individualmente validado contra os
+                    // aliases do país. Streams rejeitados aqui nunca chegam a TestStreamsAsync.
+                    var (countryStreams, countryRejected) = FilterStreamsByCountry(
+                        validator, streams, countryCode);
+                    discovered.StreamsAfterCountryFilter = countryStreams.Count;
+                    rep.StreamsAfterCountryFilter += countryStreams.Count;
+                    rep.StreamsRejectedByCountry += countryRejected;
+
+                    if (countryStreams.Count == 0)
+                    {
+                        rep.PlaylistsRejected++;
+                        rep.RejectionReasons.Add(
+                            $"{discovered.Name}: país {countryCode.ToUpperInvariant()} validado na playlist " +
+                            $"(aliases={analysis.RecognizedChannelCount}) mas nenhum stream individual do país " +
+                            $"(matched={streams.Count - countryRejected}/{streams.Count})");
+                        rep.DiscoveredPlaylists.Add(discovered);
+                        continue;
+                    }
+
+                    var tested = await TestStreamsAsync(tester, countryStreams, maxConcurrency, maxUrlsToTest);
                     rep.StreamsTested += tested.Count;
                     rep.StreamsWorking += tested.Count(s => s.IsWorking);
                     rep.StreamsFailed += tested.Count(s => !s.IsWorking);
@@ -215,7 +236,6 @@ namespace m3uCrawler.Services
                 tester.Dispose();
             }
 
-            rep.StreamsWorking = working.Count;
             rep.FinishedAt = DateTime.UtcNow;
             rep.DurationMs = (long)(rep.FinishedAt - rep.StartedAt).TotalMilliseconds;
             rep.Status = "completed";
@@ -223,7 +243,8 @@ namespace m3uCrawler.Services
             Console.WriteLine(
                 $"Pipeline Telegram: mensagens={rep.MessagesAnalyzed} candidatos={rep.CandidatesFound} " +
                 $"playlists={rep.PlaylistsDownloaded} país={rep.CountryMatches} " +
-                $"streams={rep.StreamsExtracted} testados={rep.StreamsTested} funcionais={rep.StreamsWorking}");
+                $"streams extraídos={rep.StreamsExtracted} após filtro país={rep.StreamsAfterCountryFilter} " +
+                $"rejeitados país={rep.StreamsRejectedByCountry} testados={rep.StreamsTested} funcionais={rep.StreamsWorking}");
 
             return (working, rep);
         }
@@ -476,6 +497,19 @@ namespace m3uCrawler.Services
 
             return (await Task.WhenAll(tasks)).ToList();
         }
+
+        // Filtra streams individuais pelo país alvo usando CountryChannelValidator.ValidateStreams.
+        // Devolve a lista de streams aceites (na MESMA REFERÊNCIA dos originais — sem cópias)
+        // e o número de streams rejeitados. Usada pelo pipeline desde 2026-08-30 para que
+        // apenas streams pertencentes ao país pesquisado cheguem a TestStreamsAsync.
+        internal static (List<M3uStream> Accepted, int Rejected) FilterStreamsByCountry(
+            CountryChannelValidator validator, List<M3uStream> streams, string countryCode)
+{
+    var matches = validator.ValidateStreams(streams, countryCode);
+    var accepted = matches.Select(m => m.Stream).ToList();
+    int rejected = streams.Count - accepted.Count;
+    return (accepted, rejected);
+}
 
         // Funde streams existentes (re-testados) com os novos funcionais, dedupundivos por URL
         // e priorizando os funcionais. Usado por --telegram-maintain e testável sem Telegram.

@@ -10,6 +10,12 @@ namespace m3uCrawler.Models
         public string CountryDetected { get; set; } = string.Empty;
         public int ChannelsRecognized { get; set; }
         public int StreamCount { get; set; }
+
+        // Streams que passaram o filtro per-canal/per-stream (ValidateStreams) e foram
+        // submetidos a TestStreamsAsync. <= StreamCount. Adicionado em 2026-08-30
+        // quando o pipeline deixou de aprovar streams com base apenas no gate per-playlist.
+        public int StreamsAfterCountryFilter { get; set; }
+
         public int WorkingStreams { get; set; }
         public string State { get; set; } = string.Empty;
     }
@@ -34,6 +40,15 @@ namespace m3uCrawler.Models
         public int PlaylistsRejected { get; set; }
         public int ChannelsRecognized { get; set; }
         public int StreamsExtracted { get; set; }
+
+        // Streams que efectivamente chegaram a TestStreamsAsync após o filtro per-canal.
+        // <= StreamsExtracted. Adicionado em 2026-08-30.
+        public int StreamsAfterCountryFilter { get; set; }
+
+        // Streams rejeitados pelo filtro per-canal/per-stream. (= StreamsExtracted - StreamsAfterCountryFilter).
+        // Adicionado em 2026-08-30.
+        public int StreamsRejectedByCountry { get; set; }
+
         public int StreamsTested { get; set; }
         public int StreamsWorking { get; set; }
         public int StreamsFailed { get; set; }

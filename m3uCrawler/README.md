@@ -191,7 +191,14 @@ A validação do pipeline é feita por `CountryChannelValidator.AnalyzePlaylist(
 
 ### APIs preservadas (legacy)
 
-`CountryChannelValidator.ValidatePlaylist` e `ValidateStreams` permanecem como APIs públicas para retroatibilidade (utilizadas pelos testes baseline e por `WebDashboardService` quando aplicável). O pipeline principal **não** as usa — usa exclusivamente `AnalyzePlaylist`. Recomenda-se preferir `AnalyzePlaylist` em código novo.
+`CountryChannelValidator.ValidatePlaylist` permanece como API pública para retrocompatibilidade (utilizada pelos testes baseline e por `WebDashboardService` quando aplicável). `CountryChannelValidator.ValidateStreams` é a API usada pelo pipeline principal **desde 2026-08-30** para o gate per-stream.
+
+O pipeline aplica dois níveis de validação por país:
+
+1. **`AnalyzePlaylist`** como rejeição rápida (`fast-reject`) — verifica se a playlist contém indicadores fortes do país alvo (≥3 aliases canónicos distintos). Playlists manifestamente de outro país são descartadas sem custos adicionais.
+2. **`ValidateStreams`** como aprovação final por stream — depois do parse, cada stream é validado individualmente pelo título (e em fallback pelo `group-title`). Apenas os streams aceites chegam a `TestStreamsAsync`. Streams rejeitados nunca tocam a rede.
+
+Recomendação: código novo que precise de uma decisão de país por playlist deve usar `AnalyzePlaylist`; decisões por stream devem usar `ValidateStreams`.
 
 ### Gestão de listas por país
 
