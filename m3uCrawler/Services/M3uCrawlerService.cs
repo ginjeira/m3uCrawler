@@ -612,16 +612,16 @@ namespace m3uCrawler.Services
             }
         }
 
-        private async Task ExtractLinksFromHtml(string html, HashSet<string> foundUrls, string baseUrl)
+        private Task ExtractLinksFromHtml(string html, HashSet<string> foundUrls, string baseUrl)
         {
             try
             {
                 var doc = new HtmlDocument();
                 doc.LoadHtml(html);
-                
+
                 // Procurar por links em atributos href, src, data-src
                 var linkSelectors = new[] { "//a[@href]", "//source[@src]", "//video[@src]", "//*[@data-src]" };
-                
+
                 foreach (var selector in linkSelectors)
                 {
                     var nodes = doc.DocumentNode.SelectNodes(selector);
@@ -651,6 +651,8 @@ namespace m3uCrawler.Services
             {
                 Console.WriteLine($"⚠️ Erro ao extrair links HTML: {ex.Message}");
             }
+
+            return Task.CompletedTask;
         }
 
         public async Task<List<string>> CrawlWebsiteForM3u8(string websiteUrl)
