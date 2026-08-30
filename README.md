@@ -15,9 +15,9 @@ Crawler em C# (.NET 9) para descobrir, validar e testar playlists M3U/M3U8 em fo
 
 ## Estado actual
 
-- `dotnet build` → 0 warnings, 0 errors.
-- `dotnet test` → 50 testes, 50 passados, 0 falhados.
-- `dotnet test --list-tests` descobre e executa todos os 50.
+- `dotnet build m3uCrawler.sln --configuration Release` → 0 warnings, 0 errors.
+- `dotnet test m3uCrawler.Tests/m3uCrawler.Tests.csproj --configuration Release` → 153 testes, todos passados.
+- Deployment em produção via **Docker Compose** com imagem `ghcr.io/ginjeira/m3ucrawler:latest`. Ver `DEPLOYMENT.md`.
 
 ## Início rápido
 
@@ -25,13 +25,13 @@ Crawler em C# (.NET 9) para descobrir, validar e testar playlists M3U/M3U8 em fo
 cd m3uCrawler
 dotnet restore
 dotnet build
-dotnet run -- --telegram portugal --history-hours 72
+dotnet run -- --telegram portugal --history-hours 360
 ```
 
 Para um ciclo de manutenção contínuo:
 
 ```bash
-dotnet run -- --telegram portugal --telegram-maintain --loop-hours 24 --max-streams 500 --history-hours 72
+dotnet run -- --telegram portugal --telegram-maintain --loop-hours 24 --max-streams 500 --history-hours 360
 ```
 
 ## Autenticação Telegram
@@ -51,10 +51,18 @@ Coloca-se normalmente em `m3uCrawler/runtime-data/wtelegram.config`. Os valores 
 ## Estrutura do repositório
 
 - `m3uCrawler/` — projecto principal (.NET 9) com toda a lógica, CLI, dashboard e testes.
-- `m3uCrawler-main.zip` — snapshot de referência do branch principal.
-- `docker-compose.yml` e Dockerfile — execução em contentor.
-- `.github/workflows/docker-ghcr.yml` — publicação de imagem no GHCR.
-- Documentação detalhada em `m3uCrawler/README.md` e histórico em `CHANGELOG.md`.
+- `m3uCrawler.Tests/` — testes unitários xUnit.
+- `docker-compose.yml` e `m3uCrawler/Dockerfile` — execução em contentor. **O `docker-compose.yml` é a fonte de verdade do deployment** (ver `DEPLOYMENT.md`).
+- `.github/workflows/docker-ghcr.yml` — publicação da imagem em `ghcr.io/ginjeira/m3ucrawler`.
+- `.github/workflows/build-and-test.yml` — gate de CI em push/PR para `main`.
+- `.github/workflows/package.yml` — artefacto `.tar.gz` para deploy manual.
+- Documentação:
+  - `m3uCrawler/README.md` — documentação detalhada da aplicação (CLI, pipeline, validação, dashboard).
+  - `DEPLOYMENT.md` — runbook de deployment (instalação, update, rollback, imagem, bind mounts).
+  - `OPERATIONS.md` — runbook operacional (logs, reports, diagnóstico, backups).
+  - `ROADMAP.md` — estado e direcção do projecto.
+  - `AGENTS.md` — instruções permanentes para agentes AI.
+  - `CHANGELOG.md` — histórico de alterações.
 
 ## Aviso legal
 

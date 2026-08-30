@@ -41,8 +41,8 @@ Para sugerir novas funcionalidades:
 
 Antes de submeter:
 ```bash
-dotnet build
-dotnet run -- "test"
+dotnet build m3uCrawler.sln --configuration Release --no-restore
+dotnet test m3uCrawler.Tests/m3uCrawler.Tests.csproj --configuration Release --no-build --nologo
 ```
 
 ### 📚 Documentação
@@ -50,7 +50,10 @@ dotnet run -- "test"
 - Mantenha o README.md atualizado
 - Adicione exemplos de uso
 - Documente novas configurações
-- Atualize o CHANGELOG.md
+- Atualize o CHANGELOG.md (secção `[Unreleased]`)
+- Para mudanças estruturais, actualizar também `ROADMAP.md`
+
+> **Agentes AI e regras de alteração de código**: ver `AGENTS.md`. Aí vivem as regras detalhadas (protecção de credenciais, `git add` explícito, comandos de teste em Release, ficheiros sensíveis que não devem ser tocados sem aprovação, processo analisar → plano → aprovação → implementação → testes).
 
 ### 🎯 Áreas que Precisam de Ajuda
 

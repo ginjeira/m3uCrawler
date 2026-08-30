@@ -38,9 +38,9 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 - **Distinção explícita artefacto funcional vs diagnóstico**: a playlist M3U funcional contém URLs reais (necessárias para Xtream); logs, JSONs de relatório, `RunReport` e pré-visualização do dashboard são sempre sanitizados.
 - **Acesso ao dashboard**: por defeito o `HttpListener` escuta em todas as interfaces sem autenticação — qualquer pessoa na rede podia obter a playlist Xtream funcional via `GET /api/playlist`. Adicionada protecção opcional por token partilhado (`--web-token`): quando configurado, todos os endpoints (incluindo `/api/playlist*`) exigem `Authorization: Bearer <token>` ou `?token=<token>` (comparação em tempo constante, `401` caso contrário). Sem token configurado, o comportamento mantém-se aberto para compatibilidade com uso local.
 
-### 🧪 Testes
-- **87 testes**, **87 passados**, **0 falhados** (`dotnet test m3uCrawler.sln`).
-- `dotnet build m3uCrawler.sln` → 0 warnings, 0 errors.
+### 📦 Deployment
+- **Migração para Docker Compose**: `docker-compose.yml` passa a ser a fonte de verdade do deployment. Imagem `ghcr.io/ginjeira/m3ucrawler:latest` (pull-only, sem `build:` no servidor), `container_name: m3ucrawler`, `restart: unless-stopped`, comando completo com `--history-hours 360`, bind mounts absolutos para `/opt/m3ucrawler/runtime-data`. Documentação consolidada em `DEPLOYMENT.md`, `OPERATIONS.md`, `ROADMAP.md`, `AGENTS.md`.
+- **`m3uCrawler/runtime-data/` no repositório** permanece como placeholder commitado (apenas `channel-indicators.json`, `countries/pt.json`, `.gitkeep`). Em produção é substituído por bind mount para `/opt/m3ucrawler/runtime-data` no host.
 - Cobertura: detector (URLs/anexos/conteúdo/inspecção, **Xtream server + get.php**), parser (EXTINF, master HLS), validação por país (threshold, famílias, variantes, falsos positivos, normalização), merge de manutenção, **sanitização de credenciais** (userinfo, query, path Xtream, combinações, `SanitizeM3uContent`, `SaveToJsonReport` não persiste passwords, `SaveToM3uPlaylist` preserva URLs funcionais), **autenticação do dashboard** (`IsAuthorized`: sem token, header Bearer, query `?token=`, rejeição de token errado/parcial, credenciais Xtream não aceites), carregamento de listas por país, baseline legacy.
 
 ## [v2.1.0] - 2025-11-02

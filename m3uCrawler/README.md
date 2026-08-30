@@ -357,8 +357,8 @@ Uma playlist estrangeira (ex.: apenas canais `La 1`, `Antena 3`, `Telecinco`) é
 
 ## Estado dos testes
 
-- Build: `dotnet build m3uCrawler.sln` → **0 warnings, 0 errors**.
-- Testes: `dotnet test m3uCrawler.sln` → **50 testes, 50 passados, 0 falhados**.
+- Build: `dotnet build m3uCrawler.sln --configuration Release` → **0 warnings, 0 errors**.
+- Testes: `dotnet test m3uCrawler.sln --configuration Release` → **153 testes, 153 passados, 0 falhados** (verificado em 2026-08-30 com `dotnet 9.0.317`).
 - O runner descobre e executa todos os testes; não há testes que passem sem realmente exercitar o comportamento (detector, parser, validação por país com threshold/famílias/falsos-positivos, merge de manutenção).
 - Não há teste de integração de rede (Telegram/HTTP); os testes são unitários e independentes de infra-estrutura externa.
 
@@ -399,6 +399,14 @@ m3uCrawler/
 ## Configuração
 
 A autenticação WTelegram lê `wtelegram.config` (na pasta actual ou junto ao executável) com pares `chave=valor` (linhas iniciadas por `#` são comentários). Coloca-se normalmente em `m3uCrawler/runtime-data/wtelegram.config`. Os valores `ask` indicam que o campo é pedido interactivamente (ex.: `verification_code=ask`).
+
+### Listas de canais por país
+
+- `runtime-data/countries/<code>.json` — lista principal de aliases por país. Editável directamente ou via `WebDashboardService` (`/api/country/save`).
+- `runtime-data/channel-indicators.json` — **lista suplementar específica de Portugal** (variantes regionais, desportos, sub-canais como `RTP1 HD`, `SportTV 5`, `TVI 24`, etc.). Carregada por `CountryChannelValidator.LoadSupplementaryIndicators` apenas quando `countryCode == "pt"`; para outros países é ignorada.
+- A lista final de aliases é a **união case-insensitive** dos dois ficheiros (`CountryChannelValidator.LoadCountryAliases`). O ficheiro principal tem prioridade; os indicadores suplementares só adicionam entradas novas.
+- O ficheiro é resolvido por ordem: (1) `runtime-data/channel-indicators.json` junto ao `rootDirectory` configurado; (2) irmão desse directório; (3) `runtime-data/channel-indicators.json` junto ao executável; (4) `runtime-data/channel-indicators.json` junto ao CWD. Em produção, com o bind mount do Compose, (1) é `/opt/m3ucrawler/runtime-data/channel-indicators.json` (se existir) → resolvido em `/data/channel-indicators.json` dentro do container.
+- A presença deste ficheiro **não substitui** o `runtime-data/countries/<code>.json` — é puramente complementar. Em servidores onde não exista, o pipeline funciona apenas com a lista principal.
 
 ## Dependências
 
