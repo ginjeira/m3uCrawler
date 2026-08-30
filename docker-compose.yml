@@ -11,7 +11,7 @@ services:
       - --loop-hours
       - "24"
       - --history-hours
-      - "360"
+      - "480"
       - --max-streams
       - "500"
       - --output-dir
