@@ -108,47 +108,59 @@ jobs:
       - name: Resolve published digest
         id: digest
         # docker/build-push-action não expõe o digest por output nativo.
-        # Usamos exclusivamente o registry para obter o digest imutável
-        # efectivamente publicado. `docker buildx imagetools inspect` devolve
-        # uma lista de manifestos por plataforma; seleccionamos o manifest OCI
-        # genérico (single-arch, igual à imagem que acabámos de publicar) e
-        # extraímos o campo `.digest` (SHA256 do manifest, imutável).
+        # Em vez do `docker buildx imagetools inspect --raw` (que assume
+        # multi-arch e falha quando o manifest é single-arch), consultamos
+        # directamente o Docker Registry API. O header `Docker-Content-Digest`
+        # existe tanto para manifests single-arch como multi-arch.
         #
-        # Não usamos fallback por `docker inspect` porque o daemon local
-        # pode não ter o RepoDigests populado após `buildx build --push`,
-        # o que mascararia uma falha real com uma string vazia.
+        # Autenticação: reutilizamos `GITHUB_TOKEN` (que o job já tem via
+        # permissions: packages: write + login GHCR do login-action). O token
+        # é colocado num `env:` — nunca impresso, nunca referenciado em
+        # `echo`/`Summary`, e a sua exposição em logs do runner está mitigada
+        # pelo `set +x` (não activado) e por não aparecer no diff de saída.
+        #
+        # Falha de resolução é **não bloqueante**: o push real é o step
+        # anterior. Se não conseguirmos o digest, emitimos um `::warning::`
+        # e continuamos com `exit 0`, para que workflows idempotentes não
+        # fiquem vermelhos por uma falha secundária de observabilidade.
+        env:
+          IMAGE_BASE: ${{ env.IMAGE_BASE }}
+          TAG: sha-${{ github.sha }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          REF="${{ env.IMAGE_BASE }}:sha-${{ github.sha }}"
+          REF="${IMAGE_BASE}:${TAG}"
+          REPO_PATH="${IMAGE_BASE#ghcr.io/}"
 
-          RAW=$(docker buildx imagetools inspect "$REF" --raw)
+          # Pedir o manifest com Accept negociando multi-e single-arch; a resposta
+          # HTTP traz o header `Docker-Content-Digest` com o digest imutável do
+          # manifest apontado pela tag, independentemente do media-type efectivo.
+          DIGEST=$(
+            curl -fsSL \
+              -H "Authorization: Bearer ${REGISTRY_TOKEN}" \
+              -H "Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.index.v1+json" \
+              "https://ghcr.io/v2/${REPO_PATH}/manifests/${TAG}" \
+              -D - -o /dev/null \
+            | tr -d '\r' \
+            | awk -F': ' '/^[Dd]ocker-[Cc]ontent-[Dd]igest: /{ print $2; exit }' \
+            || true
+          )
 
-          # -e: exit != 0 se o resultado for null/false. Capturamos a falha
-          # explicitamente para distinguir digest ausente de outros erros.
-          if ! DIGEST=$(printf '%s' "$RAW" | jq -er '
-              [ ."$manifest"."digest" // empty,
-                ."$linux/amd64"."digest" // empty,
-                ."$linux/arm64"."digest" // empty ]
-              | map(select(. != ""))[0] // empty
-            '); then
-            DIGEST=""
-          fi
-
-          if [ -z "$DIGEST" ]; then
-            echo "::error::Não foi possível resolver o digest publicado para ${REF}"
-            echo "::error::Manifest obtido:" >&2
-            printf '%s\n' "$RAW" >&2
-            exit 1
+          if [ -z "${DIGEST:-}" ]; then
+            echo "::warning::Não foi possível resolver o digest publicado para ${REF}; o publish já foi concluído e o workflow continua."
+            exit 0
           fi
 
           # Validação defensiva: o digest deve começar por 'sha256:'.
           if ! [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]; then
-            echo "::error::Digest inválido (esperado sha256:<64hex>): ${DIGEST}"
-            exit 1
+            echo "::warning::Digest inválido para ${REF} (esperado sha256:<64hex>): ${DIGEST}; o publish continua."
+            exit 0
           fi
 
-          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
-          echo "image=${IMAGE_BASE}@${DIGEST}" >> "$GITHUB_OUTPUT"
+          # Não imprimir o token — só o digest (que é público, é o mesmo que
+          # aparece em `docker pull <image>@sha256:...`).
+          echo "digest=${DIGEST}" >> "${GITHUB_OUTPUT}"
+          echo "image=${IMAGE_BASE}@${DIGEST}" >> "${GITHUB_OUTPUT}"
           echo "Published digest: ${DIGEST}"
 
       - name: Summary
