@@ -349,37 +349,17 @@ namespace m3uCrawler.Services
                         // Descoberta NÃO depende da keyword: deteta por URL, nome de anexo ou conteúdo.
                         var found = _detector.DetectFromMessage(text, filename).ToList();
 
-                        foreach (var candidate in found.Where(c =>
-                                     c.Kind == CandidateSourceKind.Attachment && c.Content == null))
-                        {
-                            if (m.media is MessageMediaDocument media &&
-                                media.document is Document attachmentDocument)
-                            {
-                                try
-                                {
-                                    var attachmentText = await DownloadTelegramDocumentTextAsync(attachmentDocument);
-                                    candidate.Content = attachmentText;
+                        bool hasAttachment = m.media is MessageMediaDocument media2 && media2.document is Document;
+                        Document? attachmentDocument = hasAttachment
+                            ? (Document)((MessageMediaDocument)m.media!).document
+                            : null;
 
-                                    if (!string.IsNullOrWhiteSpace(attachmentText) &&
-                                        _detector.LooksLikePlaylistContent(attachmentText) &&
-                                        !found.Any(x => x.DetectedFrom == "#EXTM3U content"))
-                                    {
-                                        found.Add(new CandidatePlaylist
-                                        {
-                                            Kind = CandidateSourceKind.Attachment,
-                                            FileName = filename,
-                                            SourceText = text,
-                                            Content = attachmentText,
-                                            DetectedFrom = "#EXTM3U content"
-                                        });
-                                    }
-                                }
-                                catch (Exception ex)
-                                {
-                                    Console.WriteLine($"Falha ao processar anexo '{filename}': {ex.Message}");
-                                }
-                            }
-                        }
+                        await ProcessAttachmentCandidatesAsync(
+                            found, hasAttachment, filename, text, async () =>
+                            {
+                                if (attachmentDocument == null) return null;
+                                return await DownloadTelegramDocumentTextAsync(attachmentDocument);
+                            });
 
                         foreach (var candidate in found)
                         {
@@ -399,6 +379,51 @@ namespace m3uCrawler.Services
             }
 
             return (messagesAnalyzed, candidates);
+        }
+
+        internal static async Task ProcessAttachmentCandidatesAsync(
+            List<CandidatePlaylist> found,
+            bool hasAttachment,
+            string filename,
+            string text,
+            Func<Task<string?>> downloader)
+        {
+            // Materializa a vista filtrada ANTES de iterar para que o `Add` que ocorre dentro
+            // do loop (quando o conteúdo do anexo começa por #EXTM3U) não invalide o enumerador
+            // activo. Sem esta materialização, mutar `found` durante o `foreach (var c in found.Where(...))`
+            // dispara InvalidOperationException: Collection was modified; enumeration operation may not execute.
+            var attachmentsNeedingDownload = found
+                .Where(c => c.Kind == CandidateSourceKind.Attachment && c.Content == null)
+                .ToList();
+
+            if (!hasAttachment) return;
+
+            foreach (var candidate in attachmentsNeedingDownload)
+            {
+                try
+                {
+                    var attachmentText = await downloader();
+                    candidate.Content = attachmentText;
+
+                    if (!string.IsNullOrWhiteSpace(attachmentText) &&
+                        new M3uCandidateDetector().LooksLikePlaylistContent(attachmentText) &&
+                        !found.Any(x => x.DetectedFrom == "#EXTM3U content"))
+                    {
+                        found.Add(new CandidatePlaylist
+                        {
+                            Kind = CandidateSourceKind.Attachment,
+                            FileName = filename,
+                            SourceText = text,
+                            Content = attachmentText,
+                            DetectedFrom = "#EXTM3U content"
+                        });
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Falha ao processar anexo '{filename}': {ex.Message}");
+                }
+            }
         }
 
         private async Task<string?> DownloadPlaylistContentAsync(string? url)

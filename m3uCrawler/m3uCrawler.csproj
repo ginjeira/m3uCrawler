@@ -8,6 +8,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="m3uCrawler.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="HtmlAgilityPack" Version="1.12.4" />
     <PackageReference Include="System.Text.Json" Version="9.0.10" />
     <PackageReference Include="Telegram.Bot" Version="22.10.1" />
