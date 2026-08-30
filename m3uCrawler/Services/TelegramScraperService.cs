@@ -9,16 +9,9 @@ namespace m3uCrawler.Services
     public class TelegramScraperService
     {
         private readonly WTelegram.Client _client;
+        private readonly M3uCandidateDetector _detector = new();
 
-        // Mesma regex usada no M3uCrawlerService, para manter consistência
-        // na deteção de URLs M3U8 em todo o projeto.
-        private static readonly Regex _m3u8Regex = new(
-            @"https?://[^\s<>""']+\.m3u8(?:\?[^\s<>""']*)?",
-            RegexOptions.IgnoreCase);
-
-        private static readonly Regex _m3uFilenameRegex = new(
-            @"\.m3u8?$",
-            RegexOptions.IgnoreCase);
+        public RunReport? LastRunReport { get; private set; }
 
         public TelegramScraperService()
         {
@@ -106,174 +99,154 @@ namespace m3uCrawler.Services
             throw new Exception("Falha de autenticação no Telegram devido a FLOOD_WAIT após múltiplas tentativas. Aguarde alguns minutos e tente novamente.");
         }
 
-        private static string NormalizeUnicode(string input)
-        {
-            if (string.IsNullOrEmpty(input)) return "";
-
-            var normalized = input.Normalize(NormalizationForm.FormKD);
-            var sb = new StringBuilder();
-
-            foreach (var c in normalized)
-            {
-                var uc = CharUnicodeInfo.GetUnicodeCategory(c);
-                if (uc != UnicodeCategory.NonSpacingMark)
-                    sb.Append(c);
-            }
-
-            return sb.ToString().Normalize(NormalizationForm.FormC).ToLowerInvariant();
-        }
-
-        // Resultado interno: cada URL encontrada junto com algum contexto
-        // (chat de origem e texto/legenda) para usar como título da stream.
-        private record FoundUrl(string Url, string ChatTitle, string SourceText, string OriginalExtInf = "");
-
+        // Resultado legível de uma pesquisa (mantido para compatibilidade de API).
         public async Task<List<string>> SearchM3UInTelegram(string keyword, int limit = 200, int historyHours = 48)
         {
-            var (textResults, _) = await SearchM3UInTelegramInternal(keyword, limit, historyHours);
-            return textResults;
+            var (_, candidates) = await SearchM3UInTelegramInternal(keyword, limit, historyHours);
+            return candidates
+                .Select(c => $"{c.Source} :: {Display(c)}")
+                .ToList();
         }
 
-        // Extrai credenciais Xtream Codes embutidas em URLs do tipo
-        // http://host:port/live/USERNAME/PASSWORD/ID.ext
-        private static readonly Regex _xtreamCredsRegex = new(
-            @"https?://[^/]+/(?:live|movie|series)/([^/]+)/([^/]+)/",
-            RegexOptions.IgnoreCase);
-
-        // Pesquisa no Telegram, extrai URLs M3U8 dos resultados, testa cada
-        // uma com o M3uTesterService (reaproveitando a lógica já existente
-        // no resto da aplicação) e devolve só as streams que funcionam.
-        public async Task<List<M3uStream>> SearchAndTestM3UInTelegram(
-            string keyword, int limit = 200, int maxConcurrency = 5, int maxUrlsToTest = 500, int historyHours = 48)
+        // Representação segura de um candidato para logs/relatórios/UI (sanitiza credenciais).
+        private static string Display(CandidatePlaylist c)
         {
-            var (textResults, foundUrls) = await SearchM3UInTelegramInternal(keyword, limit, historyHours);
+            if (!string.IsNullOrEmpty(c.FileName)) return c.FileName;
+            if (!string.IsNullOrWhiteSpace(c.Url)) return CredentialSanitizer.SanitizeUrl(c.Url);
+            return "(inline)";
+        }
 
-            if (maxUrlsToTest > 0 && foundUrls.Count > maxUrlsToTest)
-            {
-                Console.WriteLine($"A limitar teste para {maxUrlsToTest} URL(s) para evitar execuções muito longas.");
-                foundUrls = foundUrls.Take(maxUrlsToTest).ToList();
-            }
+        // Pipeline principal: descobre candidatos, obtém conteúdo, valida país e
+        // testa os streams. Devolve os streams funcionais E o relatório detalhado.
+        public async Task<(List<M3uStream> Working, RunReport Report)> SearchAndTestM3UInTelegramAsync(
+            string keyword,
+            int limit = 200,
+            int maxConcurrency = 5,
+            int maxUrlsToTest = 500,
+            int historyHours = 48,
+            string countryCode = "pt",
+            string? countriesDir = null,
+            RunReport? report = null)
+        {
+            var rep = report ?? new RunReport();
+            rep.StartedAt = DateTime.UtcNow;
+            rep.Status = "running";
 
-            Console.WriteLine($"Pesquisa Telegram: {textResults.Count} mensagem(ns) com correspondencia para '{keyword}'.");
-            Console.WriteLine($"Pesquisa Telegram: {foundUrls.Count} URL(s) de stream unica(s) extraida(s).");
+            var (messagesAnalyzed, candidates) = await SearchM3UInTelegramInternal(keyword, limit, historyHours);
+            rep.MessagesAnalyzed = messagesAnalyzed;
+            rep.CandidatesFound = candidates.Count;
+            LastRunReport = rep;
 
-            // Detetar credenciais Xtream Codes embutidas nas URLs encontradas
-            var xtreamServers = new Dictionary<string, (string user, string pass)>(StringComparer.OrdinalIgnoreCase);
-            foreach (var found in foundUrls)
-            {
-                var m = _xtreamCredsRegex.Match(found.Url);
-                if (!m.Success) continue;
-
-                if (!Uri.TryCreate(found.Url, UriKind.Absolute, out var uri)) continue;
-                var origin = $"{uri.Scheme}://{uri.Host}:{uri.Port}";
-                if (!xtreamServers.ContainsKey(origin))
-                {
-                    xtreamServers[origin] = (m.Groups[1].Value, m.Groups[2].Value);
-                }
-            }
-
-            if (xtreamServers.Count > 0)
-            {
-                Console.WriteLine();
-                Console.WriteLine("🔑 Credenciais Xtream Codes detetadas automaticamente:");
-                foreach (var kv in xtreamServers)
-                {
-                    var (user, pass) = kv.Value;
-                    Console.WriteLine($"  Servidor : {kv.Key}");
-                    Console.WriteLine($"  Utilizador: {user}");
-                    Console.WriteLine($"  Password  : {pass}");
-                    Console.WriteLine($"  Playlist  : {kv.Key}/get.php?username={user}&password={pass}&type=m3u_plus");
-                    Console.WriteLine();
-                }
-            }
-
-            if (foundUrls.Count == 0)
-            {
-                Console.WriteLine("Nenhuma URL M3U8 encontrada nas mensagens do Telegram.");
-                return new List<M3uStream>();
-            }
-
-            Console.WriteLine($"A testar {foundUrls.Count} URL(s) encontradas no Telegram...");
-
-            foreach (var preview in foundUrls.Take(5))
-            {
-                Console.WriteLine($"  - [{preview.ChatTitle}] {preview.Url}");
-            }
-            if (foundUrls.Count > 5)
-            {
-                Console.WriteLine($"  ... e mais {foundUrls.Count - 5} URL(s)");
-            }
-
+            var countriesRoot = countriesDir
+                ?? Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries");
+            var validator = new CountryChannelValidator(countriesRoot);
+            var parser = new M3uParserService();
             var tester = new M3uTesterService();
+
+            var working = new List<M3uStream>();
+
             try
             {
-                // Testa cada URL individualmente (em vez de usar TestMultipleStreams
-                // diretamente) para podermos atribuir o título/grupo corretos a
-                // partir do contexto da mensagem onde a URL foi encontrada.
-                var semaphore = new SemaphoreSlim(maxConcurrency);
-                var testTasks = foundUrls.Select(async found =>
+                foreach (var candidate in candidates)
                 {
-                    await semaphore.WaitAsync();
-                    try
+                    string? content = candidate.Content;
+                    if (content == null)
                     {
-                        string title = !string.IsNullOrWhiteSpace(found.SourceText)
-                            ? found.SourceText
-                            : found.ChatTitle;
-                        var tested = await tester.TestM3u8Stream(found.Url, title, found.ChatTitle);
-
-                        if (!string.IsNullOrWhiteSpace(found.OriginalExtInf))
-                        {
-                            tested.OriginalExtInf = found.OriginalExtInf;
-                        }
-
-                        return tested;
+                        content = await DownloadPlaylistContentAsync(candidate.Url);
                     }
-                    finally
+
+                    // URLs sem extensão (.m3u/.m3u8) detetados por heurística só são tratados como
+                    // playlist se o conteúdo HTTP for efectivamente #EXTM3U.
+                    if (candidate.RequiresContentVerification && !_detector.LooksLikePlaylistContent(content))
                     {
-                        semaphore.Release();
+                        rep.PlaylistsInvalid++;
+                        rep.RejectionReasons.Add($"{CredentialSanitizer.SanitizeUrl(candidate.Url) ?? candidate.Source}: conteúdo não é uma playlist M3U");
+                        continue;
                     }
-                });
 
-                var allTested = await Task.WhenAll(testTasks);
-                var working = allTested.Where(s => s.IsWorking).ToList();
-                var failing = allTested.Where(s => !s.IsWorking).ToList();
-
-                Console.WriteLine($"Resultado: {working.Count}/{allTested.Length} stream(s) funcionais.");
-                Console.WriteLine($"Resumo de testes: {failing.Count} com falha/timeout.");
-
-                if (failing.Count > 0)
-                {
-                    foreach (var failed in failing.Take(3))
+                    if (string.IsNullOrWhiteSpace(content))
                     {
-                        Console.WriteLine($"  x Falhou: {failed.Url}");
+                        rep.PlaylistsInvalid++;
+                        rep.RejectionReasons.Add($"{Display(candidate)}: playlist indisponível ou vazia");
+                        continue;
                     }
+
+                    rep.PlaylistsDownloaded++;
+
+                    var analysis = validator.AnalyzePlaylist(content, countryCode, 3);
+                    var discovered = new DiscoveredPlaylist
+                    {
+                        Source = candidate.Source,
+                        Name = Display(candidate),
+                        CountryDetected = analysis.IsTargetCountry ? countryCode : string.Empty,
+                        ChannelsRecognized = analysis.RecognizedChannelCount,
+                        State = analysis.IsTargetCountry ? "accepted" : "rejected"
+                    };
+
+                    if (!analysis.IsTargetCountry)
+                    {
+                        rep.PlaylistsRejected++;
+                        rep.RejectionReasons.Add(
+                            $"{discovered.Name}: país {countryCode.ToUpperInvariant()} não corresponde " +
+                            $"(canais reconhecidos {analysis.RecognizedChannelCount}/3)");
+                        rep.DiscoveredPlaylists.Add(discovered);
+                        continue;
+                    }
+
+                    rep.CountryMatches++;
+                    rep.ChannelsRecognized += analysis.RecognizedChannelCount;
+
+                    var streams = parser.Parse(content);
+                    discovered.StreamCount = streams.Count;
+                    rep.StreamsExtracted += streams.Count;
+
+                    var tested = await TestStreamsAsync(tester, streams, maxConcurrency, maxUrlsToTest);
+                    rep.StreamsTested += tested.Count;
+                    rep.StreamsWorking += tested.Count(s => s.IsWorking);
+                    rep.StreamsFailed += tested.Count(s => !s.IsWorking);
+                    discovered.WorkingStreams = tested.Count(s => s.IsWorking);
+
+                    working.AddRange(tested.Where(s => s.IsWorking));
+                    rep.DiscoveredPlaylists.Add(discovered);
                 }
-
-                return working;
             }
             finally
             {
                 tester.Dispose();
             }
+
+            rep.StreamsWorking = working.Count;
+            rep.FinishedAt = DateTime.UtcNow;
+            rep.DurationMs = (long)(rep.FinishedAt - rep.StartedAt).TotalMilliseconds;
+            rep.Status = "completed";
+
+            Console.WriteLine(
+                $"Pipeline Telegram: mensagens={rep.MessagesAnalyzed} candidatos={rep.CandidatesFound} " +
+                $"playlists={rep.PlaylistsDownloaded} país={rep.CountryMatches} " +
+                $"streams={rep.StreamsExtracted} testados={rep.StreamsTested} funcionais={rep.StreamsWorking}");
+
+            return (working, rep);
         }
 
-        private async Task<(List<string> textResults, List<FoundUrl> foundUrls)> SearchM3UInTelegramInternal(
+        // Wrapper que preserva a assinatura pública anterior (devolve só os streams funcionais).
+        public async Task<List<M3uStream>> SearchAndTestM3UInTelegram(
+            string keyword, int limit = 200, int maxConcurrency = 5, int maxUrlsToTest = 500, int historyHours = 48)
+        {
+            var (working, _) = await SearchAndTestM3UInTelegramAsync(
+                keyword, limit, maxConcurrency, maxUrlsToTest, historyHours, "pt", null, null);
+            return working;
+        }
+
+        private async Task<(int MessagesAnalyzed, List<CandidatePlaylist> Candidates)> SearchM3UInTelegramInternal(
             string keyword, int limit = 200, int historyHours = 48)
         {
-            var results = new List<string>();
-            var foundUrls = new List<FoundUrl>();
-            var seenUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-            keyword = NormalizeUnicode(keyword);
+            var candidates = new List<CandidatePlaylist>();
+            int messagesAnalyzed = 0;
 
             // Idempotente: se já autenticado, não faz nada
             var me = await _client.LoginUserIfNeeded();
             Console.WriteLine($"Autenticado como: {(me?.username ?? me?.first_name ?? "(sem nome)")}");
 
-            // dialogsBase é do tipo base Messages_DialogsBase em todas as versões.
-            // Para obter os arrays "dialogs" e "chats" de forma garantida em
-            // qualquer versão da lib, fazemos pattern matching para os tipos
-            // concretos (Messages_Dialogs / Messages_DialogsSlice), que são
-            // os únicos que a API do Telegram efetivamente devolve.
             var dialogsBase = await _client.Messages_GetAllDialogs();
 
             Dialog[] dialogList;
@@ -289,16 +262,13 @@ namespace m3uCrawler.Services
                     break;
                 default:
                     Console.WriteLine($"Nenhum diálogo encontrado (tipo de resposta: {dialogsBase?.GetType().Name}).");
-                    return (results, foundUrls);
+                    return (0, candidates);
             }
 
             foreach (var dialog in dialogList)
             {
                 var peer = dialog.Peer;
 
-                // Resolve o Peer (que é só um ID) para o objeto concreto
-                // User ou ChatBase, que pode ser passado diretamente onde
-                // a lib espera um InputPeer (conversão implícita).
                 object? resolvedPeer = peer switch
                 {
                     PeerUser pu when usersDict.TryGetValue(pu.user_id, out var u) => u,
@@ -324,8 +294,6 @@ namespace m3uCrawler.Services
                 {
                     Messages_MessagesBase? history = null;
 
-                    // Retry manual em caso de FLOOD_WAIT: o Telegram devolve
-                    // quantos segundos é preciso esperar antes de repetir.
                     while (history == null)
                     {
                         try
@@ -356,20 +324,15 @@ namespace m3uCrawler.Services
                     {
                         if (msgBase is not Message m) continue;
 
-                        // m.date é convertido pela lib para DateTime (UTC). O
-                        // histórico vem por ordem decrescente (mais recente
-                        // primeiro), por isso assim que encontramos uma
-                        // mensagem fora da janela das 48h, paramos: não há
-                        // mensagens mais recentes a seguir a esta.
                         if (m.date < cutoffDate)
                         {
                             reachedCutoff = true;
                             break;
                         }
 
-                        // Em TL atual a legenda de um media é o próprio
-                        // texto da mensagem (m.message); não existe um
-                        // campo "caption" separado dentro de MessageMediaDocument.
+                        messagesAnalyzed++;
+
+                        // Em TL atual a legenda de um media é o próprio texto da mensagem.
                         string text = m.message ?? "";
                         string filename = "";
 
@@ -383,40 +346,33 @@ namespace m3uCrawler.Services
                             }
                         }
 
-                        string normText = NormalizeUnicode(text);
-                        string normFilename = NormalizeUnicode(filename);
+                        // Descoberta NÃO depende da keyword: deteta por URL, nome de anexo ou conteúdo.
+                        var found = _detector.DetectFromMessage(text, filename).ToList();
 
-                        if (normText.Contains(keyword) || normFilename.Contains(keyword))
+                        foreach (var candidate in found.Where(c =>
+                                     c.Kind == CandidateSourceKind.Attachment && c.Content == null))
                         {
-                            results.Add($"{chatTitle} :: {(filename != "" ? filename : text)}");
-
-                            // Extrai quaisquer URLs M3U8 presentes no texto da
-                            // mensagem (a legenda de um media é o próprio
-                            // m.message, por isso isto cobre ambos os casos).
-                            foreach (Match urlMatch in _m3u8Regex.Matches(text))
-                            {
-                                if (seenUrls.Add(urlMatch.Value))
-                                {
-                                    foundUrls.Add(new FoundUrl(urlMatch.Value, chatTitle, text));
-                                }
-                            }
-
-                            // Se a mensagem tiver um anexo .m3u/.m3u8, descarrega e
-                            // extrai URLs M3U8 diretamente do conteúdo do ficheiro.
                             if (m.media is MessageMediaDocument media &&
-                                media.document is Document attachmentDocument &&
-                                !string.IsNullOrWhiteSpace(filename) &&
-                                _m3uFilenameRegex.IsMatch(filename))
+                                media.document is Document attachmentDocument)
                             {
                                 try
                                 {
-                                    await ExtractM3u8FromTelegramDocumentAsync(
-                                        attachmentDocument,
-                                        filename,
-                                        chatTitle,
-                                        text,
-                                        seenUrls,
-                                        foundUrls);
+                                    var attachmentText = await DownloadTelegramDocumentTextAsync(attachmentDocument);
+                                    candidate.Content = attachmentText;
+
+                                    if (!string.IsNullOrWhiteSpace(attachmentText) &&
+                                        _detector.LooksLikePlaylistContent(attachmentText) &&
+                                        !found.Any(x => x.DetectedFrom == "#EXTM3U content"))
+                                    {
+                                        found.Add(new CandidatePlaylist
+                                        {
+                                            Kind = CandidateSourceKind.Attachment,
+                                            FileName = filename,
+                                            SourceText = text,
+                                            Content = attachmentText,
+                                            DetectedFrom = "#EXTM3U content"
+                                        });
+                                    }
                                 }
                                 catch (Exception ex)
                                 {
@@ -424,86 +380,97 @@ namespace m3uCrawler.Services
                                 }
                             }
                         }
+
+                        foreach (var candidate in found)
+                        {
+                            candidate.Source = chatTitle;
+                            candidates.Add(candidate);
+                        }
                     }
 
                     offsetId = history.Messages.Last().ID;
 
                     if (reachedCutoff || history.Messages.Length < 100) break;
 
-                    // Pequena pausa entre pedidos para não disparar flood control
                     await Task.Delay(300);
                 }
 
-                // Pausa maior entre chats diferentes
                 await Task.Delay(500);
             }
 
-            return (results, foundUrls);
+            return (messagesAnalyzed, candidates);
         }
 
-        private async Task<int> ExtractM3u8FromTelegramDocumentAsync(
-            Document document,
-            string fileName,
-            string chatTitle,
-            string sourceText,
-            HashSet<string> seenUrls,
-            List<FoundUrl> foundUrls)
+        private async Task<string?> DownloadPlaylistContentAsync(string? url)
+        {
+            if (string.IsNullOrWhiteSpace(url)) return null;
+
+            try
+            {
+                using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+                client.DefaultRequestHeaders.Add("User-Agent",
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
+                return await client.GetStringAsync(url);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Falha ao descarregar playlist '{CredentialSanitizer.SanitizeUrl(url)}': {ex.Message}");
+                return null;
+            }
+        }
+
+        private async Task<string?> DownloadTelegramDocumentTextAsync(Document document)
         {
             using var ms = new MemoryStream();
             await _client.DownloadFileAsync(document, ms);
 
             ms.Position = 0;
             using var reader = new StreamReader(ms, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
-            var content = await reader.ReadToEndAsync();
+            return await reader.ReadToEndAsync();
+        }
 
-            int added = 0;
+        private async Task<List<M3uStream>> TestStreamsAsync(
+            M3uTesterService tester, List<M3uStream> streams, int maxConcurrency, int maxUrlsToTest)
+        {
+            var toTest = (maxUrlsToTest > 0 ? streams.Take(maxUrlsToTest) : streams).ToList();
+            if (toTest.Count == 0) return new List<M3uStream>();
 
-            string pendingExtInf = "";
-
-            // Extrai pares EXTINF + URL para preservar metadados originais.
-            foreach (var line in content.Split('\n'))
+            var semaphore = new SemaphoreSlim(maxConcurrency);
+            var tasks = toTest.Select(async s =>
             {
-                var trimmed = line.Trim();
-
-                if (trimmed.StartsWith("#EXTINF", StringComparison.OrdinalIgnoreCase))
+                await semaphore.WaitAsync();
+                try
                 {
-                    pendingExtInf = trimmed;
-                    continue;
+                    return await tester.TestM3u8Stream(s.Url, s.Title, s.Group);
                 }
-
-                if (trimmed.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
-                    trimmed.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+                finally
                 {
-                    if (seenUrls.Add(trimmed))
-                    {
-                        foundUrls.Add(new FoundUrl(trimmed, chatTitle, sourceText, pendingExtInf));
-                        added++;
-                    }
-
-                    pendingExtInf = "";
+                    semaphore.Release();
                 }
+            });
+
+            return (await Task.WhenAll(tasks)).ToList();
+        }
+
+        // Funde streams existentes (re-testados) com os novos funcionais, dedupundivos por URL
+        // e priorizando os funcionais. Usado por --telegram-maintain e testável sem Telegram.
+        public static List<M3uStream> MergeStreams(List<M3uStream> existing, List<M3uStream> fresh)
+        {
+            var merged = new Dictionary<string, M3uStream>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var stream in existing)
+            {
+                if (!string.IsNullOrWhiteSpace(stream.Url))
+                    merged[stream.Url] = stream;
             }
 
-            // Fallback para URLs inline que não estejam em linhas próprias.
-            foreach (Match urlMatch in _m3u8Regex.Matches(content))
+            foreach (var stream in fresh.Where(s => s.IsWorking))
             {
-                if (seenUrls.Add(urlMatch.Value))
-                {
-                    foundUrls.Add(new FoundUrl(urlMatch.Value, chatTitle, sourceText));
-                    added++;
-                }
+                if (!string.IsNullOrWhiteSpace(stream.Url))
+                    merged[stream.Url] = stream;
             }
 
-            if (added > 0)
-            {
-                Console.WriteLine($"Extraidas {added} URL(s) de anexo: {fileName}");
-            }
-            else
-            {
-                Console.WriteLine($"Nenhuma URL encontrada no anexo: {fileName} ({content.Length} chars)");
-            }
-
-            return added;
+            return merged.Values.ToList();
         }
 
         private static int ExtractFloodWaitSeconds(string message)

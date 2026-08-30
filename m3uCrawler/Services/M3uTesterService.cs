@@ -10,7 +10,7 @@ namespace m3uCrawler.Services
         {
             _httpClient = new HttpClient();
             _httpClient.Timeout = TimeSpan.FromSeconds(12);
-            _httpClient.DefaultRequestHeaders.Add("User-Agent", 
+            _httpClient.DefaultRequestHeaders.Add("User-Agent",
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
         }
 
@@ -23,6 +23,9 @@ namespace m3uCrawler.Services
                 Group = group,
                 LastTested = DateTime.Now
             };
+
+            // Todas as mensagens impressas usam a URL sanitizada para nunca expor credenciais Xtream.
+            var safeUrl = CredentialSanitizer.SanitizeUrl(url);
 
             try
             {
@@ -55,43 +58,43 @@ namespace m3uCrawler.Services
                         var content = await response.Content.ReadAsStringAsync();
                         if (content.Contains("#EXTM3U") || content.Contains("#EXT-X-VERSION"))
                         {
-                            Console.WriteLine($"✓ Stream funcional (M3U8): {url} ({stream.ResponseTime}ms)");
+                            Console.WriteLine($"✓ Stream funcional (M3U8): {safeUrl} ({stream.ResponseTime}ms)");
                         }
                         else if (content.Length > 0)
                         {
-                            Console.WriteLine($"✓ Stream funcional (playlist): {url} ({stream.ResponseTime}ms)");
+                            Console.WriteLine($"✓ Stream funcional (playlist): {safeUrl} ({stream.ResponseTime}ms)");
                         }
                         else
                         {
                             stream.IsWorking = false;
-                            Console.WriteLine($"✗ Playlist vazia: {url}");
+                            Console.WriteLine($"✗ Playlist vazia: {safeUrl}");
                         }
                     }
                     else if (isVideoStream)
                     {
                         // Stream de vídeo ao vivo: basta o servidor responder 200
-                        Console.WriteLine($"✓ Stream funcional (vídeo ao vivo): {url} ({stream.ResponseTime}ms)");
+                        Console.WriteLine($"✓ Stream funcional (vídeo ao vivo): {safeUrl} ({stream.ResponseTime}ms)");
                     }
                     else
                     {
                         // Qualquer outro conteúdo com 200 é considerado funcional
-                        Console.WriteLine($"✓ Stream funcional: {url} ({stream.ResponseTime}ms)");
+                        Console.WriteLine($"✓ Stream funcional: {safeUrl} ({stream.ResponseTime}ms)");
                     }
                 }
                 else
                 {
-                    Console.WriteLine($"✗ Stream não funcional: {url} (Status: {response.StatusCode})");
+                    Console.WriteLine($"✗ Stream não funcional: {safeUrl} (Status: {response.StatusCode})");
                 }
             }
             catch (TaskCanceledException)
             {
                 stream.IsWorking = false;
-                Console.WriteLine($"✗ Timeout: {url}");
+                Console.WriteLine($"✗ Timeout: {safeUrl}");
             }
             catch (Exception ex)
             {
                 stream.IsWorking = false;
-                Console.WriteLine($"✗ Erro ao testar {url}: {ex.Message}");
+                Console.WriteLine($"✗ Erro ao testar {safeUrl}: {ex.Message}");
             }
 
             return stream;

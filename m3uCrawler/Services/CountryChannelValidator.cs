@@ -9,6 +9,12 @@ namespace m3uCrawler.Services
         public string Country { get; set; } = string.Empty;
         public List<string> MatchedAliases { get; set; } = new();
         public string RawContent { get; set; } = string.Empty;
+
+        // Campos aditivos para o pipeline de país (não quebram consumidores existentes).
+        public int Threshold { get; set; } = 1;
+        public int RecognizedChannelCount { get; set; }
+        public List<string> RecognizedChannels { get; set; } = new();
+        public bool IsTargetCountry => RecognizedChannelCount >= Threshold;
     }
 
     public class CountryStreamMatch
@@ -65,6 +71,62 @@ namespace m3uCrawler.Services
                 MatchedAliases = matches.Distinct(StringComparer.OrdinalIgnoreCase).ToList(),
                 RawContent = playlistContent
             };
+
+            return result;
+        }
+
+        /// <summary>
+        /// Analisa o conteúdo de uma playlist e determina se pertence ao país alvo, contando
+        /// canais DISTINTOS reconhecidos (variantes do mesmo canal, ex.: "RTP1" e "RTP 1", contam
+        /// como um só). O país é considerado alvo quando o número de canais distintos atinge o
+        /// threshold (3 por defeito).
+        /// </summary>
+        public CountryChannelValidationResult AnalyzePlaylist(string playlistContent, string countryCode, int threshold = 3)
+        {
+            var result = new CountryChannelValidationResult
+            {
+                Country = countryCode,
+                Threshold = threshold,
+                RawContent = playlistContent
+            };
+
+            var aliases = LoadCountryAliases(countryCode);
+            if (aliases.Count == 0)
+            {
+                return result;
+            }
+
+            // A correspondência é feita contra os TÍTULOS dos canais extraídos dos #EXTINF
+            // (via M3uParserService), e não contra o conteúdo bruto da playlist. Isto evita
+            // falsos positivos de aliases curtos dentro de palavras não relacionadas
+            // (ex.: "SIC" não deve corresponder a "basics").
+            var parser = new M3uParserService();
+            var matchedAliases = new List<string>();
+            var recognizedChannels = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var stream in parser.Parse(playlistContent))
+            {
+                var titleTokens = Tokenize(NormalizeText(stream.Title));
+                if (titleTokens.Count == 0) continue;
+
+                foreach (var alias in aliases)
+                {
+                    var aliasTokens = Tokenize(NormalizeText(alias));
+                    if (aliasTokens.Count == 0) continue;
+
+                    // O conjunto de tokens do alias tem de estar contido nos tokens do título.
+                    if (aliasTokens.All(t => titleTokens.Contains(t, StringComparer.OrdinalIgnoreCase)))
+                    {
+                        matchedAliases.Add(alias);
+                        recognizedChannels.Add(CanonicalChannelKey(alias));
+                    }
+                }
+            }
+
+            result.MatchedAliases = matchedAliases.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            result.RecognizedChannels = recognizedChannels.ToList();
+            result.RecognizedChannelCount = recognizedChannels.Count;
+            result.IsMatch = recognizedChannels.Count >= threshold;
 
             return result;
         }
@@ -155,6 +217,30 @@ namespace m3uCrawler.Services
                 "br" => new List<string> { "Globo","SBT","Record","Band","Rede TV","TV Brasil" },
                 _ => new List<string>()
             };
+        }
+
+        private static List<string> Tokenize(string normalized)
+        {
+            return normalized
+                .Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries)
+                .ToList();
+        }
+
+        private static string CanonicalChannelKey(string alias)
+        {
+            if (string.IsNullOrWhiteSpace(alias)) return string.Empty;
+
+            var sb = new System.Text.StringBuilder();
+            foreach (var ch in alias)
+            {
+                if (char.IsLetterOrDigit(ch))
+                {
+                    sb.Append(char.ToLowerInvariant(ch));
+                }
+                // Separadores (-, _, ., espaço, /, etc.) são ignorados para agrupar variantes.
+            }
+
+            return sb.ToString();
         }
 
         private static string NormalizeText(string input)

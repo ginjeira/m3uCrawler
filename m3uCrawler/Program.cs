@@ -101,7 +101,8 @@ namespace m3uCrawler
                 Task? webTask = null;
                 if (webEnabled)
                 {
-                    webTask = WebDashboardService.RunDashboardAsync(outputDir, webPort, importHistoryService, CancellationToken.None);
+                    string? webToken = GetOptionValue(args, "--web-token");
+                    webTask = WebDashboardService.RunDashboardAsync(outputDir, webPort, importHistoryService, webToken, CancellationToken.None);
                     _ = webTask.ContinueWith(t =>
                     {
                         if (t.IsFaulted && t.Exception != null)
@@ -123,16 +124,20 @@ namespace m3uCrawler
                             outputDir,
                             telegramMaxStreams,
                             domainFilter,
-                            telegramHistoryHours);
+                            telegramHistoryHours,
+                            countryCode,
+                            Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries"));
                     }
                     else
                     {
-                        var workingStreams = await scraper.SearchAndTestM3UInTelegram(
+                        var (workingStreams, runReport) = await scraper.SearchAndTestM3UInTelegramAsync(
                             term,
                             limit: 200,
                             maxConcurrency: 5,
                             maxUrlsToTest: telegramMaxStreams,
-                            historyHours: telegramHistoryHours);
+                            historyHours: telegramHistoryHours,
+                            countryCode: countryCode,
+                            countriesDir: Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries"));
 
                         if (!string.IsNullOrWhiteSpace(domainFilter))
                         {
@@ -147,7 +152,7 @@ namespace m3uCrawler
 
                         foreach (var stream in workingStreams)
                         {
-                            Console.WriteLine($"  • {stream.Title} ({stream.ResponseTime}ms) :: {stream.Url}");
+                            Console.WriteLine($"  • {stream.Title} ({stream.ResponseTime}ms) :: {CredentialSanitizer.SanitizeUrl(stream.Url)}");
                         }
 
                         var countryMatches = countryChannelValidator.ValidateStreams(workingStreams, countryCode);
@@ -163,15 +168,36 @@ namespace m3uCrawler
 
                         await telegramPlaylistManager.SaveToM3uPlaylist(workingStreams, playlistPath);
                         await telegramPlaylistManager.SaveToJsonReport(workingStreams, reportPath);
+                        await SaveRunReportAsync(outputDir, runReport);
 
                         Console.WriteLine($"\n✨ Arquivos gerados:");
                         Console.WriteLine($"   • Playlist: {playlistPath}");
                         Console.WriteLine($"   • Relatório: {reportPath}");
+                        Console.WriteLine($"   • Relatório de execução: {Path.Combine(outputDir, "telegram_run_report.json")}");
 
                         if (workingStreams.Count == 0)
                         {
                             Console.WriteLine("❌ Nenhum stream funcional encontrado no Telegram.");
                         }
+
+                        await importHistoryService.RecordImportAsync(new ImportHistoryEntry
+                        {
+                            Timestamp = DateTime.UtcNow,
+                            Mode = "TelegramSearch",
+                            SearchTerm = term,
+                            HistoryHours = telegramHistoryHours,
+                            MaxStreams = telegramMaxStreams,
+                            NewFunctionalCount = workingStreams.Count,
+                            MessagesAnalyzed = runReport.MessagesAnalyzed,
+                            CandidatesFound = runReport.CandidatesFound,
+                            PlaylistsDownloaded = runReport.PlaylistsDownloaded,
+                            CountryMatches = runReport.CountryMatches,
+                            PlaylistsRejected = runReport.PlaylistsRejected,
+                            StreamsExtracted = runReport.StreamsExtracted,
+                            StreamsTested = runReport.StreamsTested,
+                            StreamsWorking = runReport.StreamsWorking,
+                            StreamsFailed = runReport.StreamsFailed
+                        });
                     }
 
                     if (loopHours > 0)
@@ -239,7 +265,7 @@ namespace m3uCrawler
                     {
                         Console.WriteLine($"✅ {result.Playlists.Count} playlist(s) encontrada(s) em {scanDomain}:");
                         foreach (var url in result.Playlists.Take(20))
-                            Console.WriteLine($"  • {url}");
+                            Console.WriteLine($"  • {CredentialSanitizer.SanitizeUrl(url)}");
                     }
                     else
                     {
@@ -251,7 +277,7 @@ namespace m3uCrawler
                         Console.WriteLine();
                         Console.WriteLine($"🖥️  {result.IptvPanels.Count} painel(éis) IPTV detetado(s) — servidor está ativo mas requer credenciais:");
                         foreach (var url in result.IptvPanels)
-                            Console.WriteLine($"  • {url}");
+                            Console.WriteLine($"  • {CredentialSanitizer.SanitizeUrl(url)}");
                     }
 
                     if (result.PlaylistTemplates.Count > 0)
@@ -262,7 +288,7 @@ namespace m3uCrawler
                         Console.WriteLine();
                         Console.WriteLine("   ou acede diretamente a:");
                         foreach (var tpl in result.PlaylistTemplates)
-                            Console.WriteLine($"  {tpl}");
+                            Console.WriteLine($"  {CredentialSanitizer.SanitizeUrl(tpl)}");
                     }
 
                     if (result.Playlists.Count == 0 && result.IptvPanels.Count == 0)
@@ -499,7 +525,9 @@ namespace m3uCrawler
             string outputDir,
             int telegramMaxStreams,
             string? domainFilter,
-            int telegramHistoryHours)
+            int telegramHistoryHours,
+            string countryCode = "pt",
+            string? countriesDir = null)
         {
             var tempPath = Path.Combine(outputDir, "playlist_temp.m3u");
             var mainPath = Path.Combine(outputDir, "playlist.m3u");
@@ -511,12 +539,14 @@ namespace m3uCrawler
             // Limpa sempre a playlist temporária no início do ciclo.
             await File.WriteAllTextAsync(tempPath, "#EXTM3U" + Environment.NewLine, Encoding.UTF8);
 
-            var freshStreams = await scraper.SearchAndTestM3UInTelegram(
+            var (freshStreams, runReport) = await scraper.SearchAndTestM3UInTelegramAsync(
                 term,
                 limit: 200,
                 maxConcurrency: 5,
                 maxUrlsToTest: telegramMaxStreams,
-                historyHours: telegramHistoryHours);
+                historyHours: telegramHistoryHours,
+                countryCode: countryCode,
+                countriesDir: countriesDir);
 
             if (!string.IsNullOrWhiteSpace(domainFilter))
             {
@@ -563,21 +593,12 @@ namespace m3uCrawler
                 stillWorkingMain = new List<M3uStream>();
             }
 
-            var mergedByUrl = new Dictionary<string, M3uStream>(StringComparer.OrdinalIgnoreCase);
+            // Se não houve novas descobertas, NÃO se apagam os streams existentes.
+            var finalStreams = TelegramScraperService.MergeStreams(stillWorkingMain, freshStreams);
 
-            foreach (var stream in stillWorkingMain)
-            {
-                mergedByUrl[stream.Url] = stream;
-            }
-
-            foreach (var stream in freshStreams.Where(s => s.IsWorking))
-            {
-                mergedByUrl[stream.Url] = stream;
-            }
-
-            var finalStreams = mergedByUrl.Values.ToList();
             await playlistManager.SaveToM3uPlaylist(finalStreams, mainPath);
             await playlistManager.SaveToJsonReport(finalStreams, reportPath);
+            await SaveRunReportAsync(outputDir, runReport);
 
             var historyEntry = new ImportHistoryEntry
             {
@@ -589,7 +610,16 @@ namespace m3uCrawler
                 NewFunctionalCount = freshStreams.Count(s => s.IsWorking),
                 ExistingRetestedCount = existingMain.Count,
                 ExistingStillWorkingCount = stillWorkingMain.Count,
-                FinalPlaylistCount = finalStreams.Count
+                FinalPlaylistCount = finalStreams.Count,
+                MessagesAnalyzed = runReport.MessagesAnalyzed,
+                CandidatesFound = runReport.CandidatesFound,
+                PlaylistsDownloaded = runReport.PlaylistsDownloaded,
+                CountryMatches = runReport.CountryMatches,
+                PlaylistsRejected = runReport.PlaylistsRejected,
+                StreamsExtracted = runReport.StreamsExtracted,
+                StreamsTested = runReport.StreamsTested,
+                StreamsWorking = runReport.StreamsWorking,
+                StreamsFailed = runReport.StreamsFailed
             };
             await importHistory.RecordImportAsync(historyEntry);
 
@@ -599,6 +629,25 @@ namespace m3uCrawler
             Console.WriteLine($"   • Total final em playlist.m3u: {finalStreams.Count}");
             Console.WriteLine($"   • playlist_temp.m3u: {tempPath}");
             Console.WriteLine($"   • playlist.m3u: {mainPath}");
+            Console.WriteLine($"   • Relatório de execução: {Path.Combine(outputDir, "telegram_run_report.json")}");
+        }
+
+        static async Task SaveRunReportAsync(string outputDir, RunReport report)
+        {
+            try
+            {
+                var path = Path.Combine(outputDir, "telegram_run_report.json");
+                var json = System.Text.Json.JsonSerializer.Serialize(report, new System.Text.Json.JsonSerializerOptions
+                {
+                    WriteIndented = true,
+                    PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase
+                });
+                await File.WriteAllTextAsync(path, json, Encoding.UTF8);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"⚠️ Não foi possível guardar o relatório de execução: {ex.Message}");
+            }
         }
     }
 }

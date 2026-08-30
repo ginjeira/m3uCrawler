@@ -30,6 +30,21 @@ namespace m3uCrawler.Services
         {
             var workingStreams = streams.Where(s => s.IsWorking).ToList();
 
+            // JSON de relatório/diagnóstico: as URLs dos streams são sanitizadas para nunca
+            // persistir credenciais Xtream (user/password/token). A playlist M3U funcional
+            // (SaveToM3uPlaylist) preserva as URLs reais, pois são necessárias para reprodução.
+            var sanitizedStreams = streams.Select(s => new
+            {
+                Url = CredentialSanitizer.SanitizeUrl(s.Url),
+                Title = s.Title,
+                Group = s.Group,
+                Logo = s.Logo,
+                IsWorking = s.IsWorking,
+                ResponseTime = s.ResponseTime,
+                LastTested = s.LastTested,
+                OriginalExtInf = s.OriginalExtInf
+            }).ToList();
+
             var report = new
             {
                 GeneratedAt = DateTime.Now,
@@ -37,7 +52,7 @@ namespace m3uCrawler.Services
                 WorkingStreams = workingStreams.Count,
                 NonWorkingStreams = streams.Count(s => !s.IsWorking),
                 AverageResponseTime = workingStreams.Any() ? workingStreams.Average(s => s.ResponseTime) : 0,
-                Streams = streams
+                Streams = sanitizedStreams
             };
 
             var options = new JsonSerializerOptions
@@ -48,7 +63,7 @@ namespace m3uCrawler.Services
 
             var json = JsonSerializer.Serialize(report, options);
             await File.WriteAllTextAsync(filePath, json, Encoding.UTF8);
-            
+
             Console.WriteLine($"Relatório JSON guardado em: {filePath}");
         }
 
