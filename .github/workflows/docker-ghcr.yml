@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-      - master
     tags:
       - "v*"
   workflow_dispatch:
@@ -13,10 +12,48 @@ permissions:
   contents: read
   packages: write
 
-jobs:
-  build-and-push:
-    runs-on: ubuntu-latest
+# Evita races em pushes muito próximos: serializa builds e cancela runs anteriores
+# do mesmo ref. Runs em refs diferentes (ex.: main e tag v1.0.0) podem correr em
+# paralelo. A tag :latest mantém-se coerente com o último push que termina.
+concurrency:
+  group: docker-ghcr-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/m3ucrawler
+  IMAGE_BASE: ghcr.io/${{ github.repository_owner }}/m3ucrawler
+
+jobs:
+  # Validação prévia: garante que o código compila e os testes passam antes de
+  # gastar tempo a publicar uma imagem. Reutiliza o mesmo toolchain do CI gate.
+  validate:
+    name: Validate build and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore m3uCrawler.sln
+
+      - name: Build (Release)
+        run: dotnet build m3uCrawler.sln --configuration Release --no-restore
+
+      - name: Test (Release)
+        run: dotnet test m3uCrawler.Tests/m3uCrawler.Tests.csproj --configuration Release --no-build --nologo
+
+  build-and-push:
+    name: Build and push image
+    runs-on: ubuntu-latest
+    needs: validate
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,22 +64,36 @@ jobs:
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
+          registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract Docker metadata
+      - name: Compute metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository_owner }}/m3ucrawler
+          images: ${{ env.IMAGE_BASE }}
+          # Tags publicadas:
+          #   - latest           : sempre no default branch
+          #   - <branch>         : refs/heads/<branch> (ex.: main)
+          #   - <tag>            : refs/tags/v* (ex.: v1.2.3)
+          #   - sha-<short>      : imutável por commit
+          #   - <sha>            : SHA completo, também imutável
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
             type=ref,event=tag
-            type=sha
+            type=sha,format=short,prefix=sha-
+            type=sha,format=long
+          labels: |
+            org.opencontainers.image.title=m3uCrawler
+            org.opencontainers.image.description=m3uCrawler — Telegram/M3U discovery, country validation and stream testing
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ github.event.repository.updated_at }}
 
       - name: Build and push image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: ./m3uCrawler
@@ -50,3 +101,70 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Cache de layers via GHCR (keyed por ref). Reduz tempo de build.
+          cache-from: type=gha,scope=${{ github.ref }}
+          cache-to: type=gha,scope=${{ github.ref }},mode=max
+
+      - name: Resolve published digest
+        id: digest
+        # docker/build-push-action não expõe o digest por output nativo.
+        # Usamos exclusivamente o registry para obter o digest imutável
+        # efectivamente publicado. `docker buildx imagetools inspect` devolve
+        # uma lista de manifestos por plataforma; seleccionamos o manifest OCI
+        # genérico (single-arch, igual à imagem que acabámos de publicar) e
+        # extraímos o campo `.digest` (SHA256 do manifest, imutável).
+        #
+        # Não usamos fallback por `docker inspect` porque o daemon local
+        # pode não ter o RepoDigests populado após `buildx build --push`,
+        # o que mascararia uma falha real com uma string vazia.
+        run: |
+          set -euo pipefail
+          REF="${{ env.IMAGE_BASE }}:sha-${{ github.sha }}"
+
+          RAW=$(docker buildx imagetools inspect "$REF" --raw)
+
+          # -e: exit != 0 se o resultado for null/false. Capturamos a falha
+          # explicitamente para distinguir digest ausente de outros erros.
+          if ! DIGEST=$(printf '%s' "$RAW" | jq -er '
+              [ ."$manifest"."digest" // empty,
+                ."$linux/amd64"."digest" // empty,
+                ."$linux/arm64"."digest" // empty ]
+              | map(select(. != ""))[0] // empty
+            '); then
+            DIGEST=""
+          fi
+
+          if [ -z "$DIGEST" ]; then
+            echo "::error::Não foi possível resolver o digest publicado para ${REF}"
+            echo "::error::Manifest obtido:" >&2
+            printf '%s\n' "$RAW" >&2
+            exit 1
+          fi
+
+          # Validação defensiva: o digest deve começar por 'sha256:'.
+          if ! [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+            echo "::error::Digest inválido (esperado sha256:<64hex>): ${DIGEST}"
+            exit 1
+          fi
+
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "image=${IMAGE_BASE}@${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Published digest: ${DIGEST}"
+
+      - name: Summary
+        run: |
+          {
+            echo "## Docker GHCR Publish"
+            echo
+            echo "- **Image**: \`${{ env.IMAGE_BASE }}\`"
+            echo "- **Revision**: \`${{ github.sha }}\`"
+            echo "- **Digest (immutable)**: \`${{ steps.digest.outputs.digest }}\`"
+            echo "- **Pull by digest**: \`docker pull ${{ env.IMAGE_BASE }}@${{ steps.digest.outputs.digest }}\`"
+            echo "- **Pull by commit**: \`docker pull ${{ env.IMAGE_BASE }}:sha-${{ github.sha }}\`"
+            echo "- **Pull :latest**: \`docker pull ${{ env.IMAGE_BASE }}:latest\`"
+            echo
+            echo "Tags published:"
+            echo "\`\`\`"
+            echo "${{ steps.meta.outputs.tags }}"
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
