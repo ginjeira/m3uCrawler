@@ -1,0 +1,73 @@
+name: package
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build and tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore m3uCrawler.sln
+
+      - name: Build
+        run: dotnet build m3uCrawler.sln --configuration Release --no-restore
+
+      - name: Test
+        run: dotnet test m3uCrawler.Tests/m3uCrawler.Tests.csproj --configuration Release --no-build --nologo
+
+  publish:
+    name: Publish linux-x64 artifact
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Publish linux-x64 (framework-dependent)
+        run: |
+          dotnet publish m3uCrawler/m3uCrawler.csproj \
+            --configuration Release \
+            --runtime linux-x64 \
+            --self-contained false \
+            --output ./publish
+
+      - name: Verify published contents
+        run: |
+          test -f publish/m3uCrawler.dll
+          test -f publish/m3uCrawler
+          echo "Published files:"
+          ls -la publish
+
+      - name: Compress publish output
+        run: |
+          tar -czf m3uCrawler-linux-x64-${{ github.sha }}.tar.gz -C publish .
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: m3uCrawler-linux-x64-${{ github.sha }}
+          path: m3uCrawler-linux-x64-${{ github.sha }}.tar.gz
+          if-no-files-found: error
+          retention-days: 14
