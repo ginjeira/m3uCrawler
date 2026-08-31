@@ -284,6 +284,7 @@ namespace m3uCrawler.Services.Sync
                 .Select(s => s.ExistingStreamId ?? (ctx.NewStreamIds.TryGetValue(s.StreamUrl, out var nid) ? nid : (long?)null))
                 .Where(id => id.HasValue)
                 .Select(id => id!.Value)
+                .Distinct()
                 .ToList();
 
             // Phase 3: create new channel OR patch existing channel (single PATCH per channel id).
