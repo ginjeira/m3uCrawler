@@ -192,86 +192,148 @@ namespace m3uCrawler.Services.Sync
 
             foreach (var channel in plan.Channels)
             {
-                try
+                if (channel.Outcome == SyncOutcome.Ambiguous || channel.Outcome == SyncOutcome.Skipped)
+                    continue;
+
+                var ctx = await BeginChannelApplyAsync(channel, existing, groupByName, ct);
+
+                if (ctx.PatchFailed)
                 {
-                    if (channel.Outcome == SyncOutcome.Ambiguous || channel.Outcome == SyncOutcome.Skipped)
-                        continue;
-
-                    long? groupId = null;
-                    if (!string.IsNullOrWhiteSpace(channel.ChannelGroupName))
-                    {
-                        if (!groupByName.TryGetValue(channel.ChannelGroupName!, out var existingId) && _config.AutoCreateGroups)
-                        {
-                            existingId = await _m3u.CreateGroupAsync(channel.ChannelGroupName!, ct);
-                            groupByName[channel.ChannelGroupName!] = existingId;
-                        }
-                        if (groupByName.TryGetValue(channel.ChannelGroupName!, out var resolved))
-                            groupId = resolved;
-                    }
-
-                    var orderedWorking = channel.Streams
-                        .Where(s => s.Outcome != SyncOutcome.Skipped && s.IsWorking)
-                        .OrderBy(s => s.ProposedOrder)
-                        .ToList();
-
-                    var newStreamIds = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
-                    foreach (var s in orderedWorking.Where(s => s.Outcome == SyncOutcome.NewStream))
-                    {
-                        var newId = await _streams.CreateAsync(new NewStreamRequest
-                        {
-                            Name = s.StreamName,
-                            Url = s.StreamUrl,
-                            ChannelGroupId = groupId,
-                            IsCustom = true,
-                        }, ct);
-                        newStreamIds[s.StreamUrl] = newId;
-                    }
-
-                    var existingId2s = orderedWorking
-                        .Where(s => s.Outcome == SyncOutcome.ExistingUnchanged && s.ExistingStreamId.HasValue)
-                        .Select(s => s.ExistingStreamId!.Value)
-                        .ToList();
-
-                    var allStreamIds = orderedWorking
-                        .Select(s => s.ExistingStreamId ?? (newStreamIds.TryGetValue(s.StreamUrl, out var nid) ? nid : (long?)null))
-                        .Where(id => id.HasValue)
-                        .Select(id => id!.Value)
-                        .ToList();
-
-                    if (channel.Outcome == SyncOutcome.NewChannel)
-                    {
-                        await _channels.CreateAsync(new NewChannelRequest
-                        {
-                            Name = channel.CanonicalName,
-                            ChannelGroupId = groupId,
-                            Streams = allStreamIds,
-                        }, ct);
-                    }
-                    else if (channel.ExistingChannelId.HasValue && allStreamIds.Count > 0)
-                    {
-                        var currentIds = await _channels.ListStreamIdsAsync(channel.ExistingChannelId.Value, ct);
-                        if (!currentIds.SequenceEqual(allStreamIds))
-                            await _channels.UpdateStreamsAsync(channel.ExistingChannelId.Value, allStreamIds, ct);
-                    }
-
-                    foreach (var removed in channel.Streams.Where(s => s.Outcome == SyncOutcome.Removed && s.ExistingStreamId.HasValue))
-                    {
-                        try { await _streams.DeleteAsync(removed.ExistingStreamId!.Value, ct); }
-                        catch (DispatcharrException dex)
-                        {
-                            Console.WriteLine($"⚠️ Falha a remover stream {removed.ExistingStreamId}: {dex.Message}");
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"❌ Falha ao aplicar canal '{channel.CanonicalName}': {ex.Message}");
                     failed.Add(new FailedReportEntry
                     {
                         Identity = channel.Identity,
-                        Reason = $"{ex.GetType().Name}: {ex.Message}",
+                        Reason = $"{ctx.PatchException?.GetType().Name}: {ctx.PatchException?.Message}",
                         ExistingChannelId = channel.ExistingChannelId,
                     });
+                    Console.WriteLine($"❌ Falha ao aplicar canal '{channel.CanonicalName}': {ctx.PatchException?.Message}");
+                }
+
+                await CompleteChannelApplyAsync(channel, ctx, failed, ct);
+            }
+        }
+
+        private sealed class ChannelApplyContext
+        {
+            public Dictionary<string, long> GroupByName { get; init; } = new();
+            public Dictionary<string, long> NewStreamIds { get; } = new(StringComparer.OrdinalIgnoreCase);
+            public IReadOnlyList<long> AllStreamIds { get; set; } = Array.Empty<long>();
+            public bool PatchFailed { get; set; }
+            public Exception? PatchException { get; set; }
+        }
+
+        private async Task<ChannelApplyContext> BeginChannelApplyAsync(
+            ChannelDecision channel,
+            DispatcharrState existing,
+            Dictionary<string, long> groupByName,
+            CancellationToken ct)
+        {
+            var ctx = new ChannelApplyContext { GroupByName = groupByName };
+
+            // Phase 1: resolve group (no HTTP yet).
+            long? groupId = null;
+            if (!string.IsNullOrWhiteSpace(channel.ChannelGroupName))
+            {
+                if (!groupByName.TryGetValue(channel.ChannelGroupName!, out var existingId) && _config.AutoCreateGroups)
+                {
+                    try
+                    {
+                        existingId = await _m3u.CreateGroupAsync(channel.ChannelGroupName!, ct);
+                        groupByName[channel.ChannelGroupName!] = existingId;
+                    }
+                    catch (DispatcharrException ex)
+                    {
+                        ctx.PatchFailed = true;
+                        ctx.PatchException = ex;
+                        Console.WriteLine($"❌ Falha ao criar grupo '{channel.ChannelGroupName}': {ex.Message}");
+                        return ctx;
+                    }
+                }
+                if (groupByName.TryGetValue(channel.ChannelGroupName!, out var resolved))
+                    groupId = resolved;
+            }
+
+            var orderedWorking = channel.Streams
+                .Where(s => s.Outcome != SyncOutcome.Skipped && s.IsWorking)
+                .OrderBy(s => s.ProposedOrder)
+                .ToList();
+
+            // Phase 2: POST every NewStream up front.
+            foreach (var s in orderedWorking.Where(s => s.Outcome == SyncOutcome.NewStream))
+            {
+                try
+                {
+                    var newId = await _streams.CreateAsync(new NewStreamRequest
+                    {
+                        Name = s.StreamName,
+                        Url = s.StreamUrl,
+                        ChannelGroupId = groupId,
+                        IsCustom = true,
+                    }, ct);
+                    ctx.NewStreamIds[s.StreamUrl] = newId;
+                }
+                catch (DispatcharrException ex)
+                {
+                    ctx.PatchFailed = true;
+                    ctx.PatchException = ex;
+                    Console.WriteLine($"❌ Falha ao criar stream '{s.StreamUrl}': {ex.Message}");
+                    return ctx;
+                }
+            }
+
+            ctx.AllStreamIds = orderedWorking
+                .Select(s => s.ExistingStreamId ?? (ctx.NewStreamIds.TryGetValue(s.StreamUrl, out var nid) ? nid : (long?)null))
+                .Where(id => id.HasValue)
+                .Select(id => id!.Value)
+                .ToList();
+
+            // Phase 3: create new channel OR patch existing channel (single PATCH per channel id).
+            try
+            {
+                if (channel.Outcome == SyncOutcome.NewChannel)
+                {
+                    await _channels.CreateAsync(new NewChannelRequest
+                    {
+                        Name = channel.CanonicalName,
+                        ChannelGroupId = groupId,
+                        Streams = ctx.AllStreamIds.ToList(),
+                    }, ct);
+                }
+                else if (channel.ExistingChannelId.HasValue && ctx.AllStreamIds.Count > 0)
+                {
+                    var currentIds = await _channels.ListStreamIdsAsync(channel.ExistingChannelId.Value, ct);
+                    if (!currentIds.SequenceEqual(ctx.AllStreamIds))
+                    {
+                        await _channels.UpdateStreamsAsync(channel.ExistingChannelId.Value, ctx.AllStreamIds.ToList(), ct);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                ctx.PatchFailed = true;
+                ctx.PatchException = ex;
+            }
+
+            return ctx;
+        }
+
+        private async Task CompleteChannelApplyAsync(
+            ChannelDecision channel,
+            ChannelApplyContext ctx,
+            List<FailedReportEntry> failed,
+            CancellationToken ct)
+        {
+            // Phase 4: DELETE streams marked as removed. Runs even if PATCH failed so the
+            // channel does not retain stale streams. Each DELETE is isolated so individual
+            // failures do not abort the channel.
+            foreach (var removed in channel.Streams.Where(s => s.Outcome == SyncOutcome.Removed && s.ExistingStreamId.HasValue))
+            {
+                try
+                {
+                    await _streams.DeleteAsync(removed.ExistingStreamId!.Value, ct);
+                }
+                catch (DispatcharrException dex)
+                {
+                    Console.WriteLine($"⚠️ Falha a remover stream {removed.ExistingStreamId}: {dex.Message}");
                 }
             }
         }
