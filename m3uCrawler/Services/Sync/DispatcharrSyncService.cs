@@ -120,6 +120,7 @@ namespace m3uCrawler.Services.Sync
             var planPath = Path.Combine(_outputDir, $"dispatcharr_plan_{startedAt:yyyyMMdd_HHmmss}.json");
             await MatchPlanSerializer.WriteAsync(plan, planPath, ct);
 
+            var failed = new List<FailedReportEntry>();
             var reportBuilder = new ReportBuilder(plan, existing.Version, playlistPath, startedAt);
             var preReport = reportBuilder.Build();
 
@@ -129,10 +130,11 @@ namespace m3uCrawler.Services.Sync
             }
             else
             {
-                await ApplyAsync(plan, existing, ct);
+                await ApplyAsync(plan, existing, failed, ct);
             }
 
-            var finalReport = reportBuilder.Finish(DateTime.UtcNow, preReport);
+            preReport.Counts.Failed = failed.Count;
+            var finalReport = reportBuilder.Finish(DateTime.UtcNow, preReport, failed);
             var reportPath = Path.Combine(_outputDir, $"dispatcharr_report_{startedAt:yyyyMMdd_HHmmss}.json");
             await MatchPlanSerializer.WriteReportAsync(finalReport, reportPath, ct);
 
@@ -161,22 +163,14 @@ namespace m3uCrawler.Services.Sync
 
         private async Task<DispatcharrState> FetchStateAsync(CancellationToken ct)
         {
-            try
-            {
-                var version = await _m3u.GetVersionAsync(ct);
-                var channels = await _channels.ListAsync(ct);
-                var streams = await _streams.ListAsync(ct);
-                var groups = await _m3u.ListGroupsAsync(ct);
-                return new DispatcharrState(channels, streams, groups, version);
-            }
-            catch (DispatcharrException ex)
-            {
-                Console.WriteLine($"⚠️ Não foi possível obter estado do Dispatcharr: {ex.SanitizedMessage}");
-                return new DispatcharrState(Array.Empty<DispatcharrChannel>(), Array.Empty<DispatcharrStream>(), Array.Empty<DispatcharrChannelGroup>(), null);
-            }
+            var version = await _m3u.GetVersionAsync(ct);
+            var channels = await _channels.ListAsync(ct);
+            var streams = await _streams.ListAsync(ct);
+            var groups = await _m3u.ListGroupsAsync(ct);
+            return new DispatcharrState(channels, streams, groups, version);
         }
 
-        private async Task ApplyAsync(MatchPlan plan, DispatcharrState existing, CancellationToken ct)
+        private async Task ApplyAsync(MatchPlan plan, DispatcharrState existing, List<FailedReportEntry> failed, CancellationToken ct)
         {
             var groupByName = existing.Groups
                 .GroupBy(g => g.Name, StringComparer.OrdinalIgnoreCase)
@@ -251,13 +245,19 @@ namespace m3uCrawler.Services.Sync
                         try { await _streams.DeleteAsync(removed.ExistingStreamId!.Value, ct); }
                         catch (DispatcharrException dex)
                         {
-                            Console.WriteLine($"⚠️ Falha a remover stream {removed.ExistingStreamId}: {dex.SanitizedMessage}");
+                            Console.WriteLine($"⚠️ Falha a remover stream {removed.ExistingStreamId}: {dex.Message}");
                         }
                     }
                 }
                 catch (Exception ex)
                 {
                     Console.WriteLine($"❌ Falha ao aplicar canal '{channel.CanonicalName}': {ex.Message}");
+                    failed.Add(new FailedReportEntry
+                    {
+                        Identity = channel.Identity,
+                        Reason = $"{ex.GetType().Name}: {ex.Message}",
+                        ExistingChannelId = channel.ExistingChannelId,
+                    });
                 }
             }
         }
@@ -308,7 +308,7 @@ namespace m3uCrawler.Services.Sync
                 };
             }
 
-            public SyncReport Finish(DateTime finishedAt, SyncReport partial)
+            public SyncReport Finish(DateTime finishedAt, SyncReport partial, IReadOnlyList<FailedReportEntry> failedChannels)
             {
                 return new SyncReport
                 {
@@ -320,7 +320,7 @@ namespace m3uCrawler.Services.Sync
                     Counts = partial.Counts,
                     Channels = partial.Channels,
                     AmbiguousDecisions = partial.AmbiguousDecisions,
-                    FailedChannels = partial.FailedChannels,
+                    FailedChannels = failedChannels,
                 };
             }
         }

@@ -48,16 +48,16 @@ namespace m3uCrawler.Models
         [JsonPropertyName("reason")] public string Reason { get; init; } = string.Empty;
     }
 
-    public sealed record SyncReportCounts
+    public sealed class SyncReportCounts
     {
-        [JsonPropertyName("matched")] public int Matched { get; init; }
-        [JsonPropertyName("newChannels")] public int NewChannels { get; init; }
-        [JsonPropertyName("newStreams")] public int NewStreams { get; init; }
-        [JsonPropertyName("removedStreams")] public int RemovedStreams { get; init; }
-        [JsonPropertyName("skipped")] public int Skipped { get; init; }
-        [JsonPropertyName("ambiguous")] public int Ambiguous { get; init; }
-        [JsonPropertyName("unchanged")] public int Unchanged { get; init; }
-        [JsonPropertyName("failed")] public int Failed { get; init; }
+        [JsonPropertyName("matched")] public int Matched { get; set; }
+        [JsonPropertyName("newChannels")] public int NewChannels { get; set; }
+        [JsonPropertyName("newStreams")] public int NewStreams { get; set; }
+        [JsonPropertyName("removedStreams")] public int RemovedStreams { get; set; }
+        [JsonPropertyName("skipped")] public int Skipped { get; set; }
+        [JsonPropertyName("ambiguous")] public int Ambiguous { get; set; }
+        [JsonPropertyName("unchanged")] public int Unchanged { get; set; }
+        [JsonPropertyName("failed")] public int Failed { get; set; }
         [JsonPropertyName("totalChannels")] public int TotalChannels => Matched + NewChannels + Unchanged + Ambiguous + Failed + Skipped;
     }
 

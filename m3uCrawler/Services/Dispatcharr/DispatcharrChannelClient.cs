@@ -28,9 +28,9 @@ namespace m3uCrawler.Services.Dispatcharr
         {
             using var resp = await _http.GetAsync("/api/channels/channels/?page_size=1000", ct);
             if (!resp.IsSuccessStatusCode)
-                throw new DispatcharrException("/api/channels/channels/", "list-failed", (int)resp.StatusCode);
+                throw await DispatcharrErrorHelper.ToExceptionAsync(resp, "/api/channels/channels/", HttpMethod.Get, "list-failed", ct);
             var page = await resp.Content.ReadFromJsonAsync<PagedResponse<ChannelDto>>(Json, ct)
-                       ?? throw new DispatcharrException("/api/channels/channels/", "empty-list-response", (int)resp.StatusCode);
+                       ?? throw await DispatcharrErrorHelper.ToExceptionAsync(resp, "/api/channels/channels/", HttpMethod.Get, "empty-list-response", ct);
             return page.Results.Select(ChannelDto.ToDomain).ToList();
         }
 
@@ -38,12 +38,9 @@ namespace m3uCrawler.Services.Dispatcharr
         {
             using var resp = await _http.PostAsJsonAsync("/api/channels/channels/", request.ToPayload(), Json, ct);
             if (!resp.IsSuccessStatusCode)
-            {
-                var body = await resp.Content.ReadAsStringAsync(ct);
-                throw new DispatcharrException("/api/channels/channels/", CredentialSanitizer.SanitizeUrl(body), (int)resp.StatusCode);
-            }
+                throw await DispatcharrErrorHelper.ToExceptionAsync(resp, "/api/channels/channels/", HttpMethod.Post, "create-failed", ct);
             var dto = await resp.Content.ReadFromJsonAsync<ChannelDto>(Json, ct)
-                      ?? throw new DispatcharrException("/api/channels/channels/", "empty-create-response", (int)resp.StatusCode);
+                      ?? throw await DispatcharrErrorHelper.ToExceptionAsync(resp, "/api/channels/channels/", HttpMethod.Post, "empty-create-response", ct);
             return dto.Id;
         }
 
@@ -52,10 +49,7 @@ namespace m3uCrawler.Services.Dispatcharr
             using var resp = await _http.PatchAsync($"/api/channels/channels/{channelId}/",
                 JsonContent.Create(new { streams = orderedStreamIds.ToArray() }), ct);
             if (!resp.IsSuccessStatusCode)
-            {
-                var body = await resp.Content.ReadAsStringAsync(ct);
-                throw new DispatcharrException($"/api/channels/channels/{channelId}/", CredentialSanitizer.SanitizeUrl(body), (int)resp.StatusCode);
-            }
+                throw await DispatcharrErrorHelper.ToExceptionAsync(resp, $"/api/channels/channels/{channelId}/", HttpMethod.Patch, "update-failed", ct);
         }
 
         public async Task<IReadOnlyList<long>> ListStreamIdsAsync(long channelId, CancellationToken ct)

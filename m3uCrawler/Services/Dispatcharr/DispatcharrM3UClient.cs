@@ -27,9 +27,9 @@ namespace m3uCrawler.Services.Dispatcharr
         {
             using var resp = await _http.GetAsync("/api/channels/groups/?page_size=1000", ct);
             if (!resp.IsSuccessStatusCode)
-                throw new DispatcharrException("/api/channels/groups/", "list-failed", (int)resp.StatusCode);
+                throw await DispatcharrErrorHelper.ToExceptionAsync(resp, "/api/channels/groups/", HttpMethod.Get, "list-failed", ct);
             var page = await resp.Content.ReadFromJsonAsync<PagedResponse<GroupDto>>(Json, ct)
-                       ?? throw new DispatcharrException("/api/channels/groups/", "empty-list-response", (int)resp.StatusCode);
+                       ?? throw await DispatcharrErrorHelper.ToExceptionAsync(resp, "/api/channels/groups/", HttpMethod.Get, "empty-list-response", ct);
             return page.Results.Select(g => new DispatcharrChannelGroup(g.Id, g.Name)).ToList();
         }
 
@@ -37,12 +37,9 @@ namespace m3uCrawler.Services.Dispatcharr
         {
             using var resp = await _http.PostAsJsonAsync("/api/channels/groups/", new { name }, Json, ct);
             if (!resp.IsSuccessStatusCode)
-            {
-                var body = await resp.Content.ReadAsStringAsync(ct);
-                throw new DispatcharrException("/api/channels/groups/", CredentialSanitizer.SanitizeUrl(body), (int)resp.StatusCode);
-            }
+                throw await DispatcharrErrorHelper.ToExceptionAsync(resp, "/api/channels/groups/", HttpMethod.Post, "create-failed", ct);
             var dto = await resp.Content.ReadFromJsonAsync<GroupDto>(Json, ct)
-                      ?? throw new DispatcharrException("/api/channels/groups/", "empty-create-response", (int)resp.StatusCode);
+                      ?? throw await DispatcharrErrorHelper.ToExceptionAsync(resp, "/api/channels/groups/", HttpMethod.Post, "empty-create-response", ct);
             return dto.Id;
         }
 
@@ -71,5 +68,17 @@ namespace m3uCrawler.Services.Dispatcharr
     internal sealed class VersionDto
     {
         [JsonPropertyName("version")] public string? Version { get; set; }
+    }
+
+    internal static class DispatcharrErrorHelper
+    {
+        public static async Task<DispatcharrException> ToExceptionAsync(
+            HttpResponseMessage resp, string endpoint, HttpMethod method, string fallbackReason, CancellationToken ct)
+        {
+            string body = string.Empty;
+            try { body = await resp.Content.ReadAsStringAsync(ct); } catch { /* keep body empty */ }
+            var sanitized = string.IsNullOrEmpty(body) ? fallbackReason : CredentialSanitizer.SanitizeUrl(body);
+            return new DispatcharrException(endpoint, sanitized, (int)resp.StatusCode, method.Method, inner: null);
+        }
     }
 }

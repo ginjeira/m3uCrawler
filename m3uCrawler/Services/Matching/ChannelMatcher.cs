@@ -140,7 +140,7 @@ namespace m3uCrawler.Services.Matching
                             }
                         }
                     });
-                    counts = counts with { Ambiguous = counts.Ambiguous + 1 };
+                    counts.Ambiguous = counts.Ambiguous + 1;
                     continue;
                 }
 
@@ -186,7 +186,7 @@ namespace m3uCrawler.Services.Matching
                                 IsWorking = false,
                                 GroupName = stream.Group,
                             });
-                            counts = counts with { Skipped = counts.Skipped + 1 };
+                            counts.Skipped = counts.Skipped + 1;
                             continue;
                         }
 
@@ -207,7 +207,7 @@ namespace m3uCrawler.Services.Matching
                             IsWorking = stream.IsWorking,
                             GroupName = stream.Group,
                         });
-                        if (isNew) counts = counts with { NewStreams = counts.NewStreams + 1 };
+                        if (isNew) counts.NewStreams = counts.NewStreams + 1;
                         order++;
                     }
 
@@ -228,7 +228,7 @@ namespace m3uCrawler.Services.Matching
                                 IsWorking = es.IsWorking,
                                 GroupName = es.GroupName,
                             });
-                            counts = counts with { RemovedStreams = counts.RemovedStreams + 1 };
+                            counts.RemovedStreams = counts.RemovedStreams + 1;
                         }
                     }
 
@@ -247,13 +247,9 @@ namespace m3uCrawler.Services.Matching
                         Streams = streamDecisions,
                         AmbiguousCandidates = Array.Empty<AmbiguousCandidate>(),
                     });
-                    counts = counts with
-                    {
-                        Matched = counts.Matched + 1,
-                        Unchanged = (streamDecisions.Any(d => d.Outcome == SyncOutcome.NewStream || d.Outcome == SyncOutcome.Removed)
-                            ? counts.Unchanged
-                            : counts.Unchanged + 1)
-                    };
+                    counts.Matched = counts.Matched + 1;
+                    if (!(streamDecisions.Any(d => d.Outcome == SyncOutcome.NewStream || d.Outcome == SyncOutcome.Removed)))
+                        counts.Unchanged = counts.Unchanged + 1;
                     continue;
                 }
 
@@ -274,12 +270,9 @@ namespace m3uCrawler.Services.Matching
                     Streams = newStreamDecisions,
                     AmbiguousCandidates = Array.Empty<AmbiguousCandidate>(),
                 });
-                counts = counts with
-                {
-                    NewChannels = counts.NewChannels + 1,
-                    NewStreams = counts.NewStreams + newStreamDecisions.Count(d => d.IsWorking),
-                    Skipped = counts.Skipped + newStreamDecisions.Count(d => d.Outcome == SyncOutcome.Skipped),
-                };
+                counts.NewChannels = counts.NewChannels + 1;
+                counts.NewStreams = counts.NewStreams + newStreamDecisions.Count(d => d.IsWorking);
+                counts.Skipped = counts.Skipped + newStreamDecisions.Count(d => d.Outcome == SyncOutcome.Skipped);
             }
 
             var plan = new MatchPlan

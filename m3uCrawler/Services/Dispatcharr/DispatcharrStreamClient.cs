@@ -27,9 +27,9 @@ namespace m3uCrawler.Services.Dispatcharr
         {
             using var resp = await _http.GetAsync("/api/channels/streams/?page_size=1000", ct);
             if (!resp.IsSuccessStatusCode)
-                throw new DispatcharrException("/api/channels/streams/", "list-failed", (int)resp.StatusCode);
+                throw await DispatcharrErrorHelper.ToExceptionAsync(resp, "/api/channels/streams/", HttpMethod.Get, "list-failed", ct);
             var page = await resp.Content.ReadFromJsonAsync<PagedResponse<StreamListDto>>(Json, ct)
-                       ?? throw new DispatcharrException("/api/channels/streams/", "empty-list-response", (int)resp.StatusCode);
+                       ?? throw await DispatcharrErrorHelper.ToExceptionAsync(resp, "/api/channels/streams/", HttpMethod.Get, "empty-list-response", ct);
             return page.Results.Select(StreamListDto.ToDomain).ToList();
         }
 
@@ -37,12 +37,9 @@ namespace m3uCrawler.Services.Dispatcharr
         {
             using var resp = await _http.PostAsJsonAsync("/api/channels/streams/", request.ToPayload(), Json, ct);
             if (!resp.IsSuccessStatusCode)
-            {
-                var body = await resp.Content.ReadAsStringAsync(ct);
-                throw new DispatcharrException("/api/channels/streams/", CredentialSanitizer.SanitizeUrl(body), (int)resp.StatusCode);
-            }
+                throw await DispatcharrErrorHelper.ToExceptionAsync(resp, "/api/channels/streams/", HttpMethod.Post, "create-failed", ct);
             var dto = await resp.Content.ReadFromJsonAsync<StreamListDto>(Json, ct)
-                      ?? throw new DispatcharrException("/api/channels/streams/", "empty-create-response", (int)resp.StatusCode);
+                      ?? throw await DispatcharrErrorHelper.ToExceptionAsync(resp, "/api/channels/streams/", HttpMethod.Post, "empty-create-response", ct);
             return dto.Id;
         }
 
@@ -50,10 +47,7 @@ namespace m3uCrawler.Services.Dispatcharr
         {
             using var resp = await _http.DeleteAsync($"/api/channels/streams/{streamId}/", ct);
             if (!resp.IsSuccessStatusCode && resp.StatusCode != System.Net.HttpStatusCode.NotFound)
-            {
-                var body = await resp.Content.ReadAsStringAsync(ct);
-                throw new DispatcharrException($"/api/channels/streams/{streamId}/", CredentialSanitizer.SanitizeUrl(body), (int)resp.StatusCode);
-            }
+                throw await DispatcharrErrorHelper.ToExceptionAsync(resp, $"/api/channels/streams/{streamId}/", HttpMethod.Delete, "delete-failed", ct);
         }
     }
 
