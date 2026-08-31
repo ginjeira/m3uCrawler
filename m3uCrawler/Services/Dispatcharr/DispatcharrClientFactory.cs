@@ -29,7 +29,9 @@ namespace m3uCrawler.Services.Dispatcharr
                 Password = password,
             };
 
-            var authHandler = new DispatcharrAuthHandler(auth, login)
+            bool useApiKey = !string.IsNullOrWhiteSpace(apiKey);
+
+            var authHandler = new DispatcharrAuthHandler(auth, login, useApiKey)
             {
                 InnerHandler = transport,
             };
@@ -47,6 +49,9 @@ namespace m3uCrawler.Services.Dispatcharr
 
             if (!string.IsNullOrWhiteSpace(apiKey))
                 auth.Set(apiKey, refresh: null);
+
+            if (useApiKey)
+                Console.WriteLine("🔑 Dispatcharr auth: X-API-Key mode active.");
 
             return (inner, auth, login, channels, streams, m3u);
         }
@@ -72,7 +77,9 @@ namespace m3uCrawler.Services.Dispatcharr
                 Password = password,
             };
 
-            var authHandler = new DispatcharrAuthHandler(auth, login)
+            bool useApiKey = !string.IsNullOrWhiteSpace(apiKey);
+
+            var authHandler = new DispatcharrAuthHandler(auth, login, useApiKey)
             {
                 InnerHandler = transport,
             };

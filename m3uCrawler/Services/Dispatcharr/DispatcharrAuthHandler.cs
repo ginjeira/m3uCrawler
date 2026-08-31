@@ -10,11 +10,18 @@ namespace m3uCrawler.Services.Dispatcharr
     {
         private readonly DispatcharrAuthState _state;
         private readonly DispatcharrLoginApi _login;
+        private readonly bool _useApiKey;
 
         public DispatcharrAuthHandler(DispatcharrAuthState state, DispatcharrLoginApi login)
+            : this(state, login, useApiKey: false)
+        {
+        }
+
+        public DispatcharrAuthHandler(DispatcharrAuthState state, DispatcharrLoginApi login, bool useApiKey)
         {
             _state = state ?? throw new ArgumentNullException(nameof(state));
             _login = login ?? throw new ArgumentNullException(nameof(login));
+            _useApiKey = useApiKey;
         }
 
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
@@ -24,6 +31,12 @@ namespace m3uCrawler.Services.Dispatcharr
             var response = await base.SendAsync(request, cancellationToken);
             if (response.StatusCode != HttpStatusCode.Unauthorized)
                 return response;
+
+            if (_useApiKey)
+            {
+                response.Dispose();
+                return MakeUnauthorizedResponse(request);
+            }
 
             if (request.Headers.Contains("X-Dispatcharr-Auth-Retry"))
                 return response;
@@ -47,8 +60,19 @@ namespace m3uCrawler.Services.Dispatcharr
         private void AttachToken(HttpRequestMessage request)
         {
             var token = _state.AccessToken;
-            if (!string.IsNullOrWhiteSpace(token))
+            if (string.IsNullOrWhiteSpace(token))
+                return;
+
+            if (_useApiKey)
+            {
+                request.Headers.Remove("X-API-Key");
+                request.Headers.Add("X-API-Key", token);
+                request.Headers.Authorization = null;
+            }
+            else
+            {
                 request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+            }
         }
 
         private static async Task<HttpRequestMessage> CloneAsync(HttpRequestMessage source, CancellationToken ct)

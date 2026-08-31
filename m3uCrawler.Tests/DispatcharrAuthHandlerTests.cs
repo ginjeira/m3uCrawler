@@ -64,6 +64,41 @@ public class DispatcharrAuthHandlerTests
         Assert.Equal(HttpStatusCode.Unauthorized, resp.StatusCode);
         Assert.Equal(2, inner.Count);
     }
+
+    [Fact]
+    public async Task Api_key_mode_attaches_X_Api_Key_header()
+    {
+        var state = new DispatcharrAuthState();
+        state.Set("API-KEY-VALUE", null);
+        var login = new StubLoginApi();
+        var capture = new ApiKeyCaptureHandler();
+        var handler = new DispatcharrAuthHandler(state, login, useApiKey: true) { InnerHandler = capture };
+        using var client = new HttpClient(handler) { BaseAddress = new Uri("http://x/api/") };
+        var resp = await client.GetAsync("/foo");
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        Assert.Equal("API-KEY-VALUE", capture.LastXApiKey);
+    }
+
+    [Fact]
+    public async Task Api_key_mode_returns_401_without_retry_or_login()
+    {
+        var state = new DispatcharrAuthState();
+        state.Set("API-KEY-VALUE", null);
+        var login = new StubLoginApi
+        {
+            RefreshHandler = _ => { throw new InvalidOperationException("refresh should not be called in api-key mode"); },
+        };
+        var inner = new SequenceHandler(
+            new HttpResponseMessage(HttpStatusCode.Unauthorized),
+            new HttpResponseMessage(HttpStatusCode.Unauthorized),
+            new HttpResponseMessage(HttpStatusCode.Unauthorized),
+            new HttpResponseMessage(HttpStatusCode.Unauthorized));
+        var handler = new DispatcharrAuthHandler(state, login, useApiKey: true) { InnerHandler = inner };
+        using var client = new HttpClient(handler) { BaseAddress = new Uri("http://x/api/") };
+        var resp = await client.GetAsync("/x");
+        Assert.Equal(HttpStatusCode.Unauthorized, resp.StatusCode);
+        Assert.Equal(1, inner.Count);
+    }
 }
 
 internal sealed class CaptureHandler : HttpMessageHandler
@@ -72,6 +107,22 @@ internal sealed class CaptureHandler : HttpMessageHandler
     {
         Assert.NotNull(req.Headers.Authorization);
         Assert.Equal("Bearer", req.Headers.Authorization!.Scheme);
+        return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK));
+    }
+}
+
+internal sealed class ApiKeyCaptureHandler : HttpMessageHandler
+{
+    public string? LastXApiKey { get; private set; }
+
+    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage req, CancellationToken ct)
+    {
+        Assert.Null(req.Headers.Authorization);
+        if (req.Headers.TryGetValues("X-API-Key", out var values))
+        {
+            var joined = string.Join(",", values);
+            LastXApiKey = string.IsNullOrEmpty(joined) ? null : joined;
+        }
         return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK));
     }
 }

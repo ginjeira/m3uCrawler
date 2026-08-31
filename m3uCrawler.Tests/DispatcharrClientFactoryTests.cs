@@ -33,7 +33,7 @@ public class DispatcharrClientFactoryTests
     }
 
     [Fact]
-    public async Task Build_attaches_bearer_when_api_key_is_set()
+    public async Task Build_attaches_X_Api_Key_when_in_api_key_mode()
     {
         var transport = new CaptureTransport();
         var (http, auth, _, _, _, _) = DispatcharrClientFactory.BuildWithTransport(
@@ -46,10 +46,60 @@ public class DispatcharrClientFactoryTests
         try
         {
             using var resp = await http.GetAsync("/api/core/version/");
-            Assert.NotNull(transport.LastAuthorization);
-            Assert.Equal("Bearer", transport.LastAuthorization!.Scheme);
-            Assert.Equal("PLACEHOLDER-API-KEY", transport.LastAuthorization.Parameter);
+            Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+            Assert.Null(transport.LastAuthorization);
+            Assert.Equal("PLACEHOLDER-API-KEY", transport.LastXApiKey);
             Assert.Equal("PLACEHOLDER-API-KEY", auth.AccessToken);
+        }
+        finally
+        {
+            http.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task Build_attaches_no_auth_header_when_in_jwt_mode_without_token()
+    {
+        var transport = new CaptureTransport();
+        var (http, auth, _, _, _, _) = DispatcharrClientFactory.BuildWithTransport(
+            "http://dispatcharr.local",
+            apiKey: null,
+            username: "u",
+            password: "p",
+            transport: transport);
+
+        try
+        {
+            using var resp = await http.GetAsync("/api/core/version/");
+            Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+            Assert.Null(transport.LastAuthorization);
+            Assert.Null(transport.LastXApiKey);
+            Assert.Null(auth.AccessToken);
+        }
+        finally
+        {
+            http.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task Build_prefers_api_key_mode_when_both_configured()
+    {
+        var transport = new CaptureTransport();
+        var (http, auth, _, _, _, _) = DispatcharrClientFactory.BuildWithTransport(
+            "http://dispatcharr.local",
+            apiKey: "KEY-FROM-CONFIG",
+            username: "u",
+            password: "p",
+            transport: transport);
+
+        try
+        {
+            using var resp = await http.GetAsync("/api/core/version/");
+            Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+            Assert.Null(transport.LastAuthorization);
+            Assert.Equal("KEY-FROM-CONFIG", transport.LastXApiKey);
+            Assert.Equal("KEY-FROM-CONFIG", auth.AccessToken);
         }
         finally
         {
@@ -164,12 +214,22 @@ public class DispatcharrClientFactoryTests
     {
         public bool Hit { get; private set; }
         public AuthenticationHeaderValue? LastAuthorization { get; private set; }
+        public string? LastXApiKey { get; private set; }
         public int DisposeCount { get; private set; }
 
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage req, CancellationToken ct)
         {
             Hit = true;
             LastAuthorization = req.Headers.Authorization;
+            if (req.Headers.TryGetValues("X-API-Key", out var values))
+            {
+                var joined = string.Join(",", values);
+                LastXApiKey = string.IsNullOrEmpty(joined) ? null : joined;
+            }
+            else
+            {
+                LastXApiKey = null;
+            }
             return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
             {
                 Content = new StringContent("{}", Encoding.UTF8, "application/json"),
