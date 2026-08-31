@@ -304,8 +304,11 @@ public class DispatcharrSyncServiceEmptyChannelTests
         var ids = body.GetProperty("streams").EnumerateArray().Select(e => e.GetInt64()).ToList();
         Assert.Equal(new long[] { 1 }, ids);
 
-        // Phase 4 must DELETE stream 2.
-        Assert.Equal(new long[] { 2 }, handler.DeleteStreamIds);
+        // Phase 4 (DELETE of stream 2) is now GLOBAL — it must not run from
+        // CompleteChannelApplyAsync. Verify here that it has not run yet, then verify
+        // in the integration RunAsync test below that the global pass calls DELETE 2
+        // once stream 2 has been confirmed orphaned across all channels.
+        Assert.DoesNotContain(2L, handler.DeleteStreamIds);
         Assert.Empty(failed);
     }
 

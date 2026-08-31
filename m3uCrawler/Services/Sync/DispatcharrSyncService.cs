@@ -170,7 +170,7 @@ namespace m3uCrawler.Services.Sync
             return new DispatcharrState(channels, streams, groups, version);
         }
 
-        private async Task ApplyAsync(MatchPlan plan, DispatcharrState existing, List<FailedReportEntry> failed, CancellationToken ct)
+        internal async Task ApplyAsync(MatchPlan plan, DispatcharrState existing, List<FailedReportEntry> failed, CancellationToken ct)
         {
             var ambiguousGroupNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var g in existing.Groups)
@@ -190,6 +190,25 @@ namespace m3uCrawler.Services.Sync
                 groupByName[g.Name] = g.Id;
             }
 
+            // Cross-channel stream ownership:
+            //
+            // Dispatcharr's data model is M2M (Channel.streams ↔ Stream), but DELETE on a
+            // Stream is GLOBAL (cascades to all ChannelStream rows referencing it). Phase 4
+            // must therefore run ONLY after every channel's Phase 2 + Phase 3 has completed
+            // — otherwise a DELETE from one channel can destroy a stream still needed by
+            // another channel whose PATCH hasn't been issued yet, producing
+            // "Invalid pk" HTTP 400 races.
+            //
+            // We collect:
+            //   globalKeepStreamIds   — stream IDs the matcher intends to keep across all
+            //                            channels. Built incrementally as Phase 2/3 progress.
+            //   globalRemoveCandidates — stream IDs the matcher intends to remove. Excluded
+            //                            from the final DELETE set are those still in globalKeep
+            //                            (cross-channel sharing) and those whose channel's
+            //                            Phase 3 failed (preserve intent when uncertain).
+            var globalKeepStreamIds = new HashSet<long>();
+            var globalRemoveCandidates = new HashSet<long>();
+
             foreach (var channel in plan.Channels)
             {
                 if (channel.Outcome == SyncOutcome.Ambiguous || channel.Outcome == SyncOutcome.Skipped)
@@ -197,7 +216,27 @@ namespace m3uCrawler.Services.Sync
 
                 var ctx = await BeginChannelApplyAsync(channel, existing, groupByName, ct);
 
-                if (ctx.PatchFailed)
+                // Record stream IDs the matcher intended to keep on this channel BEFORE
+                // any DELETE happens. NewStreamIds (Phase 2) are physical creations that
+                // must survive. AllStreamIds (Phase 3 body) is the deduplicated union of
+                // kept-existing + new ids that this channel will reference.
+                foreach (var id in ctx.NewStreamIds.Values) globalKeepStreamIds.Add(id);
+                foreach (var id in ctx.AllStreamIds) globalKeepStreamIds.Add(id);
+
+                // Record this channel's Removed candidates. We deduplicate globally and
+                // exclude them from the actual DELETE set if:
+                //   (a) another channel still needs the stream (globalKeepStreamIds contains it), or
+                //   (b) this channel's Phase 3 failed (we trust the matcher intent but cannot
+                //       confirm the channel state — preserving the stream is safer).
+                if (!ctx.PatchFailed)
+                {
+                    foreach (var s in channel.Streams)
+                    {
+                        if (s.Outcome == SyncOutcome.Removed && s.ExistingStreamId.HasValue)
+                            globalRemoveCandidates.Add(s.ExistingStreamId!.Value);
+                    }
+                }
+                else
                 {
                     failed.Add(new FailedReportEntry
                     {
@@ -207,8 +246,22 @@ namespace m3uCrawler.Services.Sync
                     });
                     Console.WriteLine($"❌ Falha ao aplicar canal '{channel.CanonicalName}': {ctx.PatchException?.Message}");
                 }
+            }
 
-                await CompleteChannelApplyAsync(channel, ctx, failed, ct);
+            // Phase 4 (global): DELETE only streams that no channel in the plan keeps.
+            // Distinct() guards against repeated references to the same id.
+            foreach (var streamId in globalRemoveCandidates
+                .Where(id => !globalKeepStreamIds.Contains(id))
+                .Distinct())
+            {
+                try
+                {
+                    await _streams.DeleteAsync(streamId, ct);
+                }
+                catch (DispatcharrException dex)
+                {
+                    Console.WriteLine($"⚠️ Falha a remover stream {streamId}: {dex.Message}");
+                }
             }
         }
 
@@ -338,24 +391,18 @@ namespace m3uCrawler.Services.Sync
             List<FailedReportEntry> failed,
             CancellationToken ct)
         {
-            // Phase 4: DELETE streams marked as removed. Runs only for scenarios A
-            // (kept/new streams + stale to remove). For scenario B the PATCH already
-            // cleared streams[] on Dispatcharr, so individual DELETE calls would 404
-            // (silently tolerated) and add no value — we skip them entirely.
-            if (channel.StreamsEmptied)
-                return;
-
-            foreach (var removed in channel.Streams.Where(s => s.Outcome == SyncOutcome.Removed && s.ExistingStreamId.HasValue))
-            {
-                try
-                {
-                    await _streams.DeleteAsync(removed.ExistingStreamId!.Value, ct);
-                }
-                catch (DispatcharrException dex)
-                {
-                    Console.WriteLine($"⚠️ Falha a remover stream {removed.ExistingStreamId}: {dex.Message}");
-                }
-            }
+            // Phase 4 (DELETE streams) was historically executed here on a per-channel
+            // basis, but DELETE on a Dispatcharr Stream is GLOBAL (it cascades to every
+            // ChannelStream referencing it). Doing that inside the channel loop races with
+            // PATCHes from other channels that still need the same stream. Phase 4 now
+            // runs ONCE at the end of ApplyAsync, in a single global pass that consults
+            // globalKeepStreamIds. This method is intentionally a no-op retained for the
+            // test seam so existing call-sites compile.
+            _ = channel;
+            _ = ctx;
+            _ = failed;
+            _ = ct;
+            await Task.CompletedTask;
         }
 
         private static IReadOnlyDictionary<string, string> AliasMapFor(AliasResolver resolver)
