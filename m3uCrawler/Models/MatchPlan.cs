@@ -11,6 +11,7 @@ namespace m3uCrawler.Models
         [JsonPropertyName("matchThreshold")] public int MatchThreshold { get; init; }
         [JsonPropertyName("counts")] public SyncReportCounts Counts { get; init; } = new();
         [JsonPropertyName("channels")] public IReadOnlyList<ChannelDecision> Channels { get; init; } = Array.Empty<ChannelDecision>();
+        [JsonPropertyName("ambiguousGroups")] public IReadOnlyList<AmbiguousGroupEntry> AmbiguousGroups { get; init; } = Array.Empty<AmbiguousGroupEntry>();
     }
 
     public sealed class ChannelDecision
@@ -58,6 +59,7 @@ namespace m3uCrawler.Models
         [JsonPropertyName("ambiguous")] public int Ambiguous { get; set; }
         [JsonPropertyName("unchanged")] public int Unchanged { get; set; }
         [JsonPropertyName("failed")] public int Failed { get; set; }
+        [JsonPropertyName("ambiguousGroups")] public int AmbiguousGroups { get; set; }
         [JsonPropertyName("totalChannels")] public int TotalChannels => Matched + NewChannels + Unchanged + Ambiguous + Failed + Skipped;
     }
 
@@ -71,6 +73,7 @@ namespace m3uCrawler.Models
         [JsonPropertyName("counts")] public SyncReportCounts Counts { get; init; } = new();
         [JsonPropertyName("channels")] public IReadOnlyList<ChannelDecision> Channels { get; init; } = Array.Empty<ChannelDecision>();
         [JsonPropertyName("ambiguousDecisions")] public IReadOnlyList<AmbiguousReportEntry> AmbiguousDecisions { get; init; } = Array.Empty<AmbiguousReportEntry>();
+        [JsonPropertyName("ambiguousGroups")] public IReadOnlyList<AmbiguousGroupEntry> AmbiguousGroups { get; init; } = Array.Empty<AmbiguousGroupEntry>();
         [JsonPropertyName("failedChannels")] public IReadOnlyList<FailedReportEntry> FailedChannels { get; init; } = Array.Empty<FailedReportEntry>();
     }
 
@@ -85,5 +88,12 @@ namespace m3uCrawler.Models
         [JsonPropertyName("identity")] public string Identity { get; init; } = string.Empty;
         [JsonPropertyName("reason")] public string Reason { get; init; } = string.Empty;
         [JsonPropertyName("existingChannelId")] public long? ExistingChannelId { get; init; }
+    }
+
+    public sealed class AmbiguousGroupEntry
+    {
+        [JsonPropertyName("normalizedName")] public string NormalizedName { get; init; } = string.Empty;
+        [JsonPropertyName("groupIds")] public IReadOnlyList<long> GroupIds { get; init; } = Array.Empty<long>();
+        [JsonPropertyName("groupNames")] public IReadOnlyList<string> GroupNames { get; init; } = Array.Empty<string>();
     }
 }

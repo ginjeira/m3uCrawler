@@ -172,9 +172,23 @@ namespace m3uCrawler.Services.Sync
 
         private async Task ApplyAsync(MatchPlan plan, DispatcharrState existing, List<FailedReportEntry> failed, CancellationToken ct)
         {
-            var groupByName = existing.Groups
-                .GroupBy(g => g.Name, StringComparer.OrdinalIgnoreCase)
-                .ToDictionary(g => g.Key, g => g.First().Id, StringComparer.OrdinalIgnoreCase);
+            var ambiguousGroupNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var g in existing.Groups)
+            {
+                var duplicates = existing.Groups
+                    .Where(x => !string.IsNullOrWhiteSpace(x.Name) &&
+                                string.Equals(x.Name, g.Name, StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+                if (duplicates.Count > 1)
+                    ambiguousGroupNames.Add(g.Name);
+            }
+
+            var groupByName = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+            foreach (var g in existing.Groups)
+            {
+                if (ambiguousGroupNames.Contains(g.Name)) continue;
+                groupByName[g.Name] = g.Id;
+            }
 
             foreach (var channel in plan.Channels)
             {
@@ -304,6 +318,7 @@ namespace m3uCrawler.Services.Sync
                     Counts = _plan.Counts,
                     Channels = _plan.Channels,
                     AmbiguousDecisions = ambiguous,
+                    AmbiguousGroups = _plan.AmbiguousGroups,
                     FailedChannels = Array.Empty<FailedReportEntry>(),
                 };
             }
@@ -320,6 +335,7 @@ namespace m3uCrawler.Services.Sync
                     Counts = partial.Counts,
                     Channels = partial.Channels,
                     AmbiguousDecisions = partial.AmbiguousDecisions,
+                    AmbiguousGroups = partial.AmbiguousGroups,
                     FailedChannels = failedChannels,
                 };
             }

@@ -88,6 +88,7 @@ namespace m3uCrawler.Services.Sync
                 MatchThreshold = plan.MatchThreshold,
                 Counts = plan.Counts,
                 Channels = channels,
+                AmbiguousGroups = plan.AmbiguousGroups,
             };
         }
     }

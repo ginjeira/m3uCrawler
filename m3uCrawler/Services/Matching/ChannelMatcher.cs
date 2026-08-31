@@ -65,11 +65,14 @@ namespace m3uCrawler.Services.Matching
                 .ToDictionary(g => g.Key, g => g.Select(t => t.StreamId).ToHashSet());
 
             var existingStreamsById = existing.Streams.ToDictionary(s => s.Id, s => s);
-            var groupByName = existing.Groups.ToDictionary(g => NormalizeGroupKey(g.Name), g => g, StringComparer.OrdinalIgnoreCase);
+            var groupIndex = GroupNameIndex.Build(existing.Groups);
 
             var newChannelIdSeed = -1L;
             var decisions = new List<ChannelDecision>();
-            var counts = new SyncReportCounts();
+            var counts = new SyncReportCounts
+            {
+                AmbiguousGroups = groupIndex.AmbiguousEntries.Count,
+            };
 
             foreach (var bucket in channelBuckets.OrderBy(b => b.Key, StringComparer.Ordinal))
             {
@@ -253,7 +256,7 @@ namespace m3uCrawler.Services.Matching
                     continue;
                 }
 
-                var newGroupName = ResolveGroupName(bucket.Value, groupByName);
+                var newGroupName = ResolveGroupName(bucket.Value, groupIndex);
                 var newStreamDecisions = bucket.Value
                     .Select(s => StreamDecisionForNewChannel(s, newChannelIdSeed--, ordering, defaultStreamId: null))
                     .ToList();
@@ -284,6 +287,7 @@ namespace m3uCrawler.Services.Matching
                 MatchThreshold = threshold,
                 Counts = counts,
                 Channels = decisions,
+                AmbiguousGroups = groupIndex.AmbiguousEntries,
             };
 
             return plan;
@@ -346,18 +350,91 @@ namespace m3uCrawler.Services.Matching
         private static string NormalizeGroupKey(string name) =>
             string.IsNullOrWhiteSpace(name) ? string.Empty : name.Trim().ToLowerInvariant();
 
-        private static string? ResolveGroupName(IReadOnlyList<DiscoveredStream> bucket, Dictionary<string, DispatcharrChannelGroup> existingGroups)
+        private static string? ResolveGroupName(IReadOnlyList<DiscoveredStream> bucket, GroupNameIndex existingGroups)
         {
-            string? candidate = null;
             foreach (var s in bucket)
             {
-                if (!string.IsNullOrWhiteSpace(s.Group))
-                {
-                    candidate = s.Group.Trim();
-                    break;
-                }
+                if (string.IsNullOrWhiteSpace(s.Group)) continue;
+                var key = NormalizeGroupKey(s.Group);
+                if (key.Length == 0) continue;
+                if (existingGroups.TryGetUnambiguous(key, out var group))
+                    return group.Name;
+                if (existingGroups.IsBlocked(key))
+                    return null;
+                return s.Group.Trim();
             }
-            return candidate;
+            return null;
+        }
+
+        private readonly struct GroupNameIndex
+        {
+            private readonly Dictionary<string, DispatcharrChannelGroup> _unique;
+            private readonly Dictionary<string, string> _blocked;
+
+            public IReadOnlyList<AmbiguousGroupEntry> AmbiguousEntries { get; }
+
+            private GroupNameIndex(
+                Dictionary<string, DispatcharrChannelGroup> unique,
+                Dictionary<string, string> blocked,
+                IReadOnlyList<AmbiguousGroupEntry> ambiguous)
+            {
+                _unique = unique;
+                _blocked = blocked;
+                AmbiguousEntries = ambiguous;
+            }
+
+            public static GroupNameIndex Build(IReadOnlyList<DispatcharrChannelGroup> groups)
+            {
+                var byKey = new Dictionary<string, List<DispatcharrChannelGroup>>(StringComparer.Ordinal);
+
+                foreach (var g in groups)
+                {
+                    var key = NormalizeGroupKey(g.Name);
+                    if (key.Length == 0) continue;
+                    if (!byKey.TryGetValue(key, out var list))
+                    {
+                        list = new List<DispatcharrChannelGroup>();
+                        byKey[key] = list;
+                    }
+                    list.Add(g);
+                }
+
+                var unique = new Dictionary<string, DispatcharrChannelGroup>(StringComparer.Ordinal);
+                var blocked = new Dictionary<string, string>(StringComparer.Ordinal);
+                var ambiguous = new List<AmbiguousGroupEntry>();
+
+                foreach (var kv in byKey.OrderBy(kv => kv.Key, StringComparer.Ordinal))
+                {
+                    if (kv.Value.Count == 1)
+                    {
+                        unique[kv.Key] = kv.Value[0];
+                    }
+                    else
+                    {
+                        blocked[kv.Key] = string.Join("|", kv.Value.Select(g => g.Id));
+                        ambiguous.Add(new AmbiguousGroupEntry
+                        {
+                            NormalizedName = kv.Key,
+                            GroupIds = kv.Value.Select(g => g.Id).ToArray(),
+                            GroupNames = kv.Value.Select(g => g.Name).ToArray(),
+                        });
+                    }
+                }
+
+                return new GroupNameIndex(unique, blocked, ambiguous);
+            }
+
+            public bool TryGetUnambiguous(string normalizedKey, out DispatcharrChannelGroup group)
+            {
+                if (_blocked.ContainsKey(normalizedKey))
+                {
+                    group = default!;
+                    return false;
+                }
+                return _unique.TryGetValue(normalizedKey, out group!);
+            }
+
+            public bool IsBlocked(string normalizedKey) => _blocked.ContainsKey(normalizedKey);
         }
     }
 }
