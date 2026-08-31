@@ -26,6 +26,12 @@ namespace m3uCrawler.Models
         [JsonPropertyName("matchScore")] public int MatchScore { get; init; }
         [JsonPropertyName("streams")] public IReadOnlyList<StreamMatchDecision> Streams { get; init; } = Array.Empty<StreamMatchDecision>();
         [JsonPropertyName("ambiguousCandidates")] public IReadOnlyList<AmbiguousCandidate> AmbiguousCandidates { get; init; } = Array.Empty<AmbiguousCandidate>();
+        /// <summary>
+        /// True when this decision emptied the channel on Dispatcharr: at least one
+        /// <see cref="SyncOutcome.Removed"/> stream and no surviving or new streams.
+        /// Triggers an explicit PATCH with <c>streams=[]</c> in the apply phase.
+        /// </summary>
+        [JsonPropertyName("streamsEmptied")] public bool StreamsEmptied { get; init; }
     }
 
     public sealed class StreamMatchDecision

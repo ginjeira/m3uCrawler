@@ -212,7 +212,7 @@ namespace m3uCrawler.Services.Sync
             }
         }
 
-        private sealed class ChannelApplyContext
+        internal sealed class ChannelApplyContext
         {
             public Dictionary<string, long> GroupByName { get; init; } = new();
             public Dictionary<string, long> NewStreamIds { get; } = new(StringComparer.OrdinalIgnoreCase);
@@ -221,7 +221,7 @@ namespace m3uCrawler.Services.Sync
             public Exception? PatchException { get; set; }
         }
 
-        private async Task<ChannelApplyContext> BeginChannelApplyAsync(
+        internal async Task<ChannelApplyContext> BeginChannelApplyAsync(
             ChannelDecision channel,
             DispatcharrState existing,
             Dictionary<string, long> groupByName,
@@ -253,7 +253,9 @@ namespace m3uCrawler.Services.Sync
             }
 
             var orderedWorking = channel.Streams
-                .Where(s => s.Outcome != SyncOutcome.Skipped && s.IsWorking)
+                .Where(s => s.Outcome != SyncOutcome.Skipped
+                         && s.Outcome != SyncOutcome.Removed
+                         && s.IsWorking)
                 .OrderBy(s => s.ProposedOrder)
                 .ToList();
 
@@ -287,7 +289,12 @@ namespace m3uCrawler.Services.Sync
                 .Distinct()
                 .ToList();
 
-            // Phase 3: create new channel OR patch existing channel (single PATCH per channel id).
+            // Phase 3: create new channel OR patch existing channel.
+            //
+            // Contract:
+            //   A) AllStreamIds.Count > 0          -> PATCH with the deduplicated list.
+            //   B) AllStreamIds.Count == 0 + StreamsEmptied  -> PATCH with streams=[].
+            //   C) AllStreamIds.Count == 0 + !StreamsEmptied -> no PATCH, no DELETE-stream.
             try
             {
                 if (channel.Outcome == SyncOutcome.NewChannel)
@@ -307,6 +314,14 @@ namespace m3uCrawler.Services.Sync
                         await _channels.UpdateStreamsAsync(channel.ExistingChannelId.Value, ctx.AllStreamIds.ToList(), ct);
                     }
                 }
+                else if (channel.ExistingChannelId.HasValue && channel.StreamsEmptied)
+                {
+                    // Scenario B: channel should be left with streams=[] on Dispatcharr.
+                    // PATCH unconditionally — even if currentIds is already empty, the explicit
+                    // PATCH documents the operator intent in the plan and is idempotent.
+                    await _channels.UpdateStreamsAsync(channel.ExistingChannelId.Value, Array.Empty<long>(), ct);
+                }
+                // else (scenario C): no PATCH, channel left untouched.
             }
             catch (Exception ex)
             {
@@ -317,15 +332,19 @@ namespace m3uCrawler.Services.Sync
             return ctx;
         }
 
-        private async Task CompleteChannelApplyAsync(
+        internal async Task CompleteChannelApplyAsync(
             ChannelDecision channel,
             ChannelApplyContext ctx,
             List<FailedReportEntry> failed,
             CancellationToken ct)
         {
-            // Phase 4: DELETE streams marked as removed. Runs even if PATCH failed so the
-            // channel does not retain stale streams. Each DELETE is isolated so individual
-            // failures do not abort the channel.
+            // Phase 4: DELETE streams marked as removed. Runs only for scenarios A
+            // (kept/new streams + stale to remove). For scenario B the PATCH already
+            // cleared streams[] on Dispatcharr, so individual DELETE calls would 404
+            // (silently tolerated) and add no value — we skip them entirely.
+            if (channel.StreamsEmptied)
+                return;
+
             foreach (var removed in channel.Streams.Where(s => s.Outcome == SyncOutcome.Removed && s.ExistingStreamId.HasValue))
             {
                 try

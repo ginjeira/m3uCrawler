@@ -485,6 +485,21 @@ namespace m3uCrawler.Services.Matching
             bool hasChange = streams.Any(s => s.Outcome == SyncOutcome.NewStream || s.Outcome == SyncOutcome.Removed);
             var outcome = hasChange ? SyncOutcome.ExistingReassigned : SyncOutcome.ExistingUnchanged;
 
+            // StreamsEmptied is true when the channel will end up with no streams on
+            // Dispatcharr after apply: at least one Removed entry and no surviving, new or
+            // skipped streams. The apply phase then issues an explicit PATCH with streams=[].
+            // We exclude Skipped entries from the "keep or new" set because they represent
+            // preservation / non-intervention (IsWorking=false) and never translate to a
+            // stream id on the channel.
+            bool streamsEmptied =
+                streams.Any(s => s.Outcome == SyncOutcome.Removed)
+                && !streams.Any(s =>
+                    s.Outcome == SyncOutcome.NewStream
+                    || s.Outcome == SyncOutcome.ExistingUnchanged
+                    || s.Outcome == SyncOutcome.ExistingReassigned
+                    || s.Outcome == SyncOutcome.ExistingReordered
+                    || s.Outcome == SyncOutcome.Skipped);
+
             return new ChannelDecision
             {
                 Identity = string.Join("|", identities),
@@ -497,6 +512,7 @@ namespace m3uCrawler.Services.Matching
                     : "merged:" + string.Join("|", matchReasons),
                 MatchScore = topScore,
                 Streams = streams,
+                StreamsEmptied = streamsEmptied,
                 AmbiguousCandidates = Array.Empty<AmbiguousCandidate>(),
             };
         }
