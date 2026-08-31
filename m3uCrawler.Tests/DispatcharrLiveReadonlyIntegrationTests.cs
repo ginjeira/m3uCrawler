@@ -17,7 +17,7 @@ public class DispatcharrLiveReadonlyIntegrationTests
     }
 
     [Fact]
-    public async Task Api_key_mode_reads_version_channels_and_streams_from_real_dispatcharr()
+    public async Task Api_key_mode_reads_version_channels_streams_and_groups_from_real_dispatcharr()
     {
         var env = TryLoadEnv();
         if (env is null)
@@ -34,14 +34,16 @@ public class DispatcharrLiveReadonlyIntegrationTests
         try
         {
             var version = await m3u.GetVersionAsync(CancellationToken.None);
+            var groups = await m3u.ListGroupsAsync(CancellationToken.None);
             var channelList = await channels.ListAsync(CancellationToken.None);
             var streamList = await streams.ListAsync(CancellationToken.None);
 
             Assert.True(version == null || version.Length > 0);
+            Assert.NotNull(groups);
             Assert.NotNull(channelList);
             Assert.NotNull(streamList);
 
-            Assert.Equal(3, capture.Count);
+            Assert.Equal(4, capture.Count);
             foreach (var (sentKey, sentAuth) in capture.Zipped())
             {
                 Assert.Equal(apiKey, sentKey);

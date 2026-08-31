@@ -28,9 +28,32 @@ namespace m3uCrawler.Services.Dispatcharr
             using var resp = await _http.GetAsync("/api/channels/groups/?page_size=1000", ct);
             if (!resp.IsSuccessStatusCode)
                 throw await DispatcharrErrorHelper.ToExceptionAsync(resp, "/api/channels/groups/", HttpMethod.Get, "list-failed", ct);
-            var page = await resp.Content.ReadFromJsonAsync<PagedResponse<GroupDto>>(Json, ct)
-                       ?? throw await DispatcharrErrorHelper.ToExceptionAsync(resp, "/api/channels/groups/", HttpMethod.Get, "empty-list-response", ct);
-            return page.Results.Select(g => new DispatcharrChannelGroup(g.Id, g.Name)).ToList();
+
+            var bytes = await resp.Content.ReadAsByteArrayAsync(ct);
+            IReadOnlyList<GroupDto> items;
+            if (LooksLikeJsonArray(bytes))
+            {
+                items = JsonSerializer.Deserialize<List<GroupDto>>(bytes, Json)
+                        ?? throw await DispatcharrErrorHelper.ToExceptionAsync(resp, "/api/channels/groups/", HttpMethod.Get, "empty-list-response", ct);
+            }
+            else
+            {
+                var page = JsonSerializer.Deserialize<PagedResponse<GroupDto>>(bytes, Json)
+                           ?? throw await DispatcharrErrorHelper.ToExceptionAsync(resp, "/api/channels/groups/", HttpMethod.Get, "empty-list-response", ct);
+                items = page.Results;
+            }
+
+            return items.Select(g => new DispatcharrChannelGroup(g.Id, g.Name)).ToList();
+        }
+
+        private static bool LooksLikeJsonArray(ReadOnlySpan<byte> bytes)
+        {
+            foreach (var b in bytes)
+            {
+                if (b == (byte)' ' || b == (byte)'\t' || b == (byte)'\r' || b == (byte)'\n') continue;
+                return b == (byte)'[';
+            }
+            return false;
         }
 
         public async Task<long> CreateGroupAsync(string name, CancellationToken ct)
