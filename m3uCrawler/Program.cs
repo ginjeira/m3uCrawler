@@ -230,6 +230,23 @@ namespace m3uCrawler
                 return;
             }
 
+            // DISPATCHARR STANDALONE SYNC
+            if (args.Contains("--dispatcharr-sync"))
+            {
+                var outputDir = GetOptionValue(args, "--output-dir") ?? "output";
+                var playlistPath = GetOptionValue(args, "--playlist")
+                    ?? Path.Combine(outputDir, "playlist.m3u");
+
+                if (!File.Exists(playlistPath))
+                {
+                    Console.WriteLine($"❌ Playlist não encontrada: {playlistPath}");
+                    return;
+                }
+
+                await TrySyncToDispatcharrAsync(playlistPath, outputDir);
+                return;
+            }
+
             // Check for help
             if (args.Contains("--help") || args.Contains("-h"))
             {
@@ -482,6 +499,8 @@ namespace m3uCrawler
             Console.WriteLine("  --loop-hours N    Repete execução a cada N horas (ex: 24)");
             Console.WriteLine("  --fast            Modo alta performance (20 conexões paralelas)");
             Console.WriteLine("  --high-performance Mesmo que --fast");
+            Console.WriteLine("  --dispatcharr-sync  Sincroniza uma playlist M3U já existente com Dispatcharr (sem Telegram)");
+            Console.WriteLine("  --playlist PATH    Caminho da playlist a sincronizar (default: <output-dir>/playlist.m3u)");
             Console.WriteLine("  --help, -h        Mostra esta ajuda");
             Console.WriteLine();
             Console.WriteLine("EXEMPLOS:");
