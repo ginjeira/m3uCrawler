@@ -22,10 +22,48 @@ namespace m3uCrawler.Services.Matching
         private readonly AliasResolver _aliases;
         private readonly FuzzyMatcher _fuzzy = new();
         private readonly MatchScorer _scorer = new();
+        private readonly Func<string?, string?, string?, bool, OutputGroupKind>? _resolutionPolicy;
 
+        private static readonly System.Text.RegularExpressions.Regex BundleTitlePattern =
+            new(
+                @"\b(Filmes|Combates|LiveCam|24\s*/\s*7|PACK|BUNDLE)\b|#f#",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
+
+        private static readonly System.Text.RegularExpressions.Regex VodGroupPattern =
+            new(
+                @"^VOD\s*\|",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
+
+        /// <summary>
+        /// Constructs a ChannelMatcher with the legacy single-dependency
+        /// surface. OutputGroup resolution (ResolutionPolicy) is
+        /// disabled unless the overload below is used.
+        /// </summary>
         public ChannelMatcher(AliasResolver aliases)
+            : this(aliases, null)
+        {
+        }
+
+        /// <summary>
+        /// Constructs a ChannelMatcher with an injected
+        /// <see cref="ResolutionPolicy"/> delegate (or null to disable
+        /// the OutputGroup pipeline). CanonicalName is always resolved
+        /// through the static <see cref="GroupResolver"/>.
+        ///
+        /// <para>
+        /// Foreign is determined deterministically: a SourceGroup that
+        /// <see cref="GroupTaxonomy"/> maps to
+        /// <see cref="OutputGroupKind.Foreign"/> marks the representative
+        /// stream as foreign. Streams whose SourceGroup is not a known
+        /// foreign group are treated as PT (isForeign=false).
+        /// </para>
+        /// </summary>
+        public ChannelMatcher(
+            AliasResolver aliases,
+            Func<string?, string?, string?, bool, OutputGroupKind>? resolutionPolicy)
         {
             _aliases = aliases ?? throw new ArgumentNullException(nameof(aliases));
+            _resolutionPolicy = resolutionPolicy;
         }
 
         public MatchPlan BuildPlan(
@@ -46,9 +84,30 @@ namespace m3uCrawler.Services.Matching
             int threshold = options.MatchThreshold;
             var stamp = (nowUtc ?? DateTime.UtcNow).ToString("o");
 
+            // Bundle / category guard.
+            //
+            // Exclui entradas que claramente não são canais ao vivo:
+            //   - "Filmes X 24/7", "Combates UFC 24/7", etc. (group "Portugal - Canais 24-7")
+            //   - "PT - <título> - <ano>" e similares (group "VOD | PORTUGAL")
+            //   - "LiveCam <praia> PT" (câmaras)
+            //   - placeholders de cor "#f#..." que aparecem na playlist
+            //     gerada pelo Dispatcharr
+            //   - nomes "PACK"/"BUNDLE" (não-canais)
+            //
+            // Estas entradas hoje entram como NewChannel no MatchPlan;
+            // ver `.kilo/plans/1788214551330-channel-normalization-investigation-report.md`,
+            // secções 4 e 5. São excluídas aqui (e não no validator nem
+            // no normalizer) para manter invariantes b0dfc48/91cad8e/420df83/8877f6f/b3157d6.
+            int excludedAsBundle = 0;
             var channelBuckets = new Dictionary<string, List<DiscoveredStream>>(StringComparer.Ordinal);
             foreach (var s in discovered)
             {
+                if (IsBundleOrCategory(s.Title, s.Group))
+                {
+                    excludedAsBundle++;
+                    continue;
+                }
+
                 var resolved = ResolveIdentity(s.Title);
                 if (!channelBuckets.TryGetValue(resolved, out var list))
                 {
@@ -72,12 +131,42 @@ namespace m3uCrawler.Services.Matching
             var counts = new SyncReportCounts
             {
                 AmbiguousGroups = groupIndex.AmbiguousEntries.Count,
+                Skipped = excludedAsBundle,
             };
 
             foreach (var bucket in channelBuckets.OrderBy(b => b.Key, StringComparer.Ordinal))
             {
                 var identity = bucket.Key;
-                var canonicalName = ChooseCanonicalName(bucket.Value);
+                var canonicalName = GroupResolver.ResolveCanonical(bucket.Value);
+
+                // Representative stream for country/OutputGroup decisions:
+                // prefer working, else first with a valid title.
+                var representative = bucket.Value
+                    .OrderByDescending(s => s.IsWorking)
+                    .ThenBy(s => string.IsNullOrWhiteSpace(s.Title))
+                    .ThenBy(s => ChannelNormalizer.Normalize(s.Title).Length)
+                    .ThenBy(s => s.Title, StringComparer.OrdinalIgnoreCase)
+                    .FirstOrDefault();
+                OutputGroupKind? outputGroup = null;
+                if (_resolutionPolicy != null && representative != null)
+                {
+                    // Foreign is deterministic: a known foreign
+                    // SourceGroup (GroupTaxonomy -> Foreign) marks the
+                    // representative stream as foreign. Streams whose
+                    // SourceGroup is not a known foreign group are
+                    // treated as PT (isForeign=false). This avoids
+                    // mislabelling legitimate PT channels that do not
+                    // carry a PT alias/token in their title (e.g.
+                    // "24 Kitchen" in "EU | PT | GENERAL").
+                    var taxonomyKind = GroupTaxonomy.Lookup(
+                        GroupNormalizer.Normalize(representative.Group)).OutputGroup;
+                    var isForeign = taxonomyKind == OutputGroupKind.Foreign;
+                    outputGroup = _resolutionPolicy(
+                        ChannelNormalizer.Normalize(representative.Title),
+                        GroupNormalizer.Normalize(representative.Group),
+                        representative.Title,
+                        isForeign);
+                }
 
                 var candidates = existing.Channels
                     .Select(c => (Channel: c, Normalized: ChannelNormalizer.Normalize(c.Name)))
@@ -122,6 +211,7 @@ namespace m3uCrawler.Services.Matching
                         Outcome = SyncOutcome.Ambiguous,
                         ExistingChannelId = null,
                         ChannelGroupName = null,
+                        OutputGroup = outputGroup,
                         MatchReason = $"ambiguous:{top.Reason}|{second.Reason}",
                         MatchScore = top.Score,
                         Streams = streamDecisions,
@@ -245,6 +335,7 @@ namespace m3uCrawler.Services.Matching
                             : SyncOutcome.ExistingUnchanged,
                         ExistingChannelId = matched.Id,
                         ChannelGroupName = groupName,
+                        OutputGroup = outputGroup,
                         MatchReason = candidates[0].Reason,
                         MatchScore = candidates[0].Score,
                         Streams = streamDecisions,
@@ -268,6 +359,7 @@ namespace m3uCrawler.Services.Matching
                     Outcome = SyncOutcome.NewChannel,
                     ExistingChannelId = null,
                     ChannelGroupName = newGroupName,
+                    OutputGroup = outputGroup,
                     MatchReason = "no-match",
                     MatchScore = 0,
                     Streams = newStreamDecisions,
@@ -354,6 +446,12 @@ namespace m3uCrawler.Services.Matching
                     reconciled.Add(ch);
                 }
             }
+
+            plan.Counts.OutputGroups = reconciled
+                .Where(c => c.OutputGroup.HasValue)
+                .GroupBy(c => c.OutputGroup!.Value.ToString())
+                .OrderBy(g => g.Key, StringComparer.Ordinal)
+                .ToDictionary(g => g.Key, g => g.Count());
 
             return new MatchPlan
             {
@@ -507,6 +605,7 @@ namespace m3uCrawler.Services.Matching
                 Outcome = outcome,
                 ExistingChannelId = existingChannelId,
                 ChannelGroupName = first.ChannelGroupName,
+                OutputGroup = first.OutputGroup,
                 MatchReason = matchReasons.Count == 1
                     ? matchReasons.First()
                     : "merged:" + string.Join("|", matchReasons),
@@ -532,6 +631,7 @@ namespace m3uCrawler.Services.Matching
                 Outcome = SyncOutcome.NewChannel,
                 ExistingChannelId = null,
                 ChannelGroupName = first.ChannelGroupName,
+                OutputGroup = first.OutputGroup,
                 MatchReason = "merged:" + string.Join("|", list.Select(d => d.MatchReason)),
                 MatchScore = 0,
                 Streams = streams,
@@ -582,15 +682,19 @@ namespace m3uCrawler.Services.Matching
             return ChannelNormalizer.Normalize(title);
         }
 
-        private string ChooseCanonicalName(IReadOnlyList<DiscoveredStream> bucket)
+        /// <summary>
+        /// Returns true when the entry is clearly a bundle, VOD file,
+        /// livecam feed, or colour placeholder and must NOT be treated
+        /// as an applicable channel. See the bundle-guard comment in
+        /// <see cref="BuildPlan"/>.
+        /// </summary>
+        internal static bool IsBundleOrCategory(string? title, string? group)
         {
-            var working = bucket.Where(b => b.IsWorking).ToList();
-            var pool = working.Count > 0 ? working : bucket.ToList();
-            return pool
-                .OrderBy(s => ChannelNormalizer.Normalize(s.Title).Length)
-                .ThenBy(s => s.Title, StringComparer.OrdinalIgnoreCase)
-                .First()
-                .Title;
+            if (!string.IsNullOrWhiteSpace(title) && BundleTitlePattern.IsMatch(title))
+                return true;
+            if (!string.IsNullOrWhiteSpace(group) && VodGroupPattern.IsMatch(group.Trim()))
+                return true;
+            return false;
         }
 
         private static string NormalizeGroupKey(string name) =>

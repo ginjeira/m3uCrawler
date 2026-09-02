@@ -18,4 +18,13 @@
   <ItemGroup>
     <ProjectReference Include="..\m3uCrawler\m3uCrawler.csproj" />
   </ItemGroup>
+
+  <ItemGroup>
+    <None Update="TestData\m3ucrawler_playlist_20260831_204529.m3u">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="TestData\m3ucrawler_playlist_20260831_223914.m3u">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
 </Project>

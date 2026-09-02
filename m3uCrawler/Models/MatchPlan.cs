@@ -1,4 +1,5 @@
 using System.Text.Json.Serialization;
+using m3uCrawler.Services.Matching;
 
 namespace m3uCrawler.Models
 {
@@ -32,6 +33,16 @@ namespace m3uCrawler.Models
         /// Triggers an explicit PATCH with <c>streams=[]</c> in the apply phase.
         /// </summary>
         [JsonPropertyName("streamsEmptied")] public bool StreamsEmptied { get; init; }
+
+        /// <summary>
+        /// Editorial output-group kind (Live/VOD/Filmes24-7/PPV/PT-category
+        /// labels/Foreign). Computed by <c>ResolutionPolicy</c> during
+        /// <c>ChannelMatcher.BuildPlan</c>. Optional: null means the
+        /// resolver did not produce a value (e.g. bucket without a
+        /// representative stream). Consumers that do not read this
+        /// field are unaffected.
+        /// </summary>
+        [JsonPropertyName("outputGroup")] public OutputGroupKind? OutputGroup { get; init; }
     }
 
     public sealed class StreamMatchDecision
@@ -67,6 +78,16 @@ namespace m3uCrawler.Models
         [JsonPropertyName("failed")] public int Failed { get; set; }
         [JsonPropertyName("ambiguousGroups")] public int AmbiguousGroups { get; set; }
         [JsonPropertyName("totalChannels")] public int TotalChannels => Matched + NewChannels + Unchanged + Ambiguous + Failed + Skipped;
+
+        /// <summary>
+        /// Aggregated count of channels per <see cref="OutputGroupKind"/>,
+        /// keyed by the enum name (e.g. "PortugalLive", "Foreign"). Null
+        /// <c>OutputGroup</c> entries on <see cref="ChannelDecision"/> are
+        /// skipped. Bucket-less decisions (no representative stream)
+        /// therefore never contribute. The map is serialised as
+        /// <c>outputGroups</c> in <c>dispatcharr_report_*.json</c>.
+        /// </summary>
+        [JsonPropertyName("outputGroups")] public IReadOnlyDictionary<string, int> OutputGroups { get; set; } = new Dictionary<string, int>();
     }
 
     public sealed class SyncReport

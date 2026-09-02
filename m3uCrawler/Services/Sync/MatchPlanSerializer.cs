@@ -66,6 +66,7 @@ namespace m3uCrawler.Services.Sync
                 MatchScore = c.MatchScore,
                 AmbiguousCandidates = c.AmbiguousCandidates,
                 StreamsEmptied = c.StreamsEmptied,
+                OutputGroup = c.OutputGroup,
                 Streams = c.Streams.Select(s => new StreamMatchDecision
                 {
                     Provider = s.Provider,

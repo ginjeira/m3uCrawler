@@ -29,12 +29,74 @@ namespace m3uCrawler.Services
         /// ser reportadas para revisão humana.
         /// </summary>
         public bool MatchedViaGroup { get; set; }
+
+        /// <summary>
+        /// True when this match was produced by ValidateStreams for the
+        /// target country (default). ValidateStreams is inclusive: it only
+        /// emits matches for streams that passed the country gate, so all
+        /// emitted instances have IsTargetCountry = true.
+        /// </summary>
+        public bool IsTargetCountry { get; init; } = true;
     }
 
     public class CountryChannelValidator
     {
         private readonly string _rootDirectory;
         private readonly Dictionary<string, List<string>> _cache = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Negative evidence (Opção C): ISO country codes that, when
+        /// found as the FIRST token of a stream title, mark the stream
+        /// as foreign. Used by <see cref="ValidateStreams"/> to reject
+        /// entries like <c>"BE - RTL TVI HEVC"</c> whose only PT alias
+        /// match (<c>"TVI"</c>) is too generic.
+        ///
+        /// Scope: a conservative set of ISO-3166 alpha-2 and alpha-3
+        /// codes that are commonly observed as foreign-country prefixes
+        /// in IPTV playlists. NOT exhaustive: short codes that collide
+        /// with common English words (e.g. <c>"tv"</c> = Tuvalu,
+        /// <c>"ad"</c> = Andorra, <c>"to"</c> = Tonga, <c>"of"</c>,
+        /// <c>"in"</c>, etc.) are deliberately omitted to avoid
+        /// false-positive rejections of legitimate PT channels
+        /// (e.g. "TV Globo FHD PT").
+        ///
+        /// See `.kilo/plans/1788214551330-country-validator-investigation.md`
+        /// for the rationale.
+        /// </summary>
+        private static readonly HashSet<string> ForeignCountryPrefixes =
+            new(StringComparer.OrdinalIgnoreCase)
+            {
+                // ISO 3166-1 alpha-2 codes observed in IPTV playlists as
+                // explicit foreign-country prefixes (BE - RTL TVI, BG -
+                // BTV, GT - CANAL 11, KH - BTV, LT - BTV, SW - SVENSKBIL,
+                // UY - CANAL 11, FR - CANAL+). Add only after confirming
+                // the code does not collide with common PT-channel tokens.
+                "ar","be","bg","br","cl","de","es","fr","gb","gt",
+                "it","lt","lu","nl","pl","ro","ru","se","si","sw","tr","uy",
+                "vn","kh","zw","xk","us","ca","au","jp","cn","in",
+                "mx","ar","bo","co","cr","cu","do","ec","gt",
+                "hn","ni","pa","pe","py","sv","uy","ve",
+                // ISO 3166-1 alpha-3 codes (commonly seen as prefixes)
+                "arg","aus","aut","aze","bel","bgr","bhs","blr","bol",
+                "bra","brb","brn","btn","bwa","bzd","caf","can","che",
+                "chl","chn","col","cri","cub","cyp","cze","deu","dnk",
+                "dom","dza","ecu","egy","esp","est","eth","fin","fra",
+                "fsm","gab","gbr","geo","gha","gin","gbr","gnb","gnq",
+                "grc","grd","gtm","guy","hnd","hrv","hun","idn","ind",
+                "irl","irn","irq","isl","isr","ita","jam","jpn","kaz",
+                "ken","kgz","khm","kir","kor","kwt","lao","lbn","lbr",
+                "lby","lca","lie","lka","ltu","lux","lva","mar","mda",
+                "mdg","mdv","mex","mhl","mkd","mli","mlt","mmr","mng",
+                "moz","mrt","mus","mwi","mys","nam","ner","nga","nic",
+                "nld","nor","npl","nzl","omn","pak","pan","per","phl",
+                "plw","png","pol","prk","prt","pry","qat","rou","rus",
+                "rwa","sau","sdn","sen","sgp","slb","sle","slv","smr",
+                "sng","som","spm","srb","sur","svk","svn","swe","swz",
+                "syc","syr","tca","tcd","tgo","tha","tjk","tkm","tls",
+                "ton","tto","tun","tur","tuv","twn","tza","uga","ukr",
+                "ury","usa","uzb","ven","vnm","vut","wsm","yem","zaf",
+                "zmb","zwe",
+            };
 
         public CountryChannelValidator(string? rootDirectory = null)
         {
@@ -172,6 +234,22 @@ namespace m3uCrawler.Services
                 var matchedViaGroup = false;
 
                 var titleTokens = Tokenize(NormalizeText(stream.Title ?? string.Empty));
+
+                // Negative evidence (Opção C): foreign ISO country code as the first
+                // token of the title. Only active when validating for the
+                // "pt" target country — other countries' ISO codes do not
+                // necessarily indicate a foreign stream (e.g. "la" is a
+                // valid token in Spanish channel names like "La 1").
+                //
+                // See `.kilo/plans/1788214551330-country-validator-investigation.md`
+                // for the rationale and the list of resolved cases.
+                if (string.Equals(countryCode, "pt", StringComparison.OrdinalIgnoreCase)
+                    && titleTokens.Count > 0
+                    && ForeignCountryPrefixes.Contains(titleTokens[0]))
+                {
+                    continue;
+                }
+
                 if (titleTokens.Count > 0)
                 {
                     foreach (var alias in aliases)
