@@ -17,7 +17,7 @@ namespace m3uCrawler
             }
 
             Console.WriteLine("=== m3uCrawler - Pesquisador de Streams M3U8 ===");
-            Console.WriteLine("Versão 2.1 - Novembro 2025");
+            Console.WriteLine(BuildInfo.Current.ToCliLine());
             Console.WriteLine();
 
             var domainFilter = GetOptionValue(args, "--domain");
@@ -27,6 +27,32 @@ namespace m3uCrawler
                 Console.WriteLine($"🌐 Filtro de domínio ativo: {domainFilter}");
             }
             Console.WriteLine($"🇵🇹 País em validação: {countryCode}");
+
+            // Dashboard web: parsing e arranque no top-level para que --web
+            // funcione standalone (sem --telegram). A pipeline Telegram
+            // continua condicionada a args.Contains("--telegram") mais abaixo.
+            bool webEnabled = args.Contains("--web");
+            int webPort = 5000;
+            var webPortArg = GetOptionValue(args, "--web-port");
+            if (int.TryParse(webPortArg, out var parsedWebPort) && parsedWebPort > 0)
+            {
+                webPort = parsedWebPort;
+            }
+            string? webToken = webEnabled ? GetOptionValue(args, "--web-token") : null;
+            Task? webTask = null;
+            if (webEnabled)
+            {
+                var dashboardOutputDir = GetOptionValue(args, "--output-dir") ?? "output";
+                var dashboardHistoryService = new ImportHistoryService(dashboardOutputDir);
+                webTask = WebDashboardService.RunDashboardAsync(dashboardOutputDir, webPort, dashboardHistoryService, webToken, CancellationToken.None);
+                _ = webTask.ContinueWith(t =>
+                {
+                    if (t.IsFaulted && t.Exception != null)
+                    {
+                        Console.WriteLine($"❌ Dashboard task falhou: {t.Exception.GetBaseException().Message}");
+                    }
+                }, TaskContinuationOptions.OnlyOnFaulted);
+            }
 
             if (args.Contains("--telegram"))
             {
@@ -83,13 +109,6 @@ namespace m3uCrawler
                 Console.WriteLine($"🕒 Janela de pesquisa Telegram: últimas {telegramHistoryHours}h");
 
                 bool maintenanceMode = args.Contains("--telegram-maintain");
-                bool webEnabled = args.Contains("--web");
-                int webPort = 5000;
-                var webPortArg = GetOptionValue(args, "--web-port");
-                if (int.TryParse(webPortArg, out var parsedWebPort) && parsedWebPort > 0)
-                {
-                    webPort = parsedWebPort;
-                }
 
                 int loopHours = 0;
                 var loopArg = GetOptionValue(args, "--loop-hours");
@@ -104,20 +123,6 @@ namespace m3uCrawler
                 var importHistoryService = new ImportHistoryService(outputDir);
                 var countryChannelValidator = new CountryChannelValidator(Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries"));
                 Console.WriteLine($"📂 Pasta de saída das playlists: {Path.GetFullPath(outputDir)}");
-
-                Task? webTask = null;
-                if (webEnabled)
-                {
-                    string? webToken = GetOptionValue(args, "--web-token");
-                    webTask = WebDashboardService.RunDashboardAsync(outputDir, webPort, importHistoryService, webToken, CancellationToken.None);
-                    _ = webTask.ContinueWith(t =>
-                    {
-                        if (t.IsFaulted && t.Exception != null)
-                        {
-                            Console.WriteLine($"❌ Dashboard task falhou: {t.Exception.GetBaseException().Message}");
-                        }
-                    }, TaskContinuationOptions.OnlyOnFaulted);
-                }
 
                 do
                 {
@@ -334,6 +339,17 @@ namespace m3uCrawler
             var tester = new M3uTesterService();
             var playlistManager = new PlaylistManagerService();
 
+            // Se o dashboard standalone está activo, manter o processo vivo
+            // enquanto o listener aceita pedidos. Caso contrário, cair no
+            // modo M3U8-search legacy (prompts interactivos).
+            if (webEnabled && webTask is not null)
+            {
+                Console.WriteLine("🌐 Modo dashboard standalone activo. Aguardando pedidos em http://+:" + webPort + "/");
+                try { await webTask; }
+                catch (Exception ex) { Console.WriteLine($"❌ Dashboard task falhou: {ex.GetBaseException().Message}"); }
+                return;
+            }
+
             Console.WriteLine("Iniciando m3uCrawler...");
 
             try
@@ -350,9 +366,10 @@ namespace m3uCrawler
                 
                 // Filter out known options from args to get search term
                 var searchArgs = new List<string>();
+                var skipWithValue = new HashSet<string> { "--max-streams", "--domain", "--web-port", "--web-token", "--loop-hours", "--history-hours", "--max-results", "--user", "--pass" };
                 for (int i = 0; i < args.Length; i++)
                 {
-                    if (args[i] == "--max-streams" || args[i] == "--domain")
+                    if (skipWithValue.Contains(args[i]))
                     {
                         i++; // Skip option value
                         continue;
