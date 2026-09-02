@@ -7,6 +7,24 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-02
+
+### ✨ Adicionado
+- **Pipeline de classificação editorial OutputGroupKind**: 9 valores (PortugalLive, PortugalVOD, PortugalFilmes24-7, PortugalEntretenimento, PortugalDesporto, PortugalInfantil, PortugalDocumentarios, PortugalPPV, Foreign) expostos como metadata não-actuante em `ChannelDecision.OutputGroup`. Componentes determinísticos em `Services/Matching/` (`GroupTaxonomy`, `GroupNormalizer`, `GroupResolver`, `ChannelCategoryLookup`, `ContentTypeDetector`, `SourceGroupCategoryLookup`, `ResolutionPolicy`).
+- **`CountryChannelValidator.IsTargetCountry`** (default true) em `CountryStreamMatch` para distinguir PT-flagged streams dos demais sem ambiguidade.
+- **`SyncReportCounts.OutputGroups`** (`IReadOnlyDictionary<string,int>`) agrega a contagem por OutputGroupKind para visibilidade editorial em `dispatcharr_report_*.json` (chave `outputGroups`).
+- **`MatchPlanSerializer.SanitizeForSerialization`** preserva `OutputGroup` no JSON sanitizado.
+- **Política de versionamento SemVer (0.x em desenvolvimento)**: `Directory.Build.props` como fonte canónica de versão + `Directory.Build.targets` para resolver metadata de build (`git rev-parse --short=12 HEAD`) e re-compor `InformationalVersion` no formato `<semver>+sha.<commit>+build.<n>+date.<iso>`. Tolerância a ausência de git (fallback `unknown`) e override via `dotnet build -p:M3uCrawlerVersion=...`.
+- **`m3uCrawler.Build.BuildInfo`** expõe em runtime `Application`, `Version`, `Commit`, `BuildNumber`, `BuildDate`; `OverrideForTesting` e `ResetForTesting` para a suite. Sem fontes manuais duplicadas em runtime.
+- **`m3uCrawler --version`** (alias `-V`) imprime `m3uCrawler <Version> (<Commit>, build <Build>, <BuildDate UTC>)` e termina com código 0, fora do fluxo principal.
+- **Endpoint `/api/version`** no dashboard devolve `{ application, version, commit, build, buildDate }` em camelCase.
+- **CI baseline** (`chore(ci)`): workflow `ci.yml` em pushes/PRs a `main` — checkout, setup .NET 9.0.x, cache de pacotes NuGet, restore, build Release e test Release. Sem tags, sem release, sem publish nesta fase.
+
+### 🐛 Corrigido
+- **SourceRevision em `InformationalVersion`**: o .NET 8+ SDK concatenava automaticamente o SHA completo a `InformationalVersion`. Com `IncludeSourceRevisionInInformationalVersion=false` e re-composição explícita no nosso target, o valor torna-se determinístico e bem-formado.
+
+## [Unreleased]
+
 ### ✨ Adicionado
 - **Pipeline Telegram completo**: descoberta de candidatos → aquisição de conteúdo → detecção M3U → parsing → validação por país → extracção de streams → teste de streams → relatório.
 - **`M3uCandidateDetector`**: descoberta independente de keyword (URLs `.m3u`/`.m3u8`, anexos, conteúdo `#EXTM3U`, URLs plausíveis sem extensão).
