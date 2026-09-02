@@ -1,14 +1,21 @@
+using m3uCrawler.Build;
 using m3uCrawler.Services;
 using m3uCrawler.Models;
 using System.Text;
 using System.Net;
 
 namespace m3uCrawler
-{    
+{
     class Program
     {
         static async Task Main(string[] args)
         {
+            if (args.Any(a => a == "--version" || a == "-V"))
+            {
+                Console.WriteLine(BuildInfo.Current.ToCliLine());
+                return;
+            }
+
             Console.WriteLine("=== m3uCrawler - Pesquisador de Streams M3U8 ===");
             Console.WriteLine("Versão 2.1 - Novembro 2025");
             Console.WriteLine();
@@ -502,6 +509,7 @@ namespace m3uCrawler
             Console.WriteLine("  --dispatcharr-sync  Sincroniza uma playlist M3U já existente com Dispatcharr (sem Telegram)");
             Console.WriteLine("  --playlist PATH    Caminho da playlist a sincronizar (default: <output-dir>/playlist.m3u)");
             Console.WriteLine("  --help, -h        Mostra esta ajuda");
+            Console.WriteLine("  --version, -V     Mostra versão (SemVer + commit SHA + build number + data) e sai");
             Console.WriteLine();
             Console.WriteLine("EXEMPLOS:");
             Console.WriteLine("  m3uCrawler \"iptv portugal\"");

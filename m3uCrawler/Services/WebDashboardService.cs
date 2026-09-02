@@ -1,3 +1,4 @@
+using m3uCrawler.Build;
 using m3uCrawler.Models;
 using System.Net;
 using System.Security.Cryptography;
@@ -66,6 +67,12 @@ namespace m3uCrawler.Services
             if (requestPath.Equals("/api/history", StringComparison.OrdinalIgnoreCase))
             {
                 await WriteJsonAsync(context.Response, await historyService.GetRecentAsync(TimeSpan.FromHours(72)));
+                return;
+            }
+
+            if (requestPath.Equals("/api/version", StringComparison.OrdinalIgnoreCase))
+            {
+                await WriteJsonAsync(context.Response, BuildVersionPayload());
                 return;
             }
 
@@ -349,6 +356,24 @@ namespace m3uCrawler.Services
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
             PropertyNameCaseInsensitive = true
         };
+
+        /// <summary>
+        /// Constrói o payload JSON do endpoint <c>/api/version</c>. Mantém-se
+        /// como função interna pura para ser testada directamente, sem
+        /// precisar do <c>HttpListener</c>.
+        /// </summary>
+        internal static object BuildVersionPayload()
+        {
+            var info = BuildInfo.Current;
+            return new
+            {
+                application = BuildInfo.Application,
+                version = info.Version,
+                commit = info.Commit,
+                build = info.BuildNumber,
+                buildDate = info.BuildDate.UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ssZ", System.Globalization.CultureInfo.InvariantCulture),
+            };
+        }
 
         private static async Task WriteJsonAsync(HttpListenerResponse response, object data)
         {
