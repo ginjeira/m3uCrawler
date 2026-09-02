@@ -1,0 +1,55 @@
+<Project>
+
+  <!--
+    Ficheiro canónico de propriedades de versão e build do m3uCrawler.
+
+    Toda a versão da aplicação flui daqui:
+      • M3uCrawlerVersion               - SemVer exacta (prefix-suffix)
+      • M3uCrawlerAssemblyVersion       - "Major.0.0.0" (API compatibility)
+      • M3uCrawlerFileVersion           - AssemblyVersion (numeric only)
+      • M3uCrawlerInformationalVersion  - "Version+sha.<git>+build.<n>+date.<iso>"
+
+    Estes valores são consumidos por Directory.Build.targets, que obtém
+    metadados do git antes da assembly info ser gerada, e por BuildInfo em
+    runtime, que lê AssemblyInformationalVersionAttribute via reflexão.
+
+    Em CI, este ficheiro é substituído por override via -p:M3uCrawlerVersion=...
+    durante a publicação da tag.
+  -->
+
+  <PropertyGroup>
+    <M3uCrawlerVersion Condition="'$(M3uCrawlerVersion)' == ''">0.1.0-dev</M3uCrawlerVersion>
+    <M3uCrawlerAssemblyVersion Condition="'$(M3uCrawlerAssemblyVersion)' == ''">0.1.0.0</M3uCrawlerAssemblyVersion>
+  </PropertyGroup>
+
+  <!--
+    Defaults consumidos pela target GenerateM3uCrawlerGitMetadata. Em build
+    local onde git não esteja disponível, são usados estes valores de fallback.
+  -->
+  <PropertyGroup>
+    <M3uCrawlerCommitSha Condition="'$(M3uCrawlerCommitSha)' == ''">unknown</M3uCrawlerCommitSha>
+    <M3uCrawlerBuildNumber Condition="'$(M3uCrawlerBuildNumber)' == ''">0</M3uCrawlerBuildNumber>
+    <M3uCrawlerBuildDate Condition="'$(M3uCrawlerBuildDate)' == ''">1970-01-01T00:00:00Z</M3uCrawlerBuildDate>
+  </PropertyGroup>
+
+  <!-- InformationalVersion derivado da versão + metadados git/build. -->
+  <PropertyGroup>
+    <M3uCrawlerInformationalVersion>$(M3uCrawlerVersion)+sha.$(M3uCrawlerCommitSha)+build.$(M3uCrawlerBuildNumber)+date.$(M3uCrawlerBuildDate)</M3uCrawlerInformationalVersion>
+  </PropertyGroup>
+
+  <!--
+    Versions expostas ao MSBuild SDK (csproj/Sdk). FileVersion usa
+    AssemblyVersion porque FileVersion tem restrições numéricas e SemVer
+    pode conter sufixo (-alpha.N) que não é permitido em FileVersion.
+  -->
+  <PropertyGroup>
+    <Version>$(M3uCrawlerVersion)</Version>
+    <AssemblyVersion>$(M3uCrawlerAssemblyVersion)</AssemblyVersion>
+    <FileVersion>$(M3uCrawlerAssemblyVersion)</FileVersion>
+    <InformationalVersion></InformationalVersion>
+    <PackageVersion>$(M3uCrawlerVersion)</PackageVersion>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+
+</Project>

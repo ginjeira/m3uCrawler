@@ -1,0 +1,60 @@
+<Project>
+
+  <!--
+    Determina os metadados de build do m3uCrawler a partir do estado do
+    repositório git (commit SHA, build date, build number). Apenas modifica
+    propriedades já declaradas em Directory.Build.props; nunca interfere
+    com a SemVer (M3uCrawlerVersion), que deve vir da tag em CI.
+
+    Estratégia:
+      1. Tentar obter `git rev-parse HEAD short=12`. Esta forma produz
+         directamente os primeiros 12 caracteres do SHA completo.
+      2. Se git não estiver disponível (ex: tarball release sem .git),
+         mantém os fallbacks declarados em Directory.Build.props.
+      3. BuildNumber pode ser overriden via GITHUB_RUN_NUMBER em CI.
+  -->
+
+  <Target Name="GenerateM3uCrawlerGitMetadata"
+          BeforeTargets="GetAssemblyAttributes"
+          Condition="'$(M3uCrawlerSkipGitMetadata)' != 'true'">
+
+    <PropertyGroup>
+      <_M3uCrawlerGitShortSha></_M3uCrawlerGitShortSha>
+      <_M3uCrawlerGitExitCode>1</_M3uCrawlerGitExitCode>
+    </PropertyGroup>
+
+    <Exec Command="git rev-parse --short=12 HEAD"
+          ConsoleToMSBuild="true"
+          IgnoreExitCode="true"
+          ContinueOnError="true">
+      <Output TaskParameter="ConsoleOutput" PropertyName="_M3uCrawlerGitShortSha" />
+      <Output TaskParameter="ExitCode" PropertyName="_M3uCrawlerGitExitCode" />
+    </Exec>
+
+    <PropertyGroup>
+      <M3uCrawlerCommitSha Condition="'$(_M3uCrawlerGitExitCode)' == '0' and '$(_M3uCrawlerGitShortSha)' != ''">$(_M3uCrawlerGitShortSha.Trim())</M3uCrawlerCommitSha>
+    </PropertyGroup>
+
+    <PropertyGroup>
+      <M3uCrawlerBuildNumber Condition="'$(GITHUB_RUN_NUMBER)' != ''">$(GITHUB_RUN_NUMBER)</M3uCrawlerBuildNumber>
+      <M3uCrawlerBuildDate Condition="'$(M3uCrawlerBuildDateOverride)' != ''">$(M3uCrawlerBuildDateOverride)</M3uCrawlerBuildDate>
+    </PropertyGroup>
+
+    <!--
+      Re-componha InformationalVersion agora que os metadados já foram
+      resolvidos. Esta cadeia precisa de ser reescrita DENTRO do target
+      (em vez de em Directory.Build.props) porque a expressão é avaliada
+      de forma eager: ela congela os valores quando o props é carregado.
+    -->
+    <PropertyGroup>
+      <M3uCrawlerInformationalVersion>$(M3uCrawlerVersion)+sha.$(M3uCrawlerCommitSha)+build.$(M3uCrawlerBuildNumber)+date.$(M3uCrawlerBuildDate)</M3uCrawlerInformationalVersion>
+      <InformationalVersion>$(M3uCrawlerInformationalVersion)</InformationalVersion>
+    </PropertyGroup>
+
+  </Target>
+
+  <PropertyGroup>
+    <GenerateAssemblyInfo Condition="'$(GenerateAssemblyInfo)' == ''">true</GenerateAssemblyInfo>
+  </PropertyGroup>
+
+</Project>
