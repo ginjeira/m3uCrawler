@@ -1,10 +1,18 @@
 bin/
 obj/
 output/
+**/bin/
+**/obj/
 **/output/
+runtime-data/
+**/runtime-data/
 
 .git/
 .gitignore
+**/.git/
+**/.gitignore
+.kilo/
+**/.kilo/
 
 wtelegram.config
 **/wtelegram.config
@@ -17,3 +25,7 @@ WTelegram.session
 *.suo
 *.tmp
 *.log
+
+*.zip
+*.tar.gz
+m3uCrawler-main.zip

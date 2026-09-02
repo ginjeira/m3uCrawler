@@ -96,7 +96,7 @@ jobs:
         id: build
         uses: docker/build-push-action@v6
         with:
-          context: ./m3uCrawler
+          context: ./
           file: ./m3uCrawler/Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
@@ -104,20 +104,39 @@ jobs:
           # Cache de layers via GHCR (keyed por ref). Reduz tempo de build.
           cache-from: type=gha,scope=${{ github.ref }}
           cache-to: type=gha,scope=${{ github.ref }},mode=max
+          # Propaga a metadata de build para o Dockerfile. Estes valores
+          # substituem os fallbacks de Directory.Build.props no contexto
+          # Docker (que não tem .git/), garantindo coerência entre
+          # AssemblyInformationalVersion em runtime e os OCI labels.
+          # Fonte canónica única: variáveis do GitHub Actions.
+          #
+          # M3uCrawlerVersion: usa o nome da tag SemVer (refs/tags/vX.Y.Z)
+          # quando disponível; caso contrário (push a branch) usa
+          # "0.0.0-dev-<sha>" para que BuildInfo nunca apresente
+          # "1.0.0" default do SDK. O Dockerfile faz um strip final do
+          # prefixo "v" para converter vX.Y.Z em X.Y.Z (SemVer puro).
+          build-args: |
+            "M3uCrawlerVersion=${{ github.ref }}"
+            "M3uCrawlerCommitSha=${{ github.sha }}"
+            "M3uCrawlerBuildNumber=${{ github.run_number }}"
+            "M3uCrawlerBuildDate=${{ github.event.repository.updated_at }}"
 
       - name: Resolve published digest
         id: digest
         # docker/build-push-action não expõe o digest por output nativo.
-        # Em vez do `docker buildx imagetools inspect --raw` (que assume
-        # multi-arch e falha quando o manifest é single-arch), consultamos
-        # directamente o Docker Registry API. O header `Docker-Content-Digest`
-        # existe tanto para manifests single-arch como multi-arch.
+        # Usamos `docker buildx imagetools inspect` (já autenticado via
+        # docker/login-action@v3) para obter o digest do manifest
+        # linux/amd64 publicado. Filtra-se a variante de plataforma para
+        # obter o digest imutável do manifesto específico que `docker pull`
+        # vai usar em produção.
         #
-        # Autenticação: reutilizamos `GITHUB_TOKEN` (que o job já tem via
-        # permissions: packages: write + login GHCR do login-action). O token
-        # é colocado num `env:` — nunca impresso, nunca referenciado em
-        # `echo`/`Summary`, e a sua exposição em logs do runner está mitigada
-        # pelo `set +x` (não activado) e por não aparecer no diff de saída.
+        # Porquê imagetools em vez de curl à API do GHCR:
+        # - A autenticação é reutilizada do docker/login-action anterior
+        #   (sem expor GITHUB_TOKEN a curl e a logs).
+        # - Não depende do scope `packages: read` no GITHUB_TOKEN (que
+        #   não está disponível por defeito).
+        # - Funciona tanto para manifest single-arch como para OCI index
+        #   multi-arch: o jq filtra o entry amd64 no caso multi-arch.
         #
         # Falha de resolução é **não bloqueante**: o push real é o step
         # anterior. Se não conseguirmos o digest, emitimos um `::warning::`
@@ -126,28 +145,37 @@ jobs:
         env:
           IMAGE_BASE: ${{ env.IMAGE_BASE }}
           TAG: sha-${{ github.sha }}
-          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           REF="${IMAGE_BASE}:${TAG}"
-          REPO_PATH="${IMAGE_BASE#ghcr.io/}"
 
-          # Pedir o manifest com Accept negociando multi-e single-arch; a resposta
-          # HTTP traz o header `Docker-Content-Digest` com o digest imutável do
-          # manifest apontado pela tag, independentemente do media-type efectivo.
-          DIGEST=$(
-            curl -fsSL \
-              -H "Authorization: Bearer ${REGISTRY_TOKEN}" \
-              -H "Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.index.v1+json" \
-              "https://ghcr.io/v2/${REPO_PATH}/manifests/${TAG}" \
-              -D - -o /dev/null \
-            | tr -d '\r' \
-            | awk -F': ' '/^[Dd]ocker-[Cc]ontent-[Dd]igest: /{ print $2; exit }' \
-            || true
-          )
+          # Pedir o manifest em formato JSON bruto. Em multi-arch é o OCI
+          # index com .manifests[]; em single-arch é o próprio image
+          # manifest (sem .manifests[], com .config e .layers).
+          RAW=$(docker buildx imagetools inspect "${REF}" --raw 2>/dev/null || true)
+
+          if [ -z "${RAW}" ]; then
+            echo "::warning::Não foi possível resolver o digest publicado para ${REF}; o publish já foi concluído e o workflow continua."
+            exit 0
+          fi
+
+          # Caminho primário: extrair o digest do manifest linux/amd64
+          # (selector .platform.architecture=="amd64" and .platform.os=="linux").
+          DIGEST=$(printf '%s' "${RAW}" | jq -r '.manifests[]? | select(.platform.architecture=="amd64" and .platform.os=="linux") | .digest' 2>/dev/null | head -n1 || true)
+
+          # Fallback: manifest single-arch. Em single-arch, docker buildx
+          # imprime o digest do próprio manifest no formato
+          # `<image>@sha256:<64hex>` no header `Name:` quando invocado
+          # sem --raw. Re-pedir e extrair.
+          if [ -z "${DIGEST:-}" ] || [ "${DIGEST}" = "null" ]; then
+            INSPECT=$(docker buildx imagetools inspect "${REF}" 2>/dev/null || true)
+            # Encontrar a linha que começa por "Name:" (header da imagem)
+            # e extrair o digest @sha256:<64hex> que vem depois.
+            DIGEST=$(printf '%s\n' "${INSPECT}" | sed -nE 's/.*@sha256:([a-f0-9]{64}).*/sha256:\1/p' | head -n1 || true)
+          fi
 
           if [ -z "${DIGEST:-}" ]; then
-            echo "::warning::Não foi possível resolver o digest publicado para ${REF}; o publish já foi concluído e o workflow continua."
+            echo "::warning::Não foi possível extrair o digest de ${REF} via docker buildx imagetools; o publish continua."
             exit 0
           fi
 
@@ -157,11 +185,9 @@ jobs:
             exit 0
           fi
 
-          # Não imprimir o token — só o digest (que é público, é o mesmo que
-          # aparece em `docker pull <image>@sha256:...`).
           echo "digest=${DIGEST}" >> "${GITHUB_OUTPUT}"
           echo "image=${IMAGE_BASE}@${DIGEST}" >> "${GITHUB_OUTPUT}"
-          echo "Published digest: ${DIGEST}"
+          echo "Published digest (linux/amd64): ${DIGEST}"
 
       - name: Summary
         run: |
