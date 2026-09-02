@@ -1,19 +1,38 @@
 name: package
 
+# Gatilhos:
+#   - workflow_dispatch       : permitir re-run manual de um packaging sem tag;
+#   - tags SemVer estáveis     : vX.Y.Z (SemVer exact match ^v[0-9]+\.[0-9]+\.[0-9]+$);
+#   - tags pre-release         : vX.Y.Z-(alpha|beta|rc).N — corre mas não cria Release.
+# O workflow NÃO corre em pushes de branches normais (esse gating vive em
+# ci.yml / docker-ghcr.yml). Cada tag gera, no máximo, uma run.
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
   workflow_dispatch:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
 
+# Permissões: o workflow precisa de escrever uma GitHub Release no job
+# `release`. O job `validate` e `package` mantêm-se em read-only.
 permissions:
   contents: read
 
+# Cada tag corre sequencialmente (cancel-in-progress=false para não
+# cancelar uma run em curso caso o operador force-push a mesma tag).
+concurrency:
+  group: package-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DOTNET_VERSION: "9.0.x"
+
 jobs:
-  build-and-test:
-    name: Build and tests
+  # Job 1 — validação obrigatória antes de qualquer publicação.
+  validate:
+    name: Validate build and tests
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -21,32 +40,97 @@ jobs:
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '9.0.x'
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
 
       - name: Restore dependencies
         run: dotnet restore m3uCrawler.sln
 
-      - name: Build
+      - name: Build (Release)
         run: dotnet build m3uCrawler.sln --configuration Release --no-restore
 
-      - name: Test
+      - name: Test (Release)
         run: dotnet test m3uCrawler.Tests/m3uCrawler.Tests.csproj --configuration Release --no-build --nologo
 
-  publish:
-    name: Publish linux-x64 artifact
+  # Job 2 — produção do artefacto .tar.gz + .sha256.
+  package:
+    name: Build .tar.gz + .sha256
     runs-on: ubuntu-latest
-    needs: build-and-test
+    needs: validate
+    timeout-minutes: 20
+    outputs:
+      tag_name: ${{ steps.metadata.outputs.tag_name }}
+      version: ${{ steps.metadata.outputs.version }}
+      commit: ${{ steps.metadata.outputs.commit }}
+      build_number: ${{ steps.metadata.outputs.build_number }}
+      build_date: ${{ steps.metadata.outputs.build_date }}
+      is_prerelease: ${{ steps.metadata.outputs.is_prerelease }}
+      artifact_name: ${{ steps.metadata.outputs.artifact_name }}
+      checksum_name: ${{ steps.metadata.outputs.checksum_name }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '9.0.x'
+          dotnet-version: ${{ env.DOTNET_VERSION }}
 
-      - name: Publish linux-x64 (framework-dependent)
+      # Extracção determinística da versão + metadados do build.
+      # - tag_name : remove 'refs/tags/' do GITHUB_REF quando corre por tag;
+      #              quando corre por workflow_dispatch (sem tag), usa
+      #              GITHUB_SHA como tag sintética 'continuous-<sha>'.
+      # - version  : nome da tag limpo, sem prefixo 'v'.
+      # - commit   : SHA completo.
+      # - build_number : GITHUB_RUN_NUMBER (inteiro monotónico por repositório).
+      # - build_date   : ISO-8601 UTC do momento de execução.
+      # - is_prerelease : true para tags -alpha.N / -beta.N / -rc.N.
+      - name: Compute build metadata
+        id: metadata
+        shell: bash
         run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            TAG_NAME="${GITHUB_REF_NAME}"
+          else
+            TAG_NAME="continuous-${GITHUB_SHA::12}"
+          fi
+          VERSION="${TAG_NAME#v}"
+          COMMIT="${GITHUB_SHA}"
+          BUILD_NUMBER="${GITHUB_RUN_NUMBER}"
+          BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          if [[ "${TAG_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-(alpha|beta|rc)\.[0-9]+$ ]]; then
+            IS_PRERELEASE="true"
+          else
+            IS_PRERELEASE="false"
+          fi
+          ARTIFACT_NAME="m3uCrawler-${TAG_NAME}-linux-x64"
+          CHECKSUM_NAME="${ARTIFACT_NAME}.sha256"
+          {
+            echo "tag_name=${TAG_NAME}"
+            echo "version=${VERSION}"
+            echo "commit=${COMMIT}"
+            echo "build_number=${BUILD_NUMBER}"
+            echo "build_date=${BUILD_DATE}"
+            echo "is_prerelease=${IS_PRERELEASE}"
+            echo "artifact_name=${ARTIFACT_NAME}"
+            echo "checksum_name=${CHECKSUM_NAME}"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Restore dependencies
+        run: dotnet restore m3uCrawler.sln
+
+      - name: Publish (linux-x64, framework-dependent)
+        run: |
+          mkdir -p ./publish
           dotnet publish m3uCrawler/m3uCrawler.csproj \
             --configuration Release \
             --runtime linux-x64 \
@@ -60,14 +144,131 @@ jobs:
           echo "Published files:"
           ls -la publish
 
-      - name: Compress publish output
+      - name: Annotate artefact with build metadata
+        shell: bash
+        env:
+          TAG_NAME: m3uCrawler-${{ steps.metadata.outputs.tag_name }}
+          VERSION: ${{ steps.metadata.outputs.version }}
+          COMMIT: ${{ steps.metadata.outputs.commit }}
+          BUILD_NUMBER: ${{ steps.metadata.outputs.build_number }}
+          BUILD_DATE: ${{ steps.metadata.outputs.build_date }}
         run: |
-          tar -czf m3uCrawler-linux-x64-${{ github.sha }}.tar.gz -C publish .
+          {
+            echo "Application: m3uCrawler"
+            echo "Tag:         ${TAG_NAME}"
+            echo "Version:     ${VERSION}"
+            echo "Commit:      ${COMMIT}"
+            echo "BuildNumber: ${BUILD_NUMBER}"
+            echo "BuildDate:   ${BUILD_DATE}"
+            echo "SourceDate:  $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > publish/BUILDINFO.txt
+          cat publish/BUILDINFO.txt
 
+      - name: Compress publish output
+        shell: bash
+        run: |
+          tar -czf "${{ steps.metadata.outputs.artifact_name }}.tar.gz" -C publish .
+
+      - name: Compute SHA256
+        shell: bash
+        run: |
+          sha256sum "${{ steps.metadata.outputs.artifact_name }}.tar.gz" \
+            | awk '{print $1}' \
+            > "${{ steps.metadata.outputs.checksum_name }}"
+          echo "---"
+          cat "${{ steps.metadata.outputs.checksum_name }}"
+
+      - name: Verify checksum is non-empty
+        run: test -s "${{ steps.metadata.outputs.checksum_name }}"
+
+      # Upload para Actions Artifacts (qualificador de retenção 90 dias para
+      # artefactos versionados). Permite download manual se o job
+      # `release` falhar.
       - name: Upload release artifact
         uses: actions/upload-artifact@v4
         with:
-          name: m3uCrawler-linux-x64-${{ github.sha }}
-          path: m3uCrawler-linux-x64-${{ github.sha }}.tar.gz
+          name: ${{ steps.metadata.outputs.artifact_name }}
+          path: |
+            ${{ steps.metadata.outputs.artifact_name }}.tar.gz
+            ${{ steps.metadata.outputs.checksum_name }}
+            publish/BUILDINFO.txt
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 90
+
+  # Job 3 — criar a GitHub Release quando aplicável.
+  #
+  # Só corre para tags SemVer estáveis (vX.Y.Z sem -alpha/-beta/-rc).
+  # Tags pre-release: o artefacto fica apenas em Actions Artifacts.
+  # A condição `if` é avaliada ao nível do job: se não correr, as
+  # dependências (`needs: package`) continuam a serem respeitadas mas os
+  # steps são simplesmente pulados pelo GitHub Actions.
+  release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    if: ${{ needs.package.outputs.is_prerelease == 'false' }}
+    needs: package
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download packaged artefact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.package.outputs.artifact_name }}
+          path: ./dist
+
+      # Notas de release: extrai a secção do CHANGELOG.md correspondente
+      # ao version. Se não existir, cai em notas padrão com SHA + commit
+      # subject. Usa `awk` literal (sem regex nas âncoras) para evitar
+      # interpretação incorrecta de `[`/`]` nos números de versão.
+      - name: Build release notes from CHANGELOG.md
+        id: notes
+        shell: bash
+        env:
+          VERSION: ${{ needs.package.outputs.version }}
+          TAG_NAME: ${{ needs.package.outputs.tag_name }}
+          COMMIT:  ${{ needs.package.outputs.commit }}
+        run: |
+          if [[ -f CHANGELOG.md ]]; then
+            # awk index($0, "## [<ver>]") > 0 detecta a linha-cabeçalho da
+            # secção como substring literal (sem regex). Continuar a copiar
+            # até à próxima secção ou fim-de-ficheiro.
+            NOTES="$(awk -v v="${VERSION}" '
+              BEGIN { p = 0 }
+              index($0, "## [" v "]") > 0 { p = 1; print; next }
+              p == 1 && index($0, "## [") == 1 && index($0, "## [" v "]") == 0 { p = 0 }
+              p == 1 { print }
+            ' CHANGELOG.md || true)"
+          else
+            NOTES=""
+          fi
+          if [[ -z "${NOTES// }" ]]; then
+            SUBJECT="$(git log -1 --pretty=%s "${COMMIT}" 2>/dev/null || echo "")"
+            NOTES="$(printf '## %s\n\nCommit: `%s`\nSubject: %s\n\n_(No CHANGELOG entry for this version.)_' \
+              "${TAG_NAME}" "${COMMIT}" "${SUBJECT}")"
+          fi
+          {
+            echo "notes<<__EOF__"
+            echo "${NOTES}"
+            echo "__EOF__"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.package.outputs.tag_name }}
+          name: "${{ needs.package.outputs.tag_name }} — m3uCrawler ${{ needs.package.outputs.version }}"
+          body: ${{ steps.notes.outputs.notes }}
+          # Não falhar se a Release já existir; a action vai fazer upload
+          # dos assets adicionais na Release preexistente.
+          fail_on_unmatched_files: true
+          files: |
+            dist/${{ needs.package.outputs.artifact_name }}.tar.gz
+            dist/${{ needs.package.outputs.checksum_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
