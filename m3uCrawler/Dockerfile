@@ -25,17 +25,28 @@ ARG M3uCrawlerBuildNumber=0
 ARG M3uCrawlerBuildDate=1970-01-01T00:00:00Z
 
 # Normaliza M3uCrawlerVersion para SemVer puro:
-#   refs/tags/v0.1.1   -> 0.1.1
-#   refs/heads/main     -> main
-#   develop/feature     -> develop/feature
-#   v0.1.1-rc.1         -> 0.1.1-rc.1
-# Strip os prefixos de protocolo Git refs/tags/, refs/heads/ (passados
-# via ${{ github.ref }} no workflow) e o "v" opcional das tags SemVer.
+#   refs/tags/v0.1.1              -> 0.1.1
+#   refs/tags/v0.1.1-rc.1         -> 0.1.1-rc.1
+#   refs/heads/main               -> 0.0.0-dev-<short-sha>  (não SemVer puro)
+#   refs/heads/fix/foo            -> 0.0.0-dev-<short-sha>
+#
+# Push de branch produz refs/heads/<branch>, que depois de strip do
+# prefixo ainda não é um SemVer válido (contém '/'). Para branch pushes
+# usa-se 0.0.0-dev-<sha-curto> para que NuGet aceite a versão e o
+# BuildInfo nunca caia nos defaults '1.0.0/unknown/0/1970-01-01' do SDK.
 # A normalização acontece em runtime no shell do RUN abaixo e é
 # consumida pela mesma shell, porque cada RUN do Dockerfile corre numa
 # camada isolada — variáveis shell não sobrevivem entre RUNs. Por isso
 # restore+publish+envio de propriedades acontece tudo num único RUN.
-RUN M3uCrawlerVersionSemver=$(echo "${M3uCrawlerVersion}" | sed -e 's|^refs/tags/||' -e 's|^refs/heads/||' -e 's|^v||') && \
+RUN M3uCrawlerShortSha=$(echo "${M3uCrawlerCommitSha}" | cut -c1-12) && \
+    case "${M3uCrawlerVersion}" in \
+      refs/tags/*) \
+        M3uCrawlerVersionSemver=$(echo "${M3uCrawlerVersion}" | sed -e 's|^refs/tags/||' -e 's|^v||') ;; \
+      refs/heads/*) \
+        M3uCrawlerVersionSemver="0.0.0-dev-${M3uCrawlerShortSha}" ;; \
+      *) \
+        M3uCrawlerVersionSemver=$(echo "${M3uCrawlerVersion}" | sed -e 's|^v||') ;; \
+    esac && \
     echo "Version: ${M3uCrawlerVersion} -> SemVer: ${M3uCrawlerVersionSemver}" && \
     dotnet restore m3uCrawler/m3uCrawler.csproj \
         /p:M3uCrawlerVersion=${M3uCrawlerVersionSemver} \
