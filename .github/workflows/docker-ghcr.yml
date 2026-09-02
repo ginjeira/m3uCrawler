@@ -96,7 +96,7 @@ jobs:
         id: build
         uses: docker/build-push-action@v6
         with:
-          context: ./m3uCrawler
+          context: ./
           file: ./m3uCrawler/Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
@@ -104,6 +104,22 @@ jobs:
           # Cache de layers via GHCR (keyed por ref). Reduz tempo de build.
           cache-from: type=gha,scope=${{ github.ref }}
           cache-to: type=gha,scope=${{ github.ref }},mode=max
+          # Propaga a metadata de build para o Dockerfile. Estes valores
+          # substituem os fallbacks de Directory.Build.props no contexto
+          # Docker (que não tem .git/), garantindo coerência entre
+          # AssemblyInformationalVersion em runtime e os OCI labels.
+          # Fonte canónica única: variáveis do GitHub Actions.
+          #
+          # M3uCrawlerVersion: usa o nome da tag SemVer (refs/tags/vX.Y.Z)
+          # quando disponível; caso contrário (push a branch) usa
+          # "0.0.0-dev-<sha>" para que BuildInfo nunca apresente
+          # "1.0.0" default do SDK. O Dockerfile faz um strip final do
+          # prefixo "v" para converter vX.Y.Z em X.Y.Z (SemVer puro).
+          build-args: |
+            "M3uCrawlerVersion=${{ github.ref }}"
+            "M3uCrawlerCommitSha=${{ github.sha }}"
+            "M3uCrawlerBuildNumber=${{ github.run_number }}"
+            "M3uCrawlerBuildDate=${{ github.event.repository.updated_at }}"
 
       - name: Resolve published digest
         id: digest
