@@ -24,16 +24,6 @@ namespace m3uCrawler.Services.Matching
         private readonly MatchScorer _scorer = new();
         private readonly Func<string?, string?, string?, bool, OutputGroupKind>? _resolutionPolicy;
 
-        private static readonly System.Text.RegularExpressions.Regex BundleTitlePattern =
-            new(
-                @"\b(Filmes|Combates|LiveCam|24\s*/\s*7|PACK|BUNDLE)\b|#f#",
-                System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
-
-        private static readonly System.Text.RegularExpressions.Regex VodGroupPattern =
-            new(
-                @"^VOD\s*\|",
-                System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
-
         /// <summary>
         /// Constructs a ChannelMatcher with the legacy single-dependency
         /// surface. OutputGroup resolution (ResolutionPolicy) is
@@ -84,27 +74,35 @@ namespace m3uCrawler.Services.Matching
             int threshold = options.MatchThreshold;
             var stamp = (nowUtc ?? DateTime.UtcNow).ToString("o");
 
-            // Bundle / category guard.
-            //
-            // Exclui entradas que claramente não são canais ao vivo:
-            //   - "Filmes X 24/7", "Combates UFC 24/7", etc. (group "Portugal - Canais 24-7")
-            //   - "PT - <título> - <ano>" e similares (group "VOD | PORTUGAL")
-            //   - "LiveCam <praia> PT" (câmaras)
-            //   - placeholders de cor "#f#..." que aparecem na playlist
-            //     gerada pelo Dispatcharr
-            //   - nomes "PACK"/"BUNDLE" (não-canais)
-            //
-            // Estas entradas hoje entram como NewChannel no MatchPlan;
-            // ver `.kilo/plans/1788214551330-channel-normalization-investigation-report.md`,
-            // secções 4 e 5. São excluídas aqui (e não no validator nem
-            // no normalizer) para manter invariantes b0dfc48/91cad8e/420df83/8877f6f/b3157d6.
-            int excludedAsBundle = 0;
+            // Classification boundary: every DiscoveredStream is
+            // classified BEFORE any bucket creation. Only entries with
+            // ChannelKind.Channel become channel candidates. All other
+            // kinds are recorded as ClassifiedExclusion diagnostics
+            // and counted under Counts.Classification; they NEVER
+            // reach NewChannel, ExistingReassigned or any apply
+            // decision. Invariantes preserved: b0dfc48 (stream dedup),
+            // 91cad8e (reconcile by existingChannelId), 420df83
+            // (ambiguous groups without arbitrary selection),
+            // 8877f6f (preserve channels without sources).
+            var classificationCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+            var excluded = new List<ClassifiedExclusion>();
             var channelBuckets = new Dictionary<string, List<DiscoveredStream>>(StringComparer.Ordinal);
             foreach (var s in discovered)
             {
-                if (IsBundleOrCategory(s.Title, s.Group))
+                var classification = ContentClassifier.Classify(s.Title, s.Group);
+                var kindName = classification.Kind.ToString();
+                classificationCounts.TryGetValue(kindName, out var prev);
+                classificationCounts[kindName] = prev + 1;
+
+                if (classification.Kind != ChannelKind.Channel)
                 {
-                    excludedAsBundle++;
+                    excluded.Add(new ClassifiedExclusion
+                    {
+                        Title = s.Title ?? string.Empty,
+                        Group = s.Group ?? string.Empty,
+                        Kind = classification.Kind,
+                        Reason = classification.Reason,
+                    });
                     continue;
                 }
 
@@ -131,7 +129,8 @@ namespace m3uCrawler.Services.Matching
             var counts = new SyncReportCounts
             {
                 AmbiguousGroups = groupIndex.AmbiguousEntries.Count,
-                Skipped = excludedAsBundle,
+                Skipped = excluded.Count,
+                Classification = classificationCounts,
             };
 
             foreach (var bucket in channelBuckets.OrderBy(b => b.Key, StringComparer.Ordinal))
@@ -380,6 +379,7 @@ namespace m3uCrawler.Services.Matching
                 Counts = counts,
                 Channels = decisions,
                 AmbiguousGroups = groupIndex.AmbiguousEntries,
+                ClassifiedExclusions = excluded,
             };
 
             return ReconcileByExistingChannelId(provisional);
@@ -463,6 +463,7 @@ namespace m3uCrawler.Services.Matching
                 Counts = plan.Counts,
                 Channels = reconciled,
                 AmbiguousGroups = plan.AmbiguousGroups,
+                ClassifiedExclusions = plan.ClassifiedExclusions,
             };
         }
 
@@ -683,18 +684,17 @@ namespace m3uCrawler.Services.Matching
         }
 
         /// <summary>
-        /// Returns true when the entry is clearly a bundle, VOD file,
-        /// livecam feed, or colour placeholder and must NOT be treated
-        /// as an applicable channel. See the bundle-guard comment in
-        /// <see cref="BuildPlan"/>.
+        /// Legacy bundle-guard helper retained as an obsolete stub for
+        /// callers in the test suite that still reference it.
+        /// Production code now delegates to
+        /// <see cref="ContentClassifier.Classify"/>. This method will
+        /// be removed in a follow-up cleanup once the tests are
+        /// migrated.
         /// </summary>
+        [Obsolete("Use ContentClassifier.Classify; retained for legacy test references.")]
         internal static bool IsBundleOrCategory(string? title, string? group)
         {
-            if (!string.IsNullOrWhiteSpace(title) && BundleTitlePattern.IsMatch(title))
-                return true;
-            if (!string.IsNullOrWhiteSpace(group) && VodGroupPattern.IsMatch(group.Trim()))
-                return true;
-            return false;
+            return ContentClassifier.Classify(title, group).Kind != ChannelKind.Channel;
         }
 
         private static string NormalizeGroupKey(string name) =>

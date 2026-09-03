@@ -8,23 +8,40 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 ## [Unreleased]
 
 ### ✨ Adicionado
-- **Coerência OCI ↔ BuildInfo ↔ `/api/version`** (commits `3a338d8` → `0797b40`): a imagem Docker publicada agora embute o mesmo `AssemblyInformationalVersion` que os OCI labels anunciam. Dockerfile expandido de `./m3uCrawler` para `./` (build context inclui `Directory.Build.props`/`Directory.Build.targets`); `.dockerignore` na raiz com exclusões reforçadas (`bin/`, `obj/`, `output/`, `runtime-data/`, `.git/`, `.kilo/`, `wtelegram.config`, `session.dat`, `WTelegram.session`); build-args do CI propagados a `restore` **e** `publish` (`M3uCrawlerVersion`, `M3uCrawlerCommitSha`, `M3uCrawlerBuildNumber`, `M3uCrawlerBuildDate`).
-- **`DockerBuildInfoContractTests`** (8 testes): parsing de `InformationalVersion` no formato `<semver>+sha.<commit>+build.<N>+date.<ISO>`, fallbacks, strip do prefixo `v`. Cobertura explícita do contrato Dockerfile↔BuildInfo.
-- **`m3uCrawler --web` standalone** (commit `e0f62e2`): o dashboard arranca independentemente de `--telegram`. O cabeçalho CLI passou a derivar de `BuildInfo.Current.ToCliLine()` (substitui o literal `Versão 2.1 - Novembro 2025`). Filtro do modo M3U8-search estendido para `--web-port`, `--web-token`, `--loop-hours`, `--history-hours`, `--max-results`, `--user`, `--pass` (valores de opções nunca mais são tratados como search term).
+- **Fronteira explícita Classification → Matching** (commits B1.2-FIX2 → esta iteração): `ContentClassifier.Classify(title, sourceGroup)` corre **antes** do bucket de canais, e devolve um `ChannelKind` explícito. Apenas `ChannelKind.Channel` produz uma `ChannelDecision`. As outras kinds (`Group`, `Bundle`, `Vod`, `LiveCam`, `Category`, `Foreign`, `Placeholder`, `Unknown`) são contabilizadas como `ClassifiedExclusion` (com `title`, `group`, `kind`, `reason`; **sem** URL nem credenciais) e nunca chegam a `NewChannel`. A precedência é determinística e documentada no xmldoc do classificador:
+  1. Título vazio → `Unknown`.
+  2. Colour-placeholder (`#f#...`) → `Placeholder`.
+  3. Identidade conhecida em `ChannelCategoryLookup.Contains` → `Channel` (a identidade tem prioridade sobre sinais de source-group).
+  4. `ContentTypeDetector` VOD ou PPV → `Vod`.
+  5. Source-group 24-7 (`canais 24-7`) ou título com `24/7`/`24-7` → `Bundle`.
+  6. `PACK`/`BUNDLE` no título → `Bundle`.
+  7. Source-group com prefixo `VOD |` → `Vod`.
+  8. Source-group com `PPV`/`BETCLIC`/`LIGA PORTUGAL` (cobre `PT - NO EVENT`) → `Vod`.
+  9. `LiveCam` no título → `LiveCam`.
+  10. Source-group estrangeiro em `GroupTaxonomy` → `Foreign` (apenas para títulos não-classificados como canal).
+  11. Caso contrário → `Unknown`.
+- **Contadores por `ChannelKind`** (`SyncReportCounts.Classification: Dictionary<string,int>`): chave = nome do enum (`Channel`, `Bundle`, `Vod`, `LiveCam`, `Foreign`, `Unknown`, `Placeholder`), valor = contagem. Serializado como `classification` no `MatchPlan` / `dispatcharr_plan_*.json` / `dispatcharr_report_*.json`.
+- **`MatchPlan.ClassifiedExclusions`**: lista sanitizada de entradas rejeitadas pela classificação (sem URL nem credenciais). Serializado como `classifiedExclusions`.
+- **`ChannelCategoryLookup.Contains`** (novo método público): distingue "identidade conhecida" do fallback `Category.Live` retornado por `Lookup`. É a fonte primária de verdade do classificador — só identidades explicitamente mapeadas são promovidas a `Channel`.
+- **Dashboard**: novo endpoint `GET /api/classification-summary` lê o `dispatcharr_plan_*.json` mais recente e devolve `classification`, `excludedCount`, e uma amostra (até 50) de `ClassifiedExclusion` (sem credenciais). Reutiliza `MatchPlanSerializer`.
+- **Testes de classificação** (38 novos): `ContentClassifierTests` cobre SIC/RTP/TVI/CMTV/Sport TV/CNN/SIC NOTICIAS/RTP NOTICIAS como `Channel`; `Filmes`, `Combates`, `SPORT TV PACK`, `PACK`, `MEGA BUNDLE` como `Bundle`; `PT - <título> - <ano>`, `PT - NO EVENT` (regressão real), `VOD | PORTUGAL`, `PPV/BETCLIC` como `Vod`; `LiveCam` como `LiveCam`; colour placeholders como `Placeholder`; unknown strings como `Unknown`. Inclui teste de integração end-to-end com a fixture de produção `m3ucrawler_playlist_20260831_223914.m3u` (`ChannelClassifierRegressionTests`) que prova que `PT - NO EVENT` e `Filmes 24/7` não aparecem em `plan.Channels` como `NewChannel`.
+- **Teste de serialização round-trip** (`WebDashboardServiceTests.MatchPlan_serialization_round_trips_classification_exclusions`): confirma que `Classification` e `ClassifiedExclusions` sobrevivem a `Serialize`/`Deserialize` em camelCase.
 
 ### 🐛 Corrigido
 - **Discrepância OCI labels ↔ `/api/version`**: o `/api/version` da imagem publicada devolveva `1.0.0 / unknown / 0 / 1970-01-01` enquanto os OCI labels mostravam o `commit` correcto. Causa: o Dockerfile (context `./m3uCrawler`) não incluía `Directory.Build.props`/`Directory.Build.targets` no contexto Docker, pelo que MSBuild aplicava os defaults do SDK NuGet. Resolvido em A1/B1.2.
+- **`PT - NO EVENT` (8 ocorrências na fixture real)** era criado como `NewChannel` em produção. Agora é classificado como `Vod` (regra 8: BETCLIC/LIGA PORTUGAL) e excluído do matching.
+- **Title="Filmes Batman 24/7"** continuava a ser classificado como canal mesmo após o bundle-guard regex legacy. O classificador cobre tanto o source-group 24-7 (`canais 24-7` regex) como o título com `24/7`/`24-7`.
 - **`docker build` em branch push** (commit `d42310a`): `refs/heads/<branch>` era convertido para `<branch>` (não SemVer válido) e abortava o `dotnet restore` com `'<branch>' is not a valid version string`. Substituído o `sed` por um `case` que normaliza `refs/heads/*` para `0.0.0-dev-<short-sha>` (SemVer válido e único).
 - **Step "Resolve published digest" do workflow GHCR** (commit `0797b40`): usava `curl` contra `ghcr.io` com `GITHUB_TOKEN`, que tem `packages:write` mas não `read:packages`, devolvendo 401 silenciosamente. Substituído por `docker buildx imagetools inspect --raw | jq '.manifests[] | select(.platform.architecture=="amd64" and .platform.os=="linux") | .digest'` (autenticado via `docker/login-action@v3`); fallback single-arch via `sed` no header `Name:`. Validado end-to-end: digest reportado pelo step bate certo com `docker buildx imagetools inspect` no servidor.
 - **`--web --web-port 5001` standalone** (B1.2-FIX2, pré-existente): o parsing de `--web`/`--web-port`/`--web-token` estava gated por `if (args.Contains("--telegram"))`, fazendo `--web` sozinho cair no M3U8-search onde `5001` era interpretado como search term. Hoist do bloco para o top-level de `Main`; quando `--web` standalone está activo, o processo aguarda `webTask` em vez de cair no M3U8-search.
 
 ### 📦 Deployment
 - **Produção live em `sha256:a29bbfe1cf84d2db3411d5713986215d9bf8c062d71b859b4844caf483c1d4a6`** (commit `e0f62e2`, build 53, `commit`/`buildDate` coerentes com OCI labels `revision`/`created`).
-- **PR #1** aberto: `fix/docker-buildinfo-metadata` → `main`, 4 commits (`3a338d8`, `d42310a`, `e0f62e2`, `0797b40`), todos os checks verdes, `mergeable=True`.
+- **PR #1** merged: `fix/docker-buildinfo-metadata` → `main`, 4 commits (`3a338d8`, `d42310a`, `e0f62e2`, `0797b40`), todos os checks verdes.
 
 ### 📊 Estado
 - Build: `dotnet build m3uCrawler.sln --configuration Release` → **0 warnings, 0 errors**.
-- Testes: `dotnet test m3uCrawler.Tests/m3uCrawler.Tests.csproj --configuration Release --no-build --nologo` → **977 testes passados, 0 falhados**.
+- Testes: `dotnet test m3uCrawler.Tests/m3uCrawler.Tests.csproj --configuration Release --no-build --nologo` → **1017 testes passados, 0 falhados**.
 - actionlint: **0 errors, 0 warnings**.
 - Imagem rollback preservada: `sha256:27b0b18dd81e9c01416bad674cfbe86515a9994be4565bb44dda49fb2e50b97e`.
 

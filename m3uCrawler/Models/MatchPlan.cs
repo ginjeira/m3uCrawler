@@ -13,6 +13,35 @@ namespace m3uCrawler.Models
         [JsonPropertyName("counts")] public SyncReportCounts Counts { get; init; } = new();
         [JsonPropertyName("channels")] public IReadOnlyList<ChannelDecision> Channels { get; init; } = Array.Empty<ChannelDecision>();
         [JsonPropertyName("ambiguousGroups")] public IReadOnlyList<AmbiguousGroupEntry> AmbiguousGroups { get; init; } = Array.Empty<AmbiguousGroupEntry>();
+
+        /// <summary>
+        /// Diagnostic list of streams excluded from the matching pipeline
+        /// because their classification was not <see cref="ChannelKind.Channel"/>.
+        /// Each entry carries the deterministic classification reason;
+        /// credentials and URLs are NEVER included (sanitisation is the
+        /// responsibility of the serializer / reporter).
+        /// </summary>
+        [JsonPropertyName("classifiedExclusions")] public IReadOnlyList<ClassifiedExclusion> ClassifiedExclusions { get; init; } = Array.Empty<ClassifiedExclusion>();
+    }
+
+    /// <summary>
+    /// Diagnostic record for an entry that the classifier rejected from
+    /// channel matching. Carries only the metadata required to explain
+    /// the decision: title, source group, the kind assigned, and the
+    /// deterministic reason emitted by <c>ContentClassifier</c>.
+    ///
+    /// <para>
+    /// URL and provider are intentionally absent so this record can be
+    /// serialised in logs / dashboard / report_builder without
+    /// requiring further sanitisation.
+    /// </para>
+    /// </summary>
+    public sealed class ClassifiedExclusion
+    {
+        [JsonPropertyName("title")] public string Title { get; init; } = string.Empty;
+        [JsonPropertyName("group")] public string Group { get; init; } = string.Empty;
+        [JsonPropertyName("kind")] public ChannelKind Kind { get; init; }
+        [JsonPropertyName("reason")] public string Reason { get; init; } = string.Empty;
     }
 
     public sealed class ChannelDecision
@@ -88,6 +117,16 @@ namespace m3uCrawler.Models
         /// <c>outputGroups</c> in <c>dispatcharr_report_*.json</c>.
         /// </summary>
         [JsonPropertyName("outputGroups")] public IReadOnlyDictionary<string, int> OutputGroups { get; set; } = new Dictionary<string, int>();
+
+        /// <summary>
+        /// Aggregated count of <see cref="DiscoveredStream"/> entries by
+        /// <see cref="ChannelKind"/> as decided by <c>ContentClassifier</c>
+        /// before the matching pipeline runs. Keys are the enum names
+        /// (e.g. "Channel", "Bundle", "Vod", "LiveCam", "Foreign",
+        /// "Unknown", "Placeholder"). Only non-zero counts are
+        /// serialised.
+        /// </summary>
+        [JsonPropertyName("classification")] public IReadOnlyDictionary<string, int> Classification { get; set; } = new Dictionary<string, int>();
     }
 
     public sealed class SyncReport
