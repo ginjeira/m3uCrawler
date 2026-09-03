@@ -358,7 +358,7 @@ Uma playlist estrangeira (ex.: apenas canais `La 1`, `Antena 3`, `Telecinco`) é
 ## Estado dos testes
 
 - Build: `dotnet build m3uCrawler.sln --configuration Release` → **0 warnings, 0 errors**.
-- Testes: `dotnet test m3uCrawler.sln --configuration Release` → **153 testes, 153 passados, 0 falhados** (verificado em 2026-08-30 com `dotnet 9.0.317`).
+- Testes: `dotnet test m3uCrawler.Tests/m3uCrawler.Tests.csproj --configuration Release --no-build --nologo` → **977 testes, 977 passados, 0 falhados** (verificado em 2026-09-03 com `dotnet 9.0.317`).
 - O runner descobre e executa todos os testes; não há testes que passem sem realmente exercitar o comportamento (detector, parser, validação por país com threshold/famílias/falsos-positivos, merge de manutenção).
 - Não há teste de integração de rede (Telegram/HTTP); os testes são unitários e independentes de infra-estrutura externa.
 
