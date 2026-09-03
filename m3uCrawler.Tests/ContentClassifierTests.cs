@@ -176,12 +176,17 @@ public class ContentClassifierTests
     }
 
     [Fact]
-    public void Unknown_entry_does_not_become_NewChannel()
+    public void Unknown_entry_with_no_existing_match_is_review_required()
     {
+        // Unknown NUNCA gera NewChannel. Sem match no Dispatcharr
+        // (a simulação não cria canais existentes), o bucket cai no
+        // path MatchBand.None e é registado em UnknownReviewRequired.
         var plan = BuildPlan(Stream("xyz", "abc"));
         Assert.Empty(plan.Channels);
-        Assert.Single(plan.ClassifiedExclusions);
-        Assert.Equal(ChannelKind.Unknown, plan.ClassifiedExclusions[0].Kind);
+        Assert.Empty(plan.ClassifiedExclusions);
+        Assert.Single(plan.UnknownReviewRequired);
+        Assert.Equal(ChannelKind.Unknown, plan.UnknownReviewRequired[0].Kind);
+        Assert.Equal("unknown-review-required", plan.UnknownReviewRequired[0].MatchingDisposition);
     }
 
     [Fact]
@@ -203,12 +208,20 @@ public class ContentClassifierTests
             Stream("xyz", "abc"));                                          // Unknown
 
         Assert.Single(plan.Channels);
-        Assert.Equal(4, plan.ClassifiedExclusions.Count);
+        // Three exclusions (Bundle, Vod, LiveCam) are EXCLUDED.
+        Assert.Equal(3, plan.ClassifiedExclusions.Count);
+        // The Unknown entry is review-required (no existing match).
+        Assert.Single(plan.UnknownReviewRequired);
         Assert.Equal(1, plan.Counts.Classification["Channel"]);
         Assert.Equal(1, plan.Counts.Classification["Bundle"]);
         Assert.Equal(1, plan.Counts.Classification["Vod"]);
         Assert.Equal(1, plan.Counts.Classification["LiveCam"]);
         Assert.Equal(1, plan.Counts.Classification["Unknown"]);
+        // Disposition counters split excluded vs review-required.
+        Assert.Equal(3, plan.Counts.MatchingDisposition["excluded"]);
+        Assert.Equal(1, plan.Counts.MatchingDisposition["unknownReviewRequired"]);
+        Assert.Equal(0, plan.Counts.MatchingDisposition["unknownMatchedToExisting"]);
+        Assert.Equal(1, plan.Counts.MatchingDisposition["newChannelsFromCuratedIdentity"]);
     }
 
     [Fact]

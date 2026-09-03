@@ -8,6 +8,20 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 ## [Unreleased]
 
 ### ✨ Adicionado
+- **Política de 3 níveis (exclude / match-existing / create-new)** (esta iteração): separa as decisões de "ser não-canal" e "criar NewChannel" que a PR #2 tinha colapsado. O `ChannelClassification` agora carrega dois flags explícitos — `ExistingMatchEligibility` e `NewChannelEligibility` — e o `ChannelMatcher` respeita-os:
+  - `exclude`: kinds `Bundle / Vod / LiveCam / Placeholder / Category / Group / Foreign` nunca chegam a bucket (preserva a correcção da PR #2 contra falsos positivos como `PT - NO EVENT`).
+  - `match-existing`: entradas classificadas como `Unknown` (sem identidade curada) podem ser comparadas contra canais existentes em Dispatcharr e anexar streams novas a eles quando há match forte e inequívoco. **Nunca** geram `NewChannel`.
+  - `review-required`: `Unknown` sem match ou com match ambíguo é registado em `MatchPlan.UnknownReviewRequired` (sanitizado, sem credenciais) e fica pendente de revisão manual. Não cai no esquecimento.
+  - `new-channels-from-curated-identity`: `NewChannel` é criado **apenas** quando a identidade está no `ChannelCategoryLookup` curado. A política anterior "só identidades explicitamente mapeadas são canais" foi corrigida para "só identidades explicitamente mapeadas são canais **promovidos a `NewChannel`**" — canais reais legítimos fora do dicionário continuam a receber streams novas via `ExistingReassigned` quando existem em Dispatcharr.
+- **`SourceGroupCategoryLookup` agora é consumido** pelo classificador: `Unknown` num source-group editorial (Live / Entretenimento / Desporto / Infantil / Documentarios) fica com `ExistingMatchEligibility=true` (com `reason="unknown-editorial:<category>"`); outros `Unknown` ficam com a eligibility base.
+- **`MatchPlan.UnknownReviewRequired`**: nova colecção sanitizada de `ClassifiedExclusion` (mesmo shape: title, group, kind, reason, matchingDisposition). Serializado como `unknownReviewRequired` no plano e nos relatórios.
+- **`SyncReportCounts.MatchingDisposition`** (dict<string,int>): quatro buckets, serializados em camelCase como `matchingDisposition`:
+  - `excluded` — entradas que nunca chegaram a bucket.
+  - `unknownMatchedToExisting` — entradas `Unknown` que anexaram streams a um canal existente.
+  - `unknownReviewRequired` — entradas `Unknown` sem match seguro.
+  - `newChannelsFromCuratedIdentity` — `NewChannel` produzido.
+- **`ClassifiedExclusion.MatchingDisposition`**: cada entrada de exclusão tem agora um disposition (sempre `"excluded"`, `"unknown-review-required"`, etc.) que permite ao dashboard distinguir o caminho que a entrada tomou.
+- **Testes de regressão** (10 novos): `ChannelClassifierThreeLevelPolicyTests` cobre cenários A-G do brief. `ChannelClassifierRegressionTests.Live_playlist_no_non_channel_kind_reaches_NewChannel` foi reforçado com lista auditada de canais legítimos (SIC, TVI, RTP, CMTV, CNN, EURONEWS) que devem ser **retidos** simultaneamente à remoção dos falsos positivos — a asserção `Assert.NotEmpty(plan.Channels)` foi substituída por asserções explícitas de retenção **e** de exclusão.
 - **Fronteira explícita Classification → Matching** (commits B1.2-FIX2 → esta iteração): `ContentClassifier.Classify(title, sourceGroup)` corre **antes** do bucket de canais, e devolve um `ChannelKind` explícito. Apenas `ChannelKind.Channel` produz uma `ChannelDecision`. As outras kinds (`Group`, `Bundle`, `Vod`, `LiveCam`, `Category`, `Foreign`, `Placeholder`, `Unknown`) são contabilizadas como `ClassifiedExclusion` (com `title`, `group`, `kind`, `reason`; **sem** URL nem credenciais) e nunca chegam a `NewChannel`. A precedência é determinística e documentada no xmldoc do classificador:
   1. Título vazio → `Unknown`.
   2. Colour-placeholder (`#f#...`) → `Placeholder`.
@@ -22,7 +36,7 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
   11. Caso contrário → `Unknown`.
 - **Contadores por `ChannelKind`** (`SyncReportCounts.Classification: Dictionary<string,int>`): chave = nome do enum (`Channel`, `Bundle`, `Vod`, `LiveCam`, `Foreign`, `Unknown`, `Placeholder`), valor = contagem. Serializado como `classification` no `MatchPlan` / `dispatcharr_plan_*.json` / `dispatcharr_report_*.json`.
 - **`MatchPlan.ClassifiedExclusions`**: lista sanitizada de entradas rejeitadas pela classificação (sem URL nem credenciais). Serializado como `classifiedExclusions`.
-- **`ChannelCategoryLookup.Contains`** (novo método público): distingue "identidade conhecida" do fallback `Category.Live` retornado por `Lookup`. É a fonte primária de verdade do classificador — só identidades explicitamente mapeadas são promovidas a `Channel`.
+- **`ChannelCategoryLookup.Contains`** (novo método público): distingue "identidade conhecida" do fallback `Category.Live` retornado por `Lookup`. É a fonte primária de verdade do classificador — é a única via para promover uma entrada a `Channel` com `NewChannelEligibility=true`. Identidades desconhecidas podem ainda ser comparadas contra canais existentes em Dispatcharr (com `ExistingMatchEligibility=true`), mas nunca geram um `NewChannel` automaticamente.
 - **Dashboard**: novo endpoint `GET /api/classification-summary` lê o `dispatcharr_plan_*.json` mais recente e devolve `classification`, `excludedCount`, e uma amostra (até 50) de `ClassifiedExclusion` (sem credenciais). Reutiliza `MatchPlanSerializer`.
 - **Testes de classificação** (38 novos): `ContentClassifierTests` cobre SIC/RTP/TVI/CMTV/Sport TV/CNN/SIC NOTICIAS/RTP NOTICIAS como `Channel`; `Filmes`, `Combates`, `SPORT TV PACK`, `PACK`, `MEGA BUNDLE` como `Bundle`; `PT - <título> - <ano>`, `PT - NO EVENT` (regressão real), `VOD | PORTUGAL`, `PPV/BETCLIC` como `Vod`; `LiveCam` como `LiveCam`; colour placeholders como `Placeholder`; unknown strings como `Unknown`. Inclui teste de integração end-to-end com a fixture de produção `m3ucrawler_playlist_20260831_223914.m3u` (`ChannelClassifierRegressionTests`) que prova que `PT - NO EVENT` e `Filmes 24/7` não aparecem em `plan.Channels` como `NewChannel`.
 - **Teste de serialização round-trip** (`WebDashboardServiceTests.MatchPlan_serialization_round_trips_classification_exclusions`): confirma que `Classification` e `ClassifiedExclusions` sobrevivem a `Serialize`/`Deserialize` em camelCase.
@@ -41,7 +55,7 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ### 📊 Estado
 - Build: `dotnet build m3uCrawler.sln --configuration Release` → **0 warnings, 0 errors**.
-- Testes: `dotnet test m3uCrawler.Tests/m3uCrawler.Tests.csproj --configuration Release --no-build --nologo` → **1017 testes passados, 0 falhados**.
+- Testes: `dotnet test m3uCrawler.Tests/m3uCrawler.Tests.csproj --configuration Release --no-build --nologo` → **1027 testes passados, 0 falhados**.
 - actionlint: **0 errors, 0 warnings**.
 - Imagem rollback preservada: `sha256:27b0b18dd81e9c01416bad674cfbe86515a9994be4565bb44dda49fb2e50b97e`.
 

@@ -92,6 +92,7 @@ namespace m3uCrawler.Services.Sync
                 Channels = channels,
                 AmbiguousGroups = plan.AmbiguousGroups,
                 ClassifiedExclusions = plan.ClassifiedExclusions,
+                UnknownReviewRequired = plan.UnknownReviewRequired,
             };
         }
     }

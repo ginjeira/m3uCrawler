@@ -57,16 +57,54 @@ namespace m3uCrawler.Services.Matching
     /// Result of classifying a single stream entry against
     /// <see cref="ContentClassifier"/>. Pure value type — no I/O,
     /// deterministic, safe to serialise.
+    ///
+    /// <para>
+    /// Carries three orthogonal decisions, separated per the brief:
+    /// </para>
+    /// <list type="bullet">
+    ///   <item><see cref="Kind"/> — structural kind of the entry
+    ///         (Channel, Bundle, Vod, LiveCam, …).</item>
+    ///   <item><see cref="ExistingMatchEligibility"/> — whether the
+    ///         entry can be compared against channels already present
+    ///         in Dispatcharr (existing-id matching). Independent of
+    ///         whether it can create a new channel.</item>
+    ///   <item><see cref="NewChannelEligibility"/> — whether the entry
+    ///         can produce a <see cref="Models.SyncOutcome.NewChannel"/>
+    ///         decision when no existing match is found. This is the
+    ///         strictest decision: only curated channel identities
+    ///         pass.</item>
+    /// </list>
     /// </summary>
     public readonly record struct ChannelClassification(
         ChannelKind Kind,
-        string Reason)
+        string Reason,
+        bool ExistingMatchEligibility,
+        bool NewChannelEligibility)
     {
-        public static readonly ChannelClassification Channel = new(ChannelKind.Channel, "channel-evidence");
-        public static readonly ChannelClassification Group = new(ChannelKind.Group, "group-taxonomy");
-        public static readonly ChannelClassification Unknown = new(ChannelKind.Unknown, "no-channel-evidence");
+        public static readonly ChannelClassification Channel = new(
+            ChannelKind.Channel,
+            "channel-evidence",
+            ExistingMatchEligibility: true,
+            NewChannelEligibility: true);
 
-        public static ChannelClassification Of(ChannelKind kind, string reason) => new(kind, reason);
+        public static readonly ChannelClassification Group = new(
+            ChannelKind.Group,
+            "group-taxonomy",
+            ExistingMatchEligibility: false,
+            NewChannelEligibility: false);
+
+        public static readonly ChannelClassification Unknown = new(
+            ChannelKind.Unknown,
+            "no-channel-evidence",
+            ExistingMatchEligibility: true,
+            NewChannelEligibility: false);
+
+        public static ChannelClassification Of(
+            ChannelKind kind,
+            string reason,
+            bool existingMatchEligibility = false,
+            bool newChannelEligibility = false) =>
+            new(kind, reason, existingMatchEligibility, newChannelEligibility);
     }
 
     /// <summary>
@@ -167,6 +205,30 @@ namespace m3uCrawler.Services.Matching
         /// <summary>
         /// Classifies the entry given by its title and source group.
         /// Never throws; always returns a defined value.
+        ///
+        /// <para>
+        /// <b>Eligibility matrix</b>:
+        /// </para>
+        /// <list type="bullet">
+        ///   <item><see cref="ChannelKind.Channel"/> — identity known
+        ///         in <see cref="ChannelCategoryLookup"/>:
+        ///         <c>existing=true</c>, <c>new=true</c>.</item>
+        ///   <item><see cref="ChannelKind.Unknown"/> — no structural
+        ///         evidence of channel / bundle / VOD / LiveCam / etc.,
+        ///         but the source group is a recognized editorial
+        ///         category OR the title normalizes cleanly:
+        ///         <c>existing=true</c>, <c>new=false</c>. Allows the
+        ///         matcher to attach streams to channels already in
+        ///         Dispatcharr, but never to create a new channel
+        ///         automatically.</item>
+        ///   <item><see cref="ChannelKind.Unknown"/> with no source
+        ///         group and an empty/short title:
+        ///         <c>existing=false</c>, <c>new=false</c>.</item>
+        ///   <item>All other kinds (Bundle / Vod / LiveCam / Placeholder
+        ///         / Category / Group / Foreign):
+        ///         <c>existing=false</c>, <c>new=false</c>. They are
+        ///         excluded from the matching pipeline entirely.</item>
+        /// </list>
         /// </summary>
         public static ChannelClassification Classify(string? title, string? sourceGroup)
         {
@@ -174,16 +236,24 @@ namespace m3uCrawler.Services.Matching
             var trimmedTitle = title?.Trim() ?? string.Empty;
             var trimmedGroup = sourceGroup?.Trim() ?? string.Empty;
 
-            // 1. Empty title → Unknown.
+            // 1. Empty title → Unknown (no match, no new).
             if (string.IsNullOrWhiteSpace(trimmedTitle))
             {
-                return ChannelClassification.Of(ChannelKind.Unknown, "empty-title");
+                return ChannelClassification.Of(
+                    ChannelKind.Unknown,
+                    "empty-title",
+                    existingMatchEligibility: false,
+                    newChannelEligibility: false);
             }
 
             // 2. Colour placeholder.
             if (ColourPlaceholderPattern.IsMatch(trimmedTitle))
             {
-                return ChannelClassification.Of(ChannelKind.Placeholder, "colour-placeholder");
+                return ChannelClassification.Of(
+                    ChannelKind.Placeholder,
+                    "colour-placeholder",
+                    existingMatchEligibility: false,
+                    newChannelEligibility: false);
             }
 
             // 3. Channel explícito: identidade conhecida no ChannelCategoryLookup.
@@ -191,14 +261,9 @@ namespace m3uCrawler.Services.Matching
             //    detectados pelo source group porque a identidade do
             //    canal é a fonte primária de verdade (ex.: "SIC" num
             //    grupo "portugal - canais 24-7" continua a ser um canal).
-            //
-            //    NOTA: Foreign NÃO é um ChannelKind — é um OutputGroupKind.
-            //    Um canal com identidade conhecida num grupo estrangeiro
-            //    continua a ser Channel; o ResolutionPolicy atribui-lhe
-            //    depois OutputGroupKind.Foreign.
             if (!string.IsNullOrEmpty(normalizedTitle) && ChannelCategoryLookup.Contains(normalizedTitle))
             {
-                return ChannelClassification.Of(ChannelKind.Channel, "channel-category-lookup");
+                return ChannelClassification.Channel;
             }
 
             // 4. VOD/Bundle/PPV via título (ContentTypeDetector).
@@ -208,46 +273,78 @@ namespace m3uCrawler.Services.Matching
             var contentType = ContentTypeDetector.Detect(trimmedTitle, trimmedGroup);
             if (contentType == ContentType.VOD)
             {
-                return ChannelClassification.Of(ChannelKind.Vod, "vod-title-pattern");
+                return ChannelClassification.Of(
+                    ChannelKind.Vod,
+                    "vod-title-pattern",
+                    existingMatchEligibility: false,
+                    newChannelEligibility: false);
             }
             if (contentType == ContentType.PPV)
             {
-                return ChannelClassification.Of(ChannelKind.Vod, "ppv-group-pattern");
+                return ChannelClassification.Of(
+                    ChannelKind.Vod,
+                    "ppv-group-pattern",
+                    existingMatchEligibility: false,
+                    newChannelEligibility: false);
             }
 
             // 5. Bundle por source group 24-7 ou por title 24/7/24-7.
             if (LoopGroupPattern.IsMatch(trimmedGroup))
             {
-                return ChannelClassification.Of(ChannelKind.Bundle, "loop-group-pattern");
+                return ChannelClassification.Of(
+                    ChannelKind.Bundle,
+                    "loop-group-pattern",
+                    existingMatchEligibility: false,
+                    newChannelEligibility: false);
             }
             if (Loop247Pattern.IsMatch(trimmedTitle))
             {
-                return ChannelClassification.Of(ChannelKind.Bundle, "loop-title-pattern");
+                return ChannelClassification.Of(
+                    ChannelKind.Bundle,
+                    "loop-title-pattern",
+                    existingMatchEligibility: false,
+                    newChannelEligibility: false);
             }
 
             // 6. Bundle por PACK / BUNDLE como palavra isolada.
             if (BundleWordPattern.IsMatch(trimmedTitle))
             {
-                return ChannelClassification.Of(ChannelKind.Bundle, "bundle-title-pattern");
+                return ChannelClassification.Of(
+                    ChannelKind.Bundle,
+                    "bundle-title-pattern",
+                    existingMatchEligibility: false,
+                    newChannelEligibility: false);
             }
 
             // 7. VOD por prefixo do source group ("VOD | ...").
             if (VodGroupPrefixPattern.IsMatch(trimmedGroup))
             {
-                return ChannelClassification.Of(ChannelKind.Vod, "vod-group-prefix");
+                return ChannelClassification.Of(
+                    ChannelKind.Vod,
+                    "vod-group-prefix",
+                    existingMatchEligibility: false,
+                    newChannelEligibility: false);
             }
 
             // 8. VOD/PPV por BETCLIC/LIGA PORTUGAL (cobre "PT - NO EVENT"
             //    em grupos PPV/BETCLIC).
             if (PpvBetclicGroupPattern.IsMatch(trimmedGroup))
             {
-                return ChannelClassification.Of(ChannelKind.Vod, "ppv-betclic-group");
+                return ChannelClassification.Of(
+                    ChannelKind.Vod,
+                    "ppv-betclic-group",
+                    existingMatchEligibility: false,
+                    newChannelEligibility: false);
             }
 
             // 9. LiveCam como palavra isolada.
             if (LiveCamWordPattern.IsMatch(trimmedTitle))
             {
-                return ChannelClassification.Of(ChannelKind.LiveCam, "livecam-title-pattern");
+                return ChannelClassification.Of(
+                    ChannelKind.LiveCam,
+                    "livecam-title-pattern",
+                    existingMatchEligibility: false,
+                    newChannelEligibility: false);
             }
 
             // 10. Foreign: SourceGroup mapeado para Foreign em
@@ -261,12 +358,60 @@ namespace m3uCrawler.Services.Matching
                 var (taxonomyKind, _) = GroupTaxonomy.Lookup(normalizedGroupLate);
                 if (taxonomyKind == OutputGroupKind.Foreign)
                 {
-                    return ChannelClassification.Of(ChannelKind.Foreign, "group-taxonomy-foreign");
+                    return ChannelClassification.Of(
+                        ChannelKind.Foreign,
+                        "group-taxonomy-foreign",
+                        existingMatchEligibility: false,
+                        newChannelEligibility: false);
                 }
             }
 
-            // 11. Sem evidência suficiente.
-            return ChannelClassification.Unknown;
+            // 11. Unknown: sem evidência estrutural. Decide eligibility
+            //     via SourceGroupCategoryLookup: se o source group for
+            //     uma categoria editorial reconhecida (Live,
+            //     Entretenimento, Desporto, Infantil, Documentarios)
+            //     então podemos tentar fazer match contra canais
+            //     existentes do mesmo domínio editorial, mas nunca
+            //     criar canais novos.
+            var groupCategory = SourceGroupCategoryLookup.Lookup(normalizedGroupLate);
+            if (groupCategory.HasValue)
+            {
+                // Unknown com source group editorial:
+                // pode comparar contra canais existentes do mesmo grupo.
+                return ChannelClassification.Of(
+                    ChannelKind.Unknown,
+                    $"unknown-editorial:{groupCategory.Value}",
+                    existingMatchEligibility: true,
+                    newChannelEligibility: false);
+            }
+
+            // 12. Unknown sem source group / com source group não
+            //     editorial: pode ainda tentar match contra canais
+            //     existentes (canais legítimos sem entry no
+            //     ChannelCategoryLookup continuam a receber streams).
+            //     Esta é a correcção da allowlist global introduzida
+            //     pela PR #2 (commit 3f4af81): Unknown NUNCA cria
+            //     canais novos, mesmo que o title normalize bem.
+            //
+            //     Apenas rejeitamos Unknown->match quando o título é
+            //     trivial (1 token, vazio, apenas símbolos): nesses
+            //     casos o risco de criar falsos positivos é tão alto
+            //     que nem a comparacão com canais existentes compensa.
+            var tokens = normalizedTitle.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (tokens.Length < 1)
+            {
+                return ChannelClassification.Of(
+                    ChannelKind.Unknown,
+                    "unknown-trivial-title",
+                    existingMatchEligibility: false,
+                    newChannelEligibility: false);
+            }
+
+            return ChannelClassification.Of(
+                ChannelKind.Unknown,
+                "unknown-can-match-existing-only",
+                existingMatchEligibility: true,
+                newChannelEligibility: false);
         }
     }
 }

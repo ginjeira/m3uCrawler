@@ -74,19 +74,47 @@ namespace m3uCrawler.Services.Matching
             int threshold = options.MatchThreshold;
             var stamp = (nowUtc ?? DateTime.UtcNow).ToString("o");
 
-            // Classification boundary: every DiscoveredStream is
-            // classified BEFORE any bucket creation. Only entries with
-            // ChannelKind.Channel become channel candidates. All other
-            // kinds are recorded as ClassifiedExclusion diagnostics
-            // and counted under Counts.Classification; they NEVER
-            // reach NewChannel, ExistingReassigned or any apply
-            // decision. Invariantes preserved: b0dfc48 (stream dedup),
-            // 91cad8e (reconcile by existingChannelId), 420df83
-            // (ambiguous groups without arbitrary selection),
-            // 8877f6f (preserve channels without sources).
+            // Two-level classification + matching policy (commit
+            // 3f4af81 + this iteration):
+            //   1. ContentClassifier returns Kind + eligibility flags
+            //      (ExistingMatchEligibility, NewChannelEligibility).
+            //   2. Kinds with eligibility=false for BOTH flags are
+            //      excluded immediately (Bundle, Vod, LiveCam,
+            //      Placeholder, Category, Group, Foreign).
+            //   3. Kinds with NewChannelEligibility=true go through the
+            //      normal matching pipeline (curated channel identities).
+            //   4. Kinds with only ExistingMatchEligibility=true
+            //      (Unknown) try to attach to a single non-ambiguous
+            //      existing channel; never create a new one.
+            //
+            // Invariantes preserved:
+            //   b0dfc48 (stream dedup)
+            //   91cad8e (reconcile by existingChannelId)
+            //   420df83 (ambiguous groups without arbitrary selection)
+            //   8877f6f (preserve channels without sources)
+            //   b3157d6 (per-stream removal vs replace, untouched)
             var classificationCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+            var dispositionCounts = new Dictionary<string, int>(StringComparer.Ordinal)
+            {
+                ["excluded"] = 0,
+                ["unknownMatchedToExisting"] = 0,
+                ["unknownReviewRequired"] = 0,
+                ["newChannelsFromCuratedIdentity"] = 0,
+            };
             var excluded = new List<ClassifiedExclusion>();
+            // Review-required entries (Unknown without an existing
+            // match) — counted, NOT promoted to NewChannel.
+            var reviewRequired = new List<ClassifiedExclusion>();
+            // Buckets that go through the existing-channel matcher
+            // (Channel + Unknown with ExistingMatchEligibility=true).
             var channelBuckets = new Dictionary<string, List<DiscoveredStream>>(StringComparer.Ordinal);
+            // Tracks, per bucket identity, whether the bucket is from
+            // a curated Channel identity or from an Unknown entry. We
+            // need this to enforce the NewChannelEligibility rule:
+            // Unknown buckets that reach MatchBand.None become
+            // review-required, NOT NewChannel.
+            var bucketIsCurated = new Dictionary<string, bool>(StringComparer.Ordinal);
+
             foreach (var s in discovered)
             {
                 var classification = ContentClassifier.Classify(s.Title, s.Group);
@@ -94,14 +122,17 @@ namespace m3uCrawler.Services.Matching
                 classificationCounts.TryGetValue(kindName, out var prev);
                 classificationCounts[kindName] = prev + 1;
 
-                if (classification.Kind != ChannelKind.Channel)
+                // 1) Kind-level exclusion: never matched, never created.
+                if (!classification.ExistingMatchEligibility && !classification.NewChannelEligibility)
                 {
+                    dispositionCounts["excluded"] = dispositionCounts["excluded"] + 1;
                     excluded.Add(new ClassifiedExclusion
                     {
                         Title = s.Title ?? string.Empty,
                         Group = s.Group ?? string.Empty,
                         Kind = classification.Kind,
                         Reason = classification.Reason,
+                        MatchingDisposition = "excluded",
                     });
                     continue;
                 }
@@ -111,6 +142,7 @@ namespace m3uCrawler.Services.Matching
                 {
                     list = new List<DiscoveredStream>();
                     channelBuckets[resolved] = list;
+                    bucketIsCurated[resolved] = classification.NewChannelEligibility;
                 }
                 list.Add(s);
             }
@@ -131,12 +163,14 @@ namespace m3uCrawler.Services.Matching
                 AmbiguousGroups = groupIndex.AmbiguousEntries.Count,
                 Skipped = excluded.Count,
                 Classification = classificationCounts,
+                MatchingDisposition = dispositionCounts,
             };
 
             foreach (var bucket in channelBuckets.OrderBy(b => b.Key, StringComparer.Ordinal))
             {
                 var identity = bucket.Key;
                 var canonicalName = GroupResolver.ResolveCanonical(bucket.Value);
+                var isCurated = bucketIsCurated.TryGetValue(identity, out var v) && v;
 
                 // Representative stream for country/OutputGroup decisions:
                 // prefer working, else first with a valid title.
@@ -149,14 +183,6 @@ namespace m3uCrawler.Services.Matching
                 OutputGroupKind? outputGroup = null;
                 if (_resolutionPolicy != null && representative != null)
                 {
-                    // Foreign is deterministic: a known foreign
-                    // SourceGroup (GroupTaxonomy -> Foreign) marks the
-                    // representative stream as foreign. Streams whose
-                    // SourceGroup is not a known foreign group are
-                    // treated as PT (isForeign=false). This avoids
-                    // mislabelling legitimate PT channels that do not
-                    // carry a PT alias/token in their title (e.g.
-                    // "24 Kitchen" in "EU | PT | GENERAL").
                     var taxonomyKind = GroupTaxonomy.Lookup(
                         GroupNormalizer.Normalize(representative.Group)).OutputGroup;
                     var isForeign = taxonomyKind == OutputGroupKind.Foreign;
@@ -197,42 +223,58 @@ namespace m3uCrawler.Services.Matching
 
                 if (band == MatchBand.Ambiguous)
                 {
-                    var top = candidates[0];
-                    var second = candidates[1];
-                    var streamDecisions = bucket.Value
-                        .Select(s => StreamDecisionForNewChannel(s, newChannelIdSeed--, ordering, defaultStreamId: null))
-                        .ToList();
-
-                    decisions.Add(new ChannelDecision
+                    // Ambiguous: never NewChannel, never silent
+                    // attachment. Record per-stream diagnostic.
+                    if (isCurated)
                     {
-                        Identity = identity,
-                        CanonicalName = canonicalName,
-                        Outcome = SyncOutcome.Ambiguous,
-                        ExistingChannelId = null,
-                        ChannelGroupName = null,
-                        OutputGroup = outputGroup,
-                        MatchReason = $"ambiguous:{top.Reason}|{second.Reason}",
-                        MatchScore = top.Score,
-                        Streams = streamDecisions,
-                        AmbiguousCandidates = new[]
+                        // For curated buckets with ambiguous matches,
+                        // preserve the legacy decision surface: an
+                        // Ambiguous decision is exposed, not silently
+                        // dropped, so the user can resolve via UI.
+                        var top = candidates[0];
+                        var second = candidates[1];
+                        var streamDecisions = bucket.Value
+                            .Select(s => StreamDecisionForNewChannel(s, newChannelIdSeed--, ordering, defaultStreamId: null))
+                            .ToList();
+                        decisions.Add(new ChannelDecision
                         {
-                            new AmbiguousCandidate
+                            Identity = identity,
+                            CanonicalName = canonicalName,
+                            Outcome = SyncOutcome.Ambiguous,
+                            ExistingChannelId = null,
+                            ChannelGroupName = null,
+                            OutputGroup = outputGroup,
+                            MatchReason = $"ambiguous:{top.Reason}|{second.Reason}",
+                            MatchScore = top.Score,
+                            Streams = streamDecisions,
+                            AmbiguousCandidates = new[]
                             {
-                                ExistingChannelId = top.Channel.Id,
-                                ExistingChannelName = top.Channel.Name,
-                                Score = top.Score,
-                                Reason = top.Reason,
-                            },
-                            new AmbiguousCandidate
-                            {
-                                ExistingChannelId = second.Channel.Id,
-                                ExistingChannelName = second.Channel.Name,
-                                Score = second.Score,
-                                Reason = second.Reason,
+                                new AmbiguousCandidate
+                                {
+                                    ExistingChannelId = top.Channel.Id,
+                                    ExistingChannelName = top.Channel.Name,
+                                    Score = top.Score,
+                                    Reason = top.Reason,
+                                },
+                                new AmbiguousCandidate
+                                {
+                                    ExistingChannelId = second.Channel.Id,
+                                    ExistingChannelName = second.Channel.Name,
+                                    Score = second.Score,
+                                    Reason = second.Reason,
+                                }
                             }
-                        }
-                    });
-                    counts.Ambiguous = counts.Ambiguous + 1;
+                        });
+                        counts.Ambiguous = counts.Ambiguous + 1;
+                    }
+                    else
+                    {
+                        // Unknown bucket: ambiguous existing matches
+                        // → review-required, no NewChannel.
+                        RecordUnknownReviewRequired(
+                            bucket.Value, classificationCounts, dispositionCounts,
+                            reviewRequired, "ambiguous-existing-match");
+                    }
                     continue;
                 }
 
@@ -340,12 +382,42 @@ namespace m3uCrawler.Services.Matching
                         Streams = streamDecisions,
                         AmbiguousCandidates = Array.Empty<AmbiguousCandidate>(),
                     });
-                    counts.Matched = counts.Matched + 1;
+                    if (isCurated)
+                    {
+                        counts.Matched = counts.Matched + 1;
+                    }
+                    else
+                    {
+                        // Unknown bucket that attached to an existing
+                        // channel: count as matched (preserves
+                        // reconcile behaviour) but route the
+                        // diagnostic to a new disposition counter
+                        // so the dashboard distinguishes curated
+                        // matches from Unknown-to-existing matches.
+                        counts.Matched = counts.Matched + 1;
+                        dispositionCounts["unknownMatchedToExisting"] =
+                            dispositionCounts["unknownMatchedToExisting"] + 1;
+                    }
                     if (!(streamDecisions.Any(d => d.Outcome == SyncOutcome.NewStream || d.Outcome == SyncOutcome.Removed)))
                         counts.Unchanged = counts.Unchanged + 1;
                     continue;
                 }
 
+                // MatchBand.None: no existing match.
+                if (!isCurated)
+                {
+                    // Unknown bucket with no existing match → review
+                    // required. NEVER NewChannel.
+                    RecordUnknownReviewRequired(
+                        bucket.Value, classificationCounts, dispositionCounts,
+                        reviewRequired, "no-existing-match");
+                    continue;
+                }
+
+                // Curated bucket with no existing match → NewChannel
+                // (only path that promotes a curated identity).
+                dispositionCounts["newChannelsFromCuratedIdentity"] =
+                    dispositionCounts["newChannelsFromCuratedIdentity"] + 1;
                 var newGroupName = ResolveGroupName(bucket.Value, groupIndex);
                 var newStreamDecisions = bucket.Value
                     .Select(s => StreamDecisionForNewChannel(s, newChannelIdSeed--, ordering, defaultStreamId: null))
@@ -380,9 +452,50 @@ namespace m3uCrawler.Services.Matching
                 Channels = decisions,
                 AmbiguousGroups = groupIndex.AmbiguousEntries,
                 ClassifiedExclusions = excluded,
+                UnknownReviewRequired = reviewRequired,
             };
 
             return ReconcileByExistingChannelId(provisional);
+        }
+
+        /// <summary>
+        /// Records a bucket whose classification is <see cref="ChannelKind.Unknown"/>
+        /// (eligible to match existing channels only) as
+        /// review-required. Used when the existing-channel match was
+        /// <see cref="MatchBand.None"/> (no match) or
+        /// <see cref="MatchBand.Ambiguous"/> (multiple close matches).
+        /// Never promotes the entry to <see cref="SyncOutcome.NewChannel"/>.
+        ///
+        /// <para>
+        /// The Kind-level counter (<c>Classification</c>) is NOT
+        /// incremented here — the main loop already counted each entry
+        /// when it was first classified. Re-counting here would
+        /// double the per-stream kind counter.
+        /// </para>
+        /// </summary>
+        private static void RecordUnknownReviewRequired(
+            IReadOnlyList<DiscoveredStream> bucket,
+            IDictionary<string, int> classificationCounts,
+            IDictionary<string, int> dispositionCounts,
+            List<ClassifiedExclusion> reviewRequired,
+            string reasonSuffix)
+        {
+            dispositionCounts["unknownReviewRequired"] =
+                dispositionCounts["unknownReviewRequired"] + 1;
+            foreach (var s in bucket)
+            {
+                // Kind for diagnostic metadata only; the kind
+                // counter is already updated by the main loop.
+                var kind = ContentClassifier.Classify(s.Title, s.Group).Kind;
+                reviewRequired.Add(new ClassifiedExclusion
+                {
+                    Title = s.Title ?? string.Empty,
+                    Group = s.Group ?? string.Empty,
+                    Kind = kind,
+                    Reason = $"unknown-review-required:{reasonSuffix}",
+                    MatchingDisposition = "unknown-review-required",
+                });
+            }
         }
 
         private static MatchPlan ReconcileByExistingChannelId(MatchPlan plan)
@@ -464,6 +577,7 @@ namespace m3uCrawler.Services.Matching
                 Channels = reconciled,
                 AmbiguousGroups = plan.AmbiguousGroups,
                 ClassifiedExclusions = plan.ClassifiedExclusions,
+                UnknownReviewRequired = plan.UnknownReviewRequired,
             };
         }
 
