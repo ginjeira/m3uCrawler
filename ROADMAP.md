@@ -12,7 +12,7 @@
 - **Sincronização Dispatcharr** (opt-in via `dispatcharr_enabled=true` em `wtelegram.config`): pós-playlist, o pipeline pode agora gerar um `MatchPlan` (matching puro, determinístico, com normalização + aliases + fuzzy + numeric-sibling guard + source ordering por provider/qualidade/reliability) e aplicá-lo ao Dispatcharr. Default `dispatcharr_dry_run=true` — primeiro rollout escreve apenas `output/dispatcharr_plan_<ts>.json` e `output/dispatcharr_report_<ts>.json`. Ver "Limitações" abaixo.
 - **Deployment** migrado para **Docker Compose** com imagem publicada em `ghcr.io/ginjeira/m3ucrawler` (pinning por digest imutável em produção) e bind mounts absolutos para `/opt/m3ucrawler/runtime-data`. Ver `DEPLOYMENT.md`.
 - **Coerência OCI ↔ BuildInfo ↔ `/api/version`** (commits `3a338d8` → `0797b40`): a imagem publicada embute o mesmo `AssemblyInformationalVersion` que os OCI labels anunciam. Ver `CHANGELOG.md` `[Unreleased]`.
-- **Cobertura de testes**: 1034 testes unitários, 0 warnings em `dotnet build m3uCrawler.sln --configuration Release` (snapshot em 2026-09-03).
+- **Cobertura de testes**: 1039 testes unitários, 0 warnings em `dotnet build m3uCrawler.sln --configuration Release` (snapshot em 2026-09-03).
 - **Sanitização de credenciais** em logs, relatórios JSON, `RunReport`, preview do dashboard e mensagens de erro. A playlist M3U funcional preserva URLs Xtream reais, como esperado. O `MatchPlanSerializer` re-aplica `CredentialSanitizer.SanitizeUrl` ao campo `streamUrl` antes de escrever.
 
 ---

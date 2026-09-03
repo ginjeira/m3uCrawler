@@ -209,6 +209,7 @@ namespace m3uCrawler.Services.Matching
                 }
 
                 bool ambiguous = false;
+                bool skipNoMatchRecord = false;
                 DispatcharrChannel? matched = null;
                 string? matchReason = null;
                 int matchScore = 0;
@@ -224,8 +225,35 @@ namespace m3uCrawler.Services.Matching
                     // (no fuzzy scores); a stream with a near-miss name
                     // is NOT allowed to alter the streams of an
                     // unrelated existing channel that just happens to
-                    // be similar in name.
-                    (matched, matchReason) = FindUnknownMatch(identity, existing.Channels);
+                    // be similar in name. Furthermore, multiple exact
+                    // or alias candidates are AMBIGUOUS — we refuse to
+                    // pick one arbitrarily.
+                    var unknown = FindUnknownMatch(identity, existing.Channels);
+                    switch (unknown.State)
+                    {
+                        case UnknownMatchState.Unique:
+                            matched = unknown.UniqueChannel;
+                            matchReason = unknown.UniqueReason;
+                            break;
+                        case UnknownMatchState.Ambiguous:
+                            // Record the bucket as review-required
+                            // with the diagnostic of ambiguity. The
+                            // matched slot is left null so the "no
+                            // existing match" branch below does NOT
+                            // re-record.
+                            RecordUnknownAmbiguous(
+                                bucket.Value, classificationCounts, dispositionCounts,
+                                reviewRequired, "ambiguous-exact-or-alias-match");
+                            skipNoMatchRecord = true;
+                            matched = null;
+                            matchReason = null;
+                            break;
+                        case UnknownMatchState.NoMatch:
+                        default:
+                            matched = null;
+                            matchReason = null;
+                            break;
+                    }
                 }
 
                 if (ambiguous && matched != null)
@@ -304,6 +332,12 @@ namespace m3uCrawler.Services.Matching
                 }
 
                 // No existing match.
+                if (skipNoMatchRecord)
+                {
+                    // Diagnostic already recorded by FindUnknownMatch's
+                    // Ambiguous branch. Continue to next bucket.
+                    continue;
+                }
                 if (!isCurated)
                 {
                     // Unknown bucket without exact/alias match →
@@ -402,6 +436,37 @@ namespace m3uCrawler.Services.Matching
         }
 
         /// <summary>
+        /// Records an Unknown bucket whose exact/alias match produced
+        /// 2+ candidates in existing channels. We never pick one
+        /// arbitrarily — the bucket is held back for manual review
+        /// with a diagnostic of ambiguity. The reason suffix
+        /// <c>ambiguous-exact-or-alias-match</c> distinguishes this
+        /// path from the plain "no-match" path.
+        /// </summary>
+        private static void RecordUnknownAmbiguous(
+            IReadOnlyList<DiscoveredStream> bucket,
+            IDictionary<string, int> classificationCounts,
+            IDictionary<string, int> dispositionCounts,
+            List<ClassifiedExclusion> reviewRequired,
+            string reasonSuffix)
+        {
+            dispositionCounts["unknownReviewRequired"] =
+                dispositionCounts["unknownReviewRequired"] + 1;
+            foreach (var s in bucket)
+            {
+                var kind = ContentClassifier.Classify(s.Title, s.Group).Kind;
+                reviewRequired.Add(new ClassifiedExclusion
+                {
+                    Title = s.Title ?? string.Empty,
+                    Group = s.Group ?? string.Empty,
+                    Kind = kind,
+                    Reason = $"unknown-review-required:{reasonSuffix}",
+                    MatchingDisposition = "unknown-review-required",
+                });
+            }
+        }
+
+        /// <summary>
         /// Eligibility tier for the bucket stage. Curated streams
         /// (with <c>NewChannelEligibility=true</c>) use the full
         /// fuzzy + threshold matching against existing channels.
@@ -415,6 +480,52 @@ namespace m3uCrawler.Services.Matching
         {
             Curated = 0,
             Unknown = 1,
+        }
+
+        /// <summary>
+        /// Result of <see cref="FindUnknownMatch"/>: tri-state that
+        /// the main loop uses to decide between
+        /// <c>ExistingReassigned/ExistingUnchanged</c> and
+        /// <c>UnknownReviewRequired</c>.
+        /// <list type="bullet">
+        ///   <item><see cref="UnknownMatchState.NoMatch"/>: 0 exact
+        ///         or alias candidates in existing channels. Caller
+        ///         routes to <c>UnknownReviewRequired</c> with
+        ///         <c>no-exact-or-alias-match</c>.</item>
+        ///   <item><see cref="UnknownMatchState.Unique"/>: exactly 1
+        ///         candidate. Caller attaches the streams to that
+        ///         channel.</item>
+        ///   <item><see cref="UnknownMatchState.Ambiguous"/>: 2+
+        ///         candidates. Caller routes to
+        ///         <c>UnknownReviewRequired</c> with
+        ///         <c>ambiguous-exact-or-alias-match</c> —
+        ///         <b>never</b> chooses arbitrarily.</item>
+        /// </list>
+        /// </summary>
+        private enum UnknownMatchState
+        {
+            NoMatch,
+            Unique,
+            Ambiguous,
+        }
+
+        /// <summary>
+        /// Discriminated union of unknown-match outcomes. All
+        /// candidate channels for the <see cref="UnknownMatchState.Ambiguous"/>
+        /// state are exposed so the diagnostic can list them.
+        /// </summary>
+        private readonly record struct UnknownMatch(
+            UnknownMatchState State,
+            DispatcharrChannel UniqueChannel,
+            string UniqueReason,
+            IReadOnlyList<DispatcharrChannel> AmbiguousCandidates)
+        {
+            public static UnknownMatch NoMatch() =>
+                new(UnknownMatchState.NoMatch, default!, string.Empty, Array.Empty<DispatcharrChannel>());
+            public static UnknownMatch Unique(DispatcharrChannel channel, string reason) =>
+                new(UnknownMatchState.Unique, channel, reason, Array.Empty<DispatcharrChannel>());
+            public static UnknownMatch Ambiguous(IReadOnlyList<DispatcharrChannel> candidates) =>
+                new(UnknownMatchState.Ambiguous, default!, string.Empty, candidates);
         }
 
         /// <summary>
@@ -486,16 +597,34 @@ namespace m3uCrawler.Services.Matching
         ///         the identity (or the existing channel name) to a
         ///         canonical that equals the other side.</item>
         /// </list>
+        ///
         /// <para>
         /// Fuzzy similarity is NOT used. A near-miss name like
         /// "Fox Sportz" must not attach to "Fox Sports" via score.
         /// </para>
+        ///
+        /// <para>
+        /// <b>Ambiguity rule for Unknown</b>: the method collects
+        /// ALL candidates (exact + alias) and returns a tri-state:
+        /// <list type="bullet">
+        ///   <item>0 candidates → <see cref="UnknownMatch.NoMatch"/>;
+        ///         caller routes to <c>UnknownReviewRequired</c> with
+        ///         <c>no-exact-or-alias-match</c>.</item>
+        ///   <item>1 candidate → <see cref="UnknownMatch.Unique"/>,
+        ///         attaches to that channel.</item>
+        ///   <item>2+ candidates → <see cref="UnknownMatch.Ambiguous"/>;
+        ///         caller routes to <c>UnknownReviewRequired</c>
+        ///         with <c>ambiguous-exact-or-alias-match</c>.
+        ///         <b>Never</b> chooses arbitrarily.</item>
+        /// </list>
+        /// </para>
         /// </summary>
-        private (DispatcharrChannel? Channel, string? Reason) FindUnknownMatch(
+        private UnknownMatch FindUnknownMatch(
             string identity,
             IReadOnlyList<DispatcharrChannel> existing)
         {
             var identityAlias = _aliases.Resolve(identity);
+            var candidates = new List<(DispatcharrChannel Channel, string Reason)>(capacity: 0);
 
             foreach (var c in existing)
             {
@@ -505,7 +634,8 @@ namespace m3uCrawler.Services.Matching
                 // Path 1: exact equality of normalized identity.
                 if (string.Equals(identity, cNameNormalized, StringComparison.Ordinal))
                 {
-                    return (c, "exact-identity");
+                    candidates.Add((c, "exact-identity"));
+                    continue;
                 }
 
                 // Path 2: explicit alias matches.
@@ -513,21 +643,38 @@ namespace m3uCrawler.Services.Matching
                 if (identityAlias != null && cAlias != null
                     && string.Equals(identityAlias.Canonical, cAlias.Canonical, StringComparison.Ordinal))
                 {
-                    return (c, $"alias:{identityAlias.Reason}->{cAlias.Canonical}");
+                    candidates.Add((c, $"alias:{identityAlias.Reason}->{cAlias.Canonical}"));
+                    continue;
                 }
                 if (identityAlias != null
                     && string.Equals(identityAlias.Canonical, cNameNormalized, StringComparison.Ordinal))
                 {
-                    return (c, $"alias:{identityAlias.Reason}");
+                    candidates.Add((c, $"alias:{identityAlias.Reason}"));
+                    continue;
                 }
                 if (cAlias != null
                     && string.Equals(identity, cAlias.Canonical, StringComparison.Ordinal))
                 {
-                    return (c, $"alias:{cAlias.Reason}");
+                    candidates.Add((c, $"alias:{cAlias.Reason}"));
+                    continue;
                 }
             }
 
-            return (null, null);
+            if (candidates.Count == 0)
+            {
+                return UnknownMatch.NoMatch();
+            }
+            if (candidates.Count == 1)
+            {
+                return UnknownMatch.Unique(candidates[0].Channel, candidates[0].Reason);
+            }
+            // 2+ candidates: ambiguity. Caller routes to
+            // UnknownReviewRequired with diagnostic. We expose the
+            // candidate channel ids (not the reason) — the diagnostic
+            // suffix on the review-required entry records the
+            // ambiguity ("ambiguous-exact-or-alias-match") and the
+            // operator can resolve manually.
+            return UnknownMatch.Ambiguous(candidates.Select(c => c.Channel).ToList());
         }
 
         /// <summary>

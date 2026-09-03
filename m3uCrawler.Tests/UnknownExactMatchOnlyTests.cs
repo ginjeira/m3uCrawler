@@ -293,4 +293,203 @@ public class UnknownExactMatchOnlyTests
         // Dispatcharr, sem match existente).
         Assert.Contains(plan.UnknownReviewRequired, r => r.Title == "RTP N");
     }
+
+    // ===================== Lacuna 1: exact/alias match único =====================
+
+    [Fact]
+    public void Unknown_with_two_exact_matches_in_existing_is_ambiguous_review_required()
+    {
+        // "Meo TV" existe em Dispatcharr com id=1 e id=2 (dois canais
+        // distintos com nomes que normalizam para "meo tv"). Uma stream
+        // Unknown "Meo TV" encontra dois candidatos exactos. Política:
+        // nunca escolher arbitrariamente — vai para review-required.
+        var existing = new DispatcharrState(
+            new[]
+            {
+                new DispatcharrChannel(1, "Meo TV", "PORTUGAL", 1, null, Array.Empty<long>()),
+                new DispatcharrChannel(2, "MEO TV", "PORTUGAL", 2, null, Array.Empty<long>()),
+            },
+            Array.Empty<DispatcharrStream>(),
+            new[] { new DispatcharrChannelGroup(45, "PORTUGAL") },
+            null);
+        var plan = Build(new[] { Stream("Meo TV", "PORTUGAL") }, existing);
+
+        Assert.Empty(plan.Channels);
+        Assert.Single(plan.UnknownReviewRequired);
+        var ex = plan.UnknownReviewRequired[0];
+        Assert.Equal("Meo TV", ex.Title);
+        Assert.Equal(ChannelKind.Unknown, ex.Kind);
+        // O diagnóstico deve distinguir "ambiguous" do "no match".
+        Assert.Contains("ambiguous", ex.Reason);
+        Assert.Equal(0, plan.Counts.MatchingDisposition["unknownMatchedToExisting"]);
+        Assert.Equal(1, plan.Counts.MatchingDisposition["unknownReviewRequired"]);
+    }
+
+    [Fact]
+    public void Unknown_with_two_alias_matches_in_existing_is_ambiguous_review_required()
+    {
+        // Duas channels distintas ("MEO TV" e "MEO TV SPORT") cujos
+        // nomes ambos resolvem para o canonical "Meo TV" via aliasMap.
+        // A stream Unknown "MEO TV" encontra dois candidatos alias
+        // para o mesmo canonical. Política: review-required, nunca
+        // escolher arbitrariamente.
+        var aliases = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["MEO TV"] = "Meo TV",
+            ["MEO TV SPORT"] = "Meo TV",
+        };
+        var existing = new DispatcharrState(
+            new[]
+            {
+                new DispatcharrChannel(11, "MEO TV", "PORTUGAL", 1, null, Array.Empty<long>()),
+                new DispatcharrChannel(22, "MEO TV SPORT", "PORTUGAL", 2, null, Array.Empty<long>()),
+            },
+            Array.Empty<DispatcharrStream>(),
+            new[] { new DispatcharrChannelGroup(46, "PORTUGAL") },
+            null);
+        var plan = Build(
+            new[] { Stream("MEO TV", "PORTUGAL") },
+            existing,
+            aliases);
+
+        Assert.Empty(plan.Channels);
+        Assert.Single(plan.UnknownReviewRequired);
+        Assert.Contains("ambiguous", plan.UnknownReviewRequired[0].Reason);
+        Assert.Equal(0, plan.Counts.MatchingDisposition["unknownMatchedToExisting"]);
+    }
+
+    [Fact]
+    public void Unknown_with_single_exact_match_among_many_non_matching_attaches()
+    {
+        // Cenário controle: 1 candidate exacto entre vários non-matches.
+        // Deve anexar determinísticamente.
+        var existing = new DispatcharrState(
+            new[]
+            {
+                new DispatcharrChannel(101, "Foo", "X", 1, null, Array.Empty<long>()),
+                new DispatcharrChannel(102, "Meo TV", "PORTUGAL", 2, null, Array.Empty<long>()),
+                new DispatcharrChannel(103, "Bar", "Y", 3, null, Array.Empty<long>()),
+            },
+            Array.Empty<DispatcharrStream>(),
+            new[]
+            {
+                new DispatcharrChannelGroup(1, "X"),
+                new DispatcharrChannelGroup(2, "PORTUGAL"),
+                new DispatcharrChannelGroup(3, "Y"),
+            },
+            null);
+        var plan = Build(new[] { Stream("Meo TV", "PORTUGAL") }, existing);
+
+        Assert.Single(plan.Channels);
+        Assert.Equal(102L, plan.Channels[0].ExistingChannelId);
+        Assert.Equal(1, plan.Counts.MatchingDisposition["unknownMatchedToExisting"]);
+    }
+
+    // ===================== Lacuna 2: tier collision por alias partilhado =====================
+
+    [Fact]
+    public void Permutation_same_resolved_identity_via_alias_tier_collision_produces_deterministic_result()
+    {
+        // Both streams resolve to the SAME identity "sic" via
+        // alias map ("SIC XYZ" -> "SIC"). The curated stream is
+        // Channel; the aliased one is Unknown. They MUST go to
+        // separate tier buckets and produce independent decisions
+        // regardless of input order.
+        var aliases = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["SIC XYZ"] = "SIC",
+        };
+        var sicCurated = Stream("SIC", "PORTUGUESE");
+        var sicUnknown = Stream("SIC XYZ", "PORTUGUESE");
+
+        var planA = Build(new[] { sicCurated, sicUnknown },
+            new DispatcharrState(
+                Array.Empty<DispatcharrChannel>(),
+                Array.Empty<DispatcharrStream>(),
+                Array.Empty<DispatcharrChannelGroup>(),
+                null),
+            aliases);
+
+        var planB = Build(new[] { sicUnknown, sicCurated },
+            new DispatcharrState(
+                Array.Empty<DispatcharrChannel>(),
+                Array.Empty<DispatcharrStream>(),
+                Array.Empty<DispatcharrChannelGroup>(),
+                null),
+            aliases);
+
+        // SIC curated tier: NewChannel.
+        // SIC XYZ Unknown tier: review-required (no existing match).
+        var planACurated = planA.Channels.SingleOrDefault(c =>
+            c.Outcome == SyncOutcome.NewChannel && c.Identity == "sic");
+        Assert.NotNull(planACurated);
+        Assert.Single(planACurated.Streams); // Apenas a stream curated, não SIC XYZ
+        Assert.Equal("SIC", planACurated.Streams[0].StreamName);
+        Assert.Single(planA.UnknownReviewRequired);
+        Assert.Equal("SIC XYZ", planA.UnknownReviewRequired[0].Title);
+
+        // Ordem inversa produz o mesmo resultado.
+        var planBCurated = planB.Channels.SingleOrDefault(c =>
+            c.Outcome == SyncOutcome.NewChannel && c.Identity == "sic");
+        Assert.NotNull(planBCurated);
+        Assert.Single(planBCurated.Streams);
+        Assert.Equal("SIC", planBCurated.Streams[0].StreamName);
+        Assert.Single(planB.UnknownReviewRequired);
+        Assert.Equal("SIC XYZ", planB.UnknownReviewRequired[0].Title);
+
+        // Contagens idênticas nas duas ordens.
+        Assert.Equal(
+            planA.Counts.MatchingDisposition["newChannelsFromCuratedIdentity"],
+            planB.Counts.MatchingDisposition["newChannelsFromCuratedIdentity"]);
+        Assert.Equal(
+            planA.Counts.MatchingDisposition["unknownReviewRequired"],
+            planB.Counts.MatchingDisposition["unknownReviewRequired"]);
+    }
+
+    [Fact]
+    public void Permutation_same_resolved_identity_via_alias_with_existing_channel_does_not_attach_Unknown_to_existing()
+    {
+        // Curated "SIC" + Unknown "SIC XYZ" (alias -> SIC) with
+        // existing "SIC" channel. Curated may match; Unknown can
+        // ONLY attach by exact/alias. SIC XYZ normalizes to "sic
+        // xyz" but ResolveIdentity("SIC XYZ") returns "sic" via
+        // alias. The existing channel is "SIC" normalized to "sic".
+        // So FindUnknownMatch sees identity="sic" == "sic" -> exact match.
+        //
+        // Per the current contract, "SIC XYZ" is an Unknown stream
+        // with `alias:SIC` to "sic". It SHOULD be allowed to attach
+        // to the existing "SIC" channel (alias match), as a single
+        // new stream. Reconciler must produce no more than one
+        // decision per existingChannelId regardless of input order.
+        var aliases = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["SIC XYZ"] = "SIC",
+        };
+        var existing = new DispatcharrState(
+            new[] { new DispatcharrChannel(700, "SIC", "PORTUGUESE", 7, null, Array.Empty<long>()) },
+            Array.Empty<DispatcharrStream>(),
+            new[] { new DispatcharrChannelGroup(1, "PORTUGUESE") },
+            null);
+
+        var sicCurated = Stream("SIC", "PORTUGUESE");
+        var sicUnknown = Stream("SIC XYZ", "PORTUGUESE");
+
+        var planA = Build(new[] { sicCurated, sicUnknown }, existing, aliases);
+        var planB = Build(new[] { sicUnknown, sicCurated }, existing, aliases);
+
+        // Apenas uma decisão: ExistingReassigned (SIC curated anexou,
+        // SIC XYZ Unknown anexou via alias exact-identity).
+        Assert.Single(planA.Channels);
+        Assert.Equal(700L, planA.Channels[0].ExistingChannelId);
+        Assert.Equal(0, planA.Counts.MatchingDisposition["newChannelsFromCuratedIdentity"]);
+        Assert.Equal(1, planA.Counts.MatchingDisposition["unknownMatchedToExisting"]);
+        Assert.Empty(planA.UnknownReviewRequired);
+
+        // Ordem inversa produz o mesmo resultado.
+        Assert.Single(planB.Channels);
+        Assert.Equal(700L, planB.Channels[0].ExistingChannelId);
+        Assert.Equal(0, planB.Counts.MatchingDisposition["newChannelsFromCuratedIdentity"]);
+        Assert.Equal(1, planB.Counts.MatchingDisposition["unknownMatchedToExisting"]);
+        Assert.Empty(planB.UnknownReviewRequired);
+    }
 }

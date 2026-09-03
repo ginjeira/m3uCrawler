@@ -8,11 +8,17 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 ## [Unreleased]
 
 ### ✨ Adicionado
-- **Segurança de Unknown → matching (commit `c3e0e4f`)** (esta iteração): uma entrada `Unknown` nunca pode usar fuzzy matching para anexar streams a um canal existente. A política de 3 níveis foi subdividida em dois **tiers** (Curated / Unknown) com bucket storage separado:
+- **Segurança de Unknown → matching (commits `c3e0e4f` → `b3f2a1e`)** (esta iteração): uma entrada `Unknown` nunca pode usar fuzzy matching para anexar streams a um canal existente. A política de 3 níveis foi subdividida em dois **tiers** (Curated / Unknown) com bucket storage separado:
   - **Curated** (`Channel`): fuzzy + alias + threshold (80). Pode produzir `NewChannel`.
   - **Unknown**: apenas match por **igualdade normalizada** ou **alias explícito**. Pode anexar streams a um canal existente (`ExistingReassigned`/`ExistingUnchanged`); nunca produz `NewChannel`. Se não houver match exacto/alias → `UnknownReviewRequired`.
   - O bucket storage é keyed por `(BucketTier, Identity)`: streams da mesma identidade normalizada em tiers diferentes (e.g. SIC curado + SIC XYZ Unknown) ficam em buckets separados e produzem decisões independentes. A ordem de chegada das streams não pode fazer com que uma stream `Unknown` seja promovida a `NewChannel` ou que uma stream curada seja anexada por fuzzy a um canal diferente.
 - **Testes de regressão** (7 novos): `UnknownExactMatchOnlyTests` cobre (a) `Fox Sportz` (typo) nunca anexa a `Fox Sports` via fuzzy; (b) `Meo TV` (igualdade exacta) anexa; (c) alias explícito `MEO → Meo TV` anexa; (d) ausência de alias não fuzzy-matcha; (e) permutação de ordem entre streams curated e Unknown da mesma identidade produz NewChannel único para a curada; (f) `RTP NOTICIAS` (curado) pode fuzzy-matchar `RTP 1` mas `RTP N` (Unknown) nunca.
+- **Determinismo de exact/alias match para Unknown** (commit `b3f2a1e`): `FindUnknownMatch` recolhe **todos** os candidatos exactos/aliases antes de decidir. A política é estritamente:
+  - 0 candidatos → `UnknownReviewRequired` com `no-exact-or-alias-match`.
+  - 1 candidato → `unknownMatchedToExisting` (anexa).
+  - 2+ candidatos → `UnknownReviewRequired` com `ambiguous-exact-or-alias-match`.
+  - Nunca escolhe `First()` ou equivalente para `Unknown`. O novo tipo `UnknownMatch` (tri-state: `NoMatch` / `Unique` / `Ambiguous`) e o helper `RecordUnknownAmbiguous` formalizam este contrato.
+- **Teste de tier collision com alias partilhado** (commit `b3f2a1e`): com `aliasMap["SIC XYZ"] = "SIC"`, ambas as streams `SIC` (curated) e `SIC XYZ` (Unknown) resolvem para o mesmo identity `sic` em buckets de tier distintos. Executa-se as permutações `[SIC, SIC XYZ]` e `[SIC XYZ, SIC]`. Sem canais existentes: NewChannel único (curated) + UnknownReviewRequired (SIC XYZ), contagens e decisões idênticas. Com canal existente SIC: ambos anexam via alias exact-identity, reconciliação produz uma única decisão para `existingChannelId=700`.
 - **Política documentada de `Foreign`**: `ChannelKind.Foreign` é emitido **apenas** quando o source group é estrangeiro em `GroupTaxonomy` E o título não é uma identidade curada. Títulos curados em grupos estrangeiros são `ChannelKind.Channel` e o carácter estrangeiro é expresso como `OutputGroupKind.Foreign` no `ResolutionPolicy`.
 
 ### 🔧 Alterado
@@ -54,7 +60,7 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ### 📊 Estado
 - Build: `dotnet build m3uCrawler.sln --configuration Release` → **0 warnings, 0 errors**.
-- Testes: `dotnet test m3uCrawler.Tests/m3uCrawler.Tests.csproj --configuration Release --no-build --nologo` → **1034 testes passados, 0 falhados**.
+- Testes: `dotnet test m3uCrawler.Tests/m3uCrawler.Tests.csproj --configuration Release --no-build --nologo` → **1039 testes passados, 0 falhados**.
 - actionlint: **0 errors, 0 warnings**.
 - Imagem rollback preservada: `sha256:27b0b18dd81e9c01416bad674cfbe86515a9994be4565bb44dda49fb2e50b97e`.
 
