@@ -7,11 +7,12 @@
 ## Estado actual
 
 - **Aplicação funcional** com pipeline Telegram completo: descoberta independente de keyword → detecção M3U → parser → validação por país (threshold 3, matching por tokens) → extracção e teste de streams → relatório detalhado.
-- **Dashboard web** (`--web`) com gestão de listas de canais por país, diagnóstico da última execução, últimas playlists descobertas e pré-visualização sanitizada das playlists. Protecção opcional por token (`--web-token`).
+- **Dashboard web** (`--web`) com gestão de listas de canais por país, diagnóstico da última execução, últimas playlists descobertas e pré-visualização sanitizada das playlists. Protecção opcional por token (`--web-token`). `--web` standalone funciona sem `--telegram`.
 - **Modo manutenção** (`--telegram-maintain`) preserva `playlist.m3u` quando não há novos candidatos.
 - **Sincronização Dispatcharr** (opt-in via `dispatcharr_enabled=true` em `wtelegram.config`): pós-playlist, o pipeline pode agora gerar um `MatchPlan` (matching puro, determinístico, com normalização + aliases + fuzzy + numeric-sibling guard + source ordering por provider/qualidade/reliability) e aplicá-lo ao Dispatcharr. Default `dispatcharr_dry_run=true` — primeiro rollout escreve apenas `output/dispatcharr_plan_<ts>.json` e `output/dispatcharr_report_<ts>.json`. Ver "Limitações" abaixo.
-- **Deployment** migrado para **Docker Compose** com imagem publicada em `ghcr.io/ginjeira/m3ucrawler:latest` e bind mounts absolutos para `/opt/m3ucrawler/runtime-data`. Ver `DEPLOYMENT.md`.
-- **Cobertura de testes**: 314 testes unitários, 0 warnings em `dotnet build m3uCrawler.sln --configuration Release` (snapshot em 2026-08-30).
+- **Deployment** migrado para **Docker Compose** com imagem publicada em `ghcr.io/ginjeira/m3ucrawler` (pinning por digest imutável em produção) e bind mounts absolutos para `/opt/m3ucrawler/runtime-data`. Ver `DEPLOYMENT.md`.
+- **Coerência OCI ↔ BuildInfo ↔ `/api/version`** (commits `3a338d8` → `0797b40`): a imagem publicada embute o mesmo `AssemblyInformationalVersion` que os OCI labels anunciam. Ver `CHANGELOG.md` `[Unreleased]`.
+- **Cobertura de testes**: 1039 testes unitários, 0 warnings em `dotnet build m3uCrawler.sln --configuration Release` (snapshot em 2026-09-03).
 - **Sanitização de credenciais** em logs, relatórios JSON, `RunReport`, preview do dashboard e mensagens de erro. A playlist M3U funcional preserva URLs Xtream reais, como esperado. O `MatchPlanSerializer` re-aplica `CredentialSanitizer.SanitizeUrl` ao campo `streamUrl` antes de escrever.
 
 ---
@@ -24,6 +25,8 @@
 - **Pipeline Telegram** (commits `39e4216` → `d083d84`): descoberta independente de keyword, parser M3U centralizado, validação por país com matching por tokens e threshold 3, suporte Xtream Codes (URLs de servidor e de playlist), sanitização de credenciais, dashboard alinhado com o pipeline, modo manutenção sem perda de streams, `RunReport` detalhado, `--telegram-maintain` corrigido para preservar `playlist.m3u` quando não há novos candidatos.
 - **Filtro per-stream por país** (`c07da69`, `d083d84`): unificação do `CountryChannelValidator` (matching por tokens, famílias canónicas, variantes colapsadas, fallback por `group-title` apenas para categorias explícitas, protecção contra falsos positivos de aliases curtos), integração no pipeline Telegram, testes dedicados.
 - **Migração para Docker Compose** (lado repositório concluído): `docker-compose.yml` reescrito com imagem, comando, porta e bind mounts alinhados com a instalação real. Cutover no servidor `/opt/m3ucrawler` é estado operacional externo (ver "Estados externos ao repositório").
+- **Coerência OCI ↔ BuildInfo ↔ `/api/version`** (commits `3a338d8` → `0797b40`, branch `fix/docker-buildinfo-metadata`, PR #1): Dockerfile expandido para `./` (inclui `Directory.Build.props`/`Directory.Build.targets`), `.dockerignore` na raiz com exclusões reforçadas, build-args do CI propagados a restore+publish, header CLI passa a derivar de `BuildInfo` (substitui o literal `Versão 2.1 - Novembro 2025`), `--web` standalone funciona sem `--telegram`, `DockerBuildInfoContractTests` cobre o contrato Dockerfile↔BuildInfo, e o step "Resolve published digest" do workflow GHCR usa `docker buildx imagetools inspect` (reutiliza `docker/login-action@v3` em vez do `GITHUB_TOKEN` que não tem `read:packages`). Producao live em digest imutável `sha256:a29bbfe1cf84d2db3411d5713986215d9bf8c062d71b859b4844caf483c1d4a6` (commit `e0f62e2`, build 53, OCI labels e BuildInfo coerentes).
+- **Fronteira Classification → Matching** (commits `3a4af81` → `3f4af81` → `c3e0e4f`, branch `fix/docker-buildinfo-metadata`, PR #2 + PR #3): `ContentClassifier.Classify` corre antes do bucket de canais. A política de 3 níveis (exclude / match-existing / create-new) é subdividida em dois **tiers** (Curated / Unknown) com bucket storage separado `(tier, identity)`: streams da mesma identidade em tiers diferentes ficam em buckets distintos, eliminando a dependência da ordem de chegada. Tier Curated usa fuzzy + alias + threshold (80) e pode produzir `NewChannel` quando não há match; tier Unknown apenas por **igualdade normalizada** ou **alias explícito** (nunca fuzzy), pode anexar streams a canais existentes mas nunca gera `NewChannel` — entradas sem match exacto/alias vão para `UnknownReviewRequired`. `Bundle / Vod / LiveCam / Placeholder` nunca chegam a bucket (preserva a correcção da PR #2 contra `PT - NO EVENT`, `Filmes 24/7`). `SourceGroupCategoryLookup` é consumido pelo classificador para detectar source-groups editoriais. `ChannelKind.Group` e `ChannelKind.Category` foram removidos do enum (não eram emitidos por regra alguma). Endpoint `GET /api/classification-summary` no dashboard expõe as contagens por disposição (`excluded`, `unknownMatchedToExisting`, `unknownReviewRequired`, `newChannelsFromCuratedIdentity`) e a amostra sanitizada.
 
 ---
 
@@ -52,16 +55,14 @@
 
 ## Problemas técnicos conhecidos
 
-- **Race condition na publicação da imagem GHCR.** O workflow `docker-ghcr.yml` não declara `concurrency:`. Em pushes muito próximos, dois jobs podem correr em paralelo e o `latest` pode ficar a apontar para um commit que não é o último. Mitigação actual: o workflow é triggado por pushes manuais a `main`, o que torna a janela pequena. Mitigação alvo: adicionar `concurrency:` ao workflow.
-- **`latest` pode estar dessincronizado de `main`.** Sem credencial GHCR do lado do agente, não é possível confirmar se a tag `latest` foi actualizada após `c07da69` e `d083d84`. O runbook em `DEPLOYMENT.md` § 5 inclui um passo de verificação do digest após `docker compose pull` para apanhar este caso antes do `up -d`.
 - **`EXEMPLOS.md` e `STREAM_LIMIT_GUIDE.md` descrevem o comportamento v2.1 (pré-pipeline Telegram)**. Os exemplos CLI ainda mostram apenas `dotnet run -- "iptv portugal"` e fluxos de pesquisa web. Não contradizem a aplicação actual mas confundem quem entra pelo topo.
-- **`README.md` (root)** — estado confirmado em 2026-08-30 com `dotnet test m3uCrawler.sln --configuration Release`: **153 testes passados, 0 warnings** em build Release. Os exemplos CLI foram actualizados para `--history-hours 360` e a referência a `m3uCrawler-main.zip` foi removida da estrutura do repositório. Inconsistências remanescentes: ver secção "Dívida documental confirmada" abaixo.
+- **`README.md` (root)** — estado confirmado em 2026-09-03 com `dotnet test m3uCrawler.Tests/m3uCrawler.Tests.csproj --configuration Release`: **977 testes passados, 0 warnings** em build Release. Os exemplos CLI foram actualizados para `--history-hours 360` e a referência a `m3uCrawler-main.zip` foi removida da estrutura do repositório. Inconsistências remanescentes: ver secção "Dívida documental confirmada" abaixo.
 - **Sem testes de integração de rede** (Telegram, HTTP de streams). Os testes são unitários e não exercitam o pipeline ponta-a-ponta. Aceitável para o estado actual; pode tornar-se limitação à medida que o pipeline crescer.
 
 ### Dívida documental confirmada
 
 - **`STREAM_LIMIT_GUIDE.md` e `m3uCrawler/EXEMPLOS.md`** descrevem o comportamento v2.1 (pré-pipeline Telegram). Os exemplos CLI ainda mostram apenas `dotnet run -- "iptv portugal"` e fluxos de pesquisa web. Não contradizem tecnicamente a aplicação actual mas confundem quem entra pelo topo. **Estado decidido**: não reescritos nesta fase; marcados aqui como follow-up a tratar numa iteração futura (opções: remover, redireccionar para `m3uCrawler/README.md`, ou substituir por secção mínima alinhada com o pipeline actual).
-- **`CHANGELOG.md` `[Unreleased]` mistura features concluídas com afirmações numéricas datadas** (ex.: "87 testes"). A contagem actual, confirmada pela execução de `dotnet test m3uCrawler.sln --configuration Release`, é **153 testes passados**. A contagem em `m3uCrawler/README.md` (50 testes) e em `CHANGELOG.md` (87) está obsoleta. A corrigir em sincronia.
+- **`CHANGELOG.md`** agora regista 977 testes em `[Unreleased]` (snapshot 2026-09-03). As contagens antigas (87, 153) foram consolidadas; o cabeçalho `[Unreleased]` substitui o anterior que tinha mistura de features concluídas com afirmações numéricas datadas.
 
 ---
 
@@ -69,8 +70,8 @@
 
 Os pontos abaixo **não podem ser determinados a partir do repositório** — são estado operacional do servidor `/opt/m3ucrawler` que será validado apenas durante a fase de deployment:
 
-- **Estado real do container no servidor**: saber se o container `m3ucrawler` actualmente em execução é o manual (criado por `docker run`) ou já o Compose-managed; saber se a migração cutover já foi executada.
-- **Alinhamento `ghcr.io/ginjeira/m3ucrawler:latest` ↔ `origin/main`**: se a imagem foi republicada após `c07da69` e `d083d84`. Sem credencial GHCR, não verificável.
+- **Estado real do container no servidor**: sabe-se que está em produção desde B1.3 (2026-09-02), pinned por digest imutável `sha256:a29bbfe1cf84d2db3411d5713986215d9bf8c062d71b859b4844caf483c1d4a6` (commit `e0f62e2`). `RestartCount=0`, `/api/version` coerente com OCI labels.
+- **Alinhamento `ghcr.io/ginjeira/m3ucrawler` ↔ código**: alinhamento confirmado — PR #1 está aberto com 4 commits coerentes (A1 + B1.2-FIX + B1.2-FIX2 + B1.4), merge para `main` pendente de aprovação.
 - **Decisão operacional sobre `--web-token` em produção**: depende do administrador.
 - **Permissões exactas de `/opt/m3ucrawler/runtime-data`**: depende da política local do host.
 

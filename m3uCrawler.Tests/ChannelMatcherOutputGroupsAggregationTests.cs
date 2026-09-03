@@ -48,13 +48,17 @@ public class ChannelMatcherOutputGroupsAggregationTests
     public void Counts_OutputGroups_aggregates_OutputGroup_per_ChannelDecision()
     {
         var matcher = NewMatcher();
+        // Use only titles that survive the new ContentClassifier
+        // (ChannelCategoryLookup.Contains). The architectural
+        // boundary established by this iteration ensures unmapped
+        // titles are NOT promoted to channels.
         var plan = BuildPlan(
             matcher,
             Stream("SIC", "eu | pt | general"),
             Stream("RTP 1", "eu | pt | documentarios"),
             Stream("TVI", "portugal - canais 24-7"),
-            Stream("Canal BENELUX", "eu | belgium"),
-            Stream("Canal LATAM", "am | latino"));
+            Stream("CNN Portugal", "eu | belgium"),
+            Stream("Euronews Portugal", "am | latino"));
 
         var og = plan.Counts.OutputGroups;
         Assert.NotNull(og);

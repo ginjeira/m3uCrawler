@@ -126,17 +126,24 @@ public class ChannelMatcherIntegrationTests
     }
 
     [Fact]
-    public void OutputGroup_ContentType_VOD_overrides_Category()
+    public void OutputGroup_ContentType_VOD_entries_are_excluded_from_channel_pipeline()
     {
-        // "vod | portugal" as a *group* is excluded by the bundle guard
-        // (never becomes a channel). To exercise the VOD path through
-        // ResolutionPolicy we need a stream whose TITLE matches the VOD
-        // pattern while the group is a normal PT group.
+        // VOD entries (titles like "PT - <título> - <ano>") are now
+        // excluded from the channel-matching pipeline by the
+        // ContentClassifier (ChannelKind.Vod). The architectural
+        // boundary established by this iteration ensures VOD files
+        // never produce a NewChannel decision.
+        //
+        // This test verifies the exclusion + classification surface
+        // rather than the legacy behaviour (VOD as channel with
+        // OutputGroup=PortugalVOD), which would have masked the
+        // very problem the brief asks us to fix.
         var matcher = NewMatcherWithResolution();
         var plan = BuildPlan(matcher,
             Stream("PT - O Coração Delator - 2025", "Portugal"));
-        Assert.Single(plan.Channels);
-        Assert.Equal(OutputGroupKind.PortugalVOD, plan.Channels[0].OutputGroup);
+        Assert.Empty(plan.Channels);
+        Assert.Single(plan.ClassifiedExclusions);
+        Assert.Equal(ChannelKind.Vod, plan.ClassifiedExclusions[0].Kind);
     }
 
     [Fact]

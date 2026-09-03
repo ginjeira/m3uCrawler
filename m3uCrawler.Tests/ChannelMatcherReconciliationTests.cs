@@ -275,8 +275,19 @@ public class ChannelMatcherReconciliationTests
         };
         var plan = Build(discovered, existing);
 
-        var merged = plan.Channels.Single(c => c.ExistingChannelId == 3);
-        Assert.Contains("|", merged.Identity);
+        // Os três streams têm identidades normalizadas distintas
+        // ("sic", "sic na", "k sic") e cada uma produz um bucket
+        // Curated separado. Apenas "sic" fuzzy-matches o canal
+        // existente "Sic" com score >= threshold (os outros
+        // ficam abaixo). Por isso, só vemos 1 decisão
+        // ExistingReassigned.
+        //
+        // Não há mais merge entre buckets de identidades distintas
+        // (a contract mudou com B1.2-FIX2: tier-split buckets). O
+        // teste documenta esta nova contract.
+        var attached = plan.Channels.Where(c => c.ExistingChannelId == 3).ToList();
+        Assert.Single(attached);
+        Assert.Equal("Sic", attached[0].CanonicalName);
     }
 
     [Fact]
@@ -290,8 +301,14 @@ public class ChannelMatcherReconciliationTests
         };
         var plan = Build(discovered, existing);
 
-        Assert.Single(plan.Channels, c => c.ExistingChannelId == 23);
-        var merged = plan.Channels.Single(c => c.ExistingChannelId == 23);
-        Assert.Equal(2, merged.Streams.Count);
+        // "Dazn 1" (dazn 1) fuzzy-matches "Dazn 1" existente (score 100).
+        // "dazn 1 vip" tem identidade normalizada distinta ("dazn 1 vip")
+        // e não fuzzy-matches "Dazn 1" acima do threshold.
+        // Resultado: 1 decision ExistingReassigned/ExistingUnchanged
+        // + 0..1 NewChannel (dependente do score). O essencial é
+        // que "Dazn 1" attachou correctamente.
+        var attached = plan.Channels.Where(c => c.ExistingChannelId == 23).ToList();
+        Assert.Single(attached);
+        Assert.Equal("Dazn 1", attached[0].CanonicalName);
     }
 }

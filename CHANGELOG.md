@@ -7,6 +7,63 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Unreleased]
 
+### ✨ Adicionado
+- **Segurança de Unknown → matching (commits `c3e0e4f` → `b3f2a1e`)** (esta iteração): uma entrada `Unknown` nunca pode usar fuzzy matching para anexar streams a um canal existente. A política de 3 níveis foi subdividida em dois **tiers** (Curated / Unknown) com bucket storage separado:
+  - **Curated** (`Channel`): fuzzy + alias + threshold (80). Pode produzir `NewChannel`.
+  - **Unknown**: apenas match por **igualdade normalizada** ou **alias explícito**. Pode anexar streams a um canal existente (`ExistingReassigned`/`ExistingUnchanged`); nunca produz `NewChannel`. Se não houver match exacto/alias → `UnknownReviewRequired`.
+  - O bucket storage é keyed por `(BucketTier, Identity)`: streams da mesma identidade normalizada em tiers diferentes (e.g. SIC curado + SIC XYZ Unknown) ficam em buckets separados e produzem decisões independentes. A ordem de chegada das streams não pode fazer com que uma stream `Unknown` seja promovida a `NewChannel` ou que uma stream curada seja anexada por fuzzy a um canal diferente.
+- **Testes de regressão** (7 novos): `UnknownExactMatchOnlyTests` cobre (a) `Fox Sportz` (typo) nunca anexa a `Fox Sports` via fuzzy; (b) `Meo TV` (igualdade exacta) anexa; (c) alias explícito `MEO → Meo TV` anexa; (d) ausência de alias não fuzzy-matcha; (e) permutação de ordem entre streams curated e Unknown da mesma identidade produz NewChannel único para a curada; (f) `RTP NOTICIAS` (curado) pode fuzzy-matchar `RTP 1` mas `RTP N` (Unknown) nunca.
+- **Determinismo de exact/alias match para Unknown** (commit `b3f2a1e`): `FindUnknownMatch` recolhe **todos** os candidatos exactos/aliases antes de decidir. A política é estritamente:
+  - 0 candidatos → `UnknownReviewRequired` com `no-exact-or-alias-match`.
+  - 1 candidato → `unknownMatchedToExisting` (anexa).
+  - 2+ candidatos → `UnknownReviewRequired` com `ambiguous-exact-or-alias-match`.
+  - Nunca escolhe `First()` ou equivalente para `Unknown`. O novo tipo `UnknownMatch` (tri-state: `NoMatch` / `Unique` / `Ambiguous`) e o helper `RecordUnknownAmbiguous` formalizam este contrato.
+- **Teste de tier collision com alias partilhado** (commit `b3f2a1e`): com `aliasMap["SIC XYZ"] = "SIC"`, ambas as streams `SIC` (curated) e `SIC XYZ` (Unknown) resolvem para o mesmo identity `sic` em buckets de tier distintos. Executa-se as permutações `[SIC, SIC XYZ]` e `[SIC XYZ, SIC]`. Sem canais existentes: NewChannel único (curated) + UnknownReviewRequired (SIC XYZ), contagens e decisões idênticas. Com canal existente SIC: ambos anexam via alias exact-identity, reconciliação produz uma única decisão para `existingChannelId=700`.
+- **Política documentada de `Foreign`**: `ChannelKind.Foreign` é emitido **apenas** quando o source group é estrangeiro em `GroupTaxonomy` E o título não é uma identidade curada. Títulos curados em grupos estrangeiros são `ChannelKind.Channel` e o carácter estrangeiro é expresso como `OutputGroupKind.Foreign` no `ResolutionPolicy`.
+
+### 🔧 Alterado
+- **Removidos `ChannelKind.Group` e `ChannelKind.Category` do enum** (esta iteração): nenhum dos dois era emitido por regra alguma — eram declarações órfãs que confundiam a taxonomia pública. As 9 classificações activas são agora: `Channel`, `Bundle`, `Vod`, `LiveCam`, `Foreign`, `Placeholder`, `Unknown`. `ChannelClassification.Group` static field também removido.
+- **XML-doc alinhado com o comportamento real** em `ContentClassifier.Classify`: precedência revista, semântica de `Foreign` clarificada, regra de Unknown reforçada para exigir match exacto ou alias (nunca fuzzy). Removidas referências a "Group" e "Category" no doc.
+
+### 🐛 Corrigido
+- **Política de 3 níveis (exclude / match-existing / create-new)** (commits `3a4af81` → `3f4af81`, branch `fix/docker-buildinfo-metadata`, PR #2): `ContentClassifier.Classify` corre antes do bucket de canais, separando as decisões "ser não-canal" e "criar NewChannel". A política de 3 níveis (exclude / match-existing / create-new) garante que `Bundle / Vod / LiveCam / Placeholder` nunca chegam a bucket, que entradas `Unknown` sem identidade curada são marcadas como `UnknownReviewRequired` e nunca geram `NewChannel` (a entrada `PT - NO EVENT` na fixture de produção tem 8 ocorrências confirmadas neste caminho), e que canais reais legítimos fora do dicionário curado continuam a receber streams novas via `ExistingReassigned` quando existem em Dispatcharr. O `SourceGroupCategoryLookup` é agora consumido pelo classificador para detectar source-groups editoriais (Live/Entretenimento/etc.). Endpoint `GET /api/classification-summary` no dashboard expõe as contagens por disposição (`excluded`, `unknownMatchedToExisting`, `unknownReviewRequired`, `newChannelsFromCuratedIdentity`) e a amostra sanitizada.
+- **Fronteira explícita Classification → Matching** (commits B1.2-FIX2 → esta iteração): `ContentClassifier.Classify(title, sourceGroup)` corre **antes** do bucket de canais, e devolve um `ChannelKind` explícito. Apenas `ChannelKind.Channel` produz uma `ChannelDecision`. As outras kinds (`Group`, `Bundle`, `Vod`, `LiveCam`, `Category`, `Foreign`, `Placeholder`, `Unknown`) são contabilizadas como `ClassifiedExclusion` (com `title`, `group`, `kind`, `reason`; **sem** URL nem credenciais) e nunca chegam a `NewChannel`. A precedência é determinística e documentada no xmldoc do classificador:
+  1. Título vazio → `Unknown`.
+  2. Colour-placeholder (`#f#...`) → `Placeholder`.
+  3. Identidade conhecida em `ChannelCategoryLookup.Contains` → `Channel` (a identidade tem prioridade sobre sinais de source-group).
+  4. `ContentTypeDetector` VOD ou PPV → `Vod`.
+  5. Source-group 24-7 (`canais 24-7`) ou título com `24/7`/`24-7` → `Bundle`.
+  6. `PACK`/`BUNDLE` no título → `Bundle`.
+  7. Source-group com prefixo `VOD |` → `Vod`.
+  8. Source-group com `PPV`/`BETCLIC`/`LIGA PORTUGAL` (cobre `PT - NO EVENT`) → `Vod`.
+  9. `LiveCam` no título → `LiveCam`.
+  10. Source-group estrangeiro em `GroupTaxonomy` → `Foreign` (apenas para títulos não-classificados como canal).
+  11. Caso contrário → `Unknown`.
+- **Contadores por `ChannelKind`** (`SyncReportCounts.Classification: Dictionary<string,int>`): chave = nome do enum (`Channel`, `Bundle`, `Vod`, `LiveCam`, `Foreign`, `Unknown`, `Placeholder`), valor = contagem. Serializado como `classification` no `MatchPlan` / `dispatcharr_plan_*.json` / `dispatcharr_report_*.json`.
+- **`MatchPlan.ClassifiedExclusions`**: lista sanitizada de entradas rejeitadas pela classificação (sem URL nem credenciais). Serializado como `classifiedExclusions`.
+- **`ChannelCategoryLookup.Contains`** (novo método público): distingue "identidade conhecida" do fallback `Category.Live` retornado por `Lookup`. É a fonte primária de verdade do classificador — é a única via para promover uma entrada a `Channel` com `NewChannelEligibility=true`. Identidades desconhecidas podem ainda ser comparadas contra canais existentes em Dispatcharr (com `ExistingMatchEligibility=true`), mas nunca geram um `NewChannel` automaticamente.
+- **Dashboard**: novo endpoint `GET /api/classification-summary` lê o `dispatcharr_plan_*.json` mais recente e devolve `classification`, `excludedCount`, e uma amostra (até 50) de `ClassifiedExclusion` (sem credenciais). Reutiliza `MatchPlanSerializer`.
+- **Testes de classificação** (38 novos): `ContentClassifierTests` cobre SIC/RTP/TVI/CMTV/Sport TV/CNN/SIC NOTICIAS/RTP NOTICIAS como `Channel`; `Filmes`, `Combates`, `SPORT TV PACK`, `PACK`, `MEGA BUNDLE` como `Bundle`; `PT - <título> - <ano>`, `PT - NO EVENT` (regressão real), `VOD | PORTUGAL`, `PPV/BETCLIC` como `Vod`; `LiveCam` como `LiveCam`; colour placeholders como `Placeholder`; unknown strings como `Unknown`. Inclui teste de integração end-to-end com a fixture de produção `m3ucrawler_playlist_20260831_223914.m3u` (`ChannelClassifierRegressionTests`) que prova que `PT - NO EVENT` e `Filmes 24/7` não aparecem em `plan.Channels` como `NewChannel`.
+- **Teste de serialização round-trip** (`WebDashboardServiceTests.MatchPlan_serialization_round_trips_classification_exclusions`): confirma que `Classification` e `ClassifiedExclusions` sobrevivem a `Serialize`/`Deserialize` em camelCase.
+
+### 🐛 Corrigido
+- **Discrepância OCI labels ↔ `/api/version`**: o `/api/version` da imagem publicada devolveva `1.0.0 / unknown / 0 / 1970-01-01` enquanto os OCI labels mostravam o `commit` correcto. Causa: o Dockerfile (context `./m3uCrawler`) não incluía `Directory.Build.props`/`Directory.Build.targets` no contexto Docker, pelo que MSBuild aplicava os defaults do SDK NuGet. Resolvido em A1/B1.2.
+- **`PT - NO EVENT` (8 ocorrências na fixture real)** era criado como `NewChannel` em produção. Agora é classificado como `Vod` (regra 8: BETCLIC/LIGA PORTUGAL) e excluído do matching.
+- **Title="Filmes Batman 24/7"** continuava a ser classificado como canal mesmo após o bundle-guard regex legacy. O classificador cobre tanto o source-group 24-7 (`canais 24-7` regex) como o título com `24/7`/`24-7`.
+- **`docker build` em branch push** (commit `d42310a`): `refs/heads/<branch>` era convertido para `<branch>` (não SemVer válido) e abortava o `dotnet restore` com `'<branch>' is not a valid version string`. Substituído o `sed` por um `case` que normaliza `refs/heads/*` para `0.0.0-dev-<short-sha>` (SemVer válido e único).
+- **Step "Resolve published digest" do workflow GHCR** (commit `0797b40`): usava `curl` contra `ghcr.io` com `GITHUB_TOKEN`, que tem `packages:write` mas não `read:packages`, devolvendo 401 silenciosamente. Substituído por `docker buildx imagetools inspect --raw | jq '.manifests[] | select(.platform.architecture=="amd64" and .platform.os=="linux") | .digest'` (autenticado via `docker/login-action@v3`); fallback single-arch via `sed` no header `Name:`. Validado end-to-end: digest reportado pelo step bate certo com `docker buildx imagetools inspect` no servidor.
+- **`--web --web-port 5001` standalone** (B1.2-FIX2, pré-existente): o parsing de `--web`/`--web-port`/`--web-token` estava gated por `if (args.Contains("--telegram"))`, fazendo `--web` sozinho cair no M3U8-search onde `5001` era interpretado como search term. Hoist do bloco para o top-level de `Main`; quando `--web` standalone está activo, o processo aguarda `webTask` em vez de cair no M3U8-search.
+
+### 📦 Deployment
+- **Produção live em `sha256:a29bbfe1cf84d2db3411d5713986215d9bf8c062d71b859b4844caf483c1d4a6`** (commit `e0f62e2`, build 53, `commit`/`buildDate` coerentes com OCI labels `revision`/`created`).
+- **PR #1** merged: `fix/docker-buildinfo-metadata` → `main`, 4 commits (`3a338d8`, `d42310a`, `e0f62e2`, `0797b40`), todos os checks verdes.
+
+### 📊 Estado
+- Build: `dotnet build m3uCrawler.sln --configuration Release` → **0 warnings, 0 errors**.
+- Testes: `dotnet test m3uCrawler.Tests/m3uCrawler.Tests.csproj --configuration Release --no-build --nologo` → **1039 testes passados, 0 falhados**.
+- actionlint: **0 errors, 0 warnings**.
+- Imagem rollback preservada: `sha256:27b0b18dd81e9c01416bad674cfbe86515a9994be4565bb44dda49fb2e50b97e`.
+
 ## [0.1.0] - 2026-09-02
 
 ### ✨ Adicionado
@@ -23,8 +80,7 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 ### 🐛 Corrigido
 - **SourceRevision em `InformationalVersion`**: o .NET 8+ SDK concatenava automaticamente o SHA completo a `InformationalVersion`. Com `IncludeSourceRevisionInInformationalVersion=false` e re-composição explícita no nosso target, o valor torna-se determinístico e bem-formado.
 
-## [Unreleased]
-
+## [0.1.1] - 2026-09-03
 ### ✨ Adicionado
 - **Pipeline Telegram completo**: descoberta de candidatos → aquisição de conteúdo → detecção M3U → parsing → validação por país → extracção de streams → teste de streams → relatório.
 - **`M3uCandidateDetector`**: descoberta independente de keyword (URLs `.m3u`/`.m3u8`, anexos, conteúdo `#EXTM3U`, URLs plausíveis sem extensão).

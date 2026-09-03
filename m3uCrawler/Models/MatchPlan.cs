@@ -13,6 +13,71 @@ namespace m3uCrawler.Models
         [JsonPropertyName("counts")] public SyncReportCounts Counts { get; init; } = new();
         [JsonPropertyName("channels")] public IReadOnlyList<ChannelDecision> Channels { get; init; } = Array.Empty<ChannelDecision>();
         [JsonPropertyName("ambiguousGroups")] public IReadOnlyList<AmbiguousGroupEntry> AmbiguousGroups { get; init; } = Array.Empty<AmbiguousGroupEntry>();
+
+        /// <summary>
+        /// Diagnostic list of streams excluded from the matching pipeline
+        /// because their classification was not <see cref="ChannelKind.Channel"/>.
+        /// Each entry carries the deterministic classification reason;
+        /// credentials and URLs are NEVER included (sanitisation is the
+        /// responsibility of the serializer / reporter).
+        /// </summary>
+        [JsonPropertyName("classifiedExclusions")] public IReadOnlyList<ClassifiedExclusion> ClassifiedExclusions { get; init; } = Array.Empty<ClassifiedExclusion>();
+
+        /// <summary>
+        /// Diagnostic list of streams classified as
+        /// <see cref="ChannelKind.Unknown"/> that could not be safely
+        /// attached to any existing channel in Dispatcharr (no match
+        /// or ambiguous match). Held back for manual review — they
+        /// NEVER produce <see cref="SyncOutcome.NewChannel"/>.
+        /// </summary>
+        [JsonPropertyName("unknownReviewRequired")] public IReadOnlyList<ClassifiedExclusion> UnknownReviewRequired { get; init; } = Array.Empty<ClassifiedExclusion>();
+    }
+
+    /// <summary>
+    /// Diagnostic record for an entry that the classifier rejected
+    /// from channel matching (or routed into the "Unknown can match
+    /// existing only" bucket). Carries only the metadata required to
+    /// explain the decision: title, source group, the kind assigned,
+    /// the deterministic classification reason, and the final
+    /// matching disposition (excluded / unknown-matched-to-existing /
+    /// unknown-review-required / new-channels-from-curated-identity).
+    ///
+    /// <para>
+    /// URL and provider are intentionally absent so this record can
+    /// be serialised in logs / dashboard / report_builder without
+    /// requiring further sanitisation.
+    /// </para>
+    /// </summary>
+    public sealed class ClassifiedExclusion
+    {
+        [JsonPropertyName("title")] public string Title { get; init; } = string.Empty;
+        [JsonPropertyName("group")] public string Group { get; init; } = string.Empty;
+        [JsonPropertyName("kind")] public ChannelKind Kind { get; init; }
+        [JsonPropertyName("reason")] public string Reason { get; init; } = string.Empty;
+
+        /// <summary>
+        /// How the matcher disposed of this entry:
+        /// <list type="bullet">
+        ///   <item><c>excluded</c> — never matched, never created
+        ///         (Bundle, Vod, LiveCam, Placeholder, Category,
+        ///         Group, Foreign).</item>
+        ///   <item><c>unknown-matched-to-existing</c> — Unknown
+        ///         entry that found a unique existing channel in
+        ///         Dispatcharr and was attached to it as a new
+        ///         stream.</item>
+        ///   <item><c>unknown-review-required</c> — Unknown entry
+        ///         that could not be matched to a single existing
+        ///         channel (no match, ambiguous match, or weak
+        ///         match). Held back for manual review.</item>
+        ///   <item><c>new-channels-from-curated-identity</c> — a
+        ///         curated channel identity that the matcher promoted
+    ///         to a NewChannel decision. This disposition is set
+    ///         on the matched <see cref="ChannelDecision"/>, not
+    ///         on the exclusion record, but is enumerated by the
+    ///         dashboard for symmetry.</item>
+        /// </list>
+        /// </summary>
+        [JsonPropertyName("matchingDisposition")] public string MatchingDisposition { get; init; } = string.Empty;
     }
 
     public sealed class ChannelDecision
@@ -88,6 +153,38 @@ namespace m3uCrawler.Models
         /// <c>outputGroups</c> in <c>dispatcharr_report_*.json</c>.
         /// </summary>
         [JsonPropertyName("outputGroups")] public IReadOnlyDictionary<string, int> OutputGroups { get; set; } = new Dictionary<string, int>();
+
+        /// <summary>
+        /// Aggregated count of <see cref="DiscoveredStream"/> entries by
+        /// <see cref="ChannelKind"/> as decided by <c>ContentClassifier</c>
+        /// before the matching pipeline runs. Keys are the enum names
+        /// (e.g. "Channel", "Bundle", "Vod", "LiveCam", "Foreign",
+        /// "Unknown", "Placeholder"). Only non-zero counts are
+        /// serialised.
+        /// </summary>
+        [JsonPropertyName("classification")] public IReadOnlyDictionary<string, int> Classification { get; set; } = new Dictionary<string, int>();
+
+        /// <summary>
+        /// Aggregated count of entries by the <b>matching
+        /// disposition</b> assigned by the matcher after classification
+        /// (orthogonal to the kind-level counter above). Keys:
+        /// </summary>
+        /// <list type="bullet">
+        ///   <item><c>excluded</c> — Bundle / Vod / LiveCam /
+        ///         Placeholder / Category / Group / Foreign entries
+        ///         that never matched, never created.</item>
+        ///   <item><c>unknownMatchedToExisting</c> — Unknown entries
+        ///         that attached to an existing channel in
+        ///         Dispatcharr.</item>
+        ///   <item><c>unknownReviewRequired</c> — Unknown entries
+        ///         that did not match any existing channel and are
+        ///         waiting for manual review (NOT promoted to
+        ///         NewChannel).</item>
+        ///   <item><c>newChannelsFromCuratedIdentity</c> — curated
+        ///         channel identities promoted to NewChannel.</item>
+        /// </list>
+        [JsonPropertyName("matchingDisposition")]
+        public IReadOnlyDictionary<string, int> MatchingDisposition { get; set; } = new Dictionary<string, int>();
     }
 
     public sealed class SyncReport

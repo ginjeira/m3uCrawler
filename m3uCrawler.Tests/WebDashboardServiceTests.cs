@@ -1,6 +1,8 @@
 using System.Text.Json;
 using m3uCrawler.Models;
 using m3uCrawler.Services;
+using m3uCrawler.Services.Matching;
+using m3uCrawler.Services.Sync;
 using Xunit;
 
 namespace m3uCrawler.Tests;
@@ -282,5 +284,66 @@ public class WebDashboardServiceTests
         Assert.Equal(0, report.MessagesAnalyzed);
         Assert.Equal(0, report.StreamsWorking);
         Assert.Equal(0, report.StreamsFailed);
+    }
+
+    [Fact]
+    public void MatchPlan_serialization_round_trips_classification_exclusions()
+    {
+        // A nova fronteira Classification -> Matching exige que o
+        // MatchPlan.Serialize preserve ClassifiedExclusions + a chave
+        // "classification" em Counts. A serialização tem de manter os
+        // nomes das propriedades em camelCase (JSON publico do
+        // dashboard / relatórios).
+        var plan = new MatchPlan
+        {
+            Counts = new SyncReportCounts
+            {
+                Classification = new Dictionary<string, int>(StringComparer.Ordinal)
+                {
+                    ["Channel"] = 42,
+                    ["Bundle"] = 7,
+                    ["Vod"] = 3,
+                    ["LiveCam"] = 1,
+                    ["Unknown"] = 2,
+                    ["Placeholder"] = 4,
+                },
+            },
+            ClassifiedExclusions = new[]
+            {
+                new ClassifiedExclusion
+                {
+                    Title = "PT - NO EVENT",
+                    Group = "VIP | LIGA PORTUGAL BETCLIC",
+                    Kind = ChannelKind.Vod,
+                    Reason = "ppv-betclic-group",
+                },
+                new ClassifiedExclusion
+                {
+                    Title = "Filmes Batman 24/7 ( Exclusivo ) PT",
+                    Group = "Portugal - Canais 24-7",
+                    Kind = ChannelKind.Bundle,
+                    Reason = "loop-group-pattern",
+                },
+            },
+        };
+
+        var json = MatchPlanSerializer.Serialize(plan);
+        var back = MatchPlanSerializer.Deserialize(json);
+
+        Assert.NotNull(back);
+        Assert.Equal(42, back!.Counts.Classification["Channel"]);
+        Assert.Equal(7, back.Counts.Classification["Bundle"]);
+        Assert.Equal(3, back.Counts.Classification["Vod"]);
+        Assert.Equal(1, back.Counts.Classification["LiveCam"]);
+        Assert.Equal(2, back.Counts.Classification["Unknown"]);
+        Assert.Equal(4, back.Counts.Classification["Placeholder"]);
+        Assert.Equal(2, back.ClassifiedExclusions.Count);
+        Assert.Equal("PT - NO EVENT", back.ClassifiedExclusions[0].Title);
+        Assert.Equal(ChannelKind.Vod, back.ClassifiedExclusions[0].Kind);
+        Assert.Equal("ppv-betclic-group", back.ClassifiedExclusions[0].Reason);
+        Assert.Equal("Filmes Batman 24/7 ( Exclusivo ) PT", back.ClassifiedExclusions[1].Title);
+        Assert.Equal(ChannelKind.Bundle, back.ClassifiedExclusions[1].Kind);
+        // No credentials, no URLs.
+        Assert.DoesNotContain(back.ClassifiedExclusions[0].GetType().GetProperties(), p => p.Name is "StreamUrl" or "Provider" or "Url");
     }
 }

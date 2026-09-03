@@ -1,5 +1,6 @@
 using m3uCrawler.Build;
 using m3uCrawler.Models;
+using m3uCrawler.Services.Sync;
 using System.Net;
 using System.Security.Cryptography;
 using System.Text;
@@ -262,6 +263,48 @@ namespace m3uCrawler.Services
                 return;
             }
 
+            // Sumário de classificação do último MatchPlan publicado.
+            // Lê o ficheiro dispatcharr_plan_<ts>.json mais recente e
+            // devolve as contagens por ChannelKind + uma amostra das
+            // entradas excluídas (sem URLs nem credenciais).
+            if (requestPath.Equals("/api/classification-summary", StringComparison.OrdinalIgnoreCase))
+            {
+                var planPath = LatestDispatcharrPlanPath(outputDir);
+                if (planPath == null)
+                {
+                    await WriteJsonAsync(context.Response, new { error = "Sem plano de classificação disponível." });
+                    return;
+                }
+
+                var plan = MatchPlanSerializer.Deserialize(await File.ReadAllTextAsync(planPath, Encoding.UTF8));
+                if (plan == null)
+                {
+                    await WriteJsonAsync(context.Response, new { error = "Plano vazio." });
+                    return;
+                }
+
+                var sample = plan.ClassifiedExclusions
+                    .Take(50)
+                    .Select(e => new
+                    {
+                        title = e.Title,
+                        group = e.Group,
+                        kind = e.Kind.ToString(),
+                        reason = e.Reason,
+                    })
+                    .ToList();
+
+                await WriteJsonAsync(context.Response, new
+                {
+                    classification = plan.Counts.Classification,
+                    excludedCount = plan.ClassifiedExclusions.Count,
+                    sample = sample,
+                    planGeneratedAtUtc = plan.GeneratedAtUtc,
+                    planSourcePlaylistPath = plan.SourcePlaylistPath,
+                });
+                return;
+            }
+
             // Run report normalizado (métricas com semântica correcta).
             if (requestPath.Equals("/api/run-report/summary", StringComparison.OrdinalIgnoreCase))
             {
@@ -383,6 +426,37 @@ namespace m3uCrawler.Services
             response.ContentLength64 = buffer.Length;
             await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
             response.Close();
+        }
+
+        /// <summary>
+        /// Returns the most recent <c>dispatcharr_plan_*.json</c>
+        /// file under <paramref name="outputDir"/>, or <c>null</c> when
+        /// no plan exists yet. Filename ordering is the same as the
+        /// writer: <c>dispatcharr_plan_{yyyyMMdd_HHmmss}.json</c>;
+        /// we use <see cref="File.GetLastWriteTimeUtc"/> to break
+        /// filename-collision ties deterministically.
+        /// </summary>
+        private static string? LatestDispatcharrPlanPath(string outputDir)
+        {
+            if (string.IsNullOrEmpty(outputDir) || !Directory.Exists(outputDir))
+            {
+                return null;
+            }
+            try
+            {
+                var files = Directory
+                    .EnumerateFiles(outputDir, "dispatcharr_plan_*.json", SearchOption.TopDirectoryOnly)
+                    .Select(p => new { Path = p, Ticks = File.GetLastWriteTimeUtc(p).Ticks })
+                    .OrderByDescending(x => x.Ticks)
+                    .ThenByDescending(x => x.Path, StringComparer.Ordinal)
+                    .Select(x => x.Path)
+                    .ToList();
+                return files.Count == 0 ? null : files[0];
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         private static async Task WriteTextAsync(HttpListenerResponse response, string text, HttpStatusCode statusCode = HttpStatusCode.OK, string contentType = "text/plain; charset=utf-8")

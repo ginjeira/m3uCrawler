@@ -24,16 +24,6 @@ namespace m3uCrawler.Services.Matching
         private readonly MatchScorer _scorer = new();
         private readonly Func<string?, string?, string?, bool, OutputGroupKind>? _resolutionPolicy;
 
-        private static readonly System.Text.RegularExpressions.Regex BundleTitlePattern =
-            new(
-                @"\b(Filmes|Combates|LiveCam|24\s*/\s*7|PACK|BUNDLE)\b|#f#",
-                System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
-
-        private static readonly System.Text.RegularExpressions.Regex VodGroupPattern =
-            new(
-                @"^VOD\s*\|",
-                System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
-
         /// <summary>
         /// Constructs a ChannelMatcher with the legacy single-dependency
         /// surface. OutputGroup resolution (ResolutionPolicy) is
@@ -84,35 +74,86 @@ namespace m3uCrawler.Services.Matching
             int threshold = options.MatchThreshold;
             var stamp = (nowUtc ?? DateTime.UtcNow).ToString("o");
 
-            // Bundle / category guard.
+            // Two-level classification + matching policy:
+            //   1. ContentClassifier returns Kind + eligibility flags
+            //      (ExistingMatchEligibility, NewChannelEligibility).
+            //   2. Kinds with eligibility=false for BOTH flags are
+            //      excluded immediately (Bundle, Vod, LiveCam,
+            //      Placeholder, Category, Group, Foreign).
+            //   3. Streams are then split by ELIGIBILITY TIER into two
+            //      parallel bucket collections (curated vs unknown),
+            //      keyed by tier+identity. This guarantees that:
+            //        - a curated stream can never be promoted to a
+            //          decision whose input is shared with an Unknown
+            //          stream of the same identity (and vice-versa);
+            //        - the order of arrival cannot promote an Unknown
+            //          stream to a curated path (or vice-versa);
+            //        - each tier uses its own matching strategy:
+            //            curated: full fuzzy + alias + threshold;
+            //            unknown: equality OR explicit alias only.
             //
-            // Exclui entradas que claramente não são canais ao vivo:
-            //   - "Filmes X 24/7", "Combates UFC 24/7", etc. (group "Portugal - Canais 24-7")
-            //   - "PT - <título> - <ano>" e similares (group "VOD | PORTUGAL")
-            //   - "LiveCam <praia> PT" (câmaras)
-            //   - placeholders de cor "#f#..." que aparecem na playlist
-            //     gerada pelo Dispatcharr
-            //   - nomes "PACK"/"BUNDLE" (não-canais)
-            //
-            // Estas entradas hoje entram como NewChannel no MatchPlan;
-            // ver `.kilo/plans/1788214551330-channel-normalization-investigation-report.md`,
-            // secções 4 e 5. São excluídas aqui (e não no validator nem
-            // no normalizer) para manter invariantes b0dfc48/91cad8e/420df83/8877f6f/b3157d6.
-            int excludedAsBundle = 0;
-            var channelBuckets = new Dictionary<string, List<DiscoveredStream>>(StringComparer.Ordinal);
+            // Invariantes preservados:
+            //   b0dfc48 (stream dedup)
+            //   91cad8e (reconcile by existingChannelId)
+            //   420df83 (ambiguous groups without arbitrary selection)
+            //   8877f6f (preserve channels without sources)
+            //   b3157d6 (per-stream removal vs replace, untouched)
+            var classificationCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+            var dispositionCounts = new Dictionary<string, int>(StringComparer.Ordinal)
+            {
+                ["excluded"] = 0,
+                ["unknownMatchedToExisting"] = 0,
+                ["unknownReviewRequired"] = 0,
+                ["newChannelsFromCuratedIdentity"] = 0,
+            };
+            var excluded = new List<ClassifiedExclusion>();
+            var reviewRequired = new List<ClassifiedExclusion>();
+            // Tier-split bucket storage. Each entry keeps track of
+            // whether the stream's classification is curated.
+            var channelBuckets = new Dictionary<(BucketTier Tier, string Identity), List<DiscoveredStream>>();
+            // Tracks the source-of-truth eligibility tier for the
+            // bucket identity in the tier. A given (tier, identity)
+            // pair is homogeneous by construction (we don't mix streams
+            // with different NewChannelEligibility in the same tier).
+            var bucketNewChannelEligible = new Dictionary<(BucketTier, string), bool>();
+
             foreach (var s in discovered)
             {
-                if (IsBundleOrCategory(s.Title, s.Group))
+                var classification = ContentClassifier.Classify(s.Title, s.Group);
+                var kindName = classification.Kind.ToString();
+                classificationCounts.TryGetValue(kindName, out var prev);
+                classificationCounts[kindName] = prev + 1;
+
+                // 1) Kind-level exclusion: never matched, never created.
+                if (!classification.ExistingMatchEligibility && !classification.NewChannelEligibility)
                 {
-                    excludedAsBundle++;
+                    dispositionCounts["excluded"] = dispositionCounts["excluded"] + 1;
+                    excluded.Add(new ClassifiedExclusion
+                    {
+                        Title = s.Title ?? string.Empty,
+                        Group = s.Group ?? string.Empty,
+                        Kind = classification.Kind,
+                        Reason = classification.Reason,
+                        MatchingDisposition = "excluded",
+                    });
                     continue;
                 }
 
+                // Pick tier. If a stream is BOTH curated-eligible and
+                // existing-match-eligible, it goes to the curated tier
+                // (preserves the editorial decision surface: the
+                // matcher treats curated streams consistently).
+                var tier = classification.NewChannelEligibility
+                    ? BucketTier.Curated
+                    : BucketTier.Unknown;
+
                 var resolved = ResolveIdentity(s.Title);
-                if (!channelBuckets.TryGetValue(resolved, out var list))
+                var key = (tier, resolved);
+                if (!channelBuckets.TryGetValue(key, out var list))
                 {
                     list = new List<DiscoveredStream>();
-                    channelBuckets[resolved] = list;
+                    channelBuckets[key] = list;
+                    bucketNewChannelEligible[key] = classification.NewChannelEligibility;
                 }
                 list.Add(s);
             }
@@ -131,16 +172,23 @@ namespace m3uCrawler.Services.Matching
             var counts = new SyncReportCounts
             {
                 AmbiguousGroups = groupIndex.AmbiguousEntries.Count,
-                Skipped = excludedAsBundle,
+                Skipped = excluded.Count,
+                Classification = classificationCounts,
+                MatchingDisposition = dispositionCounts,
             };
 
-            foreach (var bucket in channelBuckets.OrderBy(b => b.Key, StringComparer.Ordinal))
+            // Iterate buckets in deterministic order: by tier, then
+            // identity. Curated first, then Unknown (so the
+            // Reconciliation step sees a stable sequence).
+            foreach (var bucket in channelBuckets
+                .OrderBy(kv => kv.Key.Tier)
+                .ThenBy(kv => kv.Key.Identity, StringComparer.Ordinal))
             {
-                var identity = bucket.Key;
+                var (tier, identity) = bucket.Key;
+                var isCurated = bucketNewChannelEligible[bucket.Key];
                 var canonicalName = GroupResolver.ResolveCanonical(bucket.Value);
 
-                // Representative stream for country/OutputGroup decisions:
-                // prefer working, else first with a valid title.
+                // Representative stream for country/OutputGroup decisions.
                 var representative = bucket.Value
                     .OrderByDescending(s => s.IsWorking)
                     .ThenBy(s => string.IsNullOrWhiteSpace(s.Title))
@@ -150,14 +198,6 @@ namespace m3uCrawler.Services.Matching
                 OutputGroupKind? outputGroup = null;
                 if (_resolutionPolicy != null && representative != null)
                 {
-                    // Foreign is deterministic: a known foreign
-                    // SourceGroup (GroupTaxonomy -> Foreign) marks the
-                    // representative stream as foreign. Streams whose
-                    // SourceGroup is not a known foreign group are
-                    // treated as PT (isForeign=false). This avoids
-                    // mislabelling legitimate PT channels that do not
-                    // carry a PT alias/token in their title (e.g.
-                    // "24 Kitchen" in "EU | PT | GENERAL").
                     var taxonomyKind = GroupTaxonomy.Lookup(
                         GroupNormalizer.Normalize(representative.Group)).OutputGroup;
                     var isForeign = taxonomyKind == OutputGroupKind.Foreign;
@@ -168,185 +208,153 @@ namespace m3uCrawler.Services.Matching
                         isForeign);
                 }
 
-                var candidates = existing.Channels
-                    .Select(c => (Channel: c, Normalized: ChannelNormalizer.Normalize(c.Name)))
-                    .Where(c => !string.IsNullOrWhiteSpace(c.Normalized))
-                    .Select(c =>
-                    {
-                        var viaAlias = _aliases.Resolve(c.Channel.Name);
-                        var queryForAlias = viaAlias?.Canonical ?? identity;
-                        var ms = _fuzzy.Score(queryForAlias, c.Normalized);
-                        var aliasMatch = viaAlias != null && string.Equals(viaAlias.Canonical, ChannelNormalizer.Normalize(c.Channel.Name), StringComparison.Ordinal);
-                        return new
-                        {
-                            Channel = c.Channel,
-                            Score = ms.Score,
-                            Reason = aliasMatch && viaAlias != null ? $"alias:{viaAlias.Reason}" : ms.Reason,
-                        };
-                    })
-                    .OrderByDescending(c => c.Score)
-                    .Take(5)
-                    .ToList();
-
-                bool hasAnyCandidate = candidates.Count > 0;
-                int topScore = hasAnyCandidate ? candidates[0].Score : 0;
-                var otherScores = hasAnyCandidate ? candidates.Skip(1).Select(c => c.Score).ToList() : new List<int>();
-
-                var band = hasAnyCandidate
-                    ? _scorer.Classify(topScore, otherScores, threshold)
-                    : MatchBand.None;
-
-                if (band == MatchBand.Ambiguous)
+                bool ambiguous = false;
+                bool skipNoMatchRecord = false;
+                DispatcharrChannel? matched = null;
+                string? matchReason = null;
+                int matchScore = 0;
+                if (tier == BucketTier.Curated)
                 {
-                    var top = candidates[0];
-                    var second = candidates[1];
-                    var streamDecisions = bucket.Value
-                        .Select(s => StreamDecisionForNewChannel(s, newChannelIdSeed--, ordering, defaultStreamId: null))
-                        .ToList();
-
-                    decisions.Add(new ChannelDecision
+                    (matched, matchReason, matchScore, ambiguous) = FindCuratedMatch(
+                        identity, existing.Channels, threshold);
+                }
+                else
+                {
+                    // Unknown: exact equality or explicit alias only.
+                    // The match must be deterministic and reproducible
+                    // (no fuzzy scores); a stream with a near-miss name
+                    // is NOT allowed to alter the streams of an
+                    // unrelated existing channel that just happens to
+                    // be similar in name. Furthermore, multiple exact
+                    // or alias candidates are AMBIGUOUS — we refuse to
+                    // pick one arbitrarily.
+                    var unknown = FindUnknownMatch(identity, existing.Channels);
+                    switch (unknown.State)
                     {
-                        Identity = identity,
-                        CanonicalName = canonicalName,
-                        Outcome = SyncOutcome.Ambiguous,
-                        ExistingChannelId = null,
-                        ChannelGroupName = null,
-                        OutputGroup = outputGroup,
-                        MatchReason = $"ambiguous:{top.Reason}|{second.Reason}",
-                        MatchScore = top.Score,
-                        Streams = streamDecisions,
-                        AmbiguousCandidates = new[]
-                        {
-                            new AmbiguousCandidate
-                            {
-                                ExistingChannelId = top.Channel.Id,
-                                ExistingChannelName = top.Channel.Name,
-                                Score = top.Score,
-                                Reason = top.Reason,
-                            },
-                            new AmbiguousCandidate
-                            {
-                                ExistingChannelId = second.Channel.Id,
-                                ExistingChannelName = second.Channel.Name,
-                                Score = second.Score,
-                                Reason = second.Reason,
-                            }
-                        }
-                    });
-                    counts.Ambiguous = counts.Ambiguous + 1;
-                    continue;
+                        case UnknownMatchState.Unique:
+                            matched = unknown.UniqueChannel;
+                            matchReason = unknown.UniqueReason;
+                            break;
+                        case UnknownMatchState.Ambiguous:
+                            // Record the bucket as review-required
+                            // with the diagnostic of ambiguity. The
+                            // matched slot is left null so the "no
+                            // existing match" branch below does NOT
+                            // re-record.
+                            RecordUnknownAmbiguous(
+                                bucket.Value, classificationCounts, dispositionCounts,
+                                reviewRequired, "ambiguous-exact-or-alias-match");
+                            skipNoMatchRecord = true;
+                            matched = null;
+                            matchReason = null;
+                            break;
+                        case UnknownMatchState.NoMatch:
+                        default:
+                            matched = null;
+                            matchReason = null;
+                            break;
+                    }
                 }
 
-                if (band == MatchBand.Matched || band == MatchBand.Exact)
+                if (ambiguous && matched != null)
                 {
-                    var matched = candidates[0].Channel;
-                    var existingStreamIds = streamsByChannel.TryGetValue(matched.Id, out var sids)
-                        ? sids.ToHashSet()
-                        : new HashSet<long>();
-
-                    var keepStreamIds = new HashSet<long>();
-
-                    var ordered = ordering.Order(bucket.Value);
-                    var streamDecisions = new List<StreamMatchDecision>();
-                    int order = 0;
-                    foreach (var (stream, reason) in ordered)
+                    // Curated bucket with ambiguous existing match:
+                    // preserved as Ambiguous decision (legacy surface);
+                    // Unknown bucket cannot reach this path (the
+                    // exact-only matcher is binary).
+                    if (isCurated)
                     {
-                        var existingForUrl = existing.Streams.FirstOrDefault(es =>
-                            string.Equals(es.Url, stream.Url, StringComparison.OrdinalIgnoreCase) && es.IsWorking);
-
-                        if (existingForUrl == null)
+                        var top = matched;
+                        var second = existing.Channels
+                            .Where(c => c.Id != top.Id)
+                            .OrderBy(c => _fuzzy.Score(
+                                _aliases.Resolve(c.Name)?.Canonical ?? identity,
+                                ChannelNormalizer.Normalize(c.Name)).Score)
+                            .Last();
+                        var streamDecisions = bucket.Value
+                            .Select(s => StreamDecisionForNewChannel(s, newChannelIdSeed--, ordering, defaultStreamId: null))
+                            .ToList();
+                        decisions.Add(new ChannelDecision
                         {
-                            var streamNormTitle = ChannelNormalizer.Normalize(stream.Title);
-                            if (!string.IsNullOrWhiteSpace(streamNormTitle))
+                            Identity = identity,
+                            CanonicalName = canonicalName,
+                            Outcome = SyncOutcome.Ambiguous,
+                            ExistingChannelId = null,
+                            ChannelGroupName = null,
+                            OutputGroup = outputGroup,
+                            MatchReason = $"ambiguous:{top.Name}|{second.Name}",
+                            MatchScore = matchScore,
+                            Streams = streamDecisions,
+                            AmbiguousCandidates = new[]
                             {
-                                existingForUrl = existing.Streams.FirstOrDefault(es =>
-                                    es.IsWorking
-                                    && string.Equals(ChannelNormalizer.Normalize(es.Name), streamNormTitle, StringComparison.Ordinal)
-                                    && !keepStreamIds.Contains(es.Id));
+                                new AmbiguousCandidate
+                                {
+                                    ExistingChannelId = top.Id,
+                                    ExistingChannelName = top.Name,
+                                    Score = matchScore,
+                                    Reason = "top-candidate",
+                                },
+                                new AmbiguousCandidate
+                                {
+                                    ExistingChannelId = second.Id,
+                                    ExistingChannelName = second.Name,
+                                    Score = matchScore,
+                                    Reason = "second-candidate",
+                                }
                             }
-                        }
-
-                        if (existingForUrl == null && !stream.IsWorking)
-                        {
-                            streamDecisions.Add(new StreamMatchDecision
-                            {
-                                Provider = stream.Provider,
-                                StreamUrl = stream.Url,
-                                StreamName = stream.Title,
-                                Outcome = SyncOutcome.Skipped,
-                                ProposedOrder = -1,
-                                OrderReason = "not-working",
-                                IsWorking = false,
-                                GroupName = stream.Group,
-                            });
-                            counts.Skipped = counts.Skipped + 1;
-                            continue;
-                        }
-
-                        long? existingStreamId = existingForUrl?.Id;
-                        if (existingStreamId.HasValue) keepStreamIds.Add(existingStreamId.Value);
-
-                        bool isNew = existingForUrl == null;
-                        var outcome = isNew ? SyncOutcome.NewStream : SyncOutcome.ExistingUnchanged;
-                        streamDecisions.Add(new StreamMatchDecision
-                        {
-                            Provider = stream.Provider,
-                            StreamUrl = stream.Url,
-                            StreamName = stream.Title,
-                            Outcome = outcome,
-                            ExistingStreamId = existingStreamId,
-                            ProposedOrder = isNew ? order : -1,
-                            OrderReason = reason,
-                            IsWorking = stream.IsWorking,
-                            GroupName = stream.Group,
                         });
-                        if (isNew) counts.NewStreams = counts.NewStreams + 1;
-                        order++;
+                        counts.Ambiguous = counts.Ambiguous + 1;
                     }
-
-                    var staleIds = existingStreamIds.Except(keepStreamIds).ToList();
-                    foreach (var sid in staleIds)
+                    else
                     {
-                        if (existingStreamsById.TryGetValue(sid, out var es))
-                        {
-                            streamDecisions.Add(new StreamMatchDecision
-                            {
-                                Provider = es.M3uAccountName ?? "(unknown)",
-                                StreamUrl = es.Url,
-                                StreamName = es.Name,
-                                Outcome = SyncOutcome.Removed,
-                                ExistingStreamId = sid,
-                                ProposedOrder = -1,
-                                OrderReason = "missing-from-current-playlist",
-                                IsWorking = es.IsWorking,
-                                GroupName = es.GroupName,
-                            });
-                            counts.RemovedStreams = counts.RemovedStreams + 1;
-                        }
+                        // Defensive: should be unreachable (Unknown
+                        // matcher is binary), but if reached, treat
+                        // as review-required.
+                        RecordUnknownReviewRequired(
+                            bucket.Value, classificationCounts, dispositionCounts,
+                            reviewRequired, "ambiguous-existing-match");
                     }
-
-                    var groupName = matched.GroupName;
-                    decisions.Add(new ChannelDecision
-                    {
-                        Identity = identity,
-                        CanonicalName = matched.Name,
-                        Outcome = streamDecisions.Any(d => d.Outcome == SyncOutcome.NewStream || d.Outcome == SyncOutcome.Removed)
-                            ? SyncOutcome.ExistingReassigned
-                            : SyncOutcome.ExistingUnchanged,
-                        ExistingChannelId = matched.Id,
-                        ChannelGroupName = groupName,
-                        OutputGroup = outputGroup,
-                        MatchReason = candidates[0].Reason,
-                        MatchScore = candidates[0].Score,
-                        Streams = streamDecisions,
-                        AmbiguousCandidates = Array.Empty<AmbiguousCandidate>(),
-                    });
-                    counts.Matched = counts.Matched + 1;
-                    if (!(streamDecisions.Any(d => d.Outcome == SyncOutcome.NewStream || d.Outcome == SyncOutcome.Removed)))
-                        counts.Unchanged = counts.Unchanged + 1;
                     continue;
                 }
 
+                if (matched != null)
+                {
+                    if (tier == BucketTier.Unknown)
+                    {
+                        dispositionCounts["unknownMatchedToExisting"] =
+                            dispositionCounts["unknownMatchedToExisting"] + 1;
+                    }
+                    decisions.AddRange(new[] { BuildExistingDecision(
+                        bucket.Value, matched, isCurated, outputGroup,
+                        matchReason!, matchScore, ordering, existing.Streams,
+                        existingStreamsById, streamsByChannel, counts) });
+                    continue;
+                }
+
+                // No existing match.
+                if (skipNoMatchRecord)
+                {
+                    // Diagnostic already recorded by FindUnknownMatch's
+                    // Ambiguous branch. Continue to next bucket.
+                    continue;
+                }
+                if (!isCurated)
+                {
+                    // Unknown bucket without exact/alias match →
+                    // review-required. NEVER NewChannel.
+                    var reasonSuffix = tier == BucketTier.Unknown
+                        ? "no-exact-or-alias-match"
+                        : "no-existing-match";
+                    RecordUnknownReviewRequired(
+                        bucket.Value, classificationCounts, dispositionCounts,
+                        reviewRequired, reasonSuffix);
+                    continue;
+                }
+
+                // Curated bucket without existing match → NewChannel
+                // (only path that promotes a curated identity).
+                dispositionCounts["newChannelsFromCuratedIdentity"] =
+                    dispositionCounts["newChannelsFromCuratedIdentity"] + 1;
                 var newGroupName = ResolveGroupName(bucket.Value, groupIndex);
                 var newStreamDecisions = bucket.Value
                     .Select(s => StreamDecisionForNewChannel(s, newChannelIdSeed--, ordering, defaultStreamId: null))
@@ -380,9 +388,423 @@ namespace m3uCrawler.Services.Matching
                 Counts = counts,
                 Channels = decisions,
                 AmbiguousGroups = groupIndex.AmbiguousEntries,
+                ClassifiedExclusions = excluded,
+                UnknownReviewRequired = reviewRequired,
             };
 
             return ReconcileByExistingChannelId(provisional);
+        }
+
+        /// <summary>
+        /// Records a bucket whose classification is <see cref="ChannelKind.Unknown"/>
+        /// (eligible to match existing channels only) as
+        /// review-required. Used when the existing-channel match was
+        /// <see cref="MatchBand.None"/> (no match) or
+        /// <see cref="MatchBand.Ambiguous"/> (multiple close matches).
+        /// Never promotes the entry to <see cref="SyncOutcome.NewChannel"/>.
+        ///
+        /// <para>
+        /// The Kind-level counter (<c>Classification</c>) is NOT
+        /// incremented here — the main loop already counted each entry
+        /// when it was first classified. Re-counting here would
+        /// double the per-stream kind counter.
+        /// </para>
+        /// </summary>
+        private static void RecordUnknownReviewRequired(
+            IReadOnlyList<DiscoveredStream> bucket,
+            IDictionary<string, int> classificationCounts,
+            IDictionary<string, int> dispositionCounts,
+            List<ClassifiedExclusion> reviewRequired,
+            string reasonSuffix)
+        {
+            dispositionCounts["unknownReviewRequired"] =
+                dispositionCounts["unknownReviewRequired"] + 1;
+            foreach (var s in bucket)
+            {
+                // Kind for diagnostic metadata only; the kind
+                // counter is already updated by the main loop.
+                var kind = ContentClassifier.Classify(s.Title, s.Group).Kind;
+                reviewRequired.Add(new ClassifiedExclusion
+                {
+                    Title = s.Title ?? string.Empty,
+                    Group = s.Group ?? string.Empty,
+                    Kind = kind,
+                    Reason = $"unknown-review-required:{reasonSuffix}",
+                    MatchingDisposition = "unknown-review-required",
+                });
+            }
+        }
+
+        /// <summary>
+        /// Records an Unknown bucket whose exact/alias match produced
+        /// 2+ candidates in existing channels. We never pick one
+        /// arbitrarily — the bucket is held back for manual review
+        /// with a diagnostic of ambiguity. The reason suffix
+        /// <c>ambiguous-exact-or-alias-match</c> distinguishes this
+        /// path from the plain "no-match" path.
+        /// </summary>
+        private static void RecordUnknownAmbiguous(
+            IReadOnlyList<DiscoveredStream> bucket,
+            IDictionary<string, int> classificationCounts,
+            IDictionary<string, int> dispositionCounts,
+            List<ClassifiedExclusion> reviewRequired,
+            string reasonSuffix)
+        {
+            dispositionCounts["unknownReviewRequired"] =
+                dispositionCounts["unknownReviewRequired"] + 1;
+            foreach (var s in bucket)
+            {
+                var kind = ContentClassifier.Classify(s.Title, s.Group).Kind;
+                reviewRequired.Add(new ClassifiedExclusion
+                {
+                    Title = s.Title ?? string.Empty,
+                    Group = s.Group ?? string.Empty,
+                    Kind = kind,
+                    Reason = $"unknown-review-required:{reasonSuffix}",
+                    MatchingDisposition = "unknown-review-required",
+                });
+            }
+        }
+
+        /// <summary>
+        /// Eligibility tier for the bucket stage. Curated streams
+        /// (with <c>NewChannelEligibility=true</c>) use the full
+        /// fuzzy + threshold matching against existing channels.
+        /// Unknown streams (with only
+        /// <c>ExistingMatchEligibility=true</c>) only match by
+        /// equality of the normalized identity or by an explicit
+        /// alias. This is the core safety property of the
+        /// three-level policy.
+        /// </summary>
+        private enum BucketTier
+        {
+            Curated = 0,
+            Unknown = 1,
+        }
+
+        /// <summary>
+        /// Result of <see cref="FindUnknownMatch"/>: tri-state that
+        /// the main loop uses to decide between
+        /// <c>ExistingReassigned/ExistingUnchanged</c> and
+        /// <c>UnknownReviewRequired</c>.
+        /// <list type="bullet">
+        ///   <item><see cref="UnknownMatchState.NoMatch"/>: 0 exact
+        ///         or alias candidates in existing channels. Caller
+        ///         routes to <c>UnknownReviewRequired</c> with
+        ///         <c>no-exact-or-alias-match</c>.</item>
+        ///   <item><see cref="UnknownMatchState.Unique"/>: exactly 1
+        ///         candidate. Caller attaches the streams to that
+        ///         channel.</item>
+        ///   <item><see cref="UnknownMatchState.Ambiguous"/>: 2+
+        ///         candidates. Caller routes to
+        ///         <c>UnknownReviewRequired</c> with
+        ///         <c>ambiguous-exact-or-alias-match</c> —
+        ///         <b>never</b> chooses arbitrarily.</item>
+        /// </list>
+        /// </summary>
+        private enum UnknownMatchState
+        {
+            NoMatch,
+            Unique,
+            Ambiguous,
+        }
+
+        /// <summary>
+        /// Discriminated union of unknown-match outcomes. All
+        /// candidate channels for the <see cref="UnknownMatchState.Ambiguous"/>
+        /// state are exposed so the diagnostic can list them.
+        /// </summary>
+        private readonly record struct UnknownMatch(
+            UnknownMatchState State,
+            DispatcharrChannel UniqueChannel,
+            string UniqueReason,
+            IReadOnlyList<DispatcharrChannel> AmbiguousCandidates)
+        {
+            public static UnknownMatch NoMatch() =>
+                new(UnknownMatchState.NoMatch, default!, string.Empty, Array.Empty<DispatcharrChannel>());
+            public static UnknownMatch Unique(DispatcharrChannel channel, string reason) =>
+                new(UnknownMatchState.Unique, channel, reason, Array.Empty<DispatcharrChannel>());
+            public static UnknownMatch Ambiguous(IReadOnlyList<DispatcharrChannel> candidates) =>
+                new(UnknownMatchState.Ambiguous, default!, string.Empty, candidates);
+        }
+
+        /// <summary>
+        /// Curated matching path: builds a candidate list from
+        /// existing channels using the alias-resolved identity,
+        /// scores each candidate with the fuzzy matcher, and picks
+        /// the top scoring channel whose score passes
+        /// <paramref name="threshold"/>. Returns the matched channel
+        /// + reason + score, or <c>null</c> when no candidate scores
+        /// high enough. Ambiguity is reported separately
+        /// (<paramref name="ambiguous"/> = true) when the top
+        /// candidates are within 5 points of each other.
+        /// </summary>
+        private (DispatcharrChannel? Channel, string? Reason, int Score, bool Ambiguous)
+            FindCuratedMatch(
+                string identity,
+                IReadOnlyList<DispatcharrChannel> existing,
+                int threshold)
+        {
+            var candidates = existing
+                .Select(c => (Channel: c, Normalized: ChannelNormalizer.Normalize(c.Name)))
+                .Where(c => !string.IsNullOrWhiteSpace(c.Normalized))
+                .Select(c =>
+                {
+                    var viaAlias = _aliases.Resolve(c.Channel.Name);
+                    var queryForAlias = viaAlias?.Canonical ?? identity;
+                    var ms = _fuzzy.Score(queryForAlias, c.Normalized);
+                    var aliasMatch = viaAlias != null
+                        && string.Equals(viaAlias.Canonical,
+                            ChannelNormalizer.Normalize(c.Channel.Name),
+                            StringComparison.Ordinal);
+                    return new
+                    {
+                        Channel = c.Channel,
+                        Score = ms.Score,
+                        Reason = aliasMatch && viaAlias != null
+                            ? $"alias:{viaAlias.Reason}"
+                            : ms.Reason,
+                    };
+                })
+                .OrderByDescending(c => c.Score)
+                .Take(5)
+                .ToList();
+
+            if (candidates.Count == 0)
+                return (null, null, 0, false);
+
+            var top = candidates[0];
+            var others = candidates.Skip(1).Select(c => c.Score).ToList();
+            var band = _scorer.Classify(top.Score, others, threshold);
+
+            return band switch
+            {
+                MatchBand.Matched => (top.Channel, top.Reason, top.Score, false),
+                MatchBand.Exact => (top.Channel, top.Reason, top.Score, false),
+                MatchBand.Ambiguous => (top.Channel, top.Reason, top.Score, true),
+                _ => (null, null, 0, false),
+            };
+        }
+
+        /// <summary>
+        /// Unknown matching path: a stream is allowed to attach to an
+        /// existing channel if and only if:
+        /// <list type="bullet">
+        ///   <item>the normalized identity equals exactly the
+        ///         existing channel's normalized name; or</item>
+        ///   <item>an explicit alias from
+        ///         <see cref="AliasResolver.Resolve(string?)"/> maps
+        ///         the identity (or the existing channel name) to a
+        ///         canonical that equals the other side.</item>
+        /// </list>
+        ///
+        /// <para>
+        /// Fuzzy similarity is NOT used. A near-miss name like
+        /// "Fox Sportz" must not attach to "Fox Sports" via score.
+        /// </para>
+        ///
+        /// <para>
+        /// <b>Ambiguity rule for Unknown</b>: the method collects
+        /// ALL candidates (exact + alias) and returns a tri-state:
+        /// <list type="bullet">
+        ///   <item>0 candidates → <see cref="UnknownMatch.NoMatch"/>;
+        ///         caller routes to <c>UnknownReviewRequired</c> with
+        ///         <c>no-exact-or-alias-match</c>.</item>
+        ///   <item>1 candidate → <see cref="UnknownMatch.Unique"/>,
+        ///         attaches to that channel.</item>
+        ///   <item>2+ candidates → <see cref="UnknownMatch.Ambiguous"/>;
+        ///         caller routes to <c>UnknownReviewRequired</c>
+        ///         with <c>ambiguous-exact-or-alias-match</c>.
+        ///         <b>Never</b> chooses arbitrarily.</item>
+        /// </list>
+        /// </para>
+        /// </summary>
+        private UnknownMatch FindUnknownMatch(
+            string identity,
+            IReadOnlyList<DispatcharrChannel> existing)
+        {
+            var identityAlias = _aliases.Resolve(identity);
+            var candidates = new List<(DispatcharrChannel Channel, string Reason)>(capacity: 0);
+
+            foreach (var c in existing)
+            {
+                var cNameNormalized = ChannelNormalizer.Normalize(c.Name);
+                if (string.IsNullOrWhiteSpace(cNameNormalized)) continue;
+
+                // Path 1: exact equality of normalized identity.
+                if (string.Equals(identity, cNameNormalized, StringComparison.Ordinal))
+                {
+                    candidates.Add((c, "exact-identity"));
+                    continue;
+                }
+
+                // Path 2: explicit alias matches.
+                var cAlias = _aliases.Resolve(c.Name);
+                if (identityAlias != null && cAlias != null
+                    && string.Equals(identityAlias.Canonical, cAlias.Canonical, StringComparison.Ordinal))
+                {
+                    candidates.Add((c, $"alias:{identityAlias.Reason}->{cAlias.Canonical}"));
+                    continue;
+                }
+                if (identityAlias != null
+                    && string.Equals(identityAlias.Canonical, cNameNormalized, StringComparison.Ordinal))
+                {
+                    candidates.Add((c, $"alias:{identityAlias.Reason}"));
+                    continue;
+                }
+                if (cAlias != null
+                    && string.Equals(identity, cAlias.Canonical, StringComparison.Ordinal))
+                {
+                    candidates.Add((c, $"alias:{cAlias.Reason}"));
+                    continue;
+                }
+            }
+
+            if (candidates.Count == 0)
+            {
+                return UnknownMatch.NoMatch();
+            }
+            if (candidates.Count == 1)
+            {
+                return UnknownMatch.Unique(candidates[0].Channel, candidates[0].Reason);
+            }
+            // 2+ candidates: ambiguity. Caller routes to
+            // UnknownReviewRequired with diagnostic. We expose the
+            // candidate channel ids (not the reason) — the diagnostic
+            // suffix on the review-required entry records the
+            // ambiguity ("ambiguous-exact-or-alias-match") and the
+            // operator can resolve manually.
+            return UnknownMatch.Ambiguous(candidates.Select(c => c.Channel).ToList());
+        }
+
+        /// <summary>
+        /// Builds the <see cref="ChannelDecision"/> for a bucket
+        /// that attached to an existing channel. The bucket may be
+        /// either tier (curated or unknown) — the existing-channel
+        /// matching already decided this is a safe attach. Computes
+        /// the union of streams between bucket and existing channel,
+        /// marks stale existing streams as Removed, and tags the
+        /// outcome as <see cref="SyncOutcome.ExistingReassigned"/>
+        /// when there is any change.
+        /// </summary>
+        private ChannelDecision BuildExistingDecision(
+            IReadOnlyList<DiscoveredStream> bucket,
+            DispatcharrChannel matched,
+            bool isCurated,
+            OutputGroupKind? outputGroup,
+            string matchReason,
+            int matchScore,
+            IStreamOrderingPolicy ordering,
+            IReadOnlyList<DispatcharrStream> allExistingStreams,
+            IReadOnlyDictionary<long, DispatcharrStream> existingStreamsById,
+            IReadOnlyDictionary<long, HashSet<long>> streamsByChannel,
+            SyncReportCounts counts)
+        {
+            var existingStreamIds = streamsByChannel.TryGetValue(matched.Id, out var sids)
+                ? sids.ToHashSet()
+                : new HashSet<long>();
+
+            var keepExisting = new HashSet<long>();
+            var ordered = ordering.Order(bucket);
+            var streamDecisions = new List<StreamMatchDecision>();
+            int order = 0;
+            foreach (var (stream, reason) in ordered)
+            {
+                var existingForUrl = allExistingStreams.FirstOrDefault(es =>
+                    string.Equals(es.Url, stream.Url, StringComparison.OrdinalIgnoreCase) && es.IsWorking);
+
+                if (existingForUrl == null)
+                {
+                    var streamNormTitle = ChannelNormalizer.Normalize(stream.Title);
+                    if (!string.IsNullOrWhiteSpace(streamNormTitle))
+                    {
+                        existingForUrl = allExistingStreams.FirstOrDefault(es =>
+                            es.IsWorking
+                            && string.Equals(ChannelNormalizer.Normalize(es.Name), streamNormTitle, StringComparison.Ordinal)
+                            && !keepExisting.Contains(es.Id));
+                    }
+                }
+
+                if (existingForUrl == null && !stream.IsWorking)
+                {
+                    streamDecisions.Add(new StreamMatchDecision
+                    {
+                        Provider = stream.Provider,
+                        StreamUrl = stream.Url,
+                        StreamName = stream.Title,
+                        Outcome = SyncOutcome.Skipped,
+                        ProposedOrder = -1,
+                        OrderReason = "not-working",
+                        IsWorking = false,
+                        GroupName = stream.Group,
+                    });
+                    counts.Skipped = counts.Skipped + 1;
+                    continue;
+                }
+
+                long? existingStreamId = existingForUrl?.Id;
+                if (existingStreamId.HasValue) keepExisting.Add(existingStreamId.Value);
+
+                bool isNew = existingForUrl == null;
+                var outcome = isNew ? SyncOutcome.NewStream : SyncOutcome.ExistingUnchanged;
+                streamDecisions.Add(new StreamMatchDecision
+                {
+                    Provider = stream.Provider,
+                    StreamUrl = stream.Url,
+                    StreamName = stream.Title,
+                    Outcome = outcome,
+                    ExistingStreamId = existingStreamId,
+                    ProposedOrder = isNew ? order : -1,
+                    OrderReason = reason,
+                    IsWorking = stream.IsWorking,
+                    GroupName = stream.Group,
+                });
+                if (isNew) counts.NewStreams = counts.NewStreams + 1;
+                order++;
+            }
+
+            var staleIds = existingStreamIds.Except(keepExisting).ToList();
+            foreach (var sid in staleIds)
+            {
+                if (existingStreamsById.TryGetValue(sid, out var es))
+                {
+                    streamDecisions.Add(new StreamMatchDecision
+                    {
+                        Provider = es.M3uAccountName ?? "(unknown)",
+                        StreamUrl = es.Url,
+                        StreamName = es.Name,
+                        Outcome = SyncOutcome.Removed,
+                        ExistingStreamId = sid,
+                        ProposedOrder = -1,
+                        OrderReason = "missing-from-current-playlist",
+                        IsWorking = es.IsWorking,
+                        GroupName = es.GroupName,
+                    });
+                    counts.RemovedStreams = counts.RemovedStreams + 1;
+                }
+            }
+
+            counts.Matched = counts.Matched + 1;
+            if (!streamDecisions.Any(d => d.Outcome == SyncOutcome.NewStream || d.Outcome == SyncOutcome.Removed))
+            {
+                counts.Unchanged = counts.Unchanged + 1;
+            }
+
+            return new ChannelDecision
+            {
+                Identity = matched.Name,
+                CanonicalName = matched.Name,
+                Outcome = streamDecisions.Any(d => d.Outcome == SyncOutcome.NewStream || d.Outcome == SyncOutcome.Removed)
+                    ? SyncOutcome.ExistingReassigned
+                    : SyncOutcome.ExistingUnchanged,
+                ExistingChannelId = matched.Id,
+                ChannelGroupName = matched.GroupName,
+                OutputGroup = outputGroup,
+                MatchReason = matchReason,
+                MatchScore = matchScore,
+                Streams = streamDecisions,
+                AmbiguousCandidates = Array.Empty<AmbiguousCandidate>(),
+            };
         }
 
         private static MatchPlan ReconcileByExistingChannelId(MatchPlan plan)
@@ -463,6 +885,8 @@ namespace m3uCrawler.Services.Matching
                 Counts = plan.Counts,
                 Channels = reconciled,
                 AmbiguousGroups = plan.AmbiguousGroups,
+                ClassifiedExclusions = plan.ClassifiedExclusions,
+                UnknownReviewRequired = plan.UnknownReviewRequired,
             };
         }
 
@@ -683,18 +1107,17 @@ namespace m3uCrawler.Services.Matching
         }
 
         /// <summary>
-        /// Returns true when the entry is clearly a bundle, VOD file,
-        /// livecam feed, or colour placeholder and must NOT be treated
-        /// as an applicable channel. See the bundle-guard comment in
-        /// <see cref="BuildPlan"/>.
+        /// Legacy bundle-guard helper retained as an obsolete stub for
+        /// callers in the test suite that still reference it.
+        /// Production code now delegates to
+        /// <see cref="ContentClassifier.Classify"/>. This method will
+        /// be removed in a follow-up cleanup once the tests are
+        /// migrated.
         /// </summary>
+        [Obsolete("Use ContentClassifier.Classify; retained for legacy test references.")]
         internal static bool IsBundleOrCategory(string? title, string? group)
         {
-            if (!string.IsNullOrWhiteSpace(title) && BundleTitlePattern.IsMatch(title))
-                return true;
-            if (!string.IsNullOrWhiteSpace(group) && VodGroupPattern.IsMatch(group.Trim()))
-                return true;
-            return false;
+            return ContentClassifier.Classify(title, group).Kind != ChannelKind.Channel;
         }
 
         private static string NormalizeGroupKey(string name) =>

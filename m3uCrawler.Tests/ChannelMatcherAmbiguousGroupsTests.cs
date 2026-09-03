@@ -68,7 +68,10 @@ public class ChannelMatcherAmbiguousGroupsTests
             new DispatcharrChannelGroup(162, "PORTUGAL"),
             new DispatcharrChannelGroup(222, "Portugal"),
         };
-        var discovered = new[] { Stream("RTP1", group: "Portugal") };
+        // "RTP 1" is a known PT channel identity and survives
+        // classification; the ambiguous "PORTUGAL" group is reported
+        // but not selected (per 420df83 invariant).
+        var discovered = new[] { Stream("RTP 1", group: "Portugal") };
         var plan = Build(discovered, groups);
 
         Assert.Single(plan.Channels);
@@ -88,7 +91,10 @@ public class ChannelMatcherAmbiguousGroupsTests
             new DispatcharrChannelGroup(13, "Sports"),
             new DispatcharrChannelGroup(2, "TV"),
         };
-        var discovered = new[] { Stream("My Sport Channel", group: "Sports") };
+        // "SPORT TV 1" is a known PT channel identity and survives
+        // classification; the new architecture requires explicit
+        // channel identity (ChannelCategoryLookup.Contains).
+        var discovered = new[] { Stream("SPORT TV 1", group: "Sports") };
         var plan = Build(discovered, groups);
 
         Assert.Single(plan.Channels);
@@ -104,7 +110,8 @@ public class ChannelMatcherAmbiguousGroupsTests
     public void Single_portugal_group_is_not_ambiguous()
     {
         var groups = new[] { new DispatcharrChannelGroup(222, "Portugal") };
-        var discovered = new[] { Stream("RTP1", group: "Portugal") };
+        // "RTP 1" is a known PT channel identity.
+        var discovered = new[] { Stream("RTP 1", group: "Portugal") };
         var plan = Build(discovered, groups);
 
         Assert.Empty(plan.AmbiguousGroups!);
@@ -124,12 +131,14 @@ public class ChannelMatcherAmbiguousGroupsTests
             new DispatcharrChannelGroup(13, "Sports"),
             new DispatcharrChannelGroup(227, "PORTUGUESE"),
         };
+        // Use real PT channel identities that survive the new
+        // ContentClassifier (ChannelCategoryLookup.Contains).
         var discovered = new[]
         {
-            Stream("Channel A", group: "TV"),
-            Stream("Channel B", group: "Sports"),
-            Stream("Channel C", group: "PORTUGUESE"),
-            Stream("Channel D", group: "Default Group"),
+            Stream("CNN Portugal", group: "TV"),
+            Stream("SPORT TV 1", group: "Sports"),
+            Stream("SIC", group: "PORTUGUESE"),
+            Stream("RTP 1", group: "Default Group"),
         };
         var plan = Build(discovered, groups);
 
