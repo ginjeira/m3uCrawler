@@ -16,20 +16,37 @@ namespace m3uCrawler.Services.Matching
     /// </para>
     ///
     /// <para>
-    /// Taxonomia alinhada com <c>ResolutionPolicy</c> e
-    /// <c>ContentTypeDetector</c>: não há duplicação. Bundles e VOD
-    /// mantêm-se como kinds próprios porque têm semântica estrutural
-    /// distinta da editorial (Live/VOD/PPV/Foreign) — bundles são
-    /// packages de streams lineares; VOD são ficheiros individuais.
+    /// Each value maps to a deterministic rule in
+    /// <see cref="ContentClassifier.Classify"/>:
     /// </para>
+    /// <list type="bullet">
+    ///   <item><see cref="Channel"/>: title identity is in
+    ///         <see cref="ChannelCategoryLookup"/>. May match existing
+    ///         channels (full fuzzy + alias) and create
+    ///         <c>NewChannel</c> when no match exists.</item>
+    ///   <item><see cref="Bundle"/>: 24/7 themed loop, PACK, BUNDLE
+    ///         keyword, or "canais 24-7" source-group.</item>
+    ///   <item><see cref="Vod"/>: PPV/BETCLIC, "VOD | …" prefix, or
+    ///         "PT - … - YYYY" year-format title.</item>
+    ///   <item><see cref="LiveCam"/>: literal "LiveCam" keyword in
+    ///         title.</item>
+    ///   <item><see cref="Foreign"/>: source-group mapped to
+    ///         <see cref="OutputGroupKind.Foreign"/> in
+    ///         <see cref="GroupTaxonomy"/> (only emitted when the
+    ///         title is NOT a curated channel identity).</item>
+    ///   <item><see cref="Placeholder"/>: colour placeholder
+    ///         ("#f#…", "#00ff00ff####").</item>
+    ///   <item><see cref="Unknown"/>: no structural evidence; the
+    ///         stream may be compared against existing channels
+    ///         ONLY by exact identity equality or by explicit alias —
+    ///         never by fuzzy similarity. Never promoted to
+    ///         <c>NewChannel</c>.</item>
+    /// </list>
     /// </summary>
     public enum ChannelKind
     {
         /// <summary>Continuous live television channel (eligible for matching).</summary>
         Channel = 0,
-
-        /// <summary>Source group name appearing as a title (no stream content).</summary>
-        Group,
 
         /// <summary>24/7 themed loop (e.g. "Filmes Batman 24/7", "SPORT TV PACK").</summary>
         Bundle,
@@ -40,10 +57,7 @@ namespace m3uCrawler.Services.Matching
         /// <summary>Continuous camera stream (e.g. "LiveCam Nazaré").</summary>
         LiveCam,
 
-        /// <summary>Category label without stream (e.g. "Filmes", "Series").</summary>
-        Category,
-
-        /// <summary>Non-Portuguese content (tracked for reporting; never promoted to a PT channel).</summary>
+        /// <summary>Non-PT content in a foreign source-group (only emitted for non-curated titles).</summary>
         Foreign,
 
         /// <summary>Colour placeholder (#f#...), structural artefact, not a channel.</summary>
@@ -86,12 +100,6 @@ namespace m3uCrawler.Services.Matching
             "channel-evidence",
             ExistingMatchEligibility: true,
             NewChannelEligibility: true);
-
-        public static readonly ChannelClassification Group = new(
-            ChannelKind.Group,
-            "group-taxonomy",
-            ExistingMatchEligibility: false,
-            NewChannelEligibility: false);
 
         public static readonly ChannelClassification Unknown = new(
             ChannelKind.Unknown,
@@ -212,23 +220,47 @@ namespace m3uCrawler.Services.Matching
         /// <list type="bullet">
         ///   <item><see cref="ChannelKind.Channel"/> — identity known
         ///         in <see cref="ChannelCategoryLookup"/>:
-        ///         <c>existing=true</c>, <c>new=true</c>.</item>
+        ///         <c>existing=true</c>, <c>new=true</c>.
+        ///         <b>Curated channels always take precedence over
+        ///         source-group signals</b>: a curated title in a
+        ///         "portugal - canais 24-7" group is still Channel;
+        ///         a curated title in a foreign group is still
+        ///         Channel (the foreign source-group is recorded as
+        ///         <c>OutputGroupKind.Foreign</c> at the matching
+        ///         stage, not as a structural kind).</item>
         ///   <item><see cref="ChannelKind.Unknown"/> — no structural
         ///         evidence of channel / bundle / VOD / LiveCam / etc.,
         ///         but the source group is a recognized editorial
         ///         category OR the title normalizes cleanly:
         ///         <c>existing=true</c>, <c>new=false</c>. Allows the
         ///         matcher to attach streams to channels already in
-        ///         Dispatcharr, but never to create a new channel
-        ///         automatically.</item>
+        ///         Dispatcharr (by exact identity or explicit alias
+        ///         only — never by fuzzy similarity), but never to
+        ///         create a new channel automatically.</item>
         ///   <item><see cref="ChannelKind.Unknown"/> with no source
         ///         group and an empty/short title:
         ///         <c>existing=false</c>, <c>new=false</c>.</item>
-        ///   <item>All other kinds (Bundle / Vod / LiveCam / Placeholder
-        ///         / Category / Group / Foreign):
+        ///   <item>All other kinds (<see cref="ChannelKind.Bundle"/>,
+        ///         <see cref="ChannelKind.Vod"/>,
+        ///         <see cref="ChannelKind.LiveCam"/>,
+        ///         <see cref="ChannelKind.Placeholder"/>,
+        ///         <see cref="ChannelKind.Foreign"/>):
         ///         <c>existing=false</c>, <c>new=false</c>. They are
         ///         excluded from the matching pipeline entirely.</item>
         /// </list>
+        ///
+        /// <para>
+        /// <b>Note on <see cref="ChannelKind.Foreign"/></b>: it is
+        /// only emitted when the source group is mapped to
+        /// <see cref="OutputGroupKind.Foreign"/> in
+        /// <see cref="GroupTaxonomy"/> AND the title is NOT a curated
+        /// channel identity. The semantic is "the source group is
+        /// foreign and we don't have enough evidence to treat this
+        /// as a channel". A curated title in a foreign group is
+        /// classified as <see cref="ChannelKind.Channel"/> and its
+        /// foreign-ness is expressed as an
+        /// <see cref="OutputGroupKind"/> downstream.
+        /// </para>
         /// </summary>
         public static ChannelClassification Classify(string? title, string? sourceGroup)
         {

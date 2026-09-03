@@ -344,6 +344,6 @@ public class WebDashboardServiceTests
         Assert.Equal("Filmes Batman 24/7 ( Exclusivo ) PT", back.ClassifiedExclusions[1].Title);
         Assert.Equal(ChannelKind.Bundle, back.ClassifiedExclusions[1].Kind);
         // No credentials, no URLs.
-        Assert.Empty(back.ClassifiedExclusions[0].GetType().GetProperties().Where(p => p.Name is "StreamUrl" or "Provider" or "Url"));
+        Assert.DoesNotContain(back.ClassifiedExclusions[0].GetType().GetProperties(), p => p.Name is "StreamUrl" or "Provider" or "Url");
     }
 }
