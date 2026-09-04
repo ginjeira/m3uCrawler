@@ -12,3 +12,14 @@ m3uCrawler/test.txt
 m3uCrawler/runtime-data/*
 !m3uCrawler/runtime-data/.gitkeep
 !m3uCrawler/runtime-data/channel-indicators.json
+
+# Tool artifacts (not part of the application).
+.kilo/
+**/.kilo/
+.config/
+**/.config/
+
+# Test runner artifacts.
+TestResults/
+**/TestResults/
+

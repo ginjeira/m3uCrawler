@@ -142,6 +142,7 @@ namespace m3uCrawler.Models
         [JsonPropertyName("unchanged")] public int Unchanged { get; set; }
         [JsonPropertyName("failed")] public int Failed { get; set; }
         [JsonPropertyName("ambiguousGroups")] public int AmbiguousGroups { get; set; }
+        [JsonPropertyName("protectedExternalStreams")] public int ProtectedExternalStreams { get; set; }
         [JsonPropertyName("totalChannels")] public int TotalChannels => Matched + NewChannels + Unchanged + Ambiguous + Failed + Skipped;
 
         /// <summary>

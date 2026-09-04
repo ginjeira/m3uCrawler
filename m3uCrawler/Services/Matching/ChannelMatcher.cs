@@ -1,5 +1,6 @@
 using System.Globalization;
 using m3uCrawler.Models;
+using m3uCrawler.Services.Catalog;
 using m3uCrawler.Services.SourceOrdering;
 
 namespace m3uCrawler.Services.Matching
@@ -23,6 +24,7 @@ namespace m3uCrawler.Services.Matching
         private readonly FuzzyMatcher _fuzzy = new();
         private readonly MatchScorer _scorer = new();
         private readonly Func<string?, string?, string?, bool, OutputGroupKind>? _resolutionPolicy;
+        private readonly m3uCrawler.Services.Catalog.CatalogResolver? _catalog;
 
         /// <summary>
         /// Constructs a ChannelMatcher with the legacy single-dependency
@@ -30,7 +32,7 @@ namespace m3uCrawler.Services.Matching
         /// disabled unless the overload below is used.
         /// </summary>
         public ChannelMatcher(AliasResolver aliases)
-            : this(aliases, null)
+            : this(aliases, null, null)
         {
         }
 
@@ -39,24 +41,35 @@ namespace m3uCrawler.Services.Matching
         /// <see cref="ResolutionPolicy"/> delegate (or null to disable
         /// the OutputGroup pipeline). CanonicalName is always resolved
         /// through the static <see cref="GroupResolver"/>.
-        ///
-        /// <para>
-        /// Foreign is determined deterministically: a SourceGroup that
-        /// <see cref="GroupTaxonomy"/> maps to
-        /// <see cref="OutputGroupKind.Foreign"/> marks the representative
-        /// stream as foreign. Streams whose SourceGroup is not a known
-        /// foreign group are treated as PT (isForeign=false).
-        /// </para>
         /// </summary>
         public ChannelMatcher(
             AliasResolver aliases,
             Func<string?, string?, string?, bool, OutputGroupKind>? resolutionPolicy)
+            : this(aliases, resolutionPolicy, null)
+        {
+        }
+
+        /// <summary>
+        /// Constructs a ChannelMatcher with an injected
+        /// <see cref="m3uCrawler.Services.Catalog.CatalogResolver"/>
+        /// (or null to keep the legacy
+        /// <c>ChannelCategoryLookup.Contains()</c>-driven policy).
+        /// When the catalog is provided, publication policy
+        /// (<c>CreateEligible / ReviewOnly / Excluded / MergeOnly</c>)
+        /// is read from the persistent catalog; otherwise the legacy
+        /// in-memory dictionary drives the decision.
+        /// </summary>
+        public ChannelMatcher(
+            AliasResolver aliases,
+            Func<string?, string?, string?, bool, OutputGroupKind>? resolutionPolicy,
+            m3uCrawler.Services.Catalog.CatalogResolver? catalog)
         {
             _aliases = aliases ?? throw new ArgumentNullException(nameof(aliases));
             _resolutionPolicy = resolutionPolicy;
+            _catalog = catalog;
         }
 
-        public MatchPlan BuildPlan(
+        private async Task<MatchPlan> BuildPlanCoreAsync(
             IReadOnlyList<DiscoveredStream> discovered,
             DispatcharrState existing,
             MatchingOptions options,
@@ -71,16 +84,63 @@ namespace m3uCrawler.Services.Matching
             if (options == null) throw new ArgumentNullException(nameof(options));
             if (ordering == null) throw new ArgumentNullException(nameof(ordering));
 
+            return await BuildPlanCoreInternalAsync(discovered, existing, options, ordering, sourcePlaylistPath, dispatcharrBaseUrl, dryRun, nowUtc);
+        }
+
+        /// <summary>
+        /// Sync shim that calls the async core. Tests not using the
+        /// catalog can still call <c>BuildPlan(...)</c> and get a
+        /// result back synchronously.
+        /// </summary>
+        public async Task<MatchPlan> BuildPlanAsync(
+            IReadOnlyList<DiscoveredStream> discovered,
+            DispatcharrState existing,
+            MatchingOptions options,
+            IStreamOrderingPolicy ordering,
+            string sourcePlaylistPath,
+            string dispatcharrBaseUrl,
+            bool dryRun,
+            DateTime? nowUtc = null)
+        {
+            return await BuildPlanCoreAsync(discovered, existing, options, ordering, sourcePlaylistPath, dispatcharrBaseUrl, dryRun, nowUtc);
+        }
+
+        public MatchPlan BuildPlan(
+            IReadOnlyList<DiscoveredStream> discovered,
+            DispatcharrState existing,
+            MatchingOptions options,
+            IStreamOrderingPolicy ordering,
+            string sourcePlaylistPath,
+            string dispatcharrBaseUrl,
+            bool dryRun,
+            DateTime? nowUtc = null)
+        {
+            return BuildPlanAsync(discovered, existing, options, ordering, sourcePlaylistPath, dispatcharrBaseUrl, dryRun, nowUtc)
+                .GetAwaiter()
+                .GetResult();
+        }
+
+        private async Task<MatchPlan> BuildPlanCoreInternalAsync(
+            IReadOnlyList<DiscoveredStream> discovered,
+            DispatcharrState existing,
+            MatchingOptions options,
+            IStreamOrderingPolicy ordering,
+            string sourcePlaylistPath,
+            string dispatcharrBaseUrl,
+            bool dryRun,
+            DateTime? nowUtc = null)
+        {
             int threshold = options.MatchThreshold;
             var stamp = (nowUtc ?? DateTime.UtcNow).ToString("o");
 
             // Two-level classification + matching policy:
-            //   1. ContentClassifier returns Kind + eligibility flags
-            //      (ExistingMatchEligibility, NewChannelEligibility).
-            //   2. Kinds with eligibility=false for BOTH flags are
-            //      excluded immediately (Bundle, Vod, LiveCam,
-            //      Placeholder, Category, Group, Foreign).
-            //   3. Streams are then split by ELIGIBILITY TIER into two
+            //   1. ContentClassifier returns Kind + ExistingMatchEligibility
+            //      (NewChannelEligibility is removed; it now comes from
+            //      the persistent catalog in step 1.5).
+            //   2. Kinds with ExistingMatchEligibility=false are excluded
+            //      immediately (Bundle, Vod, LiveCam, Placeholder,
+            //      Category, Group, Foreign).
+            //   3. Streams are split by ELIGIBILITY TIER into two
             //      parallel bucket collections (curated vs unknown),
             //      keyed by tier+identity. This guarantees that:
             //        - a curated stream can never be promoted to a
@@ -91,6 +151,17 @@ namespace m3uCrawler.Services.Matching
             //        - each tier uses its own matching strategy:
             //            curated: full fuzzy + alias + threshold;
             //            unknown: equality OR explicit alias only.
+            //   1.5. For <c>Kind=Channel</c> the matcher consults the
+            //        catalog to decide <c>NewChannelEligibility</c>:
+            //        - IdentityRule ReviewOnly → bucket tier = Unknown
+            //          (ReviewItem path; never NewChannel);
+            //        - IdentityRule Excluded → excluded (no bucket);
+            //        - CanonicalChannel with CreateEligible →
+            //          NewChannelEligibility = true;
+            //        - CanonicalChannel with MergeOnly/ReviewOnly/
+            //          Excluded → NewChannelEligibility = false (Unknown
+            //          tier; merge-only attach to existing);
+            //        - Unknown canonical → NewChannelEligibility = false.
             //
             // Invariantes preservados:
             //   b0dfc48 (stream dedup)
@@ -125,7 +196,7 @@ namespace m3uCrawler.Services.Matching
                 classificationCounts[kindName] = prev + 1;
 
                 // 1) Kind-level exclusion: never matched, never created.
-                if (!classification.ExistingMatchEligibility && !classification.NewChannelEligibility)
+                if (!classification.ExistingMatchEligibility)
                 {
                     dispositionCounts["excluded"] = dispositionCounts["excluded"] + 1;
                     excluded.Add(new ClassifiedExclusion
@@ -139,21 +210,86 @@ namespace m3uCrawler.Services.Matching
                     continue;
                 }
 
-                // Pick tier. If a stream is BOTH curated-eligible and
-                // existing-match-eligible, it goes to the curated tier
-                // (preserves the editorial decision surface: the
-                // matcher treats curated streams consistently).
-                var tier = classification.NewChannelEligibility
-                    ? BucketTier.Curated
-                    : BucketTier.Unknown;
+                // 1.5) If the catalog is active, resolve the
+                //     publication policy for this normalized identity.
+                //     - IdentityRule ReviewOnly → bucket tier = Unknown
+                //       (ReviewItem path; never NewChannel);
+                //     - IdentityRule Excluded → excluded (no bucket);
+                //     - CanonicalChannel with CreateEligible →
+                //       NewChannelEligibility = true (tier = Curated);
+                //     - CanonicalChannel with MergeOnly/ReviewOnly/
+                //       Excluded → NewChannelEligibility = false (tier =
+                //       Unknown; merge-only attach to existing);
+                //     - Unknown canonical → NewChannelEligibility = false.
+                bool canCreateNew = false;
+                CatalogResolution? catalogResolution = null;
+                if (_catalog != null)
+                {
+                    var normalized = ChannelNormalizer.Normalize(s.Title);
+                    catalogResolution = await _catalog.ResolveAsync(normalized);
+                    if (catalogResolution.HasValue && catalogResolution.Value.Kind == CatalogResolutionKind.Rule)
+                    {
+                        if (catalogResolution.Value.RuleDisposition == RuleDisposition.ReviewOnly)
+                        {
+                            // Mark for review; never NewChannel.
+                            await _catalog.UpsertReviewItemAsync(
+                                normalized,
+                                s.Group ?? string.Empty,
+                                "not-approved-in-publication-catalog",
+                                catalogResolution.Value.RuleReason ?? string.Empty);
+                            dispositionCounts["unknownReviewRequired"] =
+                                dispositionCounts["unknownReviewRequired"] + 1;
+                            reviewRequired.Add(new ClassifiedExclusion
+                            {
+                                Title = s.Title ?? string.Empty,
+                                Group = s.Group ?? string.Empty,
+                                Kind = ChannelKind.Unknown,
+                                Reason = $"review-only:{catalogResolution.Value.RuleReason}",
+                                MatchingDisposition = "unknown-review-required",
+                            });
+                            continue;
+                        }
+                        else
+                        {
+                            // Excluded by rule.
+                            dispositionCounts["excluded"] = dispositionCounts["excluded"] + 1;
+                            excluded.Add(new ClassifiedExclusion
+                            {
+                                Title = s.Title ?? string.Empty,
+                                Group = s.Group ?? string.Empty,
+                                Kind = classification.Kind,
+                                Reason = "excluded-by-rule",
+                                MatchingDisposition = "excluded",
+                            });
+                            continue;
+                        }
+                    }
+                    canCreateNew = catalogResolution.Value.AllowsNewChannel;
+                }
+                else
+                {
+                    // Legacy mode (no catalog): the legacy code marked
+                    // every Channel kind as eligible to create new.
+                    canCreateNew = classification.Kind == ChannelKind.Channel;
+                }
 
-                var resolved = ResolveIdentity(s.Title);
+                // 2) Pick tier.
+                var tier = canCreateNew ? BucketTier.Curated : BucketTier.Unknown;
+
+                // Use the catalog-resolved canonical identity when
+                // available (so that "BTV" / "benficatv" / "benfica tv"
+                // all bucket to "benfica-tv"). When the catalog is
+                // inactive or the resolution is unknown, fall back to
+                // the legacy alias resolver / normalizer.
+                string resolved = (catalogResolution?.CanonicalKey) is { Length: > 0 } k
+                    ? k
+                    : ResolveIdentity(s.Title);
                 var key = (tier, resolved);
                 if (!channelBuckets.TryGetValue(key, out var list))
                 {
                     list = new List<DiscoveredStream>();
                     channelBuckets[key] = list;
-                    bucketNewChannelEligible[key] = classification.NewChannelEligibility;
+                    bucketNewChannelEligible[key] = canCreateNew;
                 }
                 list.Add(s);
             }
@@ -166,6 +302,21 @@ namespace m3uCrawler.Services.Matching
 
             var existingStreamsById = existing.Streams.ToDictionary(s => s.Id, s => s);
             var groupIndex = GroupNameIndex.Build(existing.Groups);
+
+            // Ownership guard: mapa de stream id → StreamOwnership
+            // carregado em batch (uma única query) para que
+            // BuildExistingDecision possa filtrar Removed de
+            // streams External/Unknown. Sem catalog (legacy mode)
+            // o mapa fica vazio e o filtro trata todas as streams
+            // como CrawlerManaged — mesmo comportamento histórico
+            // para não regredir testes pré-catalog.
+            var ownershipByStreamId = new Dictionary<long, StreamOwnership>();
+            if (_catalog != null && existing.Streams.Count > 0)
+            {
+                ownershipByStreamId = (await _catalog.GetStreamOwnershipMapAsync(
+                    existing.Streams.Select(s => s.Id).ToList()))
+                    .ToDictionary(kv => kv.Key, kv => kv.Value);
+            }
 
             var newChannelIdSeed = -1L;
             var decisions = new List<ChannelDecision>();
@@ -327,7 +478,7 @@ namespace m3uCrawler.Services.Matching
                     decisions.AddRange(new[] { BuildExistingDecision(
                         bucket.Value, matched, isCurated, outputGroup,
                         matchReason!, matchScore, ordering, existing.Streams,
-                        existingStreamsById, streamsByChannel, counts) });
+                        existingStreamsById, streamsByChannel, ownershipByStreamId, counts) });
                     continue;
                 }
 
@@ -686,6 +837,19 @@ namespace m3uCrawler.Services.Matching
         /// marks stale existing streams as Removed, and tags the
         /// outcome as <see cref="SyncOutcome.ExistingReassigned"/>
         /// when there is any change.
+        ///
+        /// <para>
+        /// Streams whose <see cref="StreamOwnership"/> é
+        /// <see cref="StreamOwnership.External"/> ou
+        /// <see cref="StreamOwnership.Unknown"/> NUNCA recebem
+        /// <see cref="SyncOutcome.Removed"/>. Apenas streams
+        /// comprovadamente <see cref="StreamOwnership.CrawlerManaged"/>
+        /// podem sair. Streams protegidas são reclassificadas para
+        /// <see cref="SyncOutcome.ExistingUnchanged"/> com
+        /// <c>OrderReason = "protected-by-ownership"</c> para
+        /// reflectir a decisão no plano sem mudar a stream no
+        /// Dispatcharr.
+        /// </para>
         /// </summary>
         private ChannelDecision BuildExistingDecision(
             IReadOnlyList<DiscoveredStream> bucket,
@@ -698,6 +862,7 @@ namespace m3uCrawler.Services.Matching
             IReadOnlyList<DispatcharrStream> allExistingStreams,
             IReadOnlyDictionary<long, DispatcharrStream> existingStreamsById,
             IReadOnlyDictionary<long, HashSet<long>> streamsByChannel,
+            IReadOnlyDictionary<long, StreamOwnership> ownershipByStreamId,
             SyncReportCounts counts)
         {
             var existingStreamIds = streamsByChannel.TryGetValue(matched.Id, out var sids)
@@ -768,6 +933,40 @@ namespace m3uCrawler.Services.Matching
             {
                 if (existingStreamsById.TryGetValue(sid, out var es))
                 {
+                    // Ownership guard: streams External ou Unknown
+                    // nunca podem ser removidas. Apenas streams
+                    // comprovadamente CrawlerManaged recebem
+                    // SyncOutcome.Removed. Streams protegidas são
+                    // reclassificadas como ExistingUnchanged com
+                    // OrderReason = "protected-by-ownership" para
+                    // ficarem visíveis no relatório mas não serem
+                    // emitidas em DELETE/PATCH. Sem catalog (legacy
+                    // mode) o mapa está vazio e todas as streams
+                    // caem no fallback CrawlerManaged. Com catalog,
+                    // streams sem registo na BD são tratadas como
+                    // Unknown (default seguro) — nunca removidas.
+                    var ownership = ownershipByStreamId.TryGetValue(sid, out var own)
+                        ? own
+                        : (_catalog != null
+                            ? StreamOwnership.Unknown
+                            : StreamOwnership.CrawlerManaged);
+                    if (ownership != StreamOwnership.CrawlerManaged)
+                    {
+                        streamDecisions.Add(new StreamMatchDecision
+                        {
+                            Provider = es.M3uAccountName ?? "(unknown)",
+                            StreamUrl = es.Url,
+                            StreamName = es.Name,
+                            Outcome = SyncOutcome.ExistingUnchanged,
+                            ExistingStreamId = sid,
+                            ProposedOrder = -1,
+                            OrderReason = "protected-by-ownership",
+                            IsWorking = es.IsWorking,
+                            GroupName = es.GroupName,
+                        });
+                        counts.ProtectedExternalStreams = counts.ProtectedExternalStreams + 1;
+                        continue;
+                    }
                     streamDecisions.Add(new StreamMatchDecision
                     {
                         Provider = es.M3uAccountName ?? "(unknown)",
