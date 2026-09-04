@@ -1382,8 +1382,11 @@ const rows = Object.entries(inv).map(([k, v]) => {
     // ===== CATALOG =====
     let currentCatalogTab = 'overview';
     async function loadCatalog() {
+      console.log('[DEBUG] loadCatalog called');
       const stats = await safeFetchJson('/api/catalog/stats', null);
+      console.log('[DEBUG] stats:', stats);
       if (!stats || stats.error) {
+        console.error('[DEBUG] stats error:', stats?.error);
         document.getElementById('catalogStats').innerHTML = `<div class='card'><p class='muted'>Catálogo não disponível: ${stats ? stats.error : 'erro de rede'}</p></div>`;
         return;
       }
@@ -1399,16 +1402,23 @@ const rows = Object.entries(inv).map(([k, v]) => {
       cards.push(metricCard('Ownership streams', nfmt(stats.dispatcharrStreamOwnerships || 0), '', 'Streams do Dispatcharr registadas.'));
       cards.push(metricCard('Sync runs', nfmt(stats.syncRuns || 0), '', 'Execuções de sync gravadas.'));
       document.getElementById('catalogStats').innerHTML = cards.join('');
+      console.log('[DEBUG] catalogStats innerHTML set, cards:', cards.length);
       document.getElementById('catalogStatsDetail').innerHTML = `
         <p><strong>DB:</strong> <code>${dbg}</code></p>
         <p class='row-counts'>Actualizado: ${tsLocal(stats.generatedAtUtc)}</p>`;
       loadCatalogTab(currentCatalogTab);
+      console.log('[DEBUG] loadCatalogTab called');
     }
 
     function loadCatalogTab(tab) {
+      console.log('[DEBUG] loadCatalogTab called with tab:', tab);
       currentCatalogTab = tab;
       document.querySelectorAll('#catalogTabs button').forEach(b => b.classList.toggle('active', b.dataset.ctab === tab));
-      document.querySelectorAll('[id^="ctab-"]').forEach(d => d.hidden = d.id !== 'ctab-' + tab);
+      document.querySelectorAll('[id^="ctab-"]').forEach(d => {
+        const shouldHide = d.id !== 'ctab-' + tab;
+        console.log('[DEBUG] ctab', d.id, 'hidden:', shouldHide);
+        d.hidden = shouldHide;
+      });
       if (tab === 'channels') loadCatalogChannels();
       else if (tab === 'rules') loadCatalogRules();
       else if (tab === 'reviews') loadCatalogReviews();
@@ -1555,8 +1565,11 @@ const rows = Object.entries(inv).map(([k, v]) => {
     document.querySelectorAll('#catalogTabs button').forEach(b => b.addEventListener('click', () => loadCatalogTab(b.dataset.ctab)));
 
     function showView(name) {
+      console.log('[DEBUG] showView called:', name);
       document.querySelectorAll('main > section').forEach(s => s.hidden = true);
-      document.getElementById('view-' + name).hidden = false;
+      const targetSection = document.getElementById('view-' + name);
+      targetSection.hidden = false;
+      console.log('[DEBUG] view-' + name + ' hidden:', targetSection.hidden);
       document.querySelectorAll('nav button').forEach(b => b.classList.toggle('active', b.dataset.view === name));
       switch (name) {
         case 'overview': loadOverview(); break;
