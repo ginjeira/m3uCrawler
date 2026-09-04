@@ -1583,7 +1583,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
       }
     }
 
-    document.querySelectorAll('nav button').forEach(b => b.addEventListener('click', () => showView(b.dataset.view)));
+    document.querySelectorAll('nav button').forEach(b => { if (!b.dataset.view) return; b.addEventListener('click', () => showView(b.dataset.view)); });
     document.getElementById('countrySelect').addEventListener('change', () => loadCountryValidation());
     ['discState','discSource','discCountry'].forEach(id => document.getElementById(id).addEventListener('change', renderDiscovery));
 
