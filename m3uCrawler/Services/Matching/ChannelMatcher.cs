@@ -227,7 +227,7 @@ namespace m3uCrawler.Services.Matching
                 {
                     var normalized = ChannelNormalizer.Normalize(s.Title);
                     catalogResolution = await _catalog.ResolveAsync(normalized);
-                    if (catalogResolution?.Kind == CatalogResolutionKind.Rule)
+                    if (catalogResolution.HasValue && catalogResolution.Value.Kind == CatalogResolutionKind.Rule)
                     {
                         if (catalogResolution.Value.RuleDisposition == RuleDisposition.ReviewOnly)
                         {
