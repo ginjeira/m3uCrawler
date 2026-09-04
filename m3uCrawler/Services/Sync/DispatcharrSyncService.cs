@@ -1,4 +1,5 @@
 using m3uCrawler.Models;
+using m3uCrawler.Services.Catalog;
 using m3uCrawler.Services.Dispatcharr;
 using m3uCrawler.Services.Matching;
 using m3uCrawler.Services.SourceOrdering;
@@ -31,6 +32,7 @@ namespace m3uCrawler.Services.Sync
         private readonly DispatcharrAuthState _auth;
         private readonly DispatcharrLoginApi _login;
         private readonly AliasResolver _aliases;
+        private readonly CatalogResolver? _catalog;
         private readonly string _outputDir;
 
         public DispatcharrSyncService(
@@ -44,13 +46,15 @@ namespace m3uCrawler.Services.Sync
             DispatcharrLoginApi? login = null,
             IDispatcharrChannelClient? channels = null,
             IDispatcharrStreamClient? streams = null,
-            IDispatcharrM3UClient? m3u = null)
+            IDispatcharrM3UClient? m3u = null,
+            CatalogResolver? catalog = null)
         {
             _config = config ?? throw new ArgumentNullException(nameof(config));
             _outputDir = outputDir ?? "output";
             _aliases = aliases ?? AliasResolver.FromFile(config.AliasFile);
             _ordering = ordering ?? new StreamOrderingPolicy(config.ProviderPriority);
             _matcher = matcher ?? new ChannelMatcher(_aliases);
+            _catalog = catalog;
 
             if (config.Enabled)
             {
@@ -250,10 +254,46 @@ namespace m3uCrawler.Services.Sync
 
             // Phase 4 (global): DELETE only streams that no channel in the plan keeps.
             // Distinct() guards against repeated references to the same id.
+            //
+            // Ownership guard (defesa redundante): o filtro principal
+            // vive em ChannelMatcher.BuildExistingDecision. Esta
+            // barreira em ApplyAsync é uma salvaguarda adicional:
+            // mesmo que um plano inválido contenha um Removed para
+            // uma stream com Ownership External/Unknown, NUNCA
+            // emitimos DELETE. Apenas streams comprovadamente
+            // CrawlerManaged são removidas. Sem catalog, o filtro
+            // não se aplica (legacy mode).
+            IReadOnlyDictionary<long, StreamOwnership> ownershipMap =
+                new Dictionary<long, StreamOwnership>();
+            if (_catalog != null && globalRemoveCandidates.Count > 0)
+            {
+                ownershipMap = await _catalog.GetStreamOwnershipMapAsync(
+                    globalRemoveCandidates.ToList(), ct);
+            }
             foreach (var streamId in globalRemoveCandidates
                 .Where(id => !globalKeepStreamIds.Contains(id))
                 .Distinct())
             {
+                // Streams sem registo de ownership caem no
+                // default seguro (Unknown) APENAS quando o catalog
+                // está activo. Sem catalog (legacy mode) o mapa
+                // está vazio e todas as streams caem no fallback
+                // CrawlerManaged (mesmo comportamento histórico).
+                var ownership = _catalog != null
+                    ? (ownershipMap.TryGetValue(streamId, out var own)
+                        ? own
+                        : StreamOwnership.Unknown)
+                    : StreamOwnership.CrawlerManaged;
+                if (ownership != StreamOwnership.CrawlerManaged)
+                {
+                    // Salvaguarda: stream com ownership protegida
+                    // (External, Unknown, ou sem registo) nunca
+                    // recebe DELETE. Log informativo apenas; não
+                    // conta como failed (não é erro de aplicação,
+                    // é defesa intencional).
+                    Console.WriteLine($"🛡️ Ownership guard: stream {streamId} ({ownership}) mantida apesar de plano a marcar como Removed.");
+                    continue;
+                }
                 try
                 {
                     await _streams.DeleteAsync(streamId, ct);

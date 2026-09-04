@@ -142,11 +142,20 @@ public class ChannelCatalogIntegrationTests : IAsyncLifetime
         Assert.Contains("benficatv", aliases);
         Assert.Contains("benfica tv", aliases);
 
-        // The identity rules were seeded.
-        var nba = await ctx.IdentityRules
-            .FirstOrDefaultAsync(r => r.NormalizedIdentity == "sport tv nba");
+        // The sport-tv-nba canonical channel was seeded with
+        // CreateEligible policy (no longer an IdentityRule).
+        var nba = await ctx.CanonicalChannels
+            .FirstOrDefaultAsync(c => c.Key == "sport-tv-nba");
         Assert.NotNull(nba);
-        Assert.Equal(RuleDisposition.ReviewOnly, nba!.Disposition);
+        Assert.Equal("Sport TV NBA", nba!.DisplayName);
+        Assert.Equal(PublicationPolicy.CreateEligible, nba.PublicationPolicy);
+        var nbaAliases = await ctx.ChannelAliases
+            .Where(a => a.CanonicalChannelId == nba.Id)
+            .Select(a => a.NormalizedAlias)
+            .ToListAsync();
+        Assert.Contains("sport tv nba", nbaAliases);
+        Assert.Contains("pt sport tv nba", nbaAliases);
+        Assert.Contains("sport tv nba hevc pt", nbaAliases);
 
         // Idempotency: a second InitializeAsync() (without dropping
         // the file) must not duplicate channels.
@@ -208,42 +217,42 @@ public class ChannelCatalogIntegrationTests : IAsyncLifetime
     }
 
     // -----------------------------------------------------------------
-    // 3) PT: SPORT TV NBA gera review e nunca canal novo.
+    // 3) SPORT TV NBA e variantes criam canal autónomo
+    //    sport-tv-nba, distinto de Sport TV 1..7.
     // -----------------------------------------------------------------
     [Theory]
-    [InlineData("PT: SPORT TV NBA")]
     [InlineData("SPORT TV NBA")]
+    [InlineData("PT: SPORT TV NBA")]
     [InlineData("PT SPORT TV NBA")]
     [InlineData("SPORT TV NBA HEVC PT")]
-    public async Task PT_SPORT_TV_NBA_is_review_only_and_never_channel(string title)
+    public async Task SPORT_TV_NBA_and_variants_resolve_to_sport_tv_nba_canonical(string title)
     {
         var plan = await BuildPlan(
             new[] { Stream(title, "PT - DESPORTO") },
             Empty());
-        // 0 NewChannel decisions.
-        Assert.Empty(plan.Channels);
-        // 1 Unknown review entry.
-        Assert.Single(plan.UnknownReviewRequired);
-        Assert.Equal("review-only:not-approved-in-publication-catalog",
-            plan.UnknownReviewRequired[0].Reason);
-        // 1 "excluded" counter increment via review-required path.
-        Assert.Equal(1, plan.Counts.MatchingDisposition["unknownReviewRequired"]);
+        // 1 NewChannel decision: "sport-tv-nba" canonical key.
+        Assert.Single(plan.Channels);
+        Assert.Equal(SyncOutcome.NewChannel, plan.Channels[0].Outcome);
+        Assert.Equal("sport-tv-nba", plan.Channels[0].Identity);
+        // Sem review-required.
+        Assert.Empty(plan.UnknownReviewRequired);
     }
 
     [Fact]
-    public async Task PT_SPORT_TV_NBA_does_not_attach_to_Sport_TV_1_to_7()
+    public async Task SPORT_TV_NBA_does_not_attach_to_existing_Sport_TV_1_to_7()
     {
-        // Even if Sport TV 1..7 already exist, NBA stays review-only.
+        // Sport TV 1..7 já existem como canais externos (não devem
+        // ser fundidos). SPORT TV NBA cria o seu próprio canal.
         var existing = new DispatcharrState(
             new[]
             {
-                Ch(1, "Sport TV 1", "SPORT TV CHANNELS"),
-                Ch(2, "Sport TV 2", "SPORT TV CHANNELS"),
-                Ch(3, "Sport TV 3", "SPORT TV CHANNELS"),
-                Ch(4, "Sport TV 4", "SPORT TV CHANNELS"),
-                Ch(5, "Sport TV 5", "SPORT TV CHANNELS"),
-                Ch(6, "Sport TV 6", "SPORT TV CHANNELS"),
-                Ch(7, "Sport TV 7", "SPORT TV CHANNELS"),
+                new DispatcharrChannel(1, "Sport TV 1", "SPORT TV CHANNELS", 100, null, Array.Empty<long>()),
+                new DispatcharrChannel(2, "Sport TV 2", "SPORT TV CHANNELS", 100, null, Array.Empty<long>()),
+                new DispatcharrChannel(3, "Sport TV 3", "SPORT TV CHANNELS", 100, null, Array.Empty<long>()),
+                new DispatcharrChannel(4, "Sport TV 4", "SPORT TV CHANNELS", 100, null, Array.Empty<long>()),
+                new DispatcharrChannel(5, "Sport TV 5", "SPORT TV CHANNELS", 100, null, Array.Empty<long>()),
+                new DispatcharrChannel(6, "Sport TV 6", "SPORT TV CHANNELS", 100, null, Array.Empty<long>()),
+                new DispatcharrChannel(7, "Sport TV 7", "SPORT TV CHANNELS", 100, null, Array.Empty<long>()),
             },
             Array.Empty<DispatcharrStream>(),
             new[] { new DispatcharrChannelGroup(99, "SPORT TV CHANNELS") },
@@ -251,8 +260,124 @@ public class ChannelCatalogIntegrationTests : IAsyncLifetime
         var plan = await BuildPlan(
             new[] { Stream("PT: SPORT TV NBA", "PT - DESPORTO") },
             existing);
-        Assert.Empty(plan.Channels);
-        Assert.Single(plan.UnknownReviewRequired);
+        // Nenhum anexo a Sport TV 1..7: ou cria novo sport-tv-nba
+        // (curated + sem match exacto) ou cai em review (Unknown).
+        // Resultado actual: NewChannel "sport-tv-nba".
+        Assert.Single(plan.Channels);
+        Assert.Equal(SyncOutcome.NewChannel, plan.Channels[0].Outcome);
+        Assert.Equal("sport-tv-nba", plan.Channels[0].Identity);
+        Assert.Empty(plan.UnknownReviewRequired);
+        // Sport TV 1..7 ficam intactos.
+        var sportTvIds = new[] { 1L, 2L, 3L, 4L, 5L, 6L, 7L };
+        Assert.DoesNotContain(plan.Channels, c => sportTvIds.Contains(c.ExistingChannelId ?? -1L));
+    }
+
+    [Fact]
+    public async Task SPORT_TV_NBA_merge_only_into_existing_external_channel()
+    {
+        // Já existe um canal "Sport TV NBA" no Dispatcharr (id=700)
+        // com uma stream externa (id=7001, Ownership=External).
+        // A stream externa tem um título distinto para que o
+        // matcher NÃO a confunda com a stream do crawler por
+        // título normalizado (o ChannelNormalizer remove "PT"
+        // como token de país, pelo que "PT: SPORT TV NBA" e
+        // "Sport TV NBA" normalizam para o mesmo token).
+        // É exactamente o cenário real em produção onde um canal
+        // externo foi criado com nomes que não colidem.
+        var existingChannel = new DispatcharrChannel(
+            700, "Sport TV NBA", "SPORT TV CHANNELS", 100, null,
+            new long[] { 7001 });
+        var existingStream = new DispatcharrStream(
+            Id: 7001, Name: "NBA External Feed",
+            Url: "https://external.test/nba-feed",
+            TvgId: null, GroupName: "SPORT TV CHANNELS",
+            M3uAccountName: "external",
+            IsCustom: true, IsWorking: true, ResponseTimeMs: 100);
+        var existing = new DispatcharrState(
+            new[] { existingChannel },
+            new[] { existingStream },
+            new[] { new DispatcharrChannelGroup(99, "SPORT TV CHANNELS") },
+            null);
+        // Bootstrap: registar ownership da stream como External.
+        var resolver = new CatalogResolver(_factory);
+        await using (var ctx = await _factory.CreateDbContextAsync())
+        {
+            ctx.DispatcharrStreamOwnerships.Add(new DispatcharrStreamOwnershipEntity
+            {
+                DispatcharrStreamId = 7001,
+                DispatcharrChannelId = 700,
+                Ownership = StreamOwnership.External,
+                CreatedBySyncRunId = null,
+                CreatedAtUtc = DateTime.UtcNow,
+                UpdatedAtUtc = DateTime.UtcNow,
+            });
+            await ctx.SaveChangesAsync();
+        }
+
+        var plan = await BuildPlan(
+            new[] { Stream("PT: SPORT TV NBA", "PT - DESPORTO") },
+            existing);
+        // Nenhum NewChannel — o canal existente 700 é reutilizado.
+        Assert.DoesNotContain(plan.Channels, c => c.Outcome == SyncOutcome.NewChannel);
+        var decision = plan.Channels.Single(c => c.ExistingChannelId == 700);
+        // Merge-only: a stream do crawler entra como NewStream; a
+        // stream externa é protegida por ownership (não removida).
+        Assert.Equal(SyncOutcome.ExistingReassigned, decision.Outcome);
+        Assert.Contains(decision.Streams, s => s.Outcome == SyncOutcome.NewStream);
+        Assert.DoesNotContain(decision.Streams, s => s.Outcome == SyncOutcome.Removed);
+        Assert.Equal(0, plan.Counts.RemovedStreams);
+        Assert.True(plan.Counts.ProtectedExternalStreams >= 1,
+            $"Esperado ≥1 stream protegida, obtido {plan.Counts.ProtectedExternalStreams}");
+    }
+
+    [Fact]
+    public async Task SPORT_TV_NBA_does_not_remove_external_streams_in_plan()
+    {
+        // Mesmo cenário do merge-only mas reforça: a stream
+        // externa 7001 não pode ser marcada Removed no plano,
+        // mesmo quando o canal matched tem streams que o
+        // bucket do crawler não traz.
+        var existingChannel = new DispatcharrChannel(
+            700, "Sport TV NBA", "SPORT TV CHANNELS", 100, null,
+            new long[] { 7001 });
+        var existingStream = new DispatcharrStream(
+            Id: 7001, Name: "NBA External Feed",
+            Url: "https://external.test/nba-feed",
+            TvgId: null, GroupName: "SPORT TV CHANNELS",
+            M3uAccountName: "external",
+            IsCustom: true, IsWorking: true, ResponseTimeMs: 100);
+        var existing = new DispatcharrState(
+            new[] { existingChannel },
+            new[] { existingStream },
+            new[] { new DispatcharrChannelGroup(99, "SPORT TV CHANNELS") },
+            null);
+        var resolver = new CatalogResolver(_factory);
+        await using (var ctx = await _factory.CreateDbContextAsync())
+        {
+            ctx.DispatcharrStreamOwnerships.Add(new DispatcharrStreamOwnershipEntity
+            {
+                DispatcharrStreamId = 7001,
+                DispatcharrChannelId = 700,
+                Ownership = StreamOwnership.External,
+                CreatedBySyncRunId = null,
+                CreatedAtUtc = DateTime.UtcNow,
+                UpdatedAtUtc = DateTime.UtcNow,
+            });
+            await ctx.SaveChangesAsync();
+        }
+
+        var plan = await BuildPlan(
+            new[] { Stream("SPORT TV NBA HEVC PT", "PT - DESPORTO") },
+            existing);
+        // A stream externa 7001 nunca é Removed.
+        Assert.All(plan.Channels, d =>
+            Assert.All(d.Streams, s =>
+                Assert.NotEqual(SyncOutcome.Removed, s.Outcome)));
+        // Contador de streams protegidas ≥ 1.
+        Assert.True(plan.Counts.ProtectedExternalStreams >= 1,
+            $"Esperado ≥1 stream protegida, obtido {plan.Counts.ProtectedExternalStreams}");
+        // E streams removidas = 0.
+        Assert.Equal(0, plan.Counts.RemovedStreams);
     }
 
     // -----------------------------------------------------------------

@@ -15,9 +15,14 @@ namespace m3uCrawler.Services.Catalog;
 ///   <item><b>Benfica TV</b>: identidade canónica com aliases
 ///         explícitos (incluindo BTV HEVC PT, BENFICATV, etc.) e
 ///         política CreateEligible.</item>
-///   <item><b>IdentityRule ReviewOnly</b>: SPORT TV NBA (e
-///         variantes) são marcados para revisão, nunca criando
-///         canal.</item>
+///   <item><b>Sport TV NBA</b>: canal autónomo
+///         (<c>sport-tv-nba</c>, <c>CreateEligible</c>), distinto
+///         de Sport TV 1..7. Os aliases cobrem as variantes
+///         <c>SPORT TV NBA</c>, <c>PT: SPORT TV NBA</c>,
+///         <c>PT SPORT TV NBA</c> e <c>SPORT TV NBA HEVC PT</c> na
+///         forma canónica (lowercase, espaços). Nunca faz fuzzy
+///         para Sport TV 1..7 (token-set ratio 67 &lt; threshold
+///         80).</item>
 ///   <item><b>Aliases canónicos legados</b>: SIC, RTP, CMTV, TVI
 ///         e restantes identidades que já existiam no
 ///         <c>ChannelCategoryLookup</c> curado, com a mesma
@@ -53,6 +58,23 @@ public static class CatalogSeed
                 "benfica tv",
                 "pt benfica tv",
                 "pt  benfica tv",
+            }),
+
+        // ========================= Sport TV NBA =========================
+        // Canal autónomo, distinto de Sport TV 1..7. Os aliases estão
+        // na forma canónica (lowercase, espaços) que o
+        // ChannelNormalizer produz a partir dos títulos raw.
+        new CanonicalChannelSeed(
+            Key: "sport-tv-nba",
+            DisplayName: "Sport TV NBA",
+            Category: EditorialCategory.Desporto,
+            Group: CanonicalEditorialGroup.PortugalDesporto,
+            Policy: PublicationPolicy.CreateEligible,
+            Aliases: new[]
+            {
+                "sport tv nba",
+                "pt sport tv nba",
+                "sport tv nba hevc pt",
             }),
 
         // ========================= Sport TV 1..7 =========================
@@ -342,21 +364,7 @@ public static class CatalogSeed
             Aliases: new[] { "canal 11" }),
     };
 
-    public static readonly IReadOnlyList<IdentityRuleSeed> IdentityRules = new[]
-    {
-        new IdentityRuleSeed(
-            NormalizedIdentity: "sport tv nba",
-            Disposition: RuleDisposition.ReviewOnly,
-            Reason: "not-approved-in-publication-catalog"),
-        new IdentityRuleSeed(
-            NormalizedIdentity: "pt sport tv nba",
-            Disposition: RuleDisposition.ReviewOnly,
-            Reason: "not-approved-in-publication-catalog"),
-        new IdentityRuleSeed(
-            NormalizedIdentity: "sport tv nba hevc pt",
-            Disposition: RuleDisposition.ReviewOnly,
-            Reason: "not-approved-in-publication-catalog"),
-    };
+    public static readonly IReadOnlyList<IdentityRuleSeed> IdentityRules = Array.Empty<IdentityRuleSeed>();
 
     /// <summary>
     /// Garante que cada alias só aparece num canal canónico (sem

@@ -201,23 +201,77 @@ No primeiro sync:
    decisão humana (vinda do dashboard).
 4. O mesmo para streams: `Unknown` até decisão humana.
 
-## 6. Protecção contra remoção
+## 6. Protecção contra remoção (defesa em duas camadas)
 
-No `ChannelMatcher.BuildPlanCoreAsync`:
+A protecção de streams `External`/`Unknown` contra remoção está
+implementada em **duas camadas independentes**, qualquer das
+quais suficiente para impedir um DELETE indevido:
 
-- Streams com `Ownership = External` ou `Unknown` nunca geram
-  `SyncOutcome.Removed` (a menos que sejam explicitamente
-  marcados como `CrawlerManaged`).
-- Canais com `Ownership = External` ou `Unknown` não são
-  renomeados, renumerados ou movidos de grupo.
+### Camada 1: `ChannelMatcher.BuildExistingDecision` (camada pura)
 
-Quando uma stream crawler-managed sai da playlist:
+`m3uCrawler/Services/Matching/ChannelMatcher.cs:947` consulta o
+ownership de cada stream stale (em batch, uma única query
+`_catalog.GetStreamOwnershipMapAsync` no início do
+`BuildPlanCoreInternalAsync`). Streams com `StreamOwnership`
+diferente de `CrawlerManaged` recebem
+`SyncOutcome.ExistingUnchanged` com `OrderReason =
+"protected-by-ownership"`. **O plano reflecte a verdade** — não
+reporta `Removed` para streams que não vão ser removidas.
+
+O counter `SyncReportCounts.ProtectedExternalStreams` regista
+o número de streams protegidas nesta camada.
+
+### Camada 2: `DispatcharrSyncService.ApplyAsync` (camada HTTP)
+
+Mesmo que um plano inválido (gerado por uma versão antiga do
+matcher, ou modificado manualmente) contenha
+`SyncOutcome.Removed` para uma stream protegida, a fase de
+aplicação tem uma salvaguarda adicional em
+`m3uCrawler/Services/Sync/DispatcharrSyncService.cs:265` que
+re-consulta o ownership antes de emitir DELETE:
+
+```csharp
+var ownership = _catalog != null
+    ? (ownershipMap.TryGetValue(streamId, out var own)
+        ? own
+        : StreamOwnership.Unknown)  // sem registo = Unknown = protegido
+    : StreamOwnership.CrawlerManaged; // legacy mode sem catalog
+if (ownership != StreamOwnership.CrawlerManaged) {
+    Console.WriteLine($"🛡️ Ownership guard: stream {streamId} ({ownership}) mantida ...");
+    continue;  // NUNCA emite DELETE
+}
+```
+
+Streams sem registo na BD são tratadas como `Unknown` (default
+seguro) e **nunca são removidas**.
+
+### Modo legacy (sem catalog)
+
+Se o `ChannelMatcher` ou o `DispatcharrSyncService` forem
+construídos sem `CatalogResolver`, o filtro **não se aplica**:
+todas as streams são tratadas como `CrawlerManaged` (fallback).
+Isto preserva o comportamento histórico para testes e para
+cenários onde o catalog ainda não foi activado.
+
+### Regras invariantes
+
+- Streams com `Ownership = External` ou `Unknown` (ou sem
+  registo, com catalog activo) **nunca** geram
+  `SyncOutcome.Removed` nem DELETE HTTP.
+- Apenas streams comprovadamente `CrawlerManaged` (criadas por um
+  sync anterior) podem ser removidas.
+- A camada de aplicação é **redundante** por defeito: o catálogo
+  é a única fonte de verdade. Se um plano inválido chegar à
+  aplicação, é interceptado e descartado.
+
+### Quando uma stream crawler-managed sai da playlist
 
 ```
 StreamOwnership = CrawlerManaged + URL sai da playlist
-    → SyncOutcome.Removed (allowed).
-StreamOwnership = External ou Unknown
-    → SyncOutcome.ExistingKept (NOT Removed).
+    → SyncOutcome.Removed (allowed) → DELETE HTTP.
+StreamOwnership = External, Unknown, ou sem registo (com catalog)
+    → SyncOutcome.ExistingUnchanged("protected-by-ownership")
+    → Nenhum DELETE.
 ```
 
 ## 7. Política para BTV e Benfica TV
@@ -240,17 +294,39 @@ para `benfica-tv` na BD:
 
 ## 8. Política para SPORT TV NBA
 
-`PT: SPORT TV NBA` (e variantes) cai em `IdentityRule ReviewOnly`:
+`SPORT TV NBA` (e variantes) é um canal canónico autónomo,
+distinto de Sport TV 1..7:
 
 1. `ContentClassifier.Classify("PT: SPORT TV NBA", ...)` →
    `Kind = Channel`.
-2. `CatalogResolver.ResolveAsync("pt sport tv nba")` →
-   `Kind = Rule, Disposition = ReviewOnly`.
-3. Matcher cria/atualiza um `ReviewItem` com fingerprint
-   `SHA-256("pt sport tv nba|{group}|not-approved-in-publication-catalog")`.
-4. Matcher não cria bucket; não altera Sport TV 1..7.
-5. `/api/classification-summary` reporta `unknownReviewRequired++
-   com reason `review-only:not-approved-in-publication-catalog`.
+2. `CatalogResolver.ResolveAsync("pt sport tv nba")` → encontra
+   `ChannelAlias.NormalizedAlias = "pt sport tv nba"` →
+   `Kind = Canonical, Key = "sport-tv-nba",
+   PublicationPolicy = CreateEligible`.
+3. O bucket resolve para `(Curated, "sport-tv-nba")`.
+4. Em `FindCuratedMatch`, o score de `"sport-tv-nba"` contra
+   "Sport TV 1..7" é ≈67 (token-set ratio: 2 de 6 tokens
+   coincidentes), abaixo do threshold 80 → **nunca** anexa.
+5. Se não existir canal "Sport TV NBA", score 0 → `NewChannel`
+   com identidade `sport-tv-nba`.
+6. Se já existir canal "Sport TV NBA" externo/desconhecido,
+   score 100 (exact) → `ExistingReassigned` com a stream do
+   crawler adicionada como `NewStream`.
+7. Streams externas nesse canal são protegidas pelo filtro de
+   ownership (ver §11).
+
+Aliases canónicos suportados (na forma produzida por
+`ChannelNormalizer.Normalize`):
+
+| Raw                      | Normalizado               |
+|--------------------------|---------------------------|
+| `SPORT TV NBA`           | `sport tv nba`            |
+| `PT: SPORT TV NBA`       | `pt sport tv nba`         |
+| `PT SPORT TV NBA`        | `pt sport tv nba`         |
+| `SPORT TV NBA HEVC PT`   | `sport tv nba hevc pt`    |
+
+(Não há mais `IdentityRule ReviewOnly` para NBA — a entrada foi
+removida quando o canal subiu para `Canonical CreateEligible`.)
 
 ## 9. Dashboard
 

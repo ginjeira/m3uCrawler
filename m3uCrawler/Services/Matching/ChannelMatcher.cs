@@ -303,6 +303,21 @@ namespace m3uCrawler.Services.Matching
             var existingStreamsById = existing.Streams.ToDictionary(s => s.Id, s => s);
             var groupIndex = GroupNameIndex.Build(existing.Groups);
 
+            // Ownership guard: mapa de stream id → StreamOwnership
+            // carregado em batch (uma única query) para que
+            // BuildExistingDecision possa filtrar Removed de
+            // streams External/Unknown. Sem catalog (legacy mode)
+            // o mapa fica vazio e o filtro trata todas as streams
+            // como CrawlerManaged — mesmo comportamento histórico
+            // para não regredir testes pré-catalog.
+            var ownershipByStreamId = new Dictionary<long, StreamOwnership>();
+            if (_catalog != null && existing.Streams.Count > 0)
+            {
+                ownershipByStreamId = (await _catalog.GetStreamOwnershipMapAsync(
+                    existing.Streams.Select(s => s.Id).ToList()))
+                    .ToDictionary(kv => kv.Key, kv => kv.Value);
+            }
+
             var newChannelIdSeed = -1L;
             var decisions = new List<ChannelDecision>();
             var counts = new SyncReportCounts
@@ -463,7 +478,7 @@ namespace m3uCrawler.Services.Matching
                     decisions.AddRange(new[] { BuildExistingDecision(
                         bucket.Value, matched, isCurated, outputGroup,
                         matchReason!, matchScore, ordering, existing.Streams,
-                        existingStreamsById, streamsByChannel, counts) });
+                        existingStreamsById, streamsByChannel, ownershipByStreamId, counts) });
                     continue;
                 }
 
@@ -822,6 +837,19 @@ namespace m3uCrawler.Services.Matching
         /// marks stale existing streams as Removed, and tags the
         /// outcome as <see cref="SyncOutcome.ExistingReassigned"/>
         /// when there is any change.
+        ///
+        /// <para>
+        /// Streams whose <see cref="StreamOwnership"/> é
+        /// <see cref="StreamOwnership.External"/> ou
+        /// <see cref="StreamOwnership.Unknown"/> NUNCA recebem
+        /// <see cref="SyncOutcome.Removed"/>. Apenas streams
+        /// comprovadamente <see cref="StreamOwnership.CrawlerManaged"/>
+        /// podem sair. Streams protegidas são reclassificadas para
+        /// <see cref="SyncOutcome.ExistingUnchanged"/> com
+        /// <c>OrderReason = "protected-by-ownership"</c> para
+        /// reflectir a decisão no plano sem mudar a stream no
+        /// Dispatcharr.
+        /// </para>
         /// </summary>
         private ChannelDecision BuildExistingDecision(
             IReadOnlyList<DiscoveredStream> bucket,
@@ -834,6 +862,7 @@ namespace m3uCrawler.Services.Matching
             IReadOnlyList<DispatcharrStream> allExistingStreams,
             IReadOnlyDictionary<long, DispatcharrStream> existingStreamsById,
             IReadOnlyDictionary<long, HashSet<long>> streamsByChannel,
+            IReadOnlyDictionary<long, StreamOwnership> ownershipByStreamId,
             SyncReportCounts counts)
         {
             var existingStreamIds = streamsByChannel.TryGetValue(matched.Id, out var sids)
@@ -904,6 +933,40 @@ namespace m3uCrawler.Services.Matching
             {
                 if (existingStreamsById.TryGetValue(sid, out var es))
                 {
+                    // Ownership guard: streams External ou Unknown
+                    // nunca podem ser removidas. Apenas streams
+                    // comprovadamente CrawlerManaged recebem
+                    // SyncOutcome.Removed. Streams protegidas são
+                    // reclassificadas como ExistingUnchanged com
+                    // OrderReason = "protected-by-ownership" para
+                    // ficarem visíveis no relatório mas não serem
+                    // emitidas em DELETE/PATCH. Sem catalog (legacy
+                    // mode) o mapa está vazio e todas as streams
+                    // caem no fallback CrawlerManaged. Com catalog,
+                    // streams sem registo na BD são tratadas como
+                    // Unknown (default seguro) — nunca removidas.
+                    var ownership = ownershipByStreamId.TryGetValue(sid, out var own)
+                        ? own
+                        : (_catalog != null
+                            ? StreamOwnership.Unknown
+                            : StreamOwnership.CrawlerManaged);
+                    if (ownership != StreamOwnership.CrawlerManaged)
+                    {
+                        streamDecisions.Add(new StreamMatchDecision
+                        {
+                            Provider = es.M3uAccountName ?? "(unknown)",
+                            StreamUrl = es.Url,
+                            StreamName = es.Name,
+                            Outcome = SyncOutcome.ExistingUnchanged,
+                            ExistingStreamId = sid,
+                            ProposedOrder = -1,
+                            OrderReason = "protected-by-ownership",
+                            IsWorking = es.IsWorking,
+                            GroupName = es.GroupName,
+                        });
+                        counts.ProtectedExternalStreams = counts.ProtectedExternalStreams + 1;
+                        continue;
+                    }
                     streamDecisions.Add(new StreamMatchDecision
                     {
                         Provider = es.M3uAccountName ?? "(unknown)",

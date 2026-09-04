@@ -268,6 +268,34 @@ public sealed class CatalogResolver
             .OrderBy(o => o.DispatcharrChannelId)
             .ToListAsync(cancellationToken);
     }
+
+    /// <summary>
+    /// Devolve um mapa de ownership por stream id para os ids
+    /// pedidos. Streams sem registo prévio ficam
+    /// <see cref="StreamOwnership.Unknown"/> (bootstrap default).
+    /// </summary>
+    public async Task<IReadOnlyDictionary<long, StreamOwnership>> GetStreamOwnershipMapAsync(
+        IReadOnlyCollection<long> dispatcharrStreamIds,
+        CancellationToken cancellationToken = default)
+    {
+        var result = new Dictionary<long, StreamOwnership>();
+        if (dispatcharrStreamIds == null || dispatcharrStreamIds.Count == 0)
+        {
+            return result;
+        }
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var distinctIds = dispatcharrStreamIds.Distinct().ToList();
+        var rows = await context.DispatcharrStreamOwnerships
+            .AsNoTracking()
+            .Where(o => distinctIds.Contains(o.DispatcharrStreamId))
+            .Select(o => new { o.DispatcharrStreamId, o.Ownership })
+            .ToListAsync(cancellationToken);
+        foreach (var r in rows)
+        {
+            result[r.DispatcharrStreamId] = r.Ownership;
+        }
+        return result;
+    }
 }
 
 /// <summary>
