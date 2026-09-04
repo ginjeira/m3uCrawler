@@ -1,5 +1,6 @@
 using System.Globalization;
 using m3uCrawler.Models;
+using m3uCrawler.Services.Catalog;
 using m3uCrawler.Services.SourceOrdering;
 
 namespace m3uCrawler.Services.Matching
@@ -23,6 +24,7 @@ namespace m3uCrawler.Services.Matching
         private readonly FuzzyMatcher _fuzzy = new();
         private readonly MatchScorer _scorer = new();
         private readonly Func<string?, string?, string?, bool, OutputGroupKind>? _resolutionPolicy;
+        private readonly m3uCrawler.Services.Catalog.CatalogResolver? _catalog;
 
         /// <summary>
         /// Constructs a ChannelMatcher with the legacy single-dependency
@@ -30,7 +32,7 @@ namespace m3uCrawler.Services.Matching
         /// disabled unless the overload below is used.
         /// </summary>
         public ChannelMatcher(AliasResolver aliases)
-            : this(aliases, null)
+            : this(aliases, null, null)
         {
         }
 
@@ -39,24 +41,35 @@ namespace m3uCrawler.Services.Matching
         /// <see cref="ResolutionPolicy"/> delegate (or null to disable
         /// the OutputGroup pipeline). CanonicalName is always resolved
         /// through the static <see cref="GroupResolver"/>.
-        ///
-        /// <para>
-        /// Foreign is determined deterministically: a SourceGroup that
-        /// <see cref="GroupTaxonomy"/> maps to
-        /// <see cref="OutputGroupKind.Foreign"/> marks the representative
-        /// stream as foreign. Streams whose SourceGroup is not a known
-        /// foreign group are treated as PT (isForeign=false).
-        /// </para>
         /// </summary>
         public ChannelMatcher(
             AliasResolver aliases,
             Func<string?, string?, string?, bool, OutputGroupKind>? resolutionPolicy)
+            : this(aliases, resolutionPolicy, null)
+        {
+        }
+
+        /// <summary>
+        /// Constructs a ChannelMatcher with an injected
+        /// <see cref="m3uCrawler.Services.Catalog.CatalogResolver"/>
+        /// (or null to keep the legacy
+        /// <c>ChannelCategoryLookup.Contains()</c>-driven policy).
+        /// When the catalog is provided, publication policy
+        /// (<c>CreateEligible / ReviewOnly / Excluded / MergeOnly</c>)
+        /// is read from the persistent catalog; otherwise the legacy
+        /// in-memory dictionary drives the decision.
+        /// </summary>
+        public ChannelMatcher(
+            AliasResolver aliases,
+            Func<string?, string?, string?, bool, OutputGroupKind>? resolutionPolicy,
+            m3uCrawler.Services.Catalog.CatalogResolver? catalog)
         {
             _aliases = aliases ?? throw new ArgumentNullException(nameof(aliases));
             _resolutionPolicy = resolutionPolicy;
+            _catalog = catalog;
         }
 
-        public MatchPlan BuildPlan(
+        private async Task<MatchPlan> BuildPlanCoreAsync(
             IReadOnlyList<DiscoveredStream> discovered,
             DispatcharrState existing,
             MatchingOptions options,
@@ -71,16 +84,63 @@ namespace m3uCrawler.Services.Matching
             if (options == null) throw new ArgumentNullException(nameof(options));
             if (ordering == null) throw new ArgumentNullException(nameof(ordering));
 
+            return await BuildPlanCoreInternalAsync(discovered, existing, options, ordering, sourcePlaylistPath, dispatcharrBaseUrl, dryRun, nowUtc);
+        }
+
+        /// <summary>
+        /// Sync shim that calls the async core. Tests not using the
+        /// catalog can still call <c>BuildPlan(...)</c> and get a
+        /// result back synchronously.
+        /// </summary>
+        public async Task<MatchPlan> BuildPlanAsync(
+            IReadOnlyList<DiscoveredStream> discovered,
+            DispatcharrState existing,
+            MatchingOptions options,
+            IStreamOrderingPolicy ordering,
+            string sourcePlaylistPath,
+            string dispatcharrBaseUrl,
+            bool dryRun,
+            DateTime? nowUtc = null)
+        {
+            return await BuildPlanCoreAsync(discovered, existing, options, ordering, sourcePlaylistPath, dispatcharrBaseUrl, dryRun, nowUtc);
+        }
+
+        public MatchPlan BuildPlan(
+            IReadOnlyList<DiscoveredStream> discovered,
+            DispatcharrState existing,
+            MatchingOptions options,
+            IStreamOrderingPolicy ordering,
+            string sourcePlaylistPath,
+            string dispatcharrBaseUrl,
+            bool dryRun,
+            DateTime? nowUtc = null)
+        {
+            return BuildPlanAsync(discovered, existing, options, ordering, sourcePlaylistPath, dispatcharrBaseUrl, dryRun, nowUtc)
+                .GetAwaiter()
+                .GetResult();
+        }
+
+        private async Task<MatchPlan> BuildPlanCoreInternalAsync(
+            IReadOnlyList<DiscoveredStream> discovered,
+            DispatcharrState existing,
+            MatchingOptions options,
+            IStreamOrderingPolicy ordering,
+            string sourcePlaylistPath,
+            string dispatcharrBaseUrl,
+            bool dryRun,
+            DateTime? nowUtc = null)
+        {
             int threshold = options.MatchThreshold;
             var stamp = (nowUtc ?? DateTime.UtcNow).ToString("o");
 
             // Two-level classification + matching policy:
-            //   1. ContentClassifier returns Kind + eligibility flags
-            //      (ExistingMatchEligibility, NewChannelEligibility).
-            //   2. Kinds with eligibility=false for BOTH flags are
-            //      excluded immediately (Bundle, Vod, LiveCam,
-            //      Placeholder, Category, Group, Foreign).
-            //   3. Streams are then split by ELIGIBILITY TIER into two
+            //   1. ContentClassifier returns Kind + ExistingMatchEligibility
+            //      (NewChannelEligibility is removed; it now comes from
+            //      the persistent catalog in step 1.5).
+            //   2. Kinds with ExistingMatchEligibility=false are excluded
+            //      immediately (Bundle, Vod, LiveCam, Placeholder,
+            //      Category, Group, Foreign).
+            //   3. Streams are split by ELIGIBILITY TIER into two
             //      parallel bucket collections (curated vs unknown),
             //      keyed by tier+identity. This guarantees that:
             //        - a curated stream can never be promoted to a
@@ -91,6 +151,17 @@ namespace m3uCrawler.Services.Matching
             //        - each tier uses its own matching strategy:
             //            curated: full fuzzy + alias + threshold;
             //            unknown: equality OR explicit alias only.
+            //   1.5. For <c>Kind=Channel</c> the matcher consults the
+            //        catalog to decide <c>NewChannelEligibility</c>:
+            //        - IdentityRule ReviewOnly → bucket tier = Unknown
+            //          (ReviewItem path; never NewChannel);
+            //        - IdentityRule Excluded → excluded (no bucket);
+            //        - CanonicalChannel with CreateEligible →
+            //          NewChannelEligibility = true;
+            //        - CanonicalChannel with MergeOnly/ReviewOnly/
+            //          Excluded → NewChannelEligibility = false (Unknown
+            //          tier; merge-only attach to existing);
+            //        - Unknown canonical → NewChannelEligibility = false.
             //
             // Invariantes preservados:
             //   b0dfc48 (stream dedup)
@@ -125,7 +196,7 @@ namespace m3uCrawler.Services.Matching
                 classificationCounts[kindName] = prev + 1;
 
                 // 1) Kind-level exclusion: never matched, never created.
-                if (!classification.ExistingMatchEligibility && !classification.NewChannelEligibility)
+                if (!classification.ExistingMatchEligibility)
                 {
                     dispositionCounts["excluded"] = dispositionCounts["excluded"] + 1;
                     excluded.Add(new ClassifiedExclusion
@@ -139,21 +210,86 @@ namespace m3uCrawler.Services.Matching
                     continue;
                 }
 
-                // Pick tier. If a stream is BOTH curated-eligible and
-                // existing-match-eligible, it goes to the curated tier
-                // (preserves the editorial decision surface: the
-                // matcher treats curated streams consistently).
-                var tier = classification.NewChannelEligibility
-                    ? BucketTier.Curated
-                    : BucketTier.Unknown;
+                // 1.5) If the catalog is active, resolve the
+                //     publication policy for this normalized identity.
+                //     - IdentityRule ReviewOnly → bucket tier = Unknown
+                //       (ReviewItem path; never NewChannel);
+                //     - IdentityRule Excluded → excluded (no bucket);
+                //     - CanonicalChannel with CreateEligible →
+                //       NewChannelEligibility = true (tier = Curated);
+                //     - CanonicalChannel with MergeOnly/ReviewOnly/
+                //       Excluded → NewChannelEligibility = false (tier =
+                //       Unknown; merge-only attach to existing);
+                //     - Unknown canonical → NewChannelEligibility = false.
+                bool canCreateNew = false;
+                CatalogResolution? catalogResolution = null;
+                if (_catalog != null)
+                {
+                    var normalized = ChannelNormalizer.Normalize(s.Title);
+                    catalogResolution = await _catalog.ResolveAsync(normalized);
+                    if (catalogResolution?.Kind == CatalogResolutionKind.Rule)
+                    {
+                        if (catalogResolution.Value.RuleDisposition == RuleDisposition.ReviewOnly)
+                        {
+                            // Mark for review; never NewChannel.
+                            await _catalog.UpsertReviewItemAsync(
+                                normalized,
+                                s.Group ?? string.Empty,
+                                "not-approved-in-publication-catalog",
+                                catalogResolution.Value.RuleReason ?? string.Empty);
+                            dispositionCounts["unknownReviewRequired"] =
+                                dispositionCounts["unknownReviewRequired"] + 1;
+                            reviewRequired.Add(new ClassifiedExclusion
+                            {
+                                Title = s.Title ?? string.Empty,
+                                Group = s.Group ?? string.Empty,
+                                Kind = ChannelKind.Unknown,
+                                Reason = $"review-only:{catalogResolution.Value.RuleReason}",
+                                MatchingDisposition = "unknown-review-required",
+                            });
+                            continue;
+                        }
+                        else
+                        {
+                            // Excluded by rule.
+                            dispositionCounts["excluded"] = dispositionCounts["excluded"] + 1;
+                            excluded.Add(new ClassifiedExclusion
+                            {
+                                Title = s.Title ?? string.Empty,
+                                Group = s.Group ?? string.Empty,
+                                Kind = classification.Kind,
+                                Reason = "excluded-by-rule",
+                                MatchingDisposition = "excluded",
+                            });
+                            continue;
+                        }
+                    }
+                    canCreateNew = catalogResolution.Value.AllowsNewChannel;
+                }
+                else
+                {
+                    // Legacy mode (no catalog): the legacy code marked
+                    // every Channel kind as eligible to create new.
+                    canCreateNew = classification.Kind == ChannelKind.Channel;
+                }
 
-                var resolved = ResolveIdentity(s.Title);
+                // 2) Pick tier.
+                var tier = canCreateNew ? BucketTier.Curated : BucketTier.Unknown;
+
+                // Use the catalog-resolved canonical identity when
+                // available (so that "BTV" / "benficatv" / "benfica tv"
+                // all bucket to "benfica-tv"). When the catalog is
+                // inactive or the resolution is unknown, fall back to
+                // the legacy alias resolver / normalizer.
+                string resolved = (catalogResolution?.CanonicalKey) is { Length: > 0 } k
+                    ? k
+                    : ResolveIdentity(s.Title);
                 var key = (tier, resolved);
                 if (!channelBuckets.TryGetValue(key, out var list))
                 {
                     list = new List<DiscoveredStream>();
                     channelBuckets[key] = list;
-                    bucketNewChannelEligible[key] = classification.NewChannelEligibility;
+                    bucketNewChannelEligible[key] = canCreateNew;
                 }
                 list.Add(s);
             }

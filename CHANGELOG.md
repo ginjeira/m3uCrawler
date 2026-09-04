@@ -8,6 +8,23 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 ## [Unreleased]
 
 ### ✨ Adicionado
+- **Catálogo persistente SQLite (EF Core + migrations)** (esta iteração): substitui o `ChannelCategoryLookup.Contains()` como autorização para criar canais. A BD vive em `/data/channel-catalog.db` em produção (mesmo directório de `wtelegram.config` / `session.dat`, montado como bind-mount do container). Migrations aplicam-se idempotentemente no arranque. Backup automático antes de migrations destrutivas. Seed versionado em `Services/Catalog/CatalogSeed.cs`. Sem nova dependência externa (sem Redis, sem EF fora deste catálogo, sem nova BD). Seed inclui Benfica TV (com aliases `btv`, `btv hevc pt`, `benficatv`, `benfica tv`, …) e a regra `IdentityRule ReviewOnly` para `sport tv nba` (motivo: `not-approved-in-publication-catalog`).
+
+### 🔧 Alterado
+- **`ContentClassifier` deixa de decidir NewChannel**: o `ChannelCategoryLookup` (em memória, 126 entradas) continua a existir apenas para decidir `EditorialCategory` (compatibilidade). A autorização para criar canais (`NewChannel`) é agora lida exclusivamente do catálogo persistente via `CatalogResolver.ResolveAsync(normalized)`. Quando o catálogo não está activo, o matcher cai no modo legado (`ChannelCategoryLookup.Contains`).
+- **`ChannelMatcher.BuildPlanAsync` é agora async**: o método `BuildPlan(...)` sync foi preservado como shim que delega em `BuildPlanAsync(...)` via `GetAwaiter().GetResult()`. Testes existentes e callers sync não mudam. Quando o catálogo está activo, o tier da bucket é decidido pelo `CatalogResolution` (`Canonical+CreateEligible → Curated`, `Canonical+MergeOnly/ReviewOnly → Unknown`, `Rule ReviewOnly → review-required`, `Rule Excluded → excluded`, `Unknown → Unknown tier`). O bucket identity usa o `CanonicalKey` do catálogo (ex.: `btv hevc pt` resolve para `benfica-tv`).
+- **Política tri-state de `FindUnknownMatch`** preservada: 0 candidatos → `no-exact-or-alias-match`, 1 candidato → `unknownMatchedToExisting`, 2+ candidatos → `ambiguous-exact-or-alias-match`. O catálogo não muda esta regra; apenas acrescenta o caminho `IdentityRule ReviewOnly` que também produz `no-exact-or-alias-match`.
+- **Removed `ChannelKind.Group` e `ChannelKind.Category`**: nunca emitidos; declarações órfãs removidas do enum.
+
+### 🐛 Corrigido
+- **`BTV HEVC PT` criava canal `BTV HEVC PT`** em vez de anexar como `Benfica TV`. Com o catálogo, `btv hevc pt` resolve para `benfica-tv` (canonical key) e o bucket identity passa a ser `benfica-tv`. Se já existir um canal `Benfica TV` em Dispatcharr (ownership = External ou CrawlerManaged), a stream entra em modo merge-only sem remover nem renomear.
+- **`PT: SPORT TV NBA` criava canal**. Agora cai em `IdentityRule ReviewOnly` (fingerprint SHA-256 estável) e nunca chega a `NewChannel`.
+- **Sincronização removia 61 streams externas**. As streams `Ownership = External` ou `Ownership = Unknown` nunca geram `SyncOutcome.Removed`. Apenas streams com `CrawlerManaged` (criadas por um sync anterior) podem ser removidas em sincronizações subsequentes.
+
+### 📦 Deployment
+- **Produção não alterada nesta iteração**: a nova correcção fica em branch dedicado para revisão. Aplicar a produção é uma iteração separada.
+
+### ✨ Adicionado
 - **Segurança de Unknown → matching (commits `c3e0e4f` → `b3f2a1e`)** (esta iteração): uma entrada `Unknown` nunca pode usar fuzzy matching para anexar streams a um canal existente. A política de 3 níveis foi subdividida em dois **tiers** (Curated / Unknown) com bucket storage separado:
   - **Curated** (`Channel`): fuzzy + alias + threshold (80). Pode produzir `NewChannel`.
   - **Unknown**: apenas match por **igualdade normalizada** ou **alias explícito**. Pode anexar streams a um canal existente (`ExistingReassigned`/`ExistingUnchanged`); nunca produz `NewChannel`. Se não houver match exacto/alias → `UnknownReviewRequired`.
