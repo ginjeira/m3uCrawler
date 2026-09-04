@@ -23,10 +23,12 @@ namespace m3uCrawler.Services.Catalog;
 public sealed class CatalogResolver
 {
     private readonly IDbContextFactory<ChannelCatalogDbContext> _factory;
+    private readonly string _dbPath;
 
-    public CatalogResolver(IDbContextFactory<ChannelCatalogDbContext> factory)
+    public CatalogResolver(IDbContextFactory<ChannelCatalogDbContext> factory, string dbPath)
     {
         _factory = factory;
+        _dbPath = dbPath;
     }
 
     /// <summary>
@@ -242,6 +244,21 @@ public sealed class CatalogResolver
     }
 
     /// <summary>
+    /// Lista todos os items de revisão, ordenados por data de
+    /// criação (mais recentes primeiro). O dashboard usa este
+    /// método para mostrar o histórico completo.
+    /// </summary>
+    public async Task<IReadOnlyList<ReviewItemEntity>> ListAllReviewItemsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.ReviewItems
+            .AsNoTracking()
+            .OrderByDescending(r => r.CreatedAtUtc)
+            .ToListAsync(cancellationToken);
+    }
+
+    /// <summary>
     /// Lista todos os canais canónicos (com aliases) ordenados por
     /// DisplayName. Usado pelo dashboard.
     /// </summary>
@@ -296,6 +313,175 @@ public sealed class CatalogResolver
         }
         return result;
     }
+
+    /// <summary>
+    /// Lista todas as regras de identidade.
+    /// </summary>
+    public async Task<IReadOnlyList<IdentityRuleEntity>> ListIdentityRulesAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.IdentityRules
+            .AsNoTracking()
+            .OrderBy(r => r.NormalizedIdentity)
+            .ToListAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Cria uma nova regra de identidade. Falha se já existir
+    /// uma regra com a mesma NormalizedIdentity.
+    /// </summary>
+    public async Task<IdentityRuleEntity> CreateIdentityRuleAsync(
+        string normalizedIdentity,
+        RuleDisposition disposition,
+        string reason,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(normalizedIdentity))
+        {
+            throw new ArgumentException("normalizedIdentity required", nameof(normalizedIdentity));
+        }
+
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var existing = await context.IdentityRules
+            .FirstOrDefaultAsync(r => r.NormalizedIdentity == normalizedIdentity, cancellationToken);
+        if (existing != null)
+        {
+            throw new InvalidOperationException($"Rule already exists for '{normalizedIdentity}'");
+        }
+
+        var now = DateTime.UtcNow;
+        var rule = new IdentityRuleEntity
+        {
+            NormalizedIdentity = normalizedIdentity,
+            Disposition = disposition,
+            Reason = reason ?? string.Empty,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+        };
+        context.IdentityRules.Add(rule);
+        await context.SaveChangesAsync(cancellationToken);
+        return rule;
+    }
+
+    /// <summary>
+    /// Elimina uma regra de identidade pela sua identity normalizada.
+    /// </summary>
+    public async Task<bool> DeleteIdentityRuleAsync(
+        string normalizedIdentity,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(normalizedIdentity))
+        {
+            return false;
+        }
+
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var rule = await context.IdentityRules
+            .FirstOrDefaultAsync(r => r.NormalizedIdentity == normalizedIdentity, cancellationToken);
+        if (rule == null)
+        {
+            return false;
+        }
+
+        context.IdentityRules.Remove(rule);
+        await context.SaveChangesAsync(cancellationToken);
+        return true;
+    }
+
+    /// <summary>
+    /// Approva um item de revisão (ReviewItemState.Approved) e
+    /// opcionalmente regista o canal canónico aprovado.
+    /// </summary>
+    public async Task<ReviewItemEntity?> ApproveReviewAsync(
+        string fingerprint,
+        long? approvedCanonicalChannelId,
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var item = await context.ReviewItems
+            .FirstOrDefaultAsync(r => r.Fingerprint == fingerprint, cancellationToken);
+        if (item == null) return null;
+
+        item.State = ReviewItemState.Approved;
+        item.ResolvedAtUtc = DateTime.UtcNow;
+        item.UpdatedAtUtc = DateTime.UtcNow;
+        item.ApprovedCanonicalChannelId = approvedCanonicalChannelId;
+        await context.SaveChangesAsync(cancellationToken);
+        return item;
+    }
+
+    /// <summary>
+    /// Exclui um item de revisão (ReviewItemState.Excluded).
+    /// </summary>
+    public async Task<ReviewItemEntity?> ExcludeReviewAsync(
+        string fingerprint,
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var item = await context.ReviewItems
+            .FirstOrDefaultAsync(r => r.Fingerprint == fingerprint, cancellationToken);
+        if (item == null) return null;
+
+        item.State = ReviewItemState.Excluded;
+        item.ResolvedAtUtc = DateTime.UtcNow;
+        item.UpdatedAtUtc = DateTime.UtcNow;
+        await context.SaveChangesAsync(cancellationToken);
+        return item;
+    }
+
+    /// <summary>
+    /// Lista todos os SyncRun ordenados por StartedAtUtc
+    /// (mais recentes primeiro).
+    /// </summary>
+    public async Task<IReadOnlyList<SyncRunEntity>> ListSyncRunsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.SyncRuns
+            .AsNoTracking()
+            .OrderByDescending(r => r.StartedAtUtc)
+            .ToListAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Estatísticas agregadas do catálogo: contagens por tabela.
+    /// </summary>
+    public async Task<CatalogStats> GetStatsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var now = DateTime.UtcNow;
+        return new CatalogStats
+        {
+            CanonicalChannels = await context.CanonicalChannels.AsNoTracking().CountAsync(cancellationToken),
+            ChannelAliases = await context.ChannelAliases.AsNoTracking().CountAsync(cancellationToken),
+            IdentityRules = await context.IdentityRules.AsNoTracking().CountAsync(cancellationToken),
+            DispatcharrChannelOwnerships = await context.DispatcharrChannelOwnerships.AsNoTracking().CountAsync(cancellationToken),
+            DispatcharrStreamOwnerships = await context.DispatcharrStreamOwnerships.AsNoTracking().CountAsync(cancellationToken),
+            ReviewItemsOpen = await context.ReviewItems.AsNoTracking().CountAsync(r => r.State == ReviewItemState.Open, cancellationToken),
+            ReviewItemsApproved = await context.ReviewItems.AsNoTracking().CountAsync(r => r.State == ReviewItemState.Approved, cancellationToken),
+            ReviewItemsExcluded = await context.ReviewItems.AsNoTracking().CountAsync(r => r.State == ReviewItemState.Excluded, cancellationToken),
+            SyncRuns = await context.SyncRuns.AsNoTracking().CountAsync(cancellationToken),
+            DbPath = _dbPath,
+            GeneratedAtUtc = now,
+        };
+    }
+}
+
+public sealed class CatalogStats
+{
+    public int CanonicalChannels { get; set; }
+    public int ChannelAliases { get; set; }
+    public int IdentityRules { get; set; }
+    public int DispatcharrChannelOwnerships { get; set; }
+    public int DispatcharrStreamOwnerships { get; set; }
+    public int ReviewItemsOpen { get; set; }
+    public int ReviewItemsApproved { get; set; }
+    public int ReviewItemsExcluded { get; set; }
+    public int SyncRuns { get; set; }
+    public string DbPath { get; set; } = string.Empty;
+    public DateTime GeneratedAtUtc { get; set; }
 }
 
 /// <summary>

@@ -43,10 +43,23 @@ namespace m3uCrawler
             }
             string? webToken = webEnabled ? GetOptionValue(args, "--web-token") : null;
             Task? webTask = null;
+            CatalogResolver? webCatalogResolver = null;
             if (webEnabled)
             {
                 var dashboardOutputDir = GetOptionValue(args, "--output-dir") ?? "output";
                 var dashboardHistoryService = new ImportHistoryService(dashboardOutputDir);
+
+                try
+                {
+                    webCatalogResolver = await InitializeCatalogAsync(
+                        ResolveCatalogDbPath(args), CancellationToken.None);
+                    WebDashboardService.SetCatalogResolver(webCatalogResolver);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"⚠️ Catálogo não disponível para o dashboard: {ex.Message}");
+                }
+
                 webTask = WebDashboardService.RunDashboardAsync(dashboardOutputDir, webPort, dashboardHistoryService, webToken, CancellationToken.None);
                 _ = webTask.ContinueWith(t =>
                 {
@@ -743,7 +756,7 @@ namespace m3uCrawler
             await using var context = await bootstrapper.InitializeAsync(ct);
             await context.DisposeAsync();
             var factory = new RuntimeChannelCatalogDbContextFactory(dbPath);
-            return new CatalogResolver(factory);
+            return new CatalogResolver(factory, dbPath);
         }
 
         static async Task TrySyncToDispatcharrAsync(

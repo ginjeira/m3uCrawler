@@ -74,7 +74,7 @@ public class DispatcharrSyncServiceOwnershipGuardTests : IAsyncLifetime
             await ctx.SaveChangesAsync();
         }
 
-        var resolver = new CatalogResolver(_factory);
+        var resolver = new CatalogResolver(_factory, _dbPath);
         var (svc, handler, state) = BuildSvc(resolver);
 
         var decision = new ChannelDecision
@@ -126,7 +126,7 @@ public class DispatcharrSyncServiceOwnershipGuardTests : IAsyncLifetime
     {
         // Stream id=8002 sem registo de ownership (Unknown por
         // bootstrap default). Plano marca como Removed. Sem DELETE.
-        var resolver = new CatalogResolver(_factory);
+        var resolver = new CatalogResolver(_factory, _dbPath);
         var (svc, handler, state) = BuildSvc(resolver);
 
         var decision = new ChannelDecision
@@ -191,7 +191,7 @@ public class DispatcharrSyncServiceOwnershipGuardTests : IAsyncLifetime
             await ctx.SaveChangesAsync();
         }
 
-        var resolver = new CatalogResolver(_factory);
+        var resolver = new CatalogResolver(_factory, _dbPath);
         var (svc, handler, state) = BuildSvc(resolver);
 
         var decision = new ChannelDecision

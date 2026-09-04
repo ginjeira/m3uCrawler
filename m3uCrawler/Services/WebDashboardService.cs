@@ -1,15 +1,24 @@
 using m3uCrawler.Build;
 using m3uCrawler.Models;
+using m3uCrawler.Services.Catalog;
 using m3uCrawler.Services.Sync;
 using System.Net;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace m3uCrawler.Services
 {
     public static class WebDashboardService
     {
+        private static CatalogResolver? _catalogResolver;
+
+        public static void SetCatalogResolver(CatalogResolver resolver)
+        {
+            _catalogResolver = resolver;
+        }
+
         public static async Task RunDashboardAsync(string outputDir, int port, ImportHistoryService historyService, string? webToken = null, CancellationToken cancellationToken = default)
         {
             var listener = new HttpListener();
@@ -385,6 +394,222 @@ namespace m3uCrawler.Services
                 return;
             }
 
+            // === Catalog API endpoints ===
+            if (_catalogResolver == null)
+            {
+                context.Response.StatusCode = (int)HttpStatusCode.ServiceUnavailable;
+                await WriteJsonAsync(context.Response, new { error = "Catálogo não inicializado." });
+                return;
+            }
+
+            if (requestPath.Equals("/api/catalog/stats", StringComparison.OrdinalIgnoreCase))
+            {
+                await WriteJsonAsync(context.Response, await _catalogResolver.GetStatsAsync());
+                return;
+            }
+
+            if (requestPath.Equals("/api/catalog/channels", StringComparison.OrdinalIgnoreCase))
+            {
+                var channels = await _catalogResolver.ListCanonicalChannelsAsync();
+                await WriteJsonAsync(context.Response, channels.Select(c => new
+                {
+                    id = c.Id,
+                    key = c.Key,
+                    displayName = c.DisplayName,
+                    editorialCategory = c.EditorialCategory.ToString(),
+                    editorialGroup = c.EditorialGroup.ToString(),
+                    publicationPolicy = c.PublicationPolicy.ToString(),
+                    isEnabled = c.IsEnabled,
+                    aliases = c.Aliases.Select(a => a.NormalizedAlias).ToList(),
+                }).ToList());
+                return;
+            }
+
+            if (requestPath.Equals("/api/catalog/identity-rules", StringComparison.OrdinalIgnoreCase))
+            {
+                if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    var rules = await _catalogResolver.ListIdentityRulesAsync();
+                    await WriteJsonAsync(context.Response, rules.Select(r => new
+                    {
+                        id = r.Id,
+                        normalizedIdentity = r.NormalizedIdentity,
+                        disposition = r.Disposition.ToString(),
+                        reason = r.Reason,
+                        createdAtUtc = r.CreatedAtUtc.ToString("o"),
+                        updatedAtUtc = r.UpdatedAtUtc.ToString("o"),
+                    }).ToList());
+                    return;
+                }
+
+                if (context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
+                        var body = await reader.ReadToEndAsync();
+                        var payload = JsonSerializer.Deserialize<IdentityRulePayload>(body, JsonOptions);
+                        if (payload == null || string.IsNullOrWhiteSpace(payload.NormalizedIdentity))
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "Payload inválido: NormalizedIdentity é obrigatório." });
+                            return;
+                        }
+
+                        var disposition = Enum.TryParse<RuleDisposition>(payload.Disposition, true, out var d) ? d : RuleDisposition.ReviewOnly;
+                        var rule = await _catalogResolver.CreateIdentityRuleAsync(payload.NormalizedIdentity, disposition, payload.Reason ?? string.Empty);
+                        await WriteJsonAsync(context.Response, new
+                        {
+                            id = rule.Id,
+                            normalizedIdentity = rule.NormalizedIdentity,
+                            disposition = rule.Disposition.ToString(),
+                            reason = rule.Reason,
+                            createdAtUtc = rule.CreatedAtUtc.ToString("o"),
+                        }, HttpStatusCode.Created);
+                        return;
+                    }
+                    catch (InvalidOperationException ex)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.Conflict;
+                        await WriteJsonAsync(context.Response, new { error = ex.Message });
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.InternalServerError;
+                        await WriteJsonAsync(context.Response, new { error = ex.Message });
+                        return;
+                    }
+                }
+
+                if (context.Request.HttpMethod.Equals("DELETE", StringComparison.OrdinalIgnoreCase))
+                {
+                    var identity = context.Request.QueryString["identity"];
+                    if (string.IsNullOrWhiteSpace(identity))
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                        await WriteJsonAsync(context.Response, new { error = "Parâmetro 'identity' é obrigatório." });
+                        return;
+                    }
+
+                    var deleted = await _catalogResolver.DeleteIdentityRuleAsync(identity);
+                    if (!deleted)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                        await WriteJsonAsync(context.Response, new { error = $"Regra não encontrada: {identity}" });
+                        return;
+                    }
+                    await WriteJsonAsync(context.Response, new { deleted = true, identity });
+                    return;
+                }
+
+                context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
+                return;
+            }
+
+            if (requestPath.Equals("/api/catalog/reviews", StringComparison.OrdinalIgnoreCase))
+            {
+                var reviews = await _catalogResolver.ListAllReviewItemsAsync();
+                await WriteJsonAsync(context.Response, reviews.Select(r => new
+                {
+                    id = r.Id,
+                    fingerprint = r.Fingerprint,
+                    normalizedIdentity = r.NormalizedIdentity,
+                    sourceGroup = r.SourceGroup,
+                    reasonSignature = r.ReasonSignature,
+                    state = r.State.ToString(),
+                    note = r.Note,
+                    approvedCanonicalChannelId = r.ApprovedCanonicalChannelId,
+                    createdAtUtc = r.CreatedAtUtc.ToString("o"),
+                    updatedAtUtc = r.UpdatedAtUtc.ToString("o"),
+                    resolvedAtUtc = r.ResolvedAtUtc?.ToString("o"),
+                }).ToList());
+                return;
+            }
+
+            if (requestPath.StartsWith("/api/catalog/reviews/", StringComparison.OrdinalIgnoreCase))
+            {
+                var fingerprint = requestPath.Substring("/api/catalog/reviews/".Length);
+                if (string.IsNullOrWhiteSpace(fingerprint))
+                {
+                    context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                    await WriteJsonAsync(context.Response, new { error = "Fingerprint é obrigatório." });
+                    return;
+                }
+
+                if (requestPath.EndsWith("/approve", StringComparison.OrdinalIgnoreCase))
+                {
+                    long? approvedId = null;
+                    if (context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                    {
+                        try
+                        {
+                            using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
+                            var body = await reader.ReadToEndAsync();
+                            var payload = JsonSerializer.Deserialize<ApproveReviewPayload>(body, JsonOptions);
+                            approvedId = payload?.ApprovedCanonicalChannelId;
+                        }
+                        catch { }
+                    }
+
+                    var approved = await _catalogResolver.ApproveReviewAsync(fingerprint, approvedId);
+                    if (approved == null)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                        await WriteJsonAsync(context.Response, new { error = "Review item não encontrado." });
+                        return;
+                    }
+                    await WriteJsonAsync(context.Response, new
+                    {
+                        fingerprint = approved.Fingerprint,
+                        state = approved.State.ToString(),
+                        resolvedAtUtc = approved.ResolvedAtUtc?.ToString("o"),
+                    });
+                    return;
+                }
+
+                if (requestPath.EndsWith("/exclude", StringComparison.OrdinalIgnoreCase))
+                {
+                    var excluded = await _catalogResolver.ExcludeReviewAsync(fingerprint);
+                    if (excluded == null)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                        await WriteJsonAsync(context.Response, new { error = "Review item não encontrado." });
+                        return;
+                    }
+                    await WriteJsonAsync(context.Response, new
+                    {
+                        fingerprint = excluded.Fingerprint,
+                        state = excluded.State.ToString(),
+                        resolvedAtUtc = excluded.ResolvedAtUtc?.ToString("o"),
+                    });
+                    return;
+                }
+
+                context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                return;
+            }
+
+            if (requestPath.Equals("/api/catalog/sync-runs", StringComparison.OrdinalIgnoreCase))
+            {
+                var runs = await _catalogResolver.ListSyncRunsAsync();
+                await WriteJsonAsync(context.Response, runs.Select(r => new
+                {
+                    id = r.Id,
+                    startedAtUtc = r.StartedAtUtc.ToString("o"),
+                    finishedAtUtc = r.FinishedAtUtc.ToString("o"),
+                    appVersion = r.AppVersion,
+                    countCreatedCrawlerManaged = r.CountCreatedCrawlerManaged,
+                    countMergedIntoExternal = r.CountMergedIntoExternal,
+                    countProtectedExternalStreams = r.CountProtectedExternalStreams,
+                    countRemovedCrawlerManagedStreams = r.CountRemovedCrawlerManagedStreams,
+                    countReviewRequired = r.CountReviewRequired,
+                    countExcluded = r.CountExcluded,
+                    result = r.Result,
+                }).ToList());
+                return;
+            }
+
             await WriteHtmlAsync(context.Response, BuildHtmlPage());
         }
 
@@ -418,8 +643,9 @@ namespace m3uCrawler.Services
             };
         }
 
-        private static async Task WriteJsonAsync(HttpListenerResponse response, object data)
+        private static async Task WriteJsonAsync(HttpListenerResponse response, object data, HttpStatusCode statusCode = HttpStatusCode.OK)
         {
+            response.StatusCode = (int)statusCode;
             var json = JsonSerializer.Serialize(data, JsonOptions);
             response.ContentType = "application/json; charset=utf-8";
             var buffer = Encoding.UTF8.GetBytes(json);
@@ -478,12 +704,28 @@ namespace m3uCrawler.Services
             response.Close();
         }
 
-        private static string BuildHtmlPage()
-        {
-            return BuildDashboardHtml();
-        }
+    private static string BuildHtmlPage()
+    {
+        return BuildDashboardHtml();
+    }
 
-        private static string BuildDashboardHtml()
+    private sealed class IdentityRulePayload
+    {
+        [JsonPropertyName("normalizedIdentity")]
+        public string? NormalizedIdentity { get; set; }
+        [JsonPropertyName("disposition")]
+        public string Disposition { get; set; } = "ReviewOnly";
+        [JsonPropertyName("reason")]
+        public string? Reason { get; set; }
+    }
+
+    private sealed class ApproveReviewPayload
+    {
+        [JsonPropertyName("approvedCanonicalChannelId")]
+        public long? ApprovedCanonicalChannelId { get; set; }
+    }
+
+    private static string BuildDashboardHtml()
         {
             string s = """
 <!doctype html>
@@ -559,13 +801,14 @@ namespace m3uCrawler.Services
     <span class='meta' id='metaLine'>a carregar…</span>
   </header>
 
-  <nav id='nav'>
+    <nav id='nav'>
     <button data-view='overview' class='active'>Overview</button>
     <button data-view='executions'>Execuções</button>
     <button data-view='discovery'>Descoberta</button>
     <button data-view='countries'>Canais / Países</button>
     <button data-view='playlist'>Playlist</button>
     <button data-view='dispatcharr'>Dispatcharr</button>
+    <button data-view='catalog'>Catálogo</button>
     <button data-view='diagnostics'>Diagnóstico</button>
   </nav>
 
@@ -649,6 +892,89 @@ namespace m3uCrawler.Services
       <div id='dispatcharrOverview'></div>
       <h3 style='font-size:14px;margin-top:24px;'>Detalhes da última sincronização</h3>
       <div id='dispatcharrDetail'></div>
+    </section>
+
+    <!-- CATÁLOGO -->
+    <section id='view-catalog' hidden>
+      <h2 style='font-size:18px;margin-top:0;'>Catálogo de Canais</h2>
+      <div class='grid' id='catalogStats'></div>
+
+      <h3 style='font-size:14px;margin-top:24px;'>Sub-separadores</h3>
+      <nav id='catalogTabs' style='background:transparent;border-bottom:1px solid var(--border);padding:0;gap:4px;'>
+        <button data-ctab='overview' class='active' style='padding:8px 14px;'>Visão Geral</button>
+        <button data-ctab='channels' style='padding:8px 14px;'>Canais</button>
+        <button data-ctab='rules' style='padding:8px 14px;'>Regras</button>
+        <button data-ctab='reviews' style='padding:8px 14px;'>Reviews</button>
+        <button data-ctab='syncruns' style='padding:8px 14px;'>Sync Runs</button>
+      </nav>
+
+      <!-- TAB: Visão Geral -->
+      <div id='ctab-overview'>
+        <div class='card' style='margin-top:16px;'>
+          <h3>Estatísticas do Catálogo</h3>
+          <div id='catalogStatsDetail'></div>
+        </div>
+      </div>
+
+      <!-- TAB: Canais -->
+      <div id='ctab-channels' hidden>
+        <div style='margin-top:16px;'>
+          <div id='catalogChannelsTable'></div>
+        </div>
+      </div>
+
+      <!-- TAB: Regras -->
+      <div id='ctab-rules' hidden>
+        <div class='toolbar' style='margin-top:16px;'>
+          <span class='muted' id='rulesCount'></span>
+          <button onclick='showAddRuleForm()'>+ Nova Regra</button>
+        </div>
+        <div id='addRuleForm' hidden style='margin-bottom:16px;'>
+          <div class='card'>
+            <h3>Nova Regra de Identidade</h3>
+            <div style='display:grid;gap:10px;grid-template-columns:1fr 1fr;'>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Identidade normalizada</label>
+                <input id='ruleIdentity' type='text' placeholder='ex: sport tv nba' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              </div>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Disposição</label>
+                <select id='ruleDisposition' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                  <option value='ReviewOnly'>ReviewOnly</option>
+                  <option value='Excluded'>Excluded</option>
+                </select>
+              </div>
+              <div style='grid-column:1/-1;'>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Razão</label>
+                <input id='ruleReason' type='text' placeholder='Razão textual (sem URLs)' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              </div>
+            </div>
+            <div style='margin-top:10px;display:flex;gap:8px;'>
+              <button onclick='submitAddRule()'>Guardar</button>
+              <button class='secondary' onclick='hideAddRuleForm()'>Cancelar</button>
+            </div>
+          </div>
+        </div>
+        <div id='catalogRulesTable'></div>
+      </div>
+
+      <!-- TAB: Reviews -->
+      <div id='ctab-reviews' hidden>
+        <div class='toolbar' style='margin-top:16px;'>
+          <span class='muted' id='reviewsCount'></span>
+          <button class='secondary' onclick='loadCatalogReviews()'>Recarregar</button>
+        </div>
+        <div id='catalogReviewsTable'></div>
+      </div>
+
+      <!-- TAB: Sync Runs -->
+      <div id='ctab-syncruns' hidden>
+        <div class='toolbar' style='margin-top:16px;'>
+          <span class='muted' id='syncRunsCount'></span>
+          <button class='secondary' onclick='loadCatalogSyncRuns()'>Recarregar</button>
+        </div>
+        <div id='catalogSyncRunsTable'></div>
+      </div>
     </section>
 
     <!-- DIAGNÓSTICO -->
@@ -1053,6 +1379,181 @@ const rows = Object.entries(inv).map(([k, v]) => {
       document.getElementById('diagGlossary').innerHTML = `<table><thead><tr><th>Métrica</th><th>Definição</th></tr></thead><tbody>${gloss.map(([k,v]) => `<tr><td><code>${k}</code></td><td>${v}</td></tr>`).join('')}</tbody></table>`;
     }
 
+    // ===== CATALOG =====
+    let currentCatalogTab = 'overview';
+    async function loadCatalog() {
+      const stats = await safeFetchJson('/api/catalog/stats', null);
+      if (!stats || stats.error) {
+        document.getElementById('catalogStats').innerHTML = `<div class='card'><p class='muted'>Catálogo não disponível: ${stats ? stats.error : 'erro de rede'}</p></div>`;
+        return;
+      }
+      const dbg = stats.dbPath || '—';
+      const cards = [];
+      cards.push(metricCard('Canais canónicos', nfmt(stats.canonicalChannels || 0), '', 'Canais comidentificados no catálogo.'));
+      cards.push(metricCard('Aliases', nfmt(stats.channelAliases || 0), '', 'Aliases normalizados activos.'));
+      cards.push(metricCard('Regras', nfmt(stats.identityRules || 0), '', 'Regras de identidade explícitas.'));
+      cards.push(metricCard('Reviews (Open)', nfmt(stats.reviewItemsOpen || 0), `<span class='badge warn'>${nfmt(stats.reviewItemsOpen || 0)}</span>`, 'Aguardam decisão humana.'));
+      cards.push(metricCard('Reviews (Approved)', nfmt(stats.reviewItemsApproved || 0), '', ''));
+      cards.push(metricCard('Reviews (Excluded)', nfmt(stats.reviewItemsExcluded || 0), '', ''));
+      cards.push(metricCard('Ownership canais', nfmt(stats.dispatcharrChannelOwnerships || 0), '', 'Canais do Dispatcharr registados.'));
+      cards.push(metricCard('Ownership streams', nfmt(stats.dispatcharrStreamOwnerships || 0), '', 'Streams do Dispatcharr registadas.'));
+      cards.push(metricCard('Sync runs', nfmt(stats.syncRuns || 0), '', 'Execuções de sync gravadas.'));
+      document.getElementById('catalogStats').innerHTML = cards.join('');
+      document.getElementById('catalogStatsDetail').innerHTML = `
+        <p><strong>DB:</strong> <code>${dbg}</code></p>
+        <p class='row-counts'>Actualizado: ${tsLocal(stats.generatedAtUtc)}</p>`;
+      loadCatalogTab(currentCatalogTab);
+    }
+
+    function loadCatalogTab(tab) {
+      currentCatalogTab = tab;
+      document.querySelectorAll('#catalogTabs button').forEach(b => b.classList.toggle('active', b.dataset.ctab === tab));
+      document.querySelectorAll('[id^="ctab-"]').forEach(d => d.hidden = d.id !== 'ctab-' + tab);
+      if (tab === 'channels') loadCatalogChannels();
+      else if (tab === 'rules') loadCatalogRules();
+      else if (tab === 'reviews') loadCatalogReviews();
+      else if (tab === 'syncruns') loadCatalogSyncRuns();
+    }
+
+    async function loadCatalogChannels() {
+      const channels = await safeFetchJson('/api/catalog/channels', []);
+      if (!Array.isArray(channels)) { document.getElementById('catalogChannelsTable').innerHTML = '<p class="muted">Erro ao carregar canais.</p>'; return; }
+      if (!channels.length) { document.getElementById('catalogChannelsTable').innerHTML = '<p class="muted">Nenhum canal canónico.</p>'; return; }
+      const rows = channels.map(c => {
+        const aliases = (c.aliases || []).join(', ') || '—';
+        const policyBadge = `<span class='badge ${c.publicationPolicy === 'CreateEligible' ? 'ok' : (c.publicationPolicy === 'Excluded' ? 'err' : 'muted')}'>${c.publicationPolicy}</span>`;
+        return `<tr>
+          <td>${c.displayName || '—'}</td>
+          <td><code>${c.key || '—'}</code></td>
+          <td>${c.editorialCategory || '—'}</td>
+          <td>${c.editorialGroup || '—'}</td>
+          <td>${policyBadge}</td>
+          <td>${c.isEnabled ? '<span class="badge ok">sim</span>' : '<span class="badge err">não</span>'}</td>
+          <td><span class='muted'>${aliases}</span></td>
+        </tr>`;
+      }).join('');
+      document.getElementById('catalogChannelsTable').innerHTML = `
+        <table><thead><tr><th>Display Name</th><th>Key</th><th>Categoria</th><th>Grupo</th><th>Política</th><th>Activo</th><th>Aliases</th></tr></thead><tbody>${rows}</tbody></table>`;
+    }
+
+    async function loadCatalogRules() {
+      const rules = await safeFetchJson('/api/catalog/identity-rules', []);
+      if (!Array.isArray(rules)) { document.getElementById('catalogRulesTable').innerHTML = '<p class="muted">Erro ao carregar regras.</p>'; return; }
+      document.getElementById('rulesCount').textContent = `${rules.length} regra(s).`;
+      if (!rules.length) { document.getElementById('catalogRulesTable').innerHTML = '<p class="muted">Nenhuma regra de identidade.</p>'; return; }
+      const rows = rules.map(r => {
+        const dispBadge = `<span class='badge ${r.disposition === 'Excluded' ? 'err' : 'warn'}'>${r.disposition}</span>`;
+        return `<tr>
+          <td><code>${r.normalizedIdentity || '—'}</code></td>
+          <td>${dispBadge}</td>
+          <td>${r.reason || '—'}</td>
+          <td>${tsLocal(r.createdAtUtc)}</td>
+          <td><button class='secondary' style='padding:4px 8px;' onclick='deleteRule("${r.normalizedIdentity.replace(/"/g, '\\"')}")'>Eliminar</button></td>
+        </tr>`;
+      }).join('');
+      document.getElementById('catalogRulesTable').innerHTML = `
+        <table><thead><tr><th>Identidade</th><th>Disposição</th><th>Razão</th><th>Criado</th><th>Ações</th></tr></thead><tbody>${rows}</tbody></table>`;
+    }
+
+    async function loadCatalogReviews() {
+      const reviews = await safeFetchJson('/api/catalog/reviews', []);
+      if (!Array.isArray(reviews)) { document.getElementById('catalogReviewsTable').innerHTML = '<p class="muted">Erro ao carregar reviews.</p>'; return; }
+      const open = reviews.filter(r => r.state === 'Open');
+      document.getElementById('reviewsCount').textContent = `${open.length} em open · ${reviews.length} total.`;
+      if (!reviews.length) { document.getElementById('catalogReviewsTable').innerHTML = '<p class="muted">Nenhum item de revisão.</p>'; return; }
+      const rows = reviews.map(r => {
+        const stateBadge = r.state === 'Open' ? '<span class="badge warn">Open</span>'
+          : r.state === 'Approved' ? '<span class="badge ok">Approved</span>'
+          : '<span class="badge err">Excluded</span>';
+        const actions = r.state === 'Open'
+          ? `<button style='padding:4px 8px;' onclick='approveReview("${r.fingerprint.replace(/"/g, '\\"')}")'>Approve</button>
+             <button class='secondary' style='padding:4px 8px;' onclick='excludeReview("${r.fingerprint.replace(/"/g, '\\"')}")'>Exclude</button>`
+          : '—';
+        return `<tr>
+          <td><code title='${r.fingerprint}'>${(r.fingerprint || '').slice(0, 12)}…</code></td>
+          <td><code>${r.normalizedIdentity || '—'}</code></td>
+          <td>${r.sourceGroup || '—'}</td>
+          <td>${r.reasonSignature || '—'}</td>
+          <td>${stateBadge}</td>
+          <td>${r.note || '—'}</td>
+          <td>${tsLocal(r.createdAtUtc)}</td>
+          <td>${actions}</td>
+        </tr>`;
+      }).join('');
+      document.getElementById('catalogReviewsTable').innerHTML = `
+        <table><thead><tr><th>Fingerprint</th><th>Identidade</th><th>Source Group</th><th>Razão</th><th>Estado</th><th>Nota</th><th>Criado</th><th>Ações</th></tr></thead><tbody>${rows}</tbody></table>`;
+    }
+
+    async function loadCatalogSyncRuns() {
+      const runs = await safeFetchJson('/api/catalog/sync-runs', []);
+      if (!Array.isArray(runs)) { document.getElementById('catalogSyncRunsTable').innerHTML = '<p class="muted">Erro ao carregar sync runs.</p>'; return; }
+      document.getElementById('syncRunsCount').textContent = `${runs.length} execução(ões).`;
+      if (!runs.length) { document.getElementById('catalogSyncRunsTable').innerHTML = '<p class="muted">Nenhuma sync run gravada.</p>'; return; }
+      const rows = runs.map(r => {
+        const resultBadge = r.result && r.result.startsWith('ok') ? '<span class="badge ok">ok</span>'
+          : r.result && r.result.startsWith('error') ? '<span class="badge err">error</span>'
+          : '<span class="badge muted">—</span>';
+        return `<tr>
+          <td>${r.id}</td>
+          <td>${tsLocal(r.startedAtUtc)}</td>
+          <td>${tsLocal(r.finishedAtUtc)}</td>
+          <td>${r.appVersion || '—'}</td>
+          <td>${nfmt(r.countCreatedCrawlerManaged || 0)}</td>
+          <td>${nfmt(r.countMergedIntoExternal || 0)}</td>
+          <td>${nfmt(r.countProtectedExternalStreams || 0)}</td>
+          <td>${nfmt(r.countRemovedCrawlerManagedStreams || 0)}</td>
+          <td>${nfmt(r.countReviewRequired || 0)}</td>
+          <td>${nfmt(r.countExcluded || 0)}</td>
+          <td>${resultBadge}</td>
+        </tr>`;
+      }).join('');
+      document.getElementById('catalogSyncRunsTable').innerHTML = `
+        <table><thead><tr><th>ID</th><th>Início</th><th>Fim</th><th>Versão</th><th>Created</th><th>Merged</th><th>Protected</th><th>Removed</th><th>Review</th><th>Excluded</th><th>Resultado</th></tr></thead><tbody>${rows}</tbody></table>`;
+    }
+
+    function showAddRuleForm() { document.getElementById('addRuleForm').hidden = false; }
+    function hideAddRuleForm() { document.getElementById('addRuleForm').hidden = true; }
+
+    async function submitAddRule() {
+      const identity = document.getElementById('ruleIdentity').value.trim();
+      const disposition = document.getElementById('ruleDisposition').value;
+      const reason = document.getElementById('ruleReason').value.trim();
+      if (!identity) { alert('Identidade é obrigatória.'); return; }
+      const r = await fetch('/api/catalog/identity-rules', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ normalizedIdentity: identity, disposition, reason })
+      });
+      if (r.ok) {
+        hideAddRuleForm();
+        loadCatalogRules();
+      } else {
+        const err = await r.json();
+        alert('Erro: ' + (err.error || r.status));
+      }
+    }
+
+    async function deleteRule(identity) {
+      if (!confirm('Eliminar regra "' + identity + '"?')) return;
+      const r = await fetch('/api/catalog/identity-rules?identity=' + encodeURIComponent(identity), { method: 'DELETE' });
+      if (r.ok) { loadCatalogRules(); loadCatalog(); }
+      else { alert('Erro: ' + r.status); }
+    }
+
+    async function approveReview(fingerprint) {
+      const r = await fetch('/api/catalog/reviews/' + encodeURIComponent(fingerprint) + '/approve', { method: 'POST' });
+      if (r.ok) { loadCatalogReviews(); loadCatalog(); }
+      else { alert('Erro: ' + r.status); }
+    }
+
+    async function excludeReview(fingerprint) {
+      const r = await fetch('/api/catalog/reviews/' + encodeURIComponent(fingerprint) + '/exclude', { method: 'POST' });
+      if (r.ok) { loadCatalogReviews(); loadCatalog(); }
+      else { alert('Erro: ' + r.status); }
+    }
+
+    document.querySelectorAll('#catalogTabs button').forEach(b => b.addEventListener('click', () => loadCatalogTab(b.dataset.ctab)));
+
     function showView(name) {
       document.querySelectorAll('main > section').forEach(s => s.hidden = true);
       document.getElementById('view-' + name).hidden = false;
@@ -1064,6 +1565,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
         case 'countries': loadCountries(); break;
         case 'playlist': loadPlaylist(); break;
         case 'dispatcharr': loadDispatcharr(); break;
+        case 'catalog': loadCatalog(); break;
         case 'diagnostics': loadDiagnostics(); break;
       }
     }

@@ -78,7 +78,7 @@ public class ChannelCatalogIntegrationTests : IAsyncLifetime
     private ChannelMatcher NewMatcher() => new(
         new AliasResolver(null),
         resolutionPolicy: null,
-        catalog: new CatalogResolver(_factory));
+        catalog: new CatalogResolver(_factory, _dbPath));
 
     private async Task<MatchPlan> BuildPlan(
         IReadOnlyList<DiscoveredStream> discovered,
@@ -299,7 +299,7 @@ public class ChannelCatalogIntegrationTests : IAsyncLifetime
             new[] { new DispatcharrChannelGroup(99, "SPORT TV CHANNELS") },
             null);
         // Bootstrap: registar ownership da stream como External.
-        var resolver = new CatalogResolver(_factory);
+        var resolver = new CatalogResolver(_factory, _dbPath);
         await using (var ctx = await _factory.CreateDbContextAsync())
         {
             ctx.DispatcharrStreamOwnerships.Add(new DispatcharrStreamOwnershipEntity
@@ -351,7 +351,7 @@ public class ChannelCatalogIntegrationTests : IAsyncLifetime
             new[] { existingStream },
             new[] { new DispatcharrChannelGroup(99, "SPORT TV CHANNELS") },
             null);
-        var resolver = new CatalogResolver(_factory);
+        var resolver = new CatalogResolver(_factory, _dbPath);
         await using (var ctx = await _factory.CreateDbContextAsync())
         {
             ctx.DispatcharrStreamOwnerships.Add(new DispatcharrStreamOwnershipEntity
@@ -480,7 +480,7 @@ public class ChannelCatalogIntegrationTests : IAsyncLifetime
         {
             // Simulate the bootstrap registering a channel that was
             // observed in Dispatcharr but not yet classified.
-            var resolver = new CatalogResolver(_factory);
+            var resolver = new CatalogResolver(_factory, _dbPath);
             await resolver.EnsureChannelOwnershipAsync(
                 dispatcharrChannelId: 5001,
                 evidence: "sync-1-bootstrap",
@@ -534,7 +534,7 @@ public class ChannelCatalogIntegrationTests : IAsyncLifetime
     [Fact]
     public async Task SyncRun_can_be_recorded_and_listed()
     {
-        var resolver = new CatalogResolver(_factory);
+        var resolver = new CatalogResolver(_factory, _dbPath);
         var run = new SyncRunEntity
         {
             StartedAtUtc = DateTime.UtcNow,
