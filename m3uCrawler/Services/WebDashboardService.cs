@@ -1588,6 +1588,16 @@ const rows = Object.entries(inv).map(([k, v]) => {
     ['discState','discSource','discCountry'].forEach(id => document.getElementById(id).addEventListener('change', renderDiscovery));
 
     showView('overview');
+
+    window.showAddRuleForm = showAddRuleForm;
+    window.hideAddRuleForm = hideAddRuleForm;
+    window.submitAddRule = submitAddRule;
+    window.loadCatalogReviews = loadCatalogReviews;
+    window.loadCatalogSyncRuns = loadCatalogSyncRuns;
+    window.loadCatalogRules = loadCatalogRules;
+    window.deleteRule = deleteRule;
+    window.approveReview = approveReview;
+    window.excludeReview = excludeReview;
   })();
   </script>
 </body>
