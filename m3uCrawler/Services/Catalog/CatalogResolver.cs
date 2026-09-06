@@ -59,7 +59,7 @@ public sealed class CatalogResolver
 
         await using var context = await _factory.CreateDbContextAsync(cancellationToken);
 
-        // 1. IdentityRule (priority over ChannelAlias).
+        // 1. IdentityRule (priority over everything).
         var rule = await context.IdentityRules
             .AsNoTracking()
             .FirstOrDefaultAsync(r => r.NormalizedIdentity == normalizedIdentity, cancellationToken);
@@ -68,7 +68,18 @@ public sealed class CatalogResolver
             return CatalogResolution.FromRule(rule);
         }
 
-        // 2. ChannelAlias -> CanonicalChannel.
+        // 2. AffinityMember -> AffinityGroup -> CanonicalChannel.
+        var member = await context.AffinityMembers
+            .AsNoTracking()
+            .Include(m => m.AffinityGroup)
+                .ThenInclude(g => g!.CanonicalChannel)
+            .FirstOrDefaultAsync(m => m.NormalizedMember == normalizedIdentity, cancellationToken);
+        if (member?.AffinityGroup?.CanonicalChannel != null && member.AffinityGroup.CanonicalChannel.IsEnabled)
+        {
+            return CatalogResolution.FromCanonical(member.AffinityGroup.CanonicalChannel);
+        }
+
+        // 3. ChannelAlias -> CanonicalChannel.
         var alias = await context.ChannelAliases
             .AsNoTracking()
             .Include(a => a.CanonicalChannel)
@@ -389,6 +400,73 @@ public sealed class CatalogResolver
         return true;
     }
 
+    public async Task<IReadOnlyList<AffinityGroupEntity>> ListAffinityGroupsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.AffinityGroups
+            .AsNoTracking()
+            .Include(g => g.Members)
+            .Include(g => g.CanonicalChannel)
+            .OrderBy(g => g.Name)
+            .ToListAsync(cancellationToken);
+    }
+
+    public async Task<AffinityGroupEntity> CreateAffinityGroupAsync(
+        string name,
+        long canonicalChannelId,
+        IReadOnlyList<string> normalizedMembers,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+            throw new ArgumentException("name required", nameof(name));
+        if (canonicalChannelId <= 0)
+            throw new ArgumentException("canonicalChannelId required", nameof(canonicalChannelId));
+        if (normalizedMembers == null || normalizedMembers.Count == 0)
+            throw new ArgumentException("at least one member required", nameof(normalizedMembers));
+
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+
+        var canonical = await context.CanonicalChannels
+            .FirstOrDefaultAsync(c => c.Id == canonicalChannelId, cancellationToken);
+        if (canonical == null)
+            throw new InvalidOperationException($"CanonicalChannel {canonicalChannelId} not found.");
+
+        var now = DateTime.UtcNow;
+        var group = new AffinityGroupEntity
+        {
+            Name = name,
+            CanonicalChannelId = canonicalChannelId,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+            Members = normalizedMembers
+                .Where(m => !string.IsNullOrWhiteSpace(m))
+                .Select(m => new AffinityMemberEntity
+                {
+                    NormalizedMember = m.Trim(),
+                    CreatedAtUtc = now,
+                }).ToList(),
+        };
+
+        context.AffinityGroups.Add(group);
+        await context.SaveChangesAsync(cancellationToken);
+        return group;
+    }
+
+    public async Task<bool> DeleteAffinityGroupAsync(
+        long groupId,
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var group = await context.AffinityGroups
+            .FirstOrDefaultAsync(g => g.Id == groupId, cancellationToken);
+        if (group == null) return false;
+
+        context.AffinityGroups.Remove(group);
+        await context.SaveChangesAsync(cancellationToken);
+        return true;
+    }
+
     /// <summary>
     /// Approva um item de revisão (ReviewItemState.Approved) e
     /// opcionalmente regista o canal canónico aprovado.
@@ -457,6 +535,8 @@ public sealed class CatalogResolver
             CanonicalChannels = await context.CanonicalChannels.AsNoTracking().CountAsync(cancellationToken),
             ChannelAliases = await context.ChannelAliases.AsNoTracking().CountAsync(cancellationToken),
             IdentityRules = await context.IdentityRules.AsNoTracking().CountAsync(cancellationToken),
+            AffinityGroups = await context.AffinityGroups.AsNoTracking().CountAsync(cancellationToken),
+            AffinityMembers = await context.AffinityMembers.AsNoTracking().CountAsync(cancellationToken),
             DispatcharrChannelOwnerships = await context.DispatcharrChannelOwnerships.AsNoTracking().CountAsync(cancellationToken),
             DispatcharrStreamOwnerships = await context.DispatcharrStreamOwnerships.AsNoTracking().CountAsync(cancellationToken),
             ReviewItemsOpen = await context.ReviewItems.AsNoTracking().CountAsync(r => r.State == ReviewItemState.Open, cancellationToken),
@@ -474,6 +554,8 @@ public sealed class CatalogStats
     public int CanonicalChannels { get; set; }
     public int ChannelAliases { get; set; }
     public int IdentityRules { get; set; }
+    public int AffinityGroups { get; set; }
+    public int AffinityMembers { get; set; }
     public int DispatcharrChannelOwnerships { get; set; }
     public int DispatcharrStreamOwnerships { get; set; }
     public int ReviewItemsOpen { get; set; }

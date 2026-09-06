@@ -294,6 +294,63 @@ namespace m3uCrawler.Services.Catalog.Migrations
                     b.ToTable("sync_runs", (string)null);
                 });
 
+            modelBuilder.Entity("m3uCrawler.Services.Catalog.AffinityGroupEntity", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long>("CanonicalChannelId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime>("CreatedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasMaxLength(200)
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("UpdatedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("CanonicalChannelId");
+
+                    b.HasIndex("Name")
+                        .IsUnique();
+
+                    b.ToTable("affinity_groups", (string)null);
+                });
+
+            modelBuilder.Entity("m3uCrawler.Services.Catalog.AffinityMemberEntity", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long>("AffinityGroupId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime>("CreatedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("NormalizedMember")
+                        .IsRequired()
+                        .HasMaxLength(200)
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("AffinityGroupId");
+
+                    b.HasIndex("NormalizedMember")
+                        .IsUnique();
+
+                    b.ToTable("affinity_members", (string)null);
+                });
+
             modelBuilder.Entity("m3uCrawler.Services.Catalog.ChannelAliasEntity", b =>
                 {
                     b.HasOne("m3uCrawler.Services.Catalog.CanonicalChannelEntity", "CanonicalChannel")
@@ -325,9 +382,36 @@ namespace m3uCrawler.Services.Catalog.Migrations
                     b.Navigation("ApprovedCanonicalChannel");
                 });
 
+            modelBuilder.Entity("m3uCrawler.Services.Catalog.AffinityGroupEntity", b =>
+                {
+                    b.HasOne("m3uCrawler.Services.Catalog.CanonicalChannelEntity", "CanonicalChannel")
+                        .WithMany()
+                        .HasForeignKey("CanonicalChannelId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+
+                    b.Navigation("CanonicalChannel");
+                });
+
+            modelBuilder.Entity("m3uCrawler.Services.Catalog.AffinityMemberEntity", b =>
+                {
+                    b.HasOne("m3uCrawler.Services.Catalog.AffinityGroupEntity", "AffinityGroup")
+                        .WithMany("Members")
+                        .HasForeignKey("AffinityGroupId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("AffinityGroup");
+                });
+
             modelBuilder.Entity("m3uCrawler.Services.Catalog.CanonicalChannelEntity", b =>
                 {
                     b.Navigation("Aliases");
+                });
+
+            modelBuilder.Entity("m3uCrawler.Services.Catalog.AffinityGroupEntity", b =>
+                {
+                    b.Navigation("Members");
                 });
 #pragma warning restore 612, 618
         }

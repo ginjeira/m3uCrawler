@@ -114,6 +114,43 @@ public enum RuleDisposition
 }
 
 /// <summary>
+/// Grupo de afinidade: um nome canónico e múltiplos membros que
+/// são considerados equivalentes (e.g. "tvi24", "tvi 24", "tvi notícias"
+/// pertencem todas ao grupo "TVI"). O grupo resolve para um
+/// <see cref="CanonicalChannelEntity"/>.
+/// </summary>
+public sealed class AffinityGroupEntity
+{
+    public long Id { get; set; }
+
+    public string Name { get; set; } = string.Empty;
+
+    public long CanonicalChannelId { get; set; }
+    public CanonicalChannelEntity? CanonicalChannel { get; set; }
+
+    public DateTime CreatedAtUtc { get; set; }
+    public DateTime UpdatedAtUtc { get; set; }
+
+    public List<AffinityMemberEntity> Members { get; set; } = new();
+}
+
+/// <summary>
+/// Membro normalizado de um grupo de afinidade. O valor stored é
+/// a forma já normalizada pelo <see cref="ChannelNormalizer"/>.
+/// </summary>
+public sealed class AffinityMemberEntity
+{
+    public long Id { get; set; }
+
+    public string NormalizedMember { get; set; } = string.Empty;
+
+    public long AffinityGroupId { get; set; }
+    public AffinityGroupEntity? AffinityGroup { get; set; }
+
+    public DateTime CreatedAtUtc { get; set; }
+}
+
+/// <summary>
 /// Ownership de um canal do Dispatcharr: se o canal foi criado
 /// pelo crawler, se é externo, ou se é desconhecido (bootstrap).
 /// </summary>

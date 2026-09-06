@@ -507,6 +507,103 @@ namespace m3uCrawler.Services
                 return;
             }
 
+            if (requestPath.Equals("/api/catalog/affinity-groups", StringComparison.OrdinalIgnoreCase))
+            {
+                if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    var groups = await _catalogResolver.ListAffinityGroupsAsync();
+                    await WriteJsonAsync(context.Response, groups.Select(g => new
+                    {
+                        id = g.Id,
+                        name = g.Name,
+                        canonicalChannelId = g.CanonicalChannelId,
+                        canonicalChannelDisplayName = g.CanonicalChannel?.DisplayName,
+                        members = g.Members.Select(m => m.NormalizedMember).ToList(),
+                        createdAtUtc = g.CreatedAtUtc.ToString("o"),
+                        updatedAtUtc = g.UpdatedAtUtc.ToString("o"),
+                    }).ToList());
+                    return;
+                }
+
+                if (context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
+                        var body = await reader.ReadToEndAsync();
+                        var payload = JsonSerializer.Deserialize<AffinityGroupPayload>(body, JsonOptions);
+                        if (payload == null || string.IsNullOrWhiteSpace(payload.Name))
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "Payload inválido: Name é obrigatório." });
+                            return;
+                        }
+                        if (payload.CanonicalChannelId <= 0)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "CanonicalChannelId é obrigatório." });
+                            return;
+                        }
+                        if (payload.Members == null || payload.Members.Count == 0)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "Members é obrigatório e não pode estar vazio." });
+                            return;
+                        }
+
+                        var group = await _catalogResolver.CreateAffinityGroupAsync(
+                            payload.Name, payload.CanonicalChannelId, payload.Members);
+                        await WriteJsonAsync(context.Response, new
+                        {
+                            id = group.Id,
+                            name = group.Name,
+                            canonicalChannelId = group.CanonicalChannelId,
+                            members = group.Members.Select(m => m.NormalizedMember).ToList(),
+                            createdAtUtc = group.CreatedAtUtc.ToString("o"),
+                        }, HttpStatusCode.Created);
+                        return;
+                    }
+                    catch (InvalidOperationException ex)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                        await WriteJsonAsync(context.Response, new { error = ex.Message });
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.InternalServerError;
+                        await WriteJsonAsync(context.Response, new { error = ex.Message });
+                        return;
+                    }
+                }
+
+                context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
+                return;
+            }
+
+            if (requestPath.StartsWith("/api/catalog/affinity-groups/", StringComparison.OrdinalIgnoreCase)
+                && requestPath.EndsWith("/delete", StringComparison.OrdinalIgnoreCase))
+            {
+                var idStr = requestPath.Substring("/api/catalog/affinity-groups/".Length);
+                idStr = idStr[..^"/delete".Length];
+                if (!long.TryParse(idStr, out var groupId))
+                {
+                    context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                    await WriteJsonAsync(context.Response, new { error = "ID inválido." });
+                    return;
+                }
+
+                var deleted = await _catalogResolver.DeleteAffinityGroupAsync(groupId);
+                if (!deleted)
+                {
+                    context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                    await WriteJsonAsync(context.Response, new { error = "Grupo não encontrado." });
+                    return;
+                }
+                await WriteJsonAsync(context.Response, new { deleted = true, id = groupId });
+                return;
+            }
+
             if (requestPath.Equals("/api/catalog/reviews", StringComparison.OrdinalIgnoreCase))
             {
                 var reviews = await _catalogResolver.ListAllReviewItemsAsync();
@@ -719,6 +816,16 @@ namespace m3uCrawler.Services
         public string? Reason { get; set; }
     }
 
+    private sealed class AffinityGroupPayload
+    {
+        [JsonPropertyName("name")]
+        public string Name { get; set; } = string.Empty;
+        [JsonPropertyName("canonicalChannelId")]
+        public long CanonicalChannelId { get; set; }
+        [JsonPropertyName("members")]
+        public List<string> Members { get; set; } = new();
+    }
+
     private sealed class ApproveReviewPayload
     {
         [JsonPropertyName("approvedCanonicalChannelId")]
@@ -904,6 +1011,7 @@ namespace m3uCrawler.Services
         <button data-ctab='overview' class='active' style='padding:8px 14px;'>Visão Geral</button>
         <button data-ctab='channels' style='padding:8px 14px;'>Canais</button>
         <button data-ctab='rules' style='padding:8px 14px;'>Regras</button>
+        <button data-ctab='affinity' style='padding:8px 14px;'>Afinidades</button>
         <button data-ctab='reviews' style='padding:8px 14px;'>Reviews</button>
         <button data-ctab='syncruns' style='padding:8px 14px;'>Sync Runs</button>
       </nav>
@@ -956,6 +1064,40 @@ namespace m3uCrawler.Services
           </div>
         </div>
         <div id='catalogRulesTable'></div>
+      </div>
+
+      <!-- TAB: Afinidades -->
+      <div id='ctab-affinity' hidden>
+        <div class='toolbar' style='margin-top:16px;'>
+          <span class='muted' id='affinityCount'></span>
+          <button onclick='showAddAffinityForm()'>+ Novo Grupo</button>
+        </div>
+        <div id='addAffinityForm' hidden style='margin-bottom:16px;'>
+          <div class='card'>
+            <h3>Novo Grupo de Afinidade</h3>
+            <div style='display:grid;gap:10px;grid-template-columns:1fr 1fr;'>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Nome do grupo</label>
+                <input id='affinityName' type='text' placeholder='ex: TVI' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              </div>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Canal canónico (ID)</label>
+                <input id='affinityChannelId' type='number' min='1' placeholder='ID do canal' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              </div>
+              <div style='grid-column:1/-1;'>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Membros (um por linha, já normalizados)</label>
+                <textarea id='affinityMembers' rows='5' placeholder='tvi24
+tvi 24
+tvi noticias' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;resize:vertical;'></textarea>
+              </div>
+            </div>
+            <div style='margin-top:10px;display:flex;gap:8px;'>
+              <button onclick='submitAddAffinityGroup()'>Guardar</button>
+              <button class='secondary' onclick='hideAddAffinityForm()'>Cancelar</button>
+            </div>
+          </div>
+        </div>
+        <div id='catalogAffinityTable'></div>
       </div>
 
       <!-- TAB: Reviews -->
@@ -1421,6 +1563,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
       });
       if (tab === 'channels') loadCatalogChannels();
       else if (tab === 'rules') loadCatalogRules();
+      else if (tab === 'affinity') loadAffinityGroups();
       else if (tab === 'reviews') loadCatalogReviews();
       else if (tab === 'syncruns') loadCatalogSyncRuns();
     }
@@ -1550,6 +1693,63 @@ const rows = Object.entries(inv).map(([k, v]) => {
       else { alert('Erro: ' + r.status); }
     }
 
+    async function loadAffinityGroups() {
+      const groups = await safeFetchJson('/api/catalog/affinity-groups', []);
+      if (!Array.isArray(groups)) { document.getElementById('catalogAffinityTable').innerHTML = '<p class="muted">Erro ao carregar grupos.</p>'; return; }
+      document.getElementById('affinityCount').textContent = `${groups.length} grupo(s).`;
+      if (!groups.length) { document.getElementById('catalogAffinityTable').innerHTML = '<p class="muted">Nenhum grupo de afinidade.</p>'; return; }
+      const rows = groups.map(g => {
+        const members = (g.members || []).join(', ') || '—';
+        return `<tr>
+          <td>${g.name || '—'}</td>
+          <td>${g.canonicalChannelDisplayName || '—'} (${g.canonicalChannelId})</td>
+          <td><code>${members}</code></td>
+          <td>${tsLocal(g.createdAtUtc)}</td>
+          <td><button class='secondary' style='padding:4px 8px;' onclick='deleteAffinityGroup(${g.id})'>Eliminar</button></td>
+        </tr>`;
+      }).join('');
+      document.getElementById('catalogAffinityTable').innerHTML = `
+        <table><thead><tr><th>Grupo</th><th>Canal</th><th>Membros</th><th>Criado</th><th>Ações</th></tr></thead><tbody>${rows}</tbody></table>`;
+    }
+
+    function showAddAffinityForm() { document.getElementById('addAffinityForm').hidden = false; }
+    function hideAddAffinityForm() {
+      document.getElementById('addAffinityForm').hidden = true;
+      document.getElementById('affinityName').value = '';
+      document.getElementById('affinityChannelId').value = '';
+      document.getElementById('affinityMembers').value = '';
+    }
+
+    async function submitAddAffinityGroup() {
+      const name = document.getElementById('affinityName').value.trim();
+      const channelId = parseInt(document.getElementById('affinityChannelId').value, 10);
+      const membersRaw = document.getElementById('affinityMembers').value.trim();
+      if (!name) { alert('Nome do grupo é obrigatório.'); return; }
+      if (!channelId || channelId <= 0) { alert('ID do canal canónico é obrigatório.'); return; }
+      if (!membersRaw) { alert('Membros são obrigatórios.'); return; }
+      const members = membersRaw.split('\n').map(m => m.trim()).filter(m => m.length > 0);
+      if (!members.length) { alert('Pelo menos um membro é obrigatório.'); return; }
+      const r = await fetch('/api/catalog/affinity-groups', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, canonicalChannelId: channelId, members })
+      });
+      if (r.ok) {
+        hideAddAffinityForm();
+        loadAffinityGroups();
+      } else {
+        const err = await r.json();
+        alert('Erro: ' + (err.error || r.status));
+      }
+    }
+
+    async function deleteAffinityGroup(id) {
+      if (!confirm('Eliminar grupo de afinidade #' + id + '?')) return;
+      const r = await fetch('/api/catalog/affinity-groups/' + id + '/delete', { method: 'DELETE' });
+      if (r.ok) { loadAffinityGroups(); loadCatalog(); }
+      else { alert('Erro: ' + r.status); }
+    }
+
     async function approveReview(fingerprint) {
       const r = await fetch('/api/catalog/reviews/' + encodeURIComponent(fingerprint) + '/approve', { method: 'POST' });
       if (r.ok) { loadCatalogReviews(); loadCatalog(); }
@@ -1598,6 +1798,11 @@ const rows = Object.entries(inv).map(([k, v]) => {
     window.deleteRule = deleteRule;
     window.approveReview = approveReview;
     window.excludeReview = excludeReview;
+    window.loadAffinityGroups = loadAffinityGroups;
+    window.showAddAffinityForm = showAddAffinityForm;
+    window.hideAddAffinityForm = hideAddAffinityForm;
+    window.submitAddAffinityGroup = submitAddAffinityGroup;
+    window.deleteAffinityGroup = deleteAffinityGroup;
   })();
   </script>
 </body>

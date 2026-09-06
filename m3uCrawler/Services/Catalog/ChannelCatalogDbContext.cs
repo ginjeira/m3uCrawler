@@ -13,6 +13,8 @@ public sealed class ChannelCatalogDbContext : DbContext
     public DbSet<CanonicalChannelEntity> CanonicalChannels => Set<CanonicalChannelEntity>();
     public DbSet<ChannelAliasEntity> ChannelAliases => Set<ChannelAliasEntity>();
     public DbSet<IdentityRuleEntity> IdentityRules => Set<IdentityRuleEntity>();
+    public DbSet<AffinityGroupEntity> AffinityGroups => Set<AffinityGroupEntity>();
+    public DbSet<AffinityMemberEntity> AffinityMembers => Set<AffinityMemberEntity>();
     public DbSet<DispatcharrChannelOwnershipEntity> DispatcharrChannelOwnerships => Set<DispatcharrChannelOwnershipEntity>();
     public DbSet<DispatcharrStreamOwnershipEntity> DispatcharrStreamOwnerships => Set<DispatcharrStreamOwnershipEntity>();
     public DbSet<ReviewItemEntity> ReviewItems => Set<ReviewItemEntity>();
@@ -65,6 +67,43 @@ public sealed class ChannelCatalogDbContext : DbContext
             e.Property(x => x.CreatedAtUtc).IsRequired();
             e.Property(x => x.UpdatedAtUtc).IsRequired();
             e.HasIndex(x => x.NormalizedIdentity).IsUnique();
+        });
+
+        // AffinityGroup
+        modelBuilder.Entity<AffinityGroupEntity>(e =>
+        {
+            e.ToTable("affinity_groups");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Id).ValueGeneratedOnAdd();
+            e.Property(x => x.Name).IsRequired().HasMaxLength(200);
+            e.Property(x => x.CanonicalChannelId).IsRequired();
+            e.Property(x => x.CreatedAtUtc).IsRequired();
+            e.Property(x => x.UpdatedAtUtc).IsRequired();
+            e.HasIndex(x => x.Name).IsUnique();
+            e.HasOne(x => x.CanonicalChannel)
+                .WithMany()
+                .HasForeignKey(x => x.CanonicalChannelId)
+                .OnDelete(DeleteBehavior.Restrict);
+            e.HasMany(x => x.Members)
+                .WithOne(m => m.AffinityGroup)
+                .HasForeignKey(m => m.AffinityGroupId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        // AffinityMember
+        modelBuilder.Entity<AffinityMemberEntity>(e =>
+        {
+            e.ToTable("affinity_members");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Id).ValueGeneratedOnAdd();
+            e.Property(x => x.NormalizedMember).IsRequired().HasMaxLength(200);
+            e.Property(x => x.AffinityGroupId).IsRequired();
+            e.Property(x => x.CreatedAtUtc).IsRequired();
+            e.HasIndex(x => x.NormalizedMember).IsUnique();
+            e.HasOne(x => x.AffinityGroup)
+                .WithMany(g => g.Members)
+                .HasForeignKey(x => x.AffinityGroupId)
+                .OnDelete(DeleteBehavior.Cascade);
         });
 
         // DispatcharrChannelOwnership
