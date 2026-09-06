@@ -140,7 +140,7 @@ namespace m3uCrawler.Services
                 {
                     using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
                     var body = await reader.ReadToEndAsync();
-                    var country = JsonSerializer.Deserialize<CountryChannelList>(body);
+                    var country = JsonSerializer.Deserialize<CountryChannelList>(body, JsonOptions);
                     if (country == null || string.IsNullOrWhiteSpace(country.Country))
                     {
                         context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
