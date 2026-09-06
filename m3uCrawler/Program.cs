@@ -75,6 +75,18 @@ namespace m3uCrawler
                 var scraper = new TelegramScraperService();
                 await scraper.LoginAsync();
 
+                var catalogDbPath = ResolveCatalogDbPath(args);
+                CatalogResolver? catalogForAffinity = null;
+                try
+                {
+                    catalogForAffinity = await InitializeCatalogAsync(catalogDbPath, CancellationToken.None);
+                    await InjectAffinityMembersToValidatorAsync(catalogForAffinity);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"⚠️ Catálogo não disponível para injeção de afinidades: {ex.Message}");
+                }
+
                 // Get search term from arguments or prompt user
                 string term = "";
                 
@@ -696,6 +708,27 @@ namespace m3uCrawler
             Console.WriteLine($"   • playlist_temp.m3u: {tempPath}");
             Console.WriteLine($"   • playlist.m3u: {mainPath}");
             Console.WriteLine($"   • Relatório de execução: {Path.Combine(outputDir, "telegram_run_report.json")}");
+        }
+
+        static async Task InjectAffinityMembersToValidatorAsync(CatalogResolver catalog)
+        {
+            var groups = await catalog.ListAffinityGroupsAsync();
+            var byCountry = groups
+                .Where(g => !string.IsNullOrWhiteSpace(g.CountryCode))
+                .GroupBy(g => g.CountryCode!.ToLowerInvariant());
+            foreach (var group in byCountry)
+            {
+                var members = group
+                    .SelectMany(g => g.Members)
+                    .Select(m => m.NormalizedMember)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+                if (members.Count > 0)
+                {
+                    CountryChannelValidator.SetAffinityMembersStatic(group.Key, members);
+                    Console.WriteLine($"  [{group.Key}] {members.Count} membro(s) de afinidade injetados");
+                }
+            }
         }
 
         static async Task SaveRunReportAsync(string outputDir, RunReport report)

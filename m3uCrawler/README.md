@@ -291,10 +291,54 @@ O dashboard (`Services/WebDashboardService.cs`, `HttpListener`) serve a UI em `h
 | `/api/run-report` | `RunReport` da última execução (sanitizado). |
 | `/api/discovered-playlists` | Lista de playlists descobertas na última execução (sanitizado). |
 
-A UI mostra:
+### Navegação do Dashboard
 
-- **Diagnóstico da última execução**: última execução, estado, mensagens, candidatos, playlists, playlists do país, streams encontrados/testados/funcionais/falhados, duração.
-- **Últimas playlists descobertas**: origem, nome, país detectado, canais reconhecidos, número de streams, streams funcionais, estado.
+O dashboard tem os seguintes separadores principais:
+
+- **Overview**: resumo do sistema com métricas da última execução, carteiras de streams e estado do Dispatcharr.
+- **Execuções**: histórico detalhado das últimas 72h com métricas por execução.
+- **Descoberta**: playlists descobertas com filtros por estado, origem e país.
+- **Canais / Países**: validação da playlist actual por país e gestão das listas de aliases.
+- **Playlist**: visualização da playlist actual com links para download funcional.
+- **Dispatcharr**: estado da última sincronização e detalhes do plano/report.
+- **Catálogo**: gestão completa do catálogo de canais (ver secção abaixo).
+- **Diagnóstico**: inventário de ficheiros, RunReport completo e glossário de métricas.
+
+### Catálogo de Canais
+
+O catálogo (`ChannelCatalogDbContext`, SQLite em `/data/channel-catalog.db`) gere:
+
+| Separador | Conteúdo |
+|---|---|
+| **Visão Geral** | Estatísticas agregadas do catálogo (canais, aliases, regras, pending approvals). |
+| **Canais** | Lista de canais canónicos com DisplayName, Key, Categoria, Grupo editorial, Política de publicação, Activo, Aliases. |
+| **Regras** | IdentityRules explícitas que sobrepõem o matching automático. Criar regra com `ReviewOnly` permite fuzzy matching futuro; `Excluded` bloqueia o canal permanentemente. |
+| **Afinidades** | Grupos de afinidade (e.g. "TVI" com membros "tvi24", "tvi 24", "tvi noticias"). Os membros são injetados no `CountryChannelValidator` como aliases adicionais para country-level targeting. |
+| **Reviews** | Itens de revisão do Dispatcharr (decisões ambíguas ou uncertainas pendentes de decisão humana). |
+| **Sync Runs** | Histórico de sincronizações Dispatcharr com contadores de created/merged/protected/removed. |
+| **Pending** | Canais que geraram dúvida no country-level targeting e aguardam decisão manual (ver secção seguinte). |
+
+### Pending Country Approvals
+
+Esta funcionalidade permite ao utilizador decidir manualmente sobre canais que geraram dúvida durante o country-level targeting.
+
+**Quando surge um canal para aprovação manual?**
+
+Quando um stream tem indicadores de país (e.g. "PT" no título ou group-title) mas:
+- Não bate num canal canónico conhecido
+- Não corresponde a nenhum grupo de afinidade
+- O matching fuzzy também não encontra correspondência clara
+
+**Motivos de dúvida:**
+- `weak_country_match`: o canal tem indicação de país mas não bate em nada conhecido (e.g. "RTP Africa", "PT Sports Channel")
+- `affinity_no_channel`: o canal corresponde a um grupo de afinidade mas o grupo não tem canal canónico associado
+
+**Como funciona a aprovação manual:**
+
+1. **Aprovar** → Cria uma `IdentityRule` com `ReviewOnly` que permite fuzzy matching futuro. O canal fica elegível para ser criado automaticamente em sincronizações futuras.
+2. **Reprovar** → Cria uma `IdentityRule` com `Excluded` que impede o canal de ser aceite. Útil para descartar canais extranjeros que usam indicadores de país enganosos.
+
+**Nota de segurança**: As URLs mostradas na lista de pending approvals são sanitizadas antes de guardar (`CredentialSanitizer.SanitizeUrl`), pelo que nunca expõem credenciais Xtream.
 
 ### Modelo de segurança do dashboard
 
@@ -358,7 +402,7 @@ Uma playlist estrangeira (ex.: apenas canais `La 1`, `Antena 3`, `Telecinco`) é
 ## Estado dos testes
 
 - Build: `dotnet build m3uCrawler.sln --configuration Release` → **0 warnings, 0 errors**.
-- Testes: `dotnet test m3uCrawler.Tests/m3uCrawler.Tests.csproj --configuration Release --no-build --nologo` → **977 testes, 977 passados, 0 falhados** (verificado em 2026-09-03 com `dotnet 9.0.317`).
+- Testes: `dotnet test m3uCrawler.Tests/m3uCrawler.Tests.csproj --configuration Release --no-build --nologo` → **1066 testes, 1066 passados, 0 falhados** (verificado em 2026-09-06 com `dotnet 9.0.317`).
 - O runner descobre e executa todos os testes; não há testes que passem sem realmente exercitar o comportamento (detector, parser, validação por país com threshold/famílias/falsos-positivos, merge de manutenção).
 - Não há teste de integração de rede (Telegram/HTTP); os testes são unitários e independentes de infra-estrutura externa.
 

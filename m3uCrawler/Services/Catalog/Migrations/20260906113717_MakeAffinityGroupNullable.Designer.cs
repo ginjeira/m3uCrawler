@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using m3uCrawler.Services.Catalog;
 
@@ -10,9 +11,11 @@ using m3uCrawler.Services.Catalog;
 namespace m3uCrawler.Services.Catalog.Migrations
 {
     [DbContext(typeof(ChannelCatalogDbContext))]
-    partial class ChannelCatalogDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260906113717_MakeAffinityGroupNullable")]
+    partial class MakeAffinityGroupNullable
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder.HasAnnotation("ProductVersion", "9.0.0");
@@ -254,64 +257,6 @@ namespace m3uCrawler.Services.Catalog.Migrations
                         .IsUnique();
 
                     b.ToTable("identity_rules", (string)null);
-                });
-
-            modelBuilder.Entity("m3uCrawler.Services.Catalog.PendingCountryApprovalEntity", b =>
-                {
-                    b.Property<long>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("INTEGER");
-
-                    b.Property<string>("CountryCode")
-                        .IsRequired()
-                        .HasMaxLength(10)
-                        .HasColumnType("TEXT");
-
-                    b.Property<DateTime>("CreatedAtUtc")
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("NormalizedIdentity")
-                        .IsRequired()
-                        .HasMaxLength(200)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("OriginalTitle")
-                        .IsRequired()
-                        .HasMaxLength(500)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("ReasonSignature")
-                        .IsRequired()
-                        .HasMaxLength(120)
-                        .HasColumnType("TEXT");
-
-                    b.Property<DateTime?>("ResolvedAtUtc")
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("SourceGroup")
-                        .HasMaxLength(200)
-                        .HasColumnType("TEXT");
-
-                    b.Property<int>("State")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<string>("StreamUrl")
-                        .IsRequired()
-                        .HasMaxLength(1000)
-                        .HasColumnType("TEXT");
-
-                    b.Property<DateTime>("UpdatedAtUtc")
-                        .HasColumnType("TEXT");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("CountryCode");
-
-                    b.HasIndex("NormalizedIdentity");
-
-                    b.HasIndex("State");
-
-                    b.ToTable("pending_country_approvals", (string)null);
                 });
 
             modelBuilder.Entity("m3uCrawler.Services.Catalog.ReviewItemEntity", b =>

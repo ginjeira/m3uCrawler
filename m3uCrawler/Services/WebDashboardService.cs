@@ -516,6 +516,7 @@ namespace m3uCrawler.Services
                     {
                         id = g.Id,
                         name = g.Name,
+                        countryCode = g.CountryCode,
                         canonicalChannelId = g.CanonicalChannelId,
                         canonicalChannelDisplayName = g.CanonicalChannel?.DisplayName,
                         members = g.Members.Select(m => m.NormalizedMember).ToList(),
@@ -538,12 +539,6 @@ namespace m3uCrawler.Services
                             await WriteJsonAsync(context.Response, new { error = "Payload inválido: Name é obrigatório." });
                             return;
                         }
-                        if (payload.CanonicalChannelId <= 0)
-                        {
-                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
-                            await WriteJsonAsync(context.Response, new { error = "CanonicalChannelId é obrigatório." });
-                            return;
-                        }
                         if (payload.Members == null || payload.Members.Count == 0)
                         {
                             context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
@@ -552,11 +547,12 @@ namespace m3uCrawler.Services
                         }
 
                         var group = await _catalogResolver.CreateAffinityGroupAsync(
-                            payload.Name, payload.CanonicalChannelId, payload.Members);
+                            payload.Name, payload.CanonicalChannelId, payload.CountryCode, payload.Members);
                         await WriteJsonAsync(context.Response, new
                         {
                             id = group.Id,
                             name = group.Name,
+                            countryCode = group.CountryCode,
                             canonicalChannelId = group.CanonicalChannelId,
                             members = group.Members.Select(m => m.NormalizedMember).ToList(),
                             createdAtUtc = group.CreatedAtUtc.ToString("o"),
@@ -601,6 +597,75 @@ namespace m3uCrawler.Services
                     return;
                 }
                 await WriteJsonAsync(context.Response, new { deleted = true, id = groupId });
+                return;
+            }
+
+            if (requestPath.StartsWith("/api/catalog/affinity-groups/", StringComparison.OrdinalIgnoreCase)
+                && !requestPath.EndsWith("/delete", StringComparison.OrdinalIgnoreCase))
+            {
+                var idStr = requestPath.Substring("/api/catalog/affinity-groups/".Length);
+                if (!long.TryParse(idStr, out var groupId))
+                {
+                    context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                    await WriteJsonAsync(context.Response, new { error = "ID inválido." });
+                    return;
+                }
+
+                if (context.Request.HttpMethod.Equals("PUT", StringComparison.OrdinalIgnoreCase)
+                    || context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
+                        var body = await reader.ReadToEndAsync();
+                        var payload = JsonSerializer.Deserialize<AffinityGroupPayload>(body, JsonOptions);
+                        if (payload == null || string.IsNullOrWhiteSpace(payload.Name))
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "Payload inválido: Name é obrigatório." });
+                            return;
+                        }
+                        if (payload.Members == null || payload.Members.Count == 0)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "Members é obrigatório e não pode estar vazio." });
+                            return;
+                        }
+
+                        var group = await _catalogResolver.UpdateAffinityGroupAsync(
+                            groupId, payload.Name, payload.CanonicalChannelId, payload.CountryCode, payload.Members);
+                        if (group == null)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                            await WriteJsonAsync(context.Response, new { error = "Grupo não encontrado." });
+                            return;
+                        }
+                        await WriteJsonAsync(context.Response, new
+                        {
+                            id = group.Id,
+                            name = group.Name,
+                            countryCode = group.CountryCode,
+                            canonicalChannelId = group.CanonicalChannelId,
+                            members = group.Members.Select(m => m.NormalizedMember).ToList(),
+                            updatedAtUtc = group.UpdatedAtUtc.ToString("o"),
+                        });
+                        return;
+                    }
+                    catch (InvalidOperationException ex)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                        await WriteJsonAsync(context.Response, new { error = ex.Message });
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.InternalServerError;
+                        await WriteJsonAsync(context.Response, new { error = ex.Message });
+                        return;
+                    }
+                }
+
+                context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
                 return;
             }
 
@@ -704,6 +769,77 @@ namespace m3uCrawler.Services
                     countExcluded = r.CountExcluded,
                     result = r.Result,
                 }).ToList());
+                return;
+            }
+
+            // Pending country approvals
+            if (requestPath.Equals("/api/catalog/pending-country-approvals", StringComparison.OrdinalIgnoreCase))
+            {
+                var pending = await _catalogResolver.ListPendingCountryApprovalsAsync();
+                await WriteJsonAsync(context.Response, pending.Select(r => new
+                {
+                    id = r.Id,
+                    normalizedIdentity = r.NormalizedIdentity,
+                    originalTitle = r.OriginalTitle,
+                    countryCode = r.CountryCode,
+                    streamUrl = r.StreamUrl,
+                    sourceGroup = r.SourceGroup,
+                    reasonSignature = r.ReasonSignature,
+                    state = r.State.ToString(),
+                    createdAtUtc = r.CreatedAtUtc.ToString("o"),
+                    updatedAtUtc = r.UpdatedAtUtc.ToString("o"),
+                    resolvedAtUtc = r.ResolvedAtUtc?.ToString("o"),
+                }).ToList());
+                return;
+            }
+
+            if (requestPath.StartsWith("/api/catalog/pending-country-approvals/", StringComparison.OrdinalIgnoreCase))
+            {
+                var idStr = requestPath.Substring("/api/catalog/pending-country-approvals/".Length);
+                if (!long.TryParse(idStr, out var pendingId))
+                {
+                    context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                    await WriteJsonAsync(context.Response, new { error = "ID inválido." });
+                    return;
+                }
+
+                if (requestPath.EndsWith("/approve", StringComparison.OrdinalIgnoreCase))
+                {
+                    var approved = await _catalogResolver.ApprovePendingCountryApprovalAsync(pendingId);
+                    if (approved == null)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                        await WriteJsonAsync(context.Response, new { error = "Pending approval não encontrado." });
+                        return;
+                    }
+                    await WriteJsonAsync(context.Response, new
+                    {
+                        id = approved.Id,
+                        state = approved.State.ToString(),
+                        resolvedAtUtc = approved.ResolvedAtUtc?.ToString("o"),
+                    });
+                    return;
+                }
+
+                if (requestPath.EndsWith("/reject", StringComparison.OrdinalIgnoreCase))
+                {
+                    var rejected = await _catalogResolver.RejectPendingCountryApprovalAsync(pendingId);
+                    if (rejected == null)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                        await WriteJsonAsync(context.Response, new { error = "Pending approval não encontrado." });
+                        return;
+                    }
+                    await WriteJsonAsync(context.Response, new
+                    {
+                        id = rejected.Id,
+                        state = rejected.State.ToString(),
+                        resolvedAtUtc = rejected.ResolvedAtUtc?.ToString("o"),
+                    });
+                    return;
+                }
+
+                context.Response.StatusCode = (int)HttpStatusCode.NotFound;
                 return;
             }
 
@@ -820,8 +956,10 @@ namespace m3uCrawler.Services
     {
         [JsonPropertyName("name")]
         public string Name { get; set; } = string.Empty;
+        [JsonPropertyName("countryCode")]
+        public string? CountryCode { get; set; }
         [JsonPropertyName("canonicalChannelId")]
-        public long CanonicalChannelId { get; set; }
+        public long? CanonicalChannelId { get; set; }
         [JsonPropertyName("members")]
         public List<string> Members { get; set; } = new();
     }
@@ -1014,6 +1152,7 @@ namespace m3uCrawler.Services
         <button data-ctab='affinity' style='padding:8px 14px;'>Afinidades</button>
         <button data-ctab='reviews' style='padding:8px 14px;'>Reviews</button>
         <button data-ctab='syncruns' style='padding:8px 14px;'>Sync Runs</button>
+        <button data-ctab='pending' style='padding:8px 14px;'>Pending <span id='pendingBadge' class='badge warn' style='margin-left:4px;padding:1px 6px;border-radius:999px;font-size:10px;display:none;'>0</span></button>
       </nav>
 
       <!-- TAB: Visão Geral -->
@@ -1074,15 +1213,19 @@ namespace m3uCrawler.Services
         </div>
         <div id='addAffinityForm' hidden style='margin-bottom:16px;'>
           <div class='card'>
-            <h3>Novo Grupo de Afinidade</h3>
-            <div style='display:grid;gap:10px;grid-template-columns:1fr 1fr;'>
+            <h3 id='affinityFormTitle'>Novo Grupo de Afinidade</h3>
+            <div style='display:grid;gap:10px;grid-template-columns:1fr 1fr 1fr;'>
               <div>
                 <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Nome do grupo</label>
                 <input id='affinityName' type='text' placeholder='ex: TVI' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
               </div>
               <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Código do país</label>
+                <input id='affinityCountryCode' type='text' maxlength='10' placeholder='pt, es, br...' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              </div>
+              <div>
                 <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Canal canónico (ID)</label>
-                <input id='affinityChannelId' type='number' min='1' placeholder='ID do canal' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                <input id='affinityChannelId' type='number' min='1' placeholder='ID do canal (opicional)' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
               </div>
               <div style='grid-column:1/-1;'>
                 <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Membros (um por linha, já normalizados)</label>
@@ -1092,8 +1235,9 @@ tvi noticias' style='width:100%;background:var(--panel-2);color:var(--text);bord
               </div>
             </div>
             <div style='margin-top:10px;display:flex;gap:8px;'>
-              <button onclick='submitAddAffinityGroup()'>Guardar</button>
+              <button id='affinitySubmitBtn' onclick='submitAddAffinityGroup()'>Guardar</button>
               <button class='secondary' onclick='hideAddAffinityForm()'>Cancelar</button>
+              <button class='secondary' id='affinityEditCancelBtn' hidden onclick='cancelAffinityEdit()'>Cancelar Edição</button>
             </div>
           </div>
         </div>
@@ -1116,6 +1260,19 @@ tvi noticias' style='width:100%;background:var(--panel-2);color:var(--text);bord
           <button class='secondary' onclick='loadCatalogSyncRuns()'>Recarregar</button>
         </div>
         <div id='catalogSyncRunsTable'></div>
+      </div>
+
+      <!-- TAB: Pending Country Approvals -->
+      <div id='ctab-pending' hidden>
+        <div class='card' style='margin-top:16px;'>
+          <h3>Canais para Aprovação Manual</h3>
+          <p class='muted' style='margin:8px 0 16px;'>Canais que geraram dúvida no country-level targeting (e.g. contêm "PT" mas não correspondem a um canal canónico conhecido). Se um canal for aceite, é adicionada uma IdentityRule com ReviewOnly que permite fuzzy matching. Se for reprovado, é criada uma IdentityRule com Excluded.</p>
+        </div>
+        <div class='toolbar' style='margin-top:16px;'>
+          <span class='muted' id='pendingCount'></span>
+          <button class='secondary' onclick='loadPendingCountryApprovals()'>Recarregar</button>
+        </div>
+        <div id='pendingCountryApprovalsTable'></div>
       </div>
     </section>
 
@@ -1543,6 +1700,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
       cards.push(metricCard('Ownership canais', nfmt(stats.dispatcharrChannelOwnerships || 0), '', 'Canais do Dispatcharr registados.'));
       cards.push(metricCard('Ownership streams', nfmt(stats.dispatcharrStreamOwnerships || 0), '', 'Streams do Dispatcharr registadas.'));
       cards.push(metricCard('Sync runs', nfmt(stats.syncRuns || 0), '', 'Execuções de sync gravadas.'));
+      cards.push(metricCard('Pending (País)', nfmt(stats.pendingCountryApprovalsOpen || 0), `<span class='badge warn'>${nfmt(stats.pendingCountryApprovalsOpen || 0)}</span>`, 'Canais pendentes de aprovação manual por país.'));
       document.getElementById('catalogStats').innerHTML = cards.join('');
       console.log('[DEBUG] catalogStats innerHTML set, cards:', cards.length);
       document.getElementById('catalogStatsDetail').innerHTML = `
@@ -1566,6 +1724,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
       else if (tab === 'affinity') loadAffinityGroups();
       else if (tab === 'reviews') loadCatalogReviews();
       else if (tab === 'syncruns') loadCatalogSyncRuns();
+      else if (tab === 'pending') loadPendingCountryApprovals();
     }
 
     async function loadCatalogChannels() {
@@ -1664,6 +1823,60 @@ const rows = Object.entries(inv).map(([k, v]) => {
         <table><thead><tr><th>ID</th><th>Início</th><th>Fim</th><th>Versão</th><th>Created</th><th>Merged</th><th>Protected</th><th>Removed</th><th>Review</th><th>Excluded</th><th>Resultado</th></tr></thead><tbody>${rows}</tbody></table>`;
     }
 
+    async function loadPendingCountryApprovals() {
+      const pending = await safeFetchJson('/api/catalog/pending-country-approvals', []);
+      if (!Array.isArray(pending)) { document.getElementById('pendingCountryApprovalsTable').innerHTML = '<p class="muted">Erro ao carregar aprovações pendentes.</p>'; return; }
+      const open = pending.filter(r => r.state === 'Open');
+      document.getElementById('pendingCount').textContent = `${open.length} pendente(s) · ${pending.length} total.`;
+      const badge = document.getElementById('pendingBadge');
+      if (open.length > 0) {
+        badge.textContent = open.length;
+        badge.style.display = 'inline-block';
+      } else {
+        badge.style.display = 'none';
+      }
+      if (!pending.length) { document.getElementById('pendingCountryApprovalsTable').innerHTML = '<p class="muted">Nenhuma aprovação pendente.</p>'; return; }
+      const rows = pending.map(r => {
+        const stateBadge = r.state === 'Open' ? '<span class="badge warn">Pendente</span>'
+          : r.state === 'Approved' ? '<span class="badge ok">Aprovado</span>'
+          : '<span class="badge err">Reprovado</span>';
+        const reasonLabel = r.reasonSignature === 'weak_country_match' ? 'Indicação fraca de país'
+          : r.reasonSignature === 'affinity_no_channel' ? 'Afinidade sem canal'
+          : r.reasonSignature;
+        const actions = r.state === 'Open'
+          ? `<button style='padding:4px 8px;' onclick='approvePendingCountryApproval(${r.id})'>Aprovar</button>
+             <button class='secondary' style='padding:4px 8px;' onclick='rejectPendingCountryApproval(${r.id})'>Reprovar</button>`
+          : '—';
+        return `<tr>
+          <td>${r.id}</td>
+          <td><code>${r.normalizedIdentity || '—'}</code></td>
+          <td>${r.originalTitle || '—'}</td>
+          <td><span class='badge' style='background:var(--accent);color:#fff;'>${r.countryCode || '—'}</span></td>
+          <td>${r.sourceGroup || '—'}</td>
+          <td><span class='muted'>${reasonLabel}</span></td>
+          <td>${stateBadge}</td>
+          <td>${tsLocal(r.createdAtUtc)}</td>
+          <td>${actions}</td>
+        </tr>`;
+      }).join('');
+      document.getElementById('pendingCountryApprovalsTable').innerHTML = `
+        <table><thead><tr><th>ID</th><th>Identidade</th><th>Título original</th><th>País</th><th>Group</th><th>Motivo</th><th>Estado</th><th>Criado</th><th>Ações</th></tr></thead><tbody>${rows}</tbody></table>`;
+    }
+
+    async function approvePendingCountryApproval(id) {
+      if (!confirm('Aprovar este canal? Será criada uma IdentityRule com ReviewOnly que permite fuzzy matching futuro.')) return;
+      const r = await fetch('/api/catalog/pending-country-approvals/' + id + '/approve', { method: 'POST' });
+      if (r.ok) { loadPendingCountryApprovals(); loadCatalog(); }
+      else { alert('Erro: ' + r.status); }
+    }
+
+    async function rejectPendingCountryApproval(id) {
+      if (!confirm('Reprovar este canal? Será criada uma IdentityRule com Excluded que impede este canal de ser aceite.')) return;
+      const r = await fetch('/api/catalog/pending-country-approvals/' + id + '/reject', { method: 'POST' });
+      if (r.ok) { loadPendingCountryApprovals(); loadCatalog(); }
+      else { alert('Erro: ' + r.status); }
+    }
+
     function showAddRuleForm() { document.getElementById('addRuleForm').hidden = false; }
     function hideAddRuleForm() { document.getElementById('addRuleForm').hidden = true; }
 
@@ -1693,6 +1906,8 @@ const rows = Object.entries(inv).map(([k, v]) => {
       else { alert('Erro: ' + r.status); }
     }
 
+    let _affinityEditId = null;
+
     async function loadAffinityGroups() {
       const groups = await safeFetchJson('/api/catalog/affinity-groups', []);
       if (!Array.isArray(groups)) { document.getElementById('catalogAffinityTable').innerHTML = '<p class="muted">Erro ao carregar grupos.</p>'; return; }
@@ -1700,39 +1915,90 @@ const rows = Object.entries(inv).map(([k, v]) => {
       if (!groups.length) { document.getElementById('catalogAffinityTable').innerHTML = '<p class="muted">Nenhum grupo de afinidade.</p>'; return; }
       const rows = groups.map(g => {
         const members = (g.members || []).join(', ') || '—';
+        const ccBadge = g.countryCode ? `<span class='badge' style='background:var(--accent);color:#fff;'>${g.countryCode}</span>` : '—';
         return `<tr>
           <td>${g.name || '—'}</td>
-          <td>${g.canonicalChannelDisplayName || '—'} (${g.canonicalChannelId})</td>
+          <td>${ccBadge}</td>
+          <td>${g.canonicalChannelDisplayName || '—'} (${g.canonicalChannelId ?? '—'})</td>
           <td><code>${members}</code></td>
           <td>${tsLocal(g.createdAtUtc)}</td>
-          <td><button class='secondary' style='padding:4px 8px;' onclick='deleteAffinityGroup(${g.id})'>Eliminar</button></td>
+          <td>
+            <button class='secondary' style='padding:4px 8px;' onclick='editAffinityGroup(${g.id})'>Editar</button>
+            <button class='secondary' style='padding:4px 8px;' onclick='deleteAffinityGroup(${g.id})'>Eliminar</button>
+          </td>
         </tr>`;
       }).join('');
       document.getElementById('catalogAffinityTable').innerHTML = `
-        <table><thead><tr><th>Grupo</th><th>Canal</th><th>Membros</th><th>Criado</th><th>Ações</th></tr></thead><tbody>${rows}</tbody></table>`;
+        <table><thead><tr><th>Grupo</th><th>País</th><th>Canal</th><th>Membros</th><th>Criado</th><th>Ações</th></tr></thead><tbody>${rows}</tbody></table>`;
     }
 
-    function showAddAffinityForm() { document.getElementById('addAffinityForm').hidden = false; }
+    function showAddAffinityForm() {
+      _affinityEditId = null;
+      document.getElementById('affinityFormTitle').textContent = 'Novo Grupo de Afinidade';
+      document.getElementById('affinitySubmitBtn').textContent = 'Guardar';
+      document.getElementById('affinityEditCancelBtn').hidden = true;
+      document.getElementById('affinityName').value = '';
+      document.getElementById('affinityCountryCode').value = '';
+      document.getElementById('affinityChannelId').value = '';
+      document.getElementById('affinityMembers').value = '';
+      document.getElementById('addAffinityForm').hidden = false;
+    }
+
     function hideAddAffinityForm() {
       document.getElementById('addAffinityForm').hidden = true;
+      _affinityEditId = null;
+      document.getElementById('affinityFormTitle').textContent = 'Novo Grupo de Afinidade';
+      document.getElementById('affinitySubmitBtn').textContent = 'Guardar';
+      document.getElementById('affinityEditCancelBtn').hidden = true;
+    }
+
+    async function editAffinityGroup(id) {
+      const groups = await safeFetchJson('/api/catalog/affinity-groups', []);
+      if (!Array.isArray(groups)) return;
+      const g = groups.find(x => x.id === id);
+      if (!g) return;
+      _affinityEditId = id;
+      document.getElementById('affinityFormTitle').textContent = 'Editar Grupo de Afinidade';
+      document.getElementById('affinitySubmitBtn').textContent = 'Atualizar';
+      document.getElementById('affinityEditCancelBtn').hidden = false;
+      document.getElementById('affinityName').value = g.name || '';
+      document.getElementById('affinityCountryCode').value = g.countryCode || '';
+      document.getElementById('affinityChannelId').value = g.canonicalChannelId || '';
+      document.getElementById('affinityMembers').value = (g.members || []).join('\n');
+      document.getElementById('addAffinityForm').hidden = false;
+      document.getElementById('addAffinityForm').scrollIntoView({ behavior: 'smooth' });
+    }
+
+    function cancelAffinityEdit() {
+      _affinityEditId = null;
+      document.getElementById('affinityFormTitle').textContent = 'Novo Grupo de Afinidade';
+      document.getElementById('affinitySubmitBtn').textContent = 'Guardar';
+      document.getElementById('affinityEditCancelBtn').hidden = true;
       document.getElementById('affinityName').value = '';
+      document.getElementById('affinityCountryCode').value = '';
       document.getElementById('affinityChannelId').value = '';
       document.getElementById('affinityMembers').value = '';
     }
 
     async function submitAddAffinityGroup() {
       const name = document.getElementById('affinityName').value.trim();
-      const channelId = parseInt(document.getElementById('affinityChannelId').value, 10);
+      const countryCode = document.getElementById('affinityCountryCode').value.trim() || null;
+      const channelIdStr = document.getElementById('affinityChannelId').value.trim();
+      const channelId = channelIdStr ? parseInt(channelIdStr, 10) : null;
       const membersRaw = document.getElementById('affinityMembers').value.trim();
       if (!name) { alert('Nome do grupo é obrigatório.'); return; }
-      if (!channelId || channelId <= 0) { alert('ID do canal canónico é obrigatório.'); return; }
       if (!membersRaw) { alert('Membros são obrigatórios.'); return; }
       const members = membersRaw.split('\n').map(m => m.trim()).filter(m => m.length > 0);
       if (!members.length) { alert('Pelo menos um membro é obrigatório.'); return; }
-      const r = await fetch('/api/catalog/affinity-groups', {
-        method: 'POST',
+      const payload = { name, countryCode, members };
+      if (channelId && channelId > 0) payload.canonicalChannelId = channelId;
+      const url = _affinityEditId
+        ? '/api/catalog/affinity-groups/' + _affinityEditId
+        : '/api/catalog/affinity-groups';
+      const r = await fetch(url, {
+        method: _affinityEditId ? 'PUT' : 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, canonicalChannelId: channelId, members })
+        body: JSON.stringify(payload)
       });
       if (r.ok) {
         hideAddAffinityForm();

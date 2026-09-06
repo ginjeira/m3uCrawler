@@ -118,6 +118,10 @@ public enum RuleDisposition
 /// são considerados equivalentes (e.g. "tvi24", "tvi 24", "tvi notícias"
 /// pertencem todas ao grupo "TVI"). O grupo resolve para um
 /// <see cref="CanonicalChannelEntity"/>.
+///
+/// Os membros de grupos com <see cref="CountryCode"/> definido
+/// são injetados em <see cref="CountryChannelValidator"/> como
+/// aliases adicionais para decisões de country-level targeting.
 /// </summary>
 public sealed class AffinityGroupEntity
 {
@@ -125,7 +129,20 @@ public sealed class AffinityGroupEntity
 
     public string Name { get; set; } = string.Empty;
 
-    public long CanonicalChannelId { get; set; }
+    /// <summary>
+    /// Código ISO do país que este grupo representa (e.g. "pt", "es").
+    /// Quando definido, os membros do grupo são usados como aliases
+    /// de país no CountryChannelValidator para AnalyzePlaylist e
+    /// ValidateStreams.
+    /// </summary>
+    public string? CountryCode { get; set; }
+
+    /// <summary>
+    /// Canal canónico opcional. Um grupo pode existir apenas com
+    /// CountryCode para country-level targeting, sem ter ainda
+    /// um canal canónico associado.
+    /// </summary>
+    public long? CanonicalChannelId { get; set; }
     public CanonicalChannelEntity? CanonicalChannel { get; set; }
 
     public DateTime CreatedAtUtc { get; set; }
@@ -294,4 +311,66 @@ public sealed class SyncRunEntity
     /// "ok", "cancelled", "error: …". Texto sanitizado.
     /// </summary>
     public string Result { get; set; } = string.Empty;
+}
+
+/// <summary>
+/// Canal que gerou dúvida no country-level targeting e aguarda
+/// decisão humana. Criado quando um stream tem indicadores de país
+/// (e.g. "PT" no título) mas não bate num canal canónico
+/// conhecido, nem num grupo de afinidade. O utilizador pode:
+/// - <c>Aprovar</c>: cria uma IdentityRule com CreateEligible
+///   e, opcionalmente, adiciona o membro ao grupo de afinidade
+///   do país em questão.
+/// - <c>Reprovar</c>: cria uma IdentityRule com Excluded,
+///   impedindo que este canal seja aceite no futuro.
+/// </summary>
+public sealed class PendingCountryApprovalEntity
+{
+    public long Id { get; set; }
+
+    /// <summary>
+    /// Identidade normalizada do canal (e.g. "rtp africa").
+    /// </summary>
+    public string NormalizedIdentity { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Título original do stream (sem normalização).
+    /// </summary>
+    public string OriginalTitle { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Código ISO do país que originou a dúvida (e.g. "pt").
+    /// </summary>
+    public string CountryCode { get; set; } = string.Empty;
+
+    /// <summary>
+    /// URL do stream que gerou a dúvida (para referência).
+    /// Sanitizada antes de guardar.
+    /// </summary>
+    public string StreamUrl { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Source group do stream (e.g. "Portugal", "Desporto").
+    /// </summary>
+    public string? SourceGroup { get; set; }
+
+    /// <summary>
+    /// Como é que o canal gerou dúvida:
+    /// - "weak_country_match" = tinha indicadores de país mas não bateu em nada conhecido
+    /// - "affinity_no_channel" = bateu num grupo de afinidade mas sem canal canónico
+    /// </summary>
+    public string ReasonSignature { get; set; } = string.Empty;
+
+    public PendingApprovalState State { get; set; } = PendingApprovalState.Open;
+
+    public DateTime CreatedAtUtc { get; set; }
+    public DateTime UpdatedAtUtc { get; set; }
+    public DateTime? ResolvedAtUtc { get; set; }
+}
+
+public enum PendingApprovalState
+{
+    Open = 0,
+    Approved = 1,
+    Rejected = 2,
 }

@@ -8,6 +8,12 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 ## [Unreleased]
 
 ### ✨ Adicionado
+- **Pending Country Approvals** (esta iteração): nova funcionalidade de aprovação manual de canais que geraram dúvida no country-level targeting. Quando um stream tem indicadores de país (e.g. "PT" no título) mas não corresponde a um canal canónico conhecido, é adicionado a uma lista de pendentes. O utilizador pode:
+  - **Aprovar**: cria uma `IdentityRule` com `ReviewOnly` que permite fuzzy matching futuro.
+  - **Reprovar**: cria uma `IdentityRule` com `Excluded` que bloqueia o canal permanentemente.
+  - A tabela `pending_country_approvals` no SQLite (`/data/channel-catalog.db`) regista: `NormalizedIdentity`, `OriginalTitle`, `CountryCode`, `StreamUrl` (sanitizada), `SourceGroup`, `ReasonSignature`, `State` (Open/Approved/Rejected).
+  - Endpoint `GET /api/catalog/pending-country-approvals` lista todos; `POST /api/catalog/pending-country-approvals/{id}/approve` aprova; `POST /api/catalog/pending-country-approvals/{id}/reject` reprova.
+  - Dashboard: novo separador "Pending" no catálogo com badges de contagem e operações de Approve/Reject.
 - **Catálogo persistente SQLite (EF Core + migrations)** (esta iteração): substitui o `ChannelCategoryLookup.Contains()` como autorização para criar canais. A BD vive em `/data/channel-catalog.db` em produção (mesmo directório de `wtelegram.config` / `session.dat`, montado como bind-mount do container). Migrations aplicam-se idempotentemente no arranque. Backup automático antes de migrations destrutivas. Seed versionado em `Services/Catalog/CatalogSeed.cs`. Sem nova dependência externa (sem Redis, sem EF fora deste catálogo, sem nova BD). Seed inclui Benfica TV (com aliases `btv`, `btv hevc pt`, `benficatv`, `benfica tv`, …) e **`Sport TV NBA` como canal canónico autónomo** (`sport-tv-nba`, `CreateEligible`, aliases `sport tv nba`, `pt sport tv nba`, `sport tv nba hevc pt`).
 
 ### 🔧 Alterado

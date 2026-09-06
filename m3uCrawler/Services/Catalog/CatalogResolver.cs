@@ -414,28 +414,31 @@ public sealed class CatalogResolver
 
     public async Task<AffinityGroupEntity> CreateAffinityGroupAsync(
         string name,
-        long canonicalChannelId,
+        long? canonicalChannelId,
+        string? countryCode,
         IReadOnlyList<string> normalizedMembers,
         CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(name))
             throw new ArgumentException("name required", nameof(name));
-        if (canonicalChannelId <= 0)
-            throw new ArgumentException("canonicalChannelId required", nameof(canonicalChannelId));
         if (normalizedMembers == null || normalizedMembers.Count == 0)
             throw new ArgumentException("at least one member required", nameof(normalizedMembers));
 
         await using var context = await _factory.CreateDbContextAsync(cancellationToken);
 
-        var canonical = await context.CanonicalChannels
-            .FirstOrDefaultAsync(c => c.Id == canonicalChannelId, cancellationToken);
-        if (canonical == null)
-            throw new InvalidOperationException($"CanonicalChannel {canonicalChannelId} not found.");
+        if (canonicalChannelId.HasValue)
+        {
+            var canonical = await context.CanonicalChannels
+                .FirstOrDefaultAsync(c => c.Id == canonicalChannelId.Value, cancellationToken);
+            if (canonical == null)
+                throw new InvalidOperationException($"CanonicalChannel {canonicalChannelId} not found.");
+        }
 
         var now = DateTime.UtcNow;
         var group = new AffinityGroupEntity
         {
             Name = name,
+            CountryCode = countryCode,
             CanonicalChannelId = canonicalChannelId,
             CreatedAtUtc = now,
             UpdatedAtUtc = now,
@@ -449,6 +452,55 @@ public sealed class CatalogResolver
         };
 
         context.AffinityGroups.Add(group);
+        await context.SaveChangesAsync(cancellationToken);
+        return group;
+    }
+
+    public async Task<AffinityGroupEntity?> UpdateAffinityGroupAsync(
+        long groupId,
+        string name,
+        long? canonicalChannelId,
+        string? countryCode,
+        IReadOnlyList<string> normalizedMembers,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+            throw new ArgumentException("name required", nameof(name));
+
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+
+        var group = await context.AffinityGroups
+            .Include(g => g.Members)
+            .FirstOrDefaultAsync(g => g.Id == groupId, cancellationToken);
+        if (group == null) return null;
+
+        if (canonicalChannelId.HasValue)
+        {
+            var canonical = await context.CanonicalChannels
+                .FirstOrDefaultAsync(c => c.Id == canonicalChannelId.Value, cancellationToken);
+            if (canonical == null)
+                throw new InvalidOperationException($"CanonicalChannel {canonicalChannelId} not found.");
+        }
+
+        group.Name = name;
+        group.CanonicalChannelId = canonicalChannelId;
+        group.CountryCode = countryCode;
+        group.UpdatedAtUtc = DateTime.UtcNow;
+
+        context.AffinityMembers.RemoveRange(group.Members);
+        group.Members.Clear();
+
+        var now = DateTime.UtcNow;
+        foreach (var m in normalizedMembers.Where(m => !string.IsNullOrWhiteSpace(m)))
+        {
+            group.Members.Add(new AffinityMemberEntity
+            {
+                NormalizedMember = m.Trim(),
+                AffinityGroupId = group.Id,
+                CreatedAtUtc = now,
+            });
+        }
+
         await context.SaveChangesAsync(cancellationToken);
         return group;
     }
@@ -523,6 +575,139 @@ public sealed class CatalogResolver
     }
 
     /// <summary>
+    /// Lista todos os PendingCountryApproval ordenados por data
+    /// de criação (mais antigos primeiro, para review FIFO).
+    /// </summary>
+    public async Task<IReadOnlyList<PendingCountryApprovalEntity>> ListPendingCountryApprovalsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.PendingCountryApprovals
+            .AsNoTracking()
+            .OrderBy(r => r.CreatedAtUtc)
+            .ToListAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Regista um novo canal pendente de aprovação. Idempotente:
+    /// se já existir um registo Open com a mesma (NormalizedIdentity,
+    /// CountryCode, ReasonSignature), não cria duplicado.
+    /// </summary>
+    public async Task<PendingCountryApprovalEntity> UpsertPendingCountryApprovalAsync(
+        string normalizedIdentity,
+        string originalTitle,
+        string countryCode,
+        string sanitizedStreamUrl,
+        string? sourceGroup,
+        string reasonSignature,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(normalizedIdentity))
+            throw new ArgumentException("normalizedIdentity required", nameof(normalizedIdentity));
+
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+
+        var existing = await context.PendingCountryApprovals
+            .FirstOrDefaultAsync(r =>
+                r.NormalizedIdentity == normalizedIdentity &&
+                r.CountryCode == countryCode &&
+                r.ReasonSignature == reasonSignature &&
+                r.State == PendingApprovalState.Open,
+                cancellationToken);
+
+        if (existing != null)
+            return existing;
+
+        var now = DateTime.UtcNow;
+        var entry = new PendingCountryApprovalEntity
+        {
+            NormalizedIdentity = normalizedIdentity,
+            OriginalTitle = originalTitle ?? string.Empty,
+            CountryCode = countryCode ?? string.Empty,
+            StreamUrl = sanitizedStreamUrl ?? string.Empty,
+            SourceGroup = sourceGroup,
+            ReasonSignature = reasonSignature ?? string.Empty,
+            State = PendingApprovalState.Open,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+        };
+        context.PendingCountryApprovals.Add(entry);
+        await context.SaveChangesAsync(cancellationToken);
+        return entry;
+    }
+
+    /// <summary>
+    /// Aprova um canal pendente: cria IdentityRule com CreateEligible
+    /// e marca o pending como Approved. Opcionalmente adiciona o membro
+    /// ao grupo de afinidade do país (criando o grupo se não existir).
+    /// </summary>
+    public async Task<PendingCountryApprovalEntity?> ApprovePendingCountryApprovalAsync(
+        long id,
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var item = await context.PendingCountryApprovals
+            .FirstOrDefaultAsync(r => r.Id == id, cancellationToken);
+        if (item == null) return null;
+
+        var existingRule = await context.IdentityRules
+            .FirstOrDefaultAsync(r => r.NormalizedIdentity == item.NormalizedIdentity, cancellationToken);
+        if (existingRule == null)
+        {
+            var now = DateTime.UtcNow;
+            context.IdentityRules.Add(new IdentityRuleEntity
+            {
+                NormalizedIdentity = item.NormalizedIdentity,
+                Disposition = RuleDisposition.ReviewOnly,
+                Reason = $"Approved from PendingCountryApproval #{id} ({item.ReasonSignature})",
+                CreatedAtUtc = now,
+                UpdatedAtUtc = now,
+            });
+        }
+
+        item.State = PendingApprovalState.Approved;
+        item.ResolvedAtUtc = DateTime.UtcNow;
+        item.UpdatedAtUtc = DateTime.UtcNow;
+        await context.SaveChangesAsync(cancellationToken);
+        return item;
+    }
+
+    /// <summary>
+    /// Reprova um canal pendente: cria IdentityRule com Excluded
+    /// e marca o pending como Rejected.
+    /// </summary>
+    public async Task<PendingCountryApprovalEntity?> RejectPendingCountryApprovalAsync(
+        long id,
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var item = await context.PendingCountryApprovals
+            .FirstOrDefaultAsync(r => r.Id == id, cancellationToken);
+        if (item == null) return null;
+
+        var existingRule = await context.IdentityRules
+            .FirstOrDefaultAsync(r => r.NormalizedIdentity == item.NormalizedIdentity, cancellationToken);
+        if (existingRule == null)
+        {
+            var now = DateTime.UtcNow;
+            context.IdentityRules.Add(new IdentityRuleEntity
+            {
+                NormalizedIdentity = item.NormalizedIdentity,
+                Disposition = RuleDisposition.Excluded,
+                Reason = $"Rejected from PendingCountryApproval #{id} ({item.ReasonSignature})",
+                CreatedAtUtc = now,
+                UpdatedAtUtc = now,
+            });
+        }
+
+        item.State = PendingApprovalState.Rejected;
+        item.ResolvedAtUtc = DateTime.UtcNow;
+        item.UpdatedAtUtc = DateTime.UtcNow;
+        await context.SaveChangesAsync(cancellationToken);
+        return item;
+    }
+
+    /// <summary>
     /// Estatísticas agregadas do catálogo: contagens por tabela.
     /// </summary>
     public async Task<CatalogStats> GetStatsAsync(
@@ -543,6 +728,8 @@ public sealed class CatalogResolver
             ReviewItemsApproved = await context.ReviewItems.AsNoTracking().CountAsync(r => r.State == ReviewItemState.Approved, cancellationToken),
             ReviewItemsExcluded = await context.ReviewItems.AsNoTracking().CountAsync(r => r.State == ReviewItemState.Excluded, cancellationToken),
             SyncRuns = await context.SyncRuns.AsNoTracking().CountAsync(cancellationToken),
+            PendingCountryApprovals = await context.PendingCountryApprovals.AsNoTracking().CountAsync(cancellationToken),
+            PendingCountryApprovalsOpen = await context.PendingCountryApprovals.AsNoTracking().CountAsync(r => r.State == PendingApprovalState.Open, cancellationToken),
             DbPath = _dbPath,
             GeneratedAtUtc = now,
         };
@@ -562,6 +749,8 @@ public sealed class CatalogStats
     public int ReviewItemsApproved { get; set; }
     public int ReviewItemsExcluded { get; set; }
     public int SyncRuns { get; set; }
+    public int PendingCountryApprovals { get; set; }
+    public int PendingCountryApprovalsOpen { get; set; }
     public string DbPath { get; set; } = string.Empty;
     public DateTime GeneratedAtUtc { get; set; }
 }
