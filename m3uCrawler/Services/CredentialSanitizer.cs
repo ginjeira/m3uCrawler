@@ -30,6 +30,18 @@ namespace m3uCrawler.Services
             if (string.IsNullOrWhiteSpace(url)) return url ?? string.Empty;
 
             var s = url;
+
+            // user:password@ em userinfo para QUALQUER scheme (incl. schemes nao-http
+            // como "xtream://" ou "rtsp://") — protege o caso onde o caller passa
+            // uma string estilo URL com credenciais em qualquer formato.
+            s = Regex.Replace(s, @"^([a-z][a-z0-9+.\-]*://)([^:@/\s]+):([^@/\s]+)@",
+                "$1$2:***@", RegexOptions.IgnoreCase);
+
+            // user/password@ em formato path-style ("scheme://user/pass@host...") — usado
+            // em alguns formatos nao-RFC como "xtream://user/pass@host:port".
+            s = Regex.Replace(s, @"^([a-z][a-z0-9+.\-]*://)([^:@/\s]+)/([^@/\s]+)@",
+                "$1$2/***@", RegexOptions.IgnoreCase);
+
             s = _userInfoRegex.Replace(s, "$1$2:***@");
             s = _pathCredsRegex.Replace(s, "/$1/***/***");
             s = _queryCredsRegex.Replace(s, "$1$2=***");
@@ -58,6 +70,45 @@ namespace m3uCrawler.Services
                 else
                 {
                     sb.AppendLine(rawLine);
+                }
+            }
+            return sb.ToString();
+        }
+
+        /// <summary>
+        /// Sanitiza um texto arbitrario (e.g. caption de mensagem Telegram, mensagem de
+        /// revisao) contra credenciais Xtream. Aplica <see cref="SanitizeUrl"/> a cada URL
+        /// http(s) presente e preserva o resto do texto. Util para diagnostico do
+        /// RunReport (mensagens rejeitadas, triage) sem nunca persistir credenciais.
+        /// </summary>
+        public static string SanitizeText(string? text)
+        {
+            if (string.IsNullOrEmpty(text)) return string.Empty;
+            var sb = new StringBuilder();
+            int i = 0;
+            while (i < text.Length)
+            {
+                if (i + 7 < text.Length &&
+                    (text.Substring(i, 7).Equals("http://", StringComparison.OrdinalIgnoreCase) ||
+                     text.Substring(i, 8).Equals("https://", StringComparison.OrdinalIgnoreCase)))
+                {
+                    int start = i;
+                    int end = i;
+                    while (end < text.Length && !char.IsWhiteSpace(text[end]) &&
+                           text[end] != '<' && text[end] != '>' &&
+                           text[end] != '"' && text[end] != '\'' &&
+                           text[end] != '(' && text[end] != ')')
+                    {
+                        end++;
+                    }
+                    var url = text.Substring(start, end - start);
+                    sb.Append(SanitizeUrl(url));
+                    i = end;
+                }
+                else
+                {
+                    sb.Append(text[i]);
+                    i++;
                 }
             }
             return sb.ToString();

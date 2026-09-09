@@ -292,6 +292,11 @@ namespace m3uCrawler.Services
             string keyword, int limit = 200, int historyHours = 48)
         {
             var candidates = new List<CandidatePlaylist>();
+            // Publicacoes descobertas em qualquer mensagem: referencias Telegram
+            // (t.me/c/...) e URLs HTTP publicas nao capturadas pelo detector.
+            // Sao resolvidas apos o loop principal, usando o cache de access_hash
+            // construido a partir dos dialogos.
+            var discoveredPublications = new List<TelegramPublicationRef>();
             int messagesAnalyzed = 0;
 
             // Idempotente: se já autenticado, não faz nada
@@ -303,6 +308,12 @@ namespace m3uCrawler.Services
             Dialog[] dialogList;
             Dictionary<long, ChatBase> chatsDict;
             Dictionary<long, User> usersDict;
+
+            Channel? ResolveChannel(long channelId)
+            {
+                if (chatsDict.TryGetValue(channelId, out var ch) && ch is Channel c) return c;
+                return null;
+            }
 
             switch (dialogsBase)
             {
@@ -416,6 +427,25 @@ namespace m3uCrawler.Services
                             });
                         }
 
+                        // Descoberta de publicacoes Telegram (t.me/c/<channel>/<message>)
+                        // e URLs HTTP publicas adicionais. As primeiras exigem resolucao
+                        // via WTelegram apos o loop principal (precisamos de access_hash do
+                        // cache de dialogos); as URLs HTTP serao processadas como
+                        // publicacoes URL pelo mesmo pipeline.
+                        var pubs = TelegramPublicationDiscovery.DiscoverFromText(text, chatTitle);
+                        foreach (var p in pubs)
+                        {
+                            // Evitar duplicados dentro do mesmo ciclo (mesma referencia
+                            // pode aparecer em varias mensagens).
+                            if (!discoveredPublications.Any(d =>
+                                    d.ReferenceUrl == p.ReferenceUrl &&
+                                    d.ChannelId == p.ChannelId &&
+                                    d.MessageId == p.MessageId))
+                            {
+                                discoveredPublications.Add(p);
+                            }
+                        }
+
                         bool hasAttachment = m.media is MessageMediaDocument media2 && media2.document is Document;
                         Document? attachmentDocument = hasAttachment
                             ? (Document)((MessageMediaDocument)m.media!).document
@@ -445,7 +475,139 @@ namespace m3uCrawler.Services
                 await Task.Delay(500);
             }
 
+            // Resolver publicacoes Telegram descobertas (t.me/c/...) usando o
+            // canal cache construido a partir dos dialogos. URLs HTTP publicas
+            // capturadas pelo discovery sao processadas pelo loop principal
+            // (download HTTP -> XtreamPublicationResolver). Apenas referencias
+            // Telegram precisam do passo de resolucao aqui.
+            var telegramRefs = discoveredPublications
+                .Where(p => p.ChannelId.HasValue && p.MessageId.HasValue)
+                .ToList();
+            if (telegramRefs.Count > 0)
+            {
+                var fetcher = BuildTelegramFetcher(ResolveChannel);
+                var resolutions = await TelegramPublicationResolver.ResolveAsync(
+                    telegramRefs, fetcher);
+
+                // Promover cada conta Xtream descoberta a CandidatePlaylist e
+                // anexar ao mesmo loop do pipeline.
+                foreach (var res in resolutions)
+                {
+                    if (res.XtreamAccounts.Count == 0) continue;
+                    foreach (var acc in res.XtreamAccounts)
+                    {
+                        var playlistUrl = acc.M3uUrl ?? BuildXtreamPlaylistUrl(acc);
+                        var promoted = PromoteXtreamAccount(playlistUrl, res.ReferenceUrl);
+                        if (promoted != null)
+                        {
+                            candidates.Add(promoted);
+                        }
+                    }
+                }
+            }
+
             return (messagesAnalyzed, candidates);
+        }
+
+        /// <summary>
+        /// Constrói um TelegramMessageFetcher que invoca WTelegram
+        /// Channels_GetMessages / Messages_GetMessages com o (channelId, messageId)
+        /// recebido, usando o cache de dialogos para obter access_hash. Devolve
+        /// null se a mensagem nao for acessivel (canal nao nos dialogos, FLOOD_WAIT
+        /// persistente, etc.).
+        /// </summary>
+        private TelegramMessageFetcher BuildTelegramFetcher(Func<long, Channel?> resolveChannel)
+        {
+            return async (long channelId, int messageId, CancellationToken ct) =>
+            {
+                ct.ThrowIfCancellationRequested();
+                var channel = resolveChannel(channelId);
+                if (channel == null) return null;
+                try
+                {
+                    var inputChannel = new InputChannel(channel.id, channel.access_hash);
+                    var ids = new InputMessage[] { new InputMessageID { id = messageId } };
+                    var response = await _client.Channels_GetMessages(inputChannel, ids);
+                    if (response is Messages_ChannelMessages mcm && mcm.messages != null && mcm.messages.Length > 0)
+                    {
+                        var msg = mcm.messages[0] as Message;
+                        if (msg == null) return null;
+                        return await BuildResolvedFromMessage(msg);
+                    }
+                    return null;
+                }
+                catch (WTelegram.WTException ex) when (ex.Message.Contains("FLOOD_WAIT", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Re-throw para que o resolver trate FLOOD_WAIT com retry.
+                    throw;
+                }
+                catch (WTelegram.WTException)
+                {
+                    // CHANNEL_INVALID, MESSAGE_ID_INVALID, etc. Devolve null
+                    // para que o resolver marque a publicacao como ResolutionFailed.
+                    return null;
+                }
+            };
+        }
+
+        /// <summary>
+        /// Converte um TL.Message (obtido via WTelegram) num ResolvedPublication
+        /// para o TelegramPublicationResolver. Suporta texto + media (Document).
+        /// </summary>
+        private async Task<ResolvedPublication?> BuildResolvedFromMessage(Message m)
+        {
+            var text = m.message ?? string.Empty;
+
+            string? filename = null;
+            byte[]? mediaContent = null;
+            string kind = "text";
+
+            if (m.media is MessageMediaDocument mediaDoc && mediaDoc.document is Document doc)
+            {
+                foreach (var attr in doc.attributes)
+                {
+                    if (attr is DocumentAttributeFilename fn)
+                    {
+                        filename = fn.file_name ?? string.Empty;
+                        break;
+                    }
+                }
+
+                if (!string.IsNullOrEmpty(filename))
+                {
+                    kind = ClassifyAttachmentForFetcher(filename);
+                    try
+                    {
+                        using var ms = new MemoryStream();
+                        await _client.DownloadFileAsync(doc, ms);
+                        mediaContent = ms.ToArray();
+                    }
+                    catch
+                    {
+                        // Download falhou; sem media content. O resolver fara'
+                        // o seu trabalho so' com o texto.
+                        mediaContent = null;
+                    }
+                }
+            }
+
+            return new ResolvedPublication
+            {
+                Text = text,
+                Filename = filename,
+                MediaContent = mediaContent,
+                Kind = kind,
+                ChannelId = m.Peer is PeerChannel pc ? pc.channel_id : null,
+                MessageId = m.ID
+            };
+        }
+
+        private static string ClassifyAttachmentForFetcher(string filename)
+        {
+            var f = filename.ToLowerInvariant();
+            if (System.Text.RegularExpressions.Regex.IsMatch(f, @"\.html?$")) return "html attachment";
+            if (System.Text.RegularExpressions.Regex.IsMatch(f, @"\.m3u8?$")) return "m3u attachment";
+            return "other attachment";
         }
 
         internal static async Task ProcessAttachmentCandidatesAsync(
@@ -663,7 +825,15 @@ namespace m3uCrawler.Services
         /// resolver canonico produzir a URL de playlist (get.php). Garante que
         /// existe uma UNICA forma de construir URLs Xtream no projeto.
         /// </summary>
-        private static string? BuildXtreamPlaylistUrl(XtreamAccountInfo acc)
+        internal static string? BuildXtreamPlaylistUrl(XtreamAccountInfo acc)
+        {
+            return BuildPlaylistUrlForTest(acc);
+        }
+
+        /// <summary>
+        /// Wrapper publico-interno (mantido para testes) com nome mais curto.
+        /// </summary>
+        internal static string? BuildPlaylistUrlForTest(XtreamAccountInfo acc)
         {
             var detector = new M3uCandidateDetector();
             var scheme = string.IsNullOrWhiteSpace(acc.Scheme) ? "http" : acc.Scheme.ToLowerInvariant();

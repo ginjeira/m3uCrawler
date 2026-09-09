@@ -201,18 +201,22 @@ Detecções suportadas pelo `M3uCandidateDetector.IsHtmlFilename`:
 | `page.htmx`, `nothtml.txt`, `script.js` | não |
 | `null` / `""` | não |
 
-#### Limitação conhecida: links `t.me/c/<channel>/<message>`
+#### Referências `t.me/c/<channel>/<message>` — caminho Telegram
 
-Deep links do Telegram (e.g. `https://t.me/c/1635952193/110637`) **não são resolvidos nesta iteração**. Estes URLs não são endereçáveis como HTML público (responder com 200 OK é apenas por conveniência do Telegram web); o conteúdo reside dentro da sessão Telegram autenticada, requerendo `Messages_GetMessages` da WTelegram e gestão de flood-wait, profundidade de resolução e ciclos.
+Deep links do Telegram (e.g. `https://t.me/c/1635952193/110637`) **são suportados**. O `TelegramPublicationDiscovery` identifica-os a partir do texto da mensagem e o `TelegramPublicationResolver` resolve-os via `WTelegram.Channels_GetMessages(inputChannel, [InputMessageID])` usando o `access_hash` cacheado a partir dos diálogos do `_client.Messages_GetAllDialogs()`.
 
-A investigação técnica confirmou que a WTelegram API (`Messages_GetMessages` com `InputMessage { Id, Peer = channel_peer(channel_id) }`) suporta esta funcionalidade, mas a implementação foi explicitamente diferida para uma iteração dedicada para evitar misturar os dois caminhos (URL pública vs. resolução de mensagem Telegram) e para preservar a sanidade do limite de profundidade.
+Casos cobertos:
 
-Se uma mensagem contiver um link `t.me/c/...`, hoje o crawler:
+- Mensagem resolvida contém **texto com URL HTTP pública** → sub-publicação reportada no `ChildPublications`, tratada pelo pipeline de URL existente.
+- Mensagem resolvida contém **attachment HTML `.html`/`.htm`** com cards Xtream → aplica-se o `XtreamPublicationResolver.ResolveFromHtml`, devolvendo 0..N `XtreamAccountInfo`. Cada conta é promovida a `CandidatePlaylist { DetectedFrom="xtream publication" }` que re-entra no loop principal do pipeline M3U/Xtream.
+- Mensagem resolvida contém **attachment M3U** → o conteúdo é entregue como `Content` no `CandidatePlaylist` (sem mudança adicional).
+- Mensagem contém **outras referências Telegram** (`https://t.me/c/...`) → recursão controlada com depth-limit (`MaxResolutionDepth = 3`) e seen-set.
+- Mensagem contém **attachment desconhecido** (e.g. `.pdf`) → `PublicationState.RequiresReview`.
+- Mensagem **sem nada útil** → `PublicationState.Unsupported`.
+- Mensagem **inacessível** (canal inexistente, FLOOD_WAIT persistente, `CHANNEL_INVALID`) → `PublicationState.ResolutionFailed` com `Reason` sanitizado. **A mensagem não desaparece silenciosamente**: é registada no `RunReport.PublicationsTriageLog`.
 
-1. **Se for a única URL na mensagem** → não é captado pelo `M3uCandidateDetector` (não tem pista de playlist/Xtream), nem pelo `ExtractRemainingHttpUrls` da forma como está implementado (a string é reconhecida como URL HTTP, mas o branch novo não sabe distinguir t.me de outros domínios; é tratado como HTML público genérico).
-2. **Se houver outras URLs na mensagem** → as restantes são processadas normalmente; o link `t.me/c/...` cai no mesmo caso genérico do ponto 1.
+Telegram publication URLs (`https://t.me/<username>/<message>`) sem canal id explícito **não** são suportadas nesta iteração — apenas o formato `t.me/c/<channel>/<message>`. Esta decisão evita resolver usernames via `Messages_ResolveUsername` (que adiciona uma chamada API e mais um ponto de falha).
 
-Em ambos os casos o link é **descartado** e fica registado em `RejectionReasons` como "no xtream cards found" após o download HTTP (que devolve a página web do Telegram, sem cards Xtream).
 
 #### Sanitização de credenciais
 
@@ -252,6 +256,18 @@ M3uCandidateDetector.DetectFromMessage
 TelegramScraperService.ExtractRemainingHttpUrls
 (URLs HTTP genéricas -> candidatas a publicação HTML)
    ↓
+TelegramPublicationDiscovery.DiscoverFromText
+   ├─ https://t.me/c/<channel>/<message> → TelegramPublicationRef
+   │       (referencia Telegram; resolvida via WTelegram Channels_GetMessages)
+   └─ outras URLs HTTP → TelegramPublicationRef (processadas como publicacao URL)
+   ↓
+TelegramPublicationResolver.ResolveAsync
+   - dado um TelegramMessageFetcher injetado (testavel)
+   - aplica depth-limit (MaxResolutionDepth=3) e seen-set para evitar ciclos
+   - classifica resultado: Resolved / ResolutionFailed / RequiresReview / Unsupported
+   - para mensagens com attachment HTML: aplica XtreamPublicationResolver.ResolveFromHtml
+   - cada conta Xtream descoberta -> promoted a CandidatePlaylist (mesmo fan-out)
+   ↓
 CandidatePlaylist
    ↓
 DownloadPlaylistContentAsync (URL) / DownloadTelegramDocumentTextAsync (anexo)
@@ -272,13 +288,40 @@ CountryChannelValidator.AnalyzePlaylist(content, countryCode, threshold: 3)
    ├─ País alvo (≥3 canais distintos) → M3uTesterService.TestM3u8Stream
    └─ País não corresponde / playlist inválida → rejeitada, sem testar streams
    ↓
-RunReport (métricas + motivos de rejeição)
+RunReport (métricas + motivos de rejeição + triage de publicações)
    ↓
 ImportHistoryService.RecordImportAsync
    ↓
 PlaylistManagerService.SaveToM3uPlaylist / SaveToJsonReport
    ↓
 output/telegram_run_report.json  +  output/playlist*.m3u
+```
+
+### Camadas de descoberta e resolução (introduzido 2026-09-09)
+
+A nova capacidade introduz três camadas distintas com responsabilidades separadas:
+
+1. **TelegramPublicationDiscovery** — parsing puro (sem I/O). Identifica:
+   - `https://t.me/c/<channel_id>/<message_id>` (referência Telegram com (channel, message) resolvíveis via WTelegram).
+   - Outras URLs HTTP genéricas no texto (mecanismo já existente).
+2. **TelegramPublicationResolver** — recebe uma lista de `TelegramPublicationRef` e um `TelegramMessageFetcher` (delegate injectado, testável sem WTelegram). Para cada referência:
+   - Resolve a mensagem (texto + attachment).
+   - Classifica resultado (`Resolved`, `ResolutionFailed`, `RequiresReview`, `Unsupported`).
+   - Para attachment HTML, aplica `XtreamPublicationResolver.ResolveFromHtml` e devolve `IReadOnlyList<XtreamAccountInfo>`.
+   - Para mensagens com sub-referências no texto, recursa com depth-limit (`MaxResolutionDepth=3`) e seen-set.
+3. **TelegramPublicationReference** no `TelegramScraperService` — orquestrador: integra as duas camadas no loop principal, converte contas Xtream em `CandidatePlaylist { DetectedFrom="xtream publication" }` que entram no pipeline M3U/Xtream existente (zero duplicação).
+
+Estados de triagem expostos no `RunReport`:
+
+- `PublicationsDiscovered` — total de referências + URLs HTTP captadas.
+- `PublicationsResolved` — cujo conteúdo foi obtido com sucesso.
+- `PublicationsResolutionFailed` — canal inexistente, mensagem inacessível, FLOOD_WAIT persistente.
+- `PublicationsRequiresReview` — HTML sem cards Xtream / attachment desconhecido.
+- `PublicationsUnsupported` — texto sem URLs nem anexos úteis.
+- `XtreamAccountsDiscovered` / `XtreamAccountsAfterDedup` / `XtreamAccountsForwarded` — fan-out.
+
+Cada entrada inclui `PublicationTriageEntry { Kind, Reference, ChannelId, MessageId, State, Reason, XtreamAccountsFound }`. `Reference` é sempre URL público (t.me/c/...) ou URL de página HTTP sem credenciais. `Reason` é sanitizado contra credenciais antes de ser persistido.
+
 ```
 
 Método principal: `TelegramScraperService.SearchAndTestM3UInTelegramAsync`.
