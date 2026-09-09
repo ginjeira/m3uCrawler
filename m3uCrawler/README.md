@@ -175,6 +175,45 @@ Esta lista é **publicidade/resumo da conta**, não a lista real de canais. O re
 
 `BuildXtreamPlaylistUrl` (em `TelegramScraperService`) **não** cria uma segunda implementação de `get.php`. Quando a card fornece uma URL M3U explícita, essa URL tem prioridade. Caso contrário, é sintetizada uma URL de servidor `http://host:port/live/USER/PASS/0.ts` e delegada a `M3uCandidateDetector.ResolveXtreamPlaylistUrl` — a única forma canónica de produzir `get.php?username=…&password=…&type=m3u_plus` no projecto. Existe uma outra construção independente em `M3uCrawlerService.ScanDomainForPlaylists` para o modo `--scan-domain`; é código pré-existente e **não** foi alterado por esta funcionalidade.
 
+#### Anexos HTML (`m3u@host.html`) — segundo mecanismo
+
+A mesma capacidade é exercida quando a mensagem Telegram traz um **anexo `.html` ou `.htm`** em vez de uma URL pública. O detector emite, sem I/O:
+
+```csharp
+CandidatePlaylist {
+  Kind = Attachment,
+  FileName = "m3u@host.example_07-09-2026.html",
+  DetectedFrom = "html attachment",
+  RequiresContentVerification = true,
+  Content = null   // downloaded by ProcessAttachmentCandidatesAsync
+}
+```
+
+A partir daqui o download, a gate `LooksLikeHtmlPublication`, a chamada ao `XtreamPublicationResolver`, a promoção a `CandidatePlaylist { DetectedFrom = "xtream publication" }` e o fan-out no pipeline M3U/Xtream são **idênticos** ao caso URL pública acima. **Não há um parser novo** — apenas uma fonte adicional para o mesmo `XtreamPublicationResolver`.
+
+Detecções suportadas pelo `M3uCandidateDetector.IsHtmlFilename`:
+
+| Filename | Detectado? |
+|---|---|
+| `m3u@host.example_07-09-2026.html` | sim |
+| `m3u@host.example_07-09-2026.htm` | sim |
+| `foo.HTML`, `foo.HTM`, `foo.HtMl`, `foo.HtM` | sim (case-insensitive) |
+| `page.htmx`, `nothtml.txt`, `script.js` | não |
+| `null` / `""` | não |
+
+#### Limitação conhecida: links `t.me/c/<channel>/<message>`
+
+Deep links do Telegram (e.g. `https://t.me/c/1635952193/110637`) **não são resolvidos nesta iteração**. Estes URLs não são endereçáveis como HTML público (responder com 200 OK é apenas por conveniência do Telegram web); o conteúdo reside dentro da sessão Telegram autenticada, requerendo `Messages_GetMessages` da WTelegram e gestão de flood-wait, profundidade de resolução e ciclos.
+
+A investigação técnica confirmou que a WTelegram API (`Messages_GetMessages` com `InputMessage { Id, Peer = channel_peer(channel_id) }`) suporta esta funcionalidade, mas a implementação foi explicitamente diferida para uma iteração dedicada para evitar misturar os dois caminhos (URL pública vs. resolução de mensagem Telegram) e para preservar a sanidade do limite de profundidade.
+
+Se uma mensagem contiver um link `t.me/c/...`, hoje o crawler:
+
+1. **Se for a única URL na mensagem** → não é captado pelo `M3uCandidateDetector` (não tem pista de playlist/Xtream), nem pelo `ExtractRemainingHttpUrls` da forma como está implementado (a string é reconhecida como URL HTTP, mas o branch novo não sabe distinguir t.me de outros domínios; é tratado como HTML público genérico).
+2. **Se houver outras URLs na mensagem** → as restantes são processadas normalmente; o link `t.me/c/...` cai no mesmo caso genérico do ponto 1.
+
+Em ambos os casos o link é **descartado** e fica registado em `RejectionReasons` como "no xtream cards found" após o download HTTP (que devolve a página web do Telegram, sem cards Xtream).
+
 #### Sanitização de credenciais
 
 A URL interna do candidato Xtream contém credenciais (necessárias para o download HTTP). O projecto distingue explicitamente entre **artefactos funcionais** e **artefactos de diagnóstico** para não quebrar a reprodução Xtream nem expor credenciais:
@@ -204,6 +243,11 @@ Fluxo real do modo Telegram:
 Telegram messages
    ↓
 M3uCandidateDetector.DetectFromMessage
+   ├─ m3u/m3u8 URL ou filename → CandidatePlaylist M3U
+   ├─ Xtream URL → CandidatePlaylist Xtream (resolve para get.php)
+   ├─ "url (inspect)" → CandidatePlaylist com RequiresContentVerification
+   ├─ .html / .htm attachment → CandidatePlaylist { DetectedFrom="html attachment",
+   │                                                    RequiresContentVerification=true }
    ↓
 TelegramScraperService.ExtractRemainingHttpUrls
 (URLs HTTP genéricas -> candidatas a publicação HTML)

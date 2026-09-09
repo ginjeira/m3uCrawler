@@ -172,4 +172,85 @@ public class M3uCandidateDetectorTests
         Assert.NotNull(resolved);
         Assert.Equal("https://host.example.com:8080/get.php?username=alice&password=secret&type=m3u_plus", resolved);
     }
+
+    // ====================================================================
+    // HTML attachments as Xtream publication candidates
+    // ====================================================================
+
+    [Theory]
+    [InlineData("m3u@host.example_05-09-2026.html")]
+    [InlineData("m3u@host.example_07-09-2026.html")]
+    [InlineData("playlist.htm")]
+    [InlineData("foo.HTML")]
+    [InlineData("foo.HTM")]
+    [InlineData("foo.HtMl")]
+    [InlineData("foo.HtM")]
+    public void Detects_html_filename_as_inspection_attachment(string filename)
+    {
+        var candidates = _detector.DetectFromMessage("", filename);
+        var html = candidates.FirstOrDefault(c => c.DetectedFrom == "html attachment");
+        Assert.NotNull(html);
+        Assert.Equal(CandidateSourceKind.Attachment, html!.Kind);
+        Assert.Equal(filename, html.FileName);
+        Assert.True(html.RequiresContentVerification);
+    }
+
+    [Theory]
+    [InlineData("nothtml.txt")]
+    [InlineData("page.json")]
+    [InlineData("script.js")]
+    [InlineData("page.htmx")]
+    [InlineData("")]
+    [InlineData(null)]
+    public void Does_not_flag_non_html_filenames(string? filename)
+    {
+        var candidates = _detector.DetectFromMessage("", filename);
+        Assert.DoesNotContain(candidates, c => c.DetectedFrom == "html attachment");
+    }
+
+    [Fact]
+    public void Html_attachment_candidate_carries_provided_content()
+    {
+        // attachmentContent populado à partida (teste determinístico): deve
+        // ser entregue no CandidatePlaylist para evitar um download I/O
+        // desnecessário no pipeline.
+        var html = "<!DOCTYPE html><html>...</html>";
+        var candidates = _detector.DetectFromMessage("texto", "page.html", html);
+        var c = candidates.FirstOrDefault(x => x.DetectedFrom == "html attachment");
+        Assert.NotNull(c);
+        Assert.Equal(html, c!.Content);
+    }
+
+    [Fact]
+    public void Html_attachment_does_not_break_m3u_attachment_detection()
+    {
+        var candidates = _detector.DetectFromMessage("ola", "lista_2026.m3u");
+        Assert.Contains(candidates, c => c.DetectedFrom == "attachment filename" && c.Kind == CandidateSourceKind.Attachment);
+        Assert.DoesNotContain(candidates, c => c.DetectedFrom == "html attachment");
+    }
+
+    [Fact]
+    public void Html_attachment_does_not_break_m3u8_attachment_detection()
+    {
+        var candidates = _detector.DetectFromMessage("ola", "lista_2026.m3u8");
+        Assert.Contains(candidates, c => c.DetectedFrom == "attachment filename" && c.Kind == CandidateSourceKind.Attachment);
+        Assert.DoesNotContain(candidates, c => c.DetectedFrom == "html attachment");
+    }
+
+    [Fact]
+    public void Html_attachment_coexists_with_xtream_url_in_same_message()
+    {
+        var text = "http://host/get.php?username=u&password=p&type=m3u_plus";
+        var candidates = _detector.DetectFromMessage(text, "page.html");
+        Assert.Contains(candidates, c => c.DetectedFrom == "xtream playlist");
+        Assert.Contains(candidates, c => c.DetectedFrom == "html attachment");
+    }
+
+    [Fact]
+    public void Html_attachment_does_not_trigger_for_url_only()
+    {
+        // Sem filename nem attachmentContent, nada deve aparecer.
+        var candidates = _detector.DetectFromMessage("veja https://host/page.html", null);
+        Assert.DoesNotContain(candidates, c => c.DetectedFrom == "html attachment");
+    }
 }
