@@ -147,8 +147,9 @@ namespace m3uCrawler.Services
 
             try
             {
-                foreach (var candidate in candidates)
+                for (int ci = 0; ci < candidates.Count; ci++)
                 {
+                    var candidate = candidates[ci];
                     string? content = candidate.Content;
                     if (content == null)
                     {
@@ -157,8 +158,37 @@ namespace m3uCrawler.Services
 
                     // URLs sem extensão (.m3u/.m3u8) detetados por heurística só são tratados como
                     // playlist se o conteúdo HTTP for efectivamente #EXTM3U.
+                    // Caso contrario, pode ser uma publicacao HTML com cards Xtream
+                    // (resolver dedicado identifica contas e faz fan-out).
                     if (candidate.RequiresContentVerification && !_detector.LooksLikePlaylistContent(content))
                     {
+                        if (LooksLikeHtmlPublication(content))
+                        {
+                            var accounts = XtreamPublicationResolver.ResolveFromHtml(
+                                content!, candidate.Url ?? string.Empty);
+                            if (accounts.Count == 0)
+                            {
+                                // Pagina HTML sem cards Xtream validas: nao incrementa
+                                // PlaylistsInvalid (a pagina existe; simplesmente nao e
+                                // uma publicacao Xtream). Apenas diagnostico sanitizado.
+                                rep.RejectionReasons.Add(
+                                    $"{CredentialSanitizer.SanitizeUrl(candidate.Url) ?? candidate.Source}: no xtream cards found");
+                                continue;
+                            }
+
+                            // Fan-out: cada conta -> CandidatePlaylist com playlist Xtream.
+                            foreach (var acc in accounts)
+                            {
+                                var playlistUrl = acc.M3uUrl ?? BuildXtreamPlaylistUrl(acc);
+                                var promoted = PromoteXtreamAccount(playlistUrl, candidate.Url ?? string.Empty);
+                                if (promoted != null)
+                                {
+                                    candidates.Add(promoted);
+                                }
+                            }
+                            continue;
+                        }
+
                         rep.PlaylistsInvalid++;
                         rep.RejectionReasons.Add($"{CredentialSanitizer.SanitizeUrl(candidate.Url) ?? candidate.Source}: conteúdo não é uma playlist M3U");
                         continue;
@@ -370,6 +400,22 @@ namespace m3uCrawler.Services
                         // Descoberta NÃO depende da keyword: deteta por URL, nome de anexo ou conteúdo.
                         var found = _detector.DetectFromMessage(text, filename).ToList();
 
+                        // URLs HTTP genericas (nao captadas pelo detector) sao candidatas a
+                        // publicacao HTML com cards Xtream. Marcadas para que o loop principal
+                        // encaminhe para XtreamPublicationResolver quando o conteudo nao for
+                        // #EXTM3U.
+                        foreach (var pubUrl in ExtractRemainingHttpUrls(text, found))
+                        {
+                            found.Add(new CandidatePlaylist
+                            {
+                                Kind = CandidateSourceKind.Url,
+                                Url = pubUrl,
+                                SourceText = text,
+                                DetectedFrom = "xtream publication url",
+                                RequiresContentVerification = true
+                            });
+                        }
+
                         bool hasAttachment = m.media is MessageMediaDocument media2 && media2.document is Document;
                         Document? attachmentDocument = hasAttachment
                             ? (Document)((MessageMediaDocument)m.media!).document
@@ -543,6 +589,105 @@ namespace m3uCrawler.Services
 
             // Algumas exceções chegam mascaradas como FLOOD_WAIT_X sem número.
             return message.Contains("FLOOD_WAIT", StringComparison.OrdinalIgnoreCase) ? 180 : 30;
+        }
+
+        // ====================================================================
+        // Publication HTML -> Xtream accounts (descoberta por fan-out)
+        // ====================================================================
+
+        private static readonly Regex _httpUrlRegexPublication = new(
+            @"https?://[^\s<>""'()]+",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+        // Quando o M3uCandidateDetector captura uma URL Xtream (/live/USER/PASS/...),
+        // emite um candidato com Url=<get.php resolvido>. Para evitar republicar
+        // a URL original como candidata a publicacao, tambem a marcamos como
+        // "ja detetada".
+        private static readonly Regex _xtreamServerUrlForPublication = new(
+            @"https?://[^/\s]+/(live|movie|series)/[^/\s]+/[^/\s]+",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+        /// <summary>
+        /// Extrai URLs HTTP/HTTPS do texto que NAO foram capturadas pelo detector.
+        /// Usado para identificar URLs de publicacao HTML que o detector, por
+        /// design, nao classifica como playlist (URLs sem pista 'xtream|playlist|m3u|...'
+        /// no path/query). Apenas estas URLs chegam ao XtreamPublicationResolver.
+        /// </summary>
+        internal static IReadOnlyList<string> ExtractRemainingHttpUrls(
+            string? text,
+            IReadOnlyList<CandidatePlaylist> alreadyDetected)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return Array.Empty<string>();
+
+            var detectedUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var c in alreadyDetected)
+            {
+                if (!string.IsNullOrWhiteSpace(c.Url)) detectedUrls.Add(c.Url);
+            }
+
+            var result = new List<string>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (Match m in _httpUrlRegexPublication.Matches(text))
+            {
+                var url = m.Value.TrimEnd('.', ',', ')', ']', ';');
+                if (url.Length == 0) continue;
+                if (seen.Contains(url)) continue;
+                // Ja detetada directamente (m3u, xtream playlist).
+                if (detectedUrls.Contains(url)) continue;
+                // Ja detetada indirectamente (xtream server: o Url do candidato e'
+                // a playlist resolvida, mas a URL original ja foi consumida).
+                if (_xtreamServerUrlForPublication.IsMatch(url)) continue;
+                seen.Add(url);
+                result.Add(url);
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// Reconhece se um conteudo descarregado parece uma publicacao HTML.
+        /// NAO valida estrutura Xtream (isso e' tarefa do XtreamPublicationResolver).
+        /// </summary>
+        internal static bool LooksLikeHtmlPublication(string? content)
+        {
+            if (string.IsNullOrWhiteSpace(content)) return false;
+            var trimmed = content.TrimStart();
+            return trimmed.StartsWith("<!DOCTYPE", StringComparison.OrdinalIgnoreCase)
+                || trimmed.StartsWith("<html", StringComparison.OrdinalIgnoreCase)
+                || trimmed.StartsWith("<HTML", StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// Constroi a URL da playlist Xtream para uma conta, reutilizando a logica
+        /// canonica existente em M3uCandidateDetector.ResolveXtreamPlaylistUrl.
+        /// Cria uma URL de servidor sintetica (/live/USER/PASS/0.ts) e deixa o
+        /// resolver canonico produzir a URL de playlist (get.php). Garante que
+        /// existe uma UNICA forma de construir URLs Xtream no projeto.
+        /// </summary>
+        private static string? BuildXtreamPlaylistUrl(XtreamAccountInfo acc)
+        {
+            var detector = new M3uCandidateDetector();
+            var scheme = string.IsNullOrWhiteSpace(acc.Scheme) ? "http" : acc.Scheme.ToLowerInvariant();
+            var syntheticServer = $"{scheme}://{acc.Host}:{acc.Port}/live/{Uri.EscapeDataString(acc.Username)}/{Uri.EscapeDataString(acc.Password)}/0.ts";
+            return detector.ResolveXtreamPlaylistUrl(syntheticServer);
+        }
+
+        /// <summary>
+        /// Promove uma conta Xtream descoberta a CandidatePlaylist, pronta para
+        /// entrar no pipeline Xtream/M3U existente. O Source e' o URL publico da
+        /// publicacao (sem credenciais) para que DiscoveredPlaylists/RunReport nao
+        /// exponham segredos.
+        /// </summary>
+        internal static CandidatePlaylist? PromoteXtreamAccount(string? playlistUrl, string publicationUrl)
+        {
+            if (string.IsNullOrWhiteSpace(playlistUrl)) return null;
+            return new CandidatePlaylist
+            {
+                Kind = CandidateSourceKind.Url,
+                Url = playlistUrl,
+                Source = $"xtream publication: {publicationUrl}",
+                DetectedFrom = "xtream publication",
+                RequiresContentVerification = true
+            };
         }
     }
 }
