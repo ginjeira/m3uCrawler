@@ -757,8 +757,11 @@ namespace m3uCrawler.Services
         // Publication HTML -> Xtream accounts (descoberta por fan-out)
         // ====================================================================
 
+        // URLs HTTP publicas normais. Exclui t.me/c/<channel>/<message> porque
+        // essas referencias sao tratadas pelo TelegramPublicationResolver
+        // (atribuida a publicacao Telegram, nao a pagina HTML publica).
         private static readonly Regex _httpUrlRegexPublication = new(
-            @"https?://[^\s<>""'()]+",
+            @"https?://(?!t\.me/)[^\s<>""'()]+",
             RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
         // Quando o M3uCandidateDetector captura uma URL Xtream (/live/USER/PASS/...),
