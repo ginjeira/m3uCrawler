@@ -141,13 +141,31 @@ O detector (`M3uCandidateDetector`) **não** trata URLs genéricas como playlist
 3. Descarta URLs Xtream servidor (`/live/USER/PASS/...`) indirectamente consumidas pelo detector;
 4. Promove as restantes a `CandidatePlaylist { DetectedFrom = "xtream publication url", RequiresContentVerification = true }`.
 
-No `for` principal de `SearchAndTestM3UInTelegramAsync`, quando o conteúdo HTTP descarregado **não** começa por `#EXTM3U` mas **parece** HTML (`<!DOCTYPE` ou `<html`), o `XtreamPublicationResolver.ResolveFromHtml` é invocado:
+No `for` principal de `SearchAndTestM3UInTelegramAsync`, quando o conteúdo HTTP descarregado **não** começa por `#EXTM3U` mas **parece** HTML (`<!DOCTYPE` ou `<html`), o `XtreamPublicationResolver.ResolveFromHtml` é invocado. A estratégia é adaptativa — **não depende de cosmética específica de um publisher**.
 
-- Estratégia de segmentação de cards, por ordem de preferência: `<hr>` no body → `<div class='card'>` / `<section class='card'>` / `<article class='card'>` / `<li class='card'>` → `<tr>` de `<table>` (>=2 linhas) → body como fallback único.
-- Cada card é parseada de forma tolerante a capitalização (`Host`/`HOST`/`host`), espaços (`Max Connections`), HTML entities (`&amp;`, `&lt;`), `<a href>` (captura o `href` em vez do texto do link) e labels alternativos (`Server`, `Username`, `Password`).
-- Apenas são produzidas contas com **Host + User + Pass** presentes. Cards incompletas são descartadas silenciosamente.
-- Deduplicação determinística por **identidade lógica = `scheme://host:port/username`** (normalizado, case-insensitive em scheme/host; password **nunca** participa). Múltiplas contas no mesmo servidor com usernames diferentes permanecem como fontes independentes; contas repetidas colapsam para uma única.
-- Páginas HTML sem nenhuma card Xtream válida geram um único registo em `RunReport.RejectionReasons` (sanitizado), mas **não** incrementam `PlaylistsInvalid` (a página existe; simplesmente não é uma publicação Xtream).
+#### Parser adaptativo (commits `e963a7a` → `4df856e`)
+
+O parser funciona em duas camadas:
+
+1. **Caminho DOM-based** (preservado): segmentação por estrutura HTML explícita — `<table>` (>=2 linhas de `<tr>`), `<div|section|article|li class='card'>`, ou `<hr>` no body. Cards dentro de cada segmento são parseadas com tolerância a capitalização (`Host`/`HOST`/`host`), espaços, HTML entities (`&amp;`, `&lt;`), `<a href>` (captura `href` em vez do texto do link) e labels alternativos (`Server`, `Username`, `Password`).
+
+2. **Caminho flat-text fallback** (novo): se o caminho DOM não produz contas mas o `InnerText` tem ≥ 50 chars, o `ResolveFromFlatText` é invocado. Este caminho:
+   - Strip de ruído cosmético: box-drawing (U+2500..U+25FF), símbolos (U+2600..U+27BF), math (U+2200..U+23FF), pares surrogate (U+D800..U+DFFF), ANSI escape codes, sequências longas de chars repetidos.
+   - Transliteração de glyphs fancy para ASCII: modifier letters U+1D00..U+1D7F (small caps `ᴜ`, `ᴇ`, `ᴄ`, …), IPA U+0260..U+029F (`ɢ`, `ɪ`, `ɴ`, …), Latin-1 supplement U+00C0..U+00FF (`á`, `ç`, `ñ`, …), mathematical double-struck digits U+1D7D0..U+1D7D9. Aplica-se em pares surrogate (mathematical `3` é codepoint U+1D7D3).
+   - Anchor detection via regex tolerante: labels conhecidos (`host`, `user`, `pass`, `m3u`, `epg`, `expires`, `port`, `server`, `playlist`, etc.) seguidos de separador (`:`, `=`, `→`, `➢`, `|`, `-` ou apenas whitespace) + valor.
+   - **Clustering com boundary explícito em `host`**: cada `host` repetido FECHA o cluster anterior e ABRE um novo. Isto resolve a fusão de cards adjacentes mesmo quando estão dentro da janela de proximidade (1000 chars). Janela conservadora calibrada para o caso iptvgold onde `Host` fica no topo e `M3U`/`EPG` no fundo (≈700-800 chars de distância).
+   - Validação de host: `LooksLikeValidHost` rejeita texto livre sem `.` ou TLD — protege contra falsos positivos em texto que mencione `Host:`/`User:`/`Pass:` sem ser uma publicação real.
+   - Apenas são produzidas contas com **Host + User + Pass** presentes. Cards incompletas são descartadas silenciosamente.
+   - Deduplicação determinística por **identidade lógica = `scheme://host:port/username`** (normalizado, case-insensitive em scheme/host; password **nunca** participa). Múltiplas contas no mesmo servidor com usernames diferentes permanecem como fontes independentes; contas repetidas colapsam para uma única.
+   - Páginas HTML sem nenhuma card Xtream válida geram um único registo em `RunReport.RejectionReasons` (sanitizado), mas **não** incrementam `PlaylistsInvalid`.
+
+**Validado em produção** (servidor `192.168.68.142`, container `m3ucrawler:sha-4df856e`, single-cycle `--history-hours 24`): descobriu 10 contas Xtream distintas do HTML da msg `110705` (canal `1635952193`, publisher `neorcqds.top:8080`), testou streams funcionais e integrou canais portugueses na `playlist.m3u`. Unitariamente, o fixture `m3uCrawler.Tests/Fixtures/iptvgold_07-09-2026.html` (msg `110658`, 70 contas Xtream em `iptvgold.online:8880`) é parseada correctamente num único `ResolveFromHtml` call.
+
+#### Limitações conhecidas do parser adaptativo
+
+- **Cards adjacentes que partilham labels** com metadata externa (e.g. `CHANNELS`/`MOVIES`/`SERIES` numa MEDIA LIST entre cards) podem fundir-se num cluster único. A heurística `host`-boundary mitiga mas não elimina o caso onde anchors de media list se misturam com labels do card no intervalo.
+- **`Label -> Value`** (seta colada sem espaço) não suportado — separador requer pelo menos 1 espaço.
+- Variantes FR/ES (`Serveur`/`Mot de passe`, `Servidor`/`Contraseña`) não estão no vocabulário actual; expansão é trivial quando houver procura real.
 
 Cada conta válida é promovida a `CandidatePlaylist { Url = acc.M3uUrl ?? BuildXtreamPlaylistUrl(acc), DetectedFrom = "xtream publication", RequiresContentVerification = true }` e entra no **mesmo loop** do pipeline M3U/Xtream existente (`AnalyzePlaylist` → `Parse` → `ValidateStreams` → `TestStreamsAsync` → `RunReport`). **Não há uma segunda pipeline paralela**.
 
