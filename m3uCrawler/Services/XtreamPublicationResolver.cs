@@ -153,9 +153,10 @@ namespace m3uCrawler.Services
         // ResolveFromFlatText faz a sua propria gating em 50 chars.
         private const int MinFlatTextLengthForFallback = 50;
 
-        // Janela maxima (em caracteres) entre duas ancora consecutivas que
-        // pertencem ao mesmo card. Acima desta distancia, considera-se que
-        // comeca um novo card.
+        // Janela maxima (em caracteres) entre duas ancora consecutivas dentro
+        // do mesmo card. Acima desta distancia, considera-se que comeca um novo
+        // card (a menos que a ancora em causa seja 'host', que SEMPRE fecha
+        // o cluster anterior - ver ClusterAnchors).
         //
         // NOTA: o parser adaptativo tem um trade-off fundamental. Publishers
         // que intercalam metadata (e.g. "MEDIA LIST" com labels como CHANNELS,
@@ -163,9 +164,9 @@ namespace m3uCrawler.Services
         // essas metadata labels de labels do card sem heuristicas especifica
         // do publisher. Para esses casos, o parser produz menos contas do
         // que existem (cards que partilham labels sao fundidos num so').
-        // Janela conservadora (500) minimiza fundicoes a custo de perder
-        // alguns M3U/EPG labels que ficam fora do card.
-        private const int AnchorClusterWindowChars = 500;
+        // Janela conservadora (1000 chars) acomoda iptvgold onde Host fica
+        // no topo e M3U/EPG no fundo (separados por ~700-800 chars).
+        private const int AnchorClusterWindowChars = 1000;
 
         private static List<HtmlNode> ExtractCardContainers(HtmlDocument doc)
         {
@@ -873,17 +874,22 @@ namespace m3uCrawler.Services
         }
 
         /// <summary>
-        /// Clusteriza ancora por proximidade. Cada cluster = conjunto de
-        /// ancora separadas por menos de windowChars. NAO partimos o cluster
-        /// em labels repetidas: em vez disso, ExtractFieldsFromCluster usa
-        /// `if (!dict.ContainsKey(label))` para ficar com o primeiro valor
-        /// de cada label. A janela de 800 chars acomoda publishers estilo
-        /// "iptvgold" onde Host+User+Pass ficam no topo e M3U/EPG no fundo
-        /// do card; publishers mais compactos continuam a funcionar porque
-        /// ExtractFieldsFromCluster e' ganancioso dentro do cluster.
+        /// Clusteriza ancora por proximidade COM boundary explicito em 'host'.
         ///
-        /// Um cluster so' produz conta se tiver H+U+P (ver BuildAccount).
-        /// Clusters que falham este gate sao descartados silenciosamente.
+        /// Regras:
+        ///   * Cada ancora 'host' FECHA o cluster anterior e ABRE um novo.
+        ///     Isto e' o sinal de boundary mais robusto: cada card comeca com
+        ///     Host ➢ http://..., e cada Host pertence a um unico card.
+        ///     Mesmo que a janela de proximidade nao separe cards adjacentes,
+        ///     um host explicito quebra o cluster.
+        ///   * Dentro de um cluster, ancora 'user'/'pass'/'m3u'/'epg'/'expires'
+        ///     sao absorvidas pelo cluster actual (desde que dentro da janela).
+        ///   * Outras labels (channels/vod/series) sao ignoradas para cluster
+        ///     (nao contribuem para o card mas nao criam boundary).
+        ///
+        /// Janela conservadora: 1000 chars acomodam o caso iptvgold onde
+        /// Host fica no topo e M3U/EPG no fundo. Cards adjacentes sao
+        /// separados pelo host repetido do card seguinte.
         /// </summary>
         private static List<List<Anchor>> ClusterAnchors(List<Anchor> anchors, int windowChars)
         {
@@ -891,21 +897,35 @@ namespace m3uCrawler.Services
             if (anchors.Count == 0) return result;
 
             var current = new List<Anchor>();
-            int lastPos = -windowChars;
 
             foreach (var a in anchors)
             {
-                if (current.Count > 0 && (a.Position - lastPos) > windowChars)
+                bool isHost = a.CanonicalLabel == "host";
+
+                if (isHost && current.Count > 0)
                 {
-                    // Gap grande: fecha cluster actual e inicia novo.
+                    // Host FECHA cluster anterior (boundary explicito).
                     result.Add(current);
                     current = new List<Anchor>();
                 }
-                current.Add(a);
-                lastPos = a.Position;
-            }
-            if (current.Count > 0) result.Add(current);
 
+                if (current.Count == 0)
+                {
+                    // Primeiro anchor do cluster (que pode ser host ou outro).
+                    current.Add(a);
+                }
+                else if ((a.Position - current[current.Count - 1].Position) <= windowChars)
+                {
+                    // Dentro da janela: absorve.
+                    current.Add(a);
+                }
+                // Fora da janela sem ser host: ainda absorve (host vai fechar).
+
+                // Se ainda nada no cluster (host imediatamente seguido de outro
+                // host): absorve para o novo cluster. Garantido pelo bloco acima.
+            }
+
+            if (current.Count > 0) result.Add(current);
             return result;
         }
 

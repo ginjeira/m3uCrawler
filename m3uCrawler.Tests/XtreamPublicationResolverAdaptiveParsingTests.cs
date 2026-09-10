@@ -148,13 +148,11 @@ Pᴀss  pass123
     }
 
     [Fact]
-    public void Multiple_accounts_within_window_collapse_into_single_card()
+    public void Multiple_accounts_with_host_boundary_split_into_distinct_cards()
     {
-        // NOTA: este teste documenta uma limitacao conhecida. Quando 2 contas
-        // Xtream estao dentro da janela de clustering (500 chars), fundem-se
-        // num unico card. O publisher teria de separar visualmente os cards
-        // (com <table>, <div>, etc.) para que sejam extraidos como fontes
-        // independentes. Ver comentario da classe.
+        // Cada card comeca com 'Host' explicito, o que actua como boundary
+        // mesmo quando as contas estao dentro da janela de clustering. Cards
+        // adjacentes sao separados pelo 'Host' repetido do card seguinte.
         var html = @"
             <html><body>
             <pre>
@@ -169,8 +167,8 @@ Pass  secret2
 
         var accounts = XtreamPublicationResolver.ResolveFromHtml(html, "https://example.com/page.html");
 
-        // Limitacao: 2 contas fundem-se em 1 (a primeira).
-        var acc = Assert.Single(accounts);
-        Assert.Equal("alice", acc.Username);
+        Assert.Equal(2, accounts.Count);
+        Assert.Equal("alice", accounts[0].Username);
+        Assert.Equal("bob", accounts[1].Username);
     }
 }
