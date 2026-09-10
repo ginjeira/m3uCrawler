@@ -1,0 +1,506 @@
+{
+  "catalog_id": "pt-canonical-tv",
+  "version": "1.0",
+  "country": "PT",
+  "language": "pt-PT",
+  "purpose": "Canonical guide for m3uCrawler normalization of Portuguese TV/radio playlists.",
+  "principles": [
+    "Canonical channel identity is independent of operator position.",
+    "Positions are normalized for a Portuguese IPTV experience, not copied from one operator.",
+    "RTP1, RTP2, SIC and TVI are fixed at positions 1-4.",
+    "Groups are canonical and must be configurable from the Dashboard.",
+    "VOD is separate from linear TV and may be enabled/disabled from the Dashboard.",
+    "Source playlists may contain aliases, duplicates, operator-specific numbering and inconsistent group names."
+  ],
+  "source_basis": {
+    "operators": [
+      "MEO",
+      "NOS",
+      "Vodafone"
+    ],
+    "checked": "2026-09-10",
+    "notes": "Operator grids change. This catalog is a normalization baseline, not a copy of any operator's contractual channel lineup."
+  },
+  "numbering": {
+    "1": "RTP 1",
+    "2": "RTP 2",
+    "3": "SIC",
+    "4": "TVI",
+    "5": "SIC Notícias",
+    "6": "RTP Notícias",
+    "7": "CNN Portugal",
+    "8": "CMTV",
+    "9": "News Now",
+    "10": "Globo",
+    "11": "Canal 11",
+    "12": "V+ TVI",
+    "13": "SIC Mulher",
+    "14": "SIC Caras",
+    "15": "SIC Radical",
+    "16": "RTP Memória",
+    "17": "SIC Novelas",
+    "18": "TVI Ficção",
+    "19": "TVI Reality",
+    "20": "Porto Canal",
+    "21": "ARTV",
+    "22": "Record News",
+    "23": "Euronews",
+    "24": "RTP África",
+    "30": "Sport TV+",
+    "31": "Sport TV 1",
+    "32": "Sport TV 2",
+    "33": "Sport TV 3",
+    "34": "Sport TV 4",
+    "35": "Sport TV 5",
+    "36": "Sport TV 6",
+    "37": "Sport TV 7",
+    "38": "Eurosport 1",
+    "39": "Eurosport 2",
+    "40": "A Bola TV",
+    "41": "BTV",
+    "42": "Sporting TV",
+    "43": "W-Sport",
+    "44": "Fuel TV",
+    "60": "Disney Channel",
+    "61": "Disney Junior",
+    "62": "Panda",
+    "63": "Panda Kids",
+    "64": "Cartoon Network",
+    "65": "Cartoonito",
+    "66": "Nickelodeon",
+    "67": "Nick Jr.",
+    "68": "SIC K",
+    "69": "BabyTV",
+    "70": "TVCine Top",
+    "71": "TVCine Edition",
+    "72": "TVCine Emotion",
+    "73": "TVCine Action",
+    "74": "Hollywood",
+    "75": "Cinemundo",
+    "76": "AXN",
+    "77": "AXN White",
+    "78": "AXN Black",
+    "79": "STAR Channel",
+    "80": "STAR Life",
+    "81": "STAR Crime",
+    "82": "STAR Comedy",
+    "83": "Syfy",
+    "84": "AMC",
+    "85": "Dizi",
+    "100": "Discovery Channel",
+    "101": "National Geographic",
+    "102": "Nat Geo Wild",
+    "103": "Odisseia",
+    "104": "Canal História",
+    "105": "Investigation Discovery",
+    "106": "Animal Planet",
+    "110": "24Kitchen",
+    "111": "Casa e Cozinha",
+    "112": "TLC",
+    "113": "Canal Q",
+    "114": "MTV",
+    "115": "E!",
+    "120": "BBC News",
+    "121": "Sky News",
+    "122": "France 24",
+    "123": "TV5MONDE",
+    "124": "Deutsche Welle",
+    "125": "Rai News",
+    "126": "TVE Internacional",
+    "127": "Record",
+    "130": "MTV 00s",
+    "131": "Trace Urban",
+    "132": "Mezzo",
+    "133": "Mezzo Live",
+    "134": "MCM Top",
+    "135": "MCM Pop",
+    "300": "Antena 1",
+    "301": "Antena 2",
+    "302": "Antena 3",
+    "303": "Rádio Comercial",
+    "304": "RFM",
+    "305": "M80",
+    "306": "TSF",
+    "307": "Rádio Renascença",
+    "308": "Mega Hits"
+  },
+  "groups": [
+    {
+      "id": "pt-generalistas",
+      "name": "Portugal | Generalistas",
+      "range": [
+        1,
+        29
+      ]
+    },
+    {
+      "id": "pt-desporto",
+      "name": "Portugal | Desporto",
+      "range": [
+        30,
+        59
+      ]
+    },
+    {
+      "id": "pt-infantil",
+      "name": "Portugal | Infantil",
+      "range": [
+        60,
+        69
+      ]
+    },
+    {
+      "id": "pt-filmes-series",
+      "name": "Portugal | Filmes e Séries",
+      "range": [
+        70,
+        99
+      ]
+    },
+    {
+      "id": "pt-documentarios",
+      "name": "Portugal | Documentários",
+      "range": [
+        100,
+        109
+      ]
+    },
+    {
+      "id": "pt-entretenimento",
+      "name": "Portugal | Entretenimento",
+      "range": [
+        110,
+        119
+      ]
+    },
+    {
+      "id": "international-news",
+      "name": "Internacional | Notícias",
+      "range": [
+        120,
+        129
+      ]
+    },
+    {
+      "id": "pt-musica",
+      "name": "Portugal | Música",
+      "range": [
+        130,
+        159
+      ]
+    },
+    {
+      "id": "international",
+      "name": "Internacional | Geral",
+      "range": [
+        160,
+        199
+      ]
+    },
+    {
+      "id": "pt-tematicos",
+      "name": "Portugal | Temáticos",
+      "range": [
+        200,
+        219
+      ]
+    },
+    {
+      "id": "adultos",
+      "name": "Adultos",
+      "range": [
+        250,
+        299
+      ]
+    },
+    {
+      "id": "radio-pt",
+      "name": "Rádios | Portugal",
+      "range": [
+        300,
+        399
+      ]
+    },
+    {
+      "id": "radio-int",
+      "name": "Rádios | Internacional",
+      "range": [
+        400,
+        449
+      ]
+    },
+    {
+      "id": "vod-filmes",
+      "name": "VOD | Filmes",
+      "range": null
+    },
+    {
+      "id": "vod-series",
+      "name": "VOD | Séries",
+      "range": null
+    },
+    {
+      "id": "vod-infantil",
+      "name": "VOD | Infantil",
+      "range": null
+    },
+    {
+      "id": "vod-documentarios",
+      "name": "VOD | Documentários",
+      "range": null
+    },
+    {
+      "id": "vod-concertos",
+      "name": "VOD | Concertos",
+      "range": null
+    }
+  ],
+  "dashboard_options": {
+    "import_tv": true,
+    "import_radio": true,
+    "import_vod": true,
+    "keep_vod": true,
+    "vod_groups": [
+      "vod-filmes",
+      "vod-series",
+      "vod-infantil",
+      "vod-documentarios",
+      "vod-concertos"
+    ],
+    "preserve_source_numbers": false,
+    "normalize_groups": true,
+    "deduplicate_channels": true,
+    "prefer_hd": true
+  },
+  "matching": {
+    "canonical_fields": [
+      "canonical_id",
+      "name",
+      "aliases"
+    ],
+    "match_priority": [
+      "exact tvg-id",
+      "known provider/canonical ID",
+      "normalized channel name",
+      "alias",
+      "logo/name heuristic"
+    ],
+    "examples": {
+      "rtp1": {
+        "canonical_id": "pt.rtp1",
+        "name": "RTP 1",
+        "aliases": [
+          "RTP1",
+          "RTP 1 HD",
+          "RTP 1 FHD",
+          "RTP1 HD"
+        ]
+      },
+      "rtp2": {
+        "canonical_id": "pt.rtp2",
+        "name": "RTP 2",
+        "aliases": [
+          "RTP2",
+          "RTP 2 HD",
+          "RTP 2 FHD"
+        ]
+      },
+      "sic": {
+        "canonical_id": "pt.sic",
+        "name": "SIC",
+        "aliases": [
+          "SIC HD",
+          "SIC FHD"
+        ]
+      },
+      "tvi": {
+        "canonical_id": "pt.tvi",
+        "name": "TVI",
+        "aliases": [
+          "TVI HD",
+          "TVI FHD"
+        ]
+      },
+      "sic-noticias": {
+        "canonical_id": "pt.sicnoticias",
+        "name": "SIC Notícias",
+        "aliases": [
+          "SIC Noticias",
+          "SIC NOTICIAS HD",
+          "SIC Notícias HD"
+        ]
+      },
+      "rtp-noticias": {
+        "canonical_id": "pt.rtpnoticias",
+        "name": "RTP Notícias",
+        "aliases": [
+          "RTP Notícias HD",
+          "RTP3",
+          "RTP 3",
+          "RTP 3 HD"
+        ]
+      },
+      "cnn-portugal": {
+        "canonical_id": "pt.cnnportugal",
+        "name": "CNN Portugal",
+        "aliases": [
+          "CNN Portugal HD",
+          "TVI24",
+          "TVI 24"
+        ]
+      },
+      "cmtv": {
+        "canonical_id": "pt.cmtv",
+        "name": "CMTV",
+        "aliases": [
+          "CMTV HD"
+        ]
+      },
+      "news-now": {
+        "canonical_id": "pt.newsnow",
+        "name": "News Now",
+        "aliases": [
+          "NEWS NOW",
+          "News Now HD"
+        ]
+      },
+      "canal11": {
+        "canonical_id": "pt.canal11",
+        "name": "Canal 11",
+        "aliases": [
+          "11",
+          "11 HD",
+          "Canal 11 HD"
+        ]
+      },
+      "vmais-tvi": {
+        "canonical_id": "pt.vmais",
+        "name": "V+ TVI",
+        "aliases": [
+          "V+",
+          "V+ TVI HD"
+        ]
+      },
+      "rtp-memoria": {
+        "canonical_id": "pt.rtpmemoria",
+        "name": "RTP Memória",
+        "aliases": [
+          "RTP MEMÓRIA",
+          "RTP Memoria"
+        ]
+      },
+      "porto-canal": {
+        "canonical_id": "pt.portocanal",
+        "name": "Porto Canal",
+        "aliases": [
+          "Porto Canal HD"
+        ]
+      },
+      "sporttv1": {
+        "canonical_id": "pt.sporttv1",
+        "name": "Sport TV 1",
+        "aliases": [
+          "SPORT TV1",
+          "SPORTTV1",
+          "SportTV1 HD",
+          "SPORT TV 1 HD"
+        ]
+      },
+      "eurosport1": {
+        "canonical_id": "pt.eurosport1",
+        "name": "Eurosport 1",
+        "aliases": [
+          "Eurosport",
+          "Eurosport HD",
+          "Eurosport 1 HD"
+        ]
+      },
+      "btv": {
+        "canonical_id": "pt.btv",
+        "name": "BTV",
+        "aliases": [
+          "BTV 1",
+          "BTV1",
+          "BTV 1 HD"
+        ]
+      },
+      "sic-k": {
+        "canonical_id": "pt.sick",
+        "name": "SIC K",
+        "aliases": [
+          "SIC K HD"
+        ]
+      },
+      "panda": {
+        "canonical_id": "pt.panda",
+        "name": "Panda",
+        "aliases": [
+          "Canal Panda",
+          "Panda HD"
+        ]
+      },
+      "cartoon-network": {
+        "canonical_id": "pt.cartoonnetwork",
+        "name": "Cartoon Network",
+        "aliases": [
+          "Cartoon Network HD"
+        ]
+      },
+      "hollywood": {
+        "canonical_id": "pt.hollywood",
+        "name": "Hollywood",
+        "aliases": [
+          "Hollywood HD",
+          "Canal Hollywood"
+        ]
+      },
+      "cinemundo": {
+        "canonical_id": "pt.cinemundo",
+        "name": "Cinemundo",
+        "aliases": [
+          "Cinemundo HD"
+        ]
+      },
+      "axn": {
+        "canonical_id": "pt.axn",
+        "name": "AXN",
+        "aliases": [
+          "AXN HD"
+        ]
+      },
+      "discovery": {
+        "canonical_id": "pt.discovery",
+        "name": "Discovery Channel",
+        "aliases": [
+          "Discovery",
+          "Discovery Channel HD"
+        ]
+      },
+      "natgeo": {
+        "canonical_id": "pt.natgeo",
+        "name": "National Geographic",
+        "aliases": [
+          "National Geographic HD",
+          "Nat Geo"
+        ]
+      },
+      "globo": {
+        "canonical_id": "pt.globo",
+        "name": "Globo",
+        "aliases": [
+          "Globo HD",
+          "TV Globo"
+        ]
+      }
+    }
+  },
+  "implementation_rules": [
+    "Do not infer canonical identity from source channel number.",
+    "Do not use source group-title as canonical group without normalization.",
+    "If multiple variants of the same channel exist, prefer HD/FHD according to dashboard policy.",
+    "Do not delete an unmatched channel solely because it is not in the catalog; classify it as Unmatched/Other for review.",
+    "Canonical numbering must be deterministic.",
+    "VOD must never consume linear-TV canonical positions.",
+    "Every configurable behavior must be exposed to the Dashboard."
+  ]
+}

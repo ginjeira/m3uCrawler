@@ -117,8 +117,98 @@ public sealed class ChannelCatalogBootstrapper
         // (futuras) sem ter de criar nova migration.
         await SeedAsync(context, cancellationToken);
 
+        // Baseline JSON versionado: se existir em docs/catalog/,
+        // importa-o idempotentemente sobre o seed programático.
+        // Este passo adiciona os canais e aliases da baseline
+        // canónica portuguesa sem remover nada do seed legacy.
+        await TryImportBaselineAsync(context, cancellationToken);
+
         lockStream?.Dispose();
         return context;
+    }
+
+    /// <summary>
+    /// Procura o ficheiro <c>docs/catalog/m3ucrawler_pt_canonical_catalog.json</c>
+    /// em três localizações canónicas:
+    /// <list type="number">
+    ///   <item>Directório de trabalho actual (override).</item>
+    ///   <item>Raiz do repo: <c>docs/catalog/m3ucrawler_pt_canonical_catalog.json</c>.</item>
+    ///   <item>Directório do executável + 5 níveis acima (caso esteja
+    ///         instalado a partir de um deploy empacotado).</item>
+    /// </list>
+    /// Se não encontrar, não falha — é um baseline opcional. Quando
+    /// encontra, importa-o idempotentemente via
+    /// <see cref="CatalogBaselineImporter"/>. O relatório da
+    /// importação fica registado em log.
+    /// </summary>
+    private async Task TryImportBaselineAsync(ChannelCatalogDbContext context, CancellationToken cancellationToken)
+    {
+        var baselinePath = ResolveBaselinePath();
+        if (baselinePath is null)
+        {
+            _logger.LogDebug("No baseline canonical catalog JSON found; skipping baseline import.");
+            return;
+        }
+
+        try
+        {
+            _logger.LogInformation("Importing baseline canonical catalog from {Path}", baselinePath);
+            var baseline = await CatalogBaselineImporter.LoadFromFileAsync(baselinePath, cancellationToken);
+            var report = await CatalogBaselineImporter.ImportAsync(context, baseline, cancellationToken);
+            _logger.LogInformation(
+                "Baseline import: catalogId={CatalogId} version={Version} channelsCreated={Created} " +
+                "channelsUpdated={Updated} aliasesAdded={AliasesAdded} aliasesSkipped={AliasesSkipped}",
+                report.CatalogId, report.Version, report.ChannelsCreated,
+                report.ChannelsUpdated, report.AliasesAdded, report.AliasesSkipped);
+            foreach (var warning in report.Warnings)
+            {
+                _logger.LogWarning("Baseline import warning: {Warning}", warning);
+            }
+        }
+        catch (FileNotFoundException)
+        {
+            // Já tratado acima; re-throw não esperado.
+        }
+        catch (Exception ex)
+        {
+            // Baseline é uma extensão opcional. Falha na importação
+            // não aborta o arranque (o seed programático continua a
+            // funcionar) mas é registada para diagnóstico.
+            _logger.LogWarning(ex,
+                "Failed to import baseline canonical catalog from {Path}. The programmed seed is still active.",
+                baselinePath);
+        }
+    }
+
+    private string? ResolveBaselinePath()
+    {
+        // Ordem de resolução:
+        //   1. Override via variável de ambiente M3U_BASELINE_PATH.
+        //   2. CWD/docs/catalog/m3ucrawler_pt_canonical_catalog.json.
+        //   3. Repo root / docs/catalog/m3ucrawler_pt_canonical_catalog.json
+        //      (a partir do CWD ou do BaseDirectory).
+        var env = Environment.GetEnvironmentVariable("M3U_BASELINE_PATH");
+        if (!string.IsNullOrEmpty(env) && File.Exists(env)) return env;
+
+        var candidates = new[]
+        {
+            Path.Combine(Directory.GetCurrentDirectory(), "docs", "catalog", "m3ucrawler_pt_canonical_catalog.json"),
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", "docs", "catalog", "m3ucrawler_pt_canonical_catalog.json"),
+            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "docs", "catalog", "m3ucrawler_pt_canonical_catalog.json"),
+        };
+        foreach (var c in candidates)
+        {
+            try
+            {
+                var full = Path.GetFullPath(c);
+                if (File.Exists(full)) return full;
+            }
+            catch
+            {
+                // Ignorar caminhos inválidos; continuar a procurar.
+            }
+        }
+        return null;
     }
 
     /// <summary>

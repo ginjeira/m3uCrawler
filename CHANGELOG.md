@@ -136,10 +136,18 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ### 📊 Estado
 - Build: `dotnet build m3uCrawler.sln --configuration Release` → **0 warnings, 0 errors**.
-- Testes: `dotnet test m3uCrawler.Tests/m3uCrawler.Tests.csproj --configuration Release --no-build --nologo` → **1187 testes passados, 0 falhados, 0 skipped**.
+- Testes: `dotnet test m3uCrawler.Tests/m3uCrawler.Tests.csproj --configuration Release --no-build --nologo` → **1211 testes passados, 0 falhados, 0 skipped**.
 - actionlint: **0 errors, 0 warnings**.
 - Imagem rollback preservada: `sha256:27b0b18dd81e9c01416bad674cfbe86515a9994be4565bb44dda49fb2e50b97e`.
 - **Validação em produção** (servidor `192.168.68.142`, container `m3ucrawler:sha-4df856e`, commit `4df856e`): single-cycle com `--history-hours 24` descobriu 10 contas Xtream distintas do HTML da msg `110705` (canal `1635952193`), testou streams funcionais em `neorcqds.top:8080`, e integrou canais portugueses na `playlist.m3u` final. `telegram_run_report.json` contém `discoveredPlaylists` com URLs sanitizadas (`username=***&password=***`).
+
+### ✨ Adicionado (PHASE 1 — Canonical Catalogue)
+
+- **Catálogo canónico baseline**: `docs/catalog/m3ucrawler_pt_canonical_catalog.json` adicionado ao repositório. `catalog_id=pt-canonical-tv`, `version=1.0`, `country=PT`. Contém `numbering` (RTP1=1, RTP2=2, SIC=3, TVI=4, …), `groups` (16, incluindo 8 grupos de TV/Rádio e 5 de VOD com `range=null`), `dashboard_options` (`import_vod=true`, `prefer_hd=true`, `deduplicate_channels=true`, `normalize_groups=true`, `preserve_source_numbers=false`, `keep_vod=true`) e `matching.examples` (≥20 canais PT: `rtp1`, `rtp2`, `sic`, `tvi`, `sic-noticias`, `cnn-portugal`, `sporttv1`, `eurosport1`, `btv`, `hollywood`, `natgeo`, `globo`, etc.). É um **artefacto versionado** — não substitui a persistência SQLite.
+- **`CatalogBaselineImporter`** (`m3uCrawler/Services/Catalog/CatalogBaselineImporter.cs`): importa o JSON para `CanonicalChannelEntity` + `ChannelAliasEntity` de forma **idempotente** (sem duplicações), **aditiva** (não destrói canais pré-existentes) e **auditável** (`CatalogBaselineImportReport` com `ChannelsCreated/Updated`, `AliasesAdded/Skipped`, `Warnings`). Converte `canonical_id` (`pt.rtp1`) em `Key` interno (`rtp1`), removendo prefixo país ISO-like. Resolve `EditorialGroup` e `EditorialCategory` heurísticamente. Filtra aliases idênticas ao `DisplayName`.
+- **Integração no `ChannelCatalogBootstrapper`** (`TryImportBaselineAsync`): chamada automaticamente após `SeedAsync`. Procura o baseline em três localizações canónicas (env var `M3U_BASELINE_PATH`, `CWD/docs/catalog/`, `AppContext.BaseDirectory` com subida relativa). Falha na importação é registada em log mas **não aborta** o arranque.
+- **Testes** (`m3uCrawler.Tests/CatalogBaselineImporterTests.cs`): 19 testes cobrindo conversão de `canonical_id`, resolução de grupo/categoria, idempotência, preservação de canais pré-existentes, actualização de `DisplayName`, sanitização do report, round-trip JSON, integração com o ficheiro baseline real.
+- **Operação esperada em produção**: primeiro arranque com baseline disponível adiciona ~70 canais e ~150 aliases ao seed programático (`CatalogSeed` = 36 canais). Arranques seguintes são zero-operação (idempotência).
 
 ## [0.1.0] - 2026-09-02
 
