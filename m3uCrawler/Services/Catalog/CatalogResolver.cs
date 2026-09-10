@@ -23,10 +23,12 @@ namespace m3uCrawler.Services.Catalog;
 public sealed class CatalogResolver
 {
     private readonly IDbContextFactory<ChannelCatalogDbContext> _factory;
+    private readonly string _dbPath;
 
-    public CatalogResolver(IDbContextFactory<ChannelCatalogDbContext> factory)
+    public CatalogResolver(IDbContextFactory<ChannelCatalogDbContext> factory, string dbPath)
     {
         _factory = factory;
+        _dbPath = dbPath;
     }
 
     /// <summary>
@@ -57,7 +59,7 @@ public sealed class CatalogResolver
 
         await using var context = await _factory.CreateDbContextAsync(cancellationToken);
 
-        // 1. IdentityRule (priority over ChannelAlias).
+        // 1. IdentityRule (priority over everything).
         var rule = await context.IdentityRules
             .AsNoTracking()
             .FirstOrDefaultAsync(r => r.NormalizedIdentity == normalizedIdentity, cancellationToken);
@@ -66,7 +68,18 @@ public sealed class CatalogResolver
             return CatalogResolution.FromRule(rule);
         }
 
-        // 2. ChannelAlias -> CanonicalChannel.
+        // 2. AffinityMember -> AffinityGroup -> CanonicalChannel.
+        var member = await context.AffinityMembers
+            .AsNoTracking()
+            .Include(m => m.AffinityGroup)
+                .ThenInclude(g => g!.CanonicalChannel)
+            .FirstOrDefaultAsync(m => m.NormalizedMember == normalizedIdentity, cancellationToken);
+        if (member?.AffinityGroup?.CanonicalChannel != null && member.AffinityGroup.CanonicalChannel.IsEnabled)
+        {
+            return CatalogResolution.FromCanonical(member.AffinityGroup.CanonicalChannel);
+        }
+
+        // 3. ChannelAlias -> CanonicalChannel.
         var alias = await context.ChannelAliases
             .AsNoTracking()
             .Include(a => a.CanonicalChannel)
@@ -242,6 +255,21 @@ public sealed class CatalogResolver
     }
 
     /// <summary>
+    /// Lista todos os items de revisão, ordenados por data de
+    /// criação (mais recentes primeiro). O dashboard usa este
+    /// método para mostrar o histórico completo.
+    /// </summary>
+    public async Task<IReadOnlyList<ReviewItemEntity>> ListAllReviewItemsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.ReviewItems
+            .AsNoTracking()
+            .OrderByDescending(r => r.CreatedAtUtc)
+            .ToListAsync(cancellationToken);
+    }
+
+    /// <summary>
     /// Lista todos os canais canónicos (com aliases) ordenados por
     /// DisplayName. Usado pelo dashboard.
     /// </summary>
@@ -268,6 +296,463 @@ public sealed class CatalogResolver
             .OrderBy(o => o.DispatcharrChannelId)
             .ToListAsync(cancellationToken);
     }
+
+    /// <summary>
+    /// Devolve um mapa de ownership por stream id para os ids
+    /// pedidos. Streams sem registo prévio ficam
+    /// <see cref="StreamOwnership.Unknown"/> (bootstrap default).
+    /// </summary>
+    public async Task<IReadOnlyDictionary<long, StreamOwnership>> GetStreamOwnershipMapAsync(
+        IReadOnlyCollection<long> dispatcharrStreamIds,
+        CancellationToken cancellationToken = default)
+    {
+        var result = new Dictionary<long, StreamOwnership>();
+        if (dispatcharrStreamIds == null || dispatcharrStreamIds.Count == 0)
+        {
+            return result;
+        }
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var distinctIds = dispatcharrStreamIds.Distinct().ToList();
+        var rows = await context.DispatcharrStreamOwnerships
+            .AsNoTracking()
+            .Where(o => distinctIds.Contains(o.DispatcharrStreamId))
+            .Select(o => new { o.DispatcharrStreamId, o.Ownership })
+            .ToListAsync(cancellationToken);
+        foreach (var r in rows)
+        {
+            result[r.DispatcharrStreamId] = r.Ownership;
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Lista todas as regras de identidade.
+    /// </summary>
+    public async Task<IReadOnlyList<IdentityRuleEntity>> ListIdentityRulesAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.IdentityRules
+            .AsNoTracking()
+            .OrderBy(r => r.NormalizedIdentity)
+            .ToListAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Cria uma nova regra de identidade. Falha se já existir
+    /// uma regra com a mesma NormalizedIdentity.
+    /// </summary>
+    public async Task<IdentityRuleEntity> CreateIdentityRuleAsync(
+        string normalizedIdentity,
+        RuleDisposition disposition,
+        string reason,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(normalizedIdentity))
+        {
+            throw new ArgumentException("normalizedIdentity required", nameof(normalizedIdentity));
+        }
+
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var existing = await context.IdentityRules
+            .FirstOrDefaultAsync(r => r.NormalizedIdentity == normalizedIdentity, cancellationToken);
+        if (existing != null)
+        {
+            throw new InvalidOperationException($"Rule already exists for '{normalizedIdentity}'");
+        }
+
+        var now = DateTime.UtcNow;
+        var rule = new IdentityRuleEntity
+        {
+            NormalizedIdentity = normalizedIdentity,
+            Disposition = disposition,
+            Reason = reason ?? string.Empty,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+        };
+        context.IdentityRules.Add(rule);
+        await context.SaveChangesAsync(cancellationToken);
+        return rule;
+    }
+
+    /// <summary>
+    /// Elimina uma regra de identidade pela sua identity normalizada.
+    /// </summary>
+    public async Task<bool> DeleteIdentityRuleAsync(
+        string normalizedIdentity,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(normalizedIdentity))
+        {
+            return false;
+        }
+
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var rule = await context.IdentityRules
+            .FirstOrDefaultAsync(r => r.NormalizedIdentity == normalizedIdentity, cancellationToken);
+        if (rule == null)
+        {
+            return false;
+        }
+
+        context.IdentityRules.Remove(rule);
+        await context.SaveChangesAsync(cancellationToken);
+        return true;
+    }
+
+    public async Task<IReadOnlyList<AffinityGroupEntity>> ListAffinityGroupsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.AffinityGroups
+            .AsNoTracking()
+            .Include(g => g.Members)
+            .Include(g => g.CanonicalChannel)
+            .OrderBy(g => g.Name)
+            .ToListAsync(cancellationToken);
+    }
+
+    public async Task<AffinityGroupEntity> CreateAffinityGroupAsync(
+        string name,
+        long? canonicalChannelId,
+        string? countryCode,
+        IReadOnlyList<string> normalizedMembers,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+            throw new ArgumentException("name required", nameof(name));
+        if (normalizedMembers == null || normalizedMembers.Count == 0)
+            throw new ArgumentException("at least one member required", nameof(normalizedMembers));
+
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+
+        if (canonicalChannelId.HasValue)
+        {
+            var canonical = await context.CanonicalChannels
+                .FirstOrDefaultAsync(c => c.Id == canonicalChannelId.Value, cancellationToken);
+            if (canonical == null)
+                throw new InvalidOperationException($"CanonicalChannel {canonicalChannelId} not found.");
+        }
+
+        var now = DateTime.UtcNow;
+        var group = new AffinityGroupEntity
+        {
+            Name = name,
+            CountryCode = countryCode,
+            CanonicalChannelId = canonicalChannelId,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+            Members = normalizedMembers
+                .Where(m => !string.IsNullOrWhiteSpace(m))
+                .Select(m => new AffinityMemberEntity
+                {
+                    NormalizedMember = m.Trim(),
+                    CreatedAtUtc = now,
+                }).ToList(),
+        };
+
+        context.AffinityGroups.Add(group);
+        await context.SaveChangesAsync(cancellationToken);
+        return group;
+    }
+
+    public async Task<AffinityGroupEntity?> UpdateAffinityGroupAsync(
+        long groupId,
+        string name,
+        long? canonicalChannelId,
+        string? countryCode,
+        IReadOnlyList<string> normalizedMembers,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+            throw new ArgumentException("name required", nameof(name));
+
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+
+        var group = await context.AffinityGroups
+            .Include(g => g.Members)
+            .FirstOrDefaultAsync(g => g.Id == groupId, cancellationToken);
+        if (group == null) return null;
+
+        if (canonicalChannelId.HasValue)
+        {
+            var canonical = await context.CanonicalChannels
+                .FirstOrDefaultAsync(c => c.Id == canonicalChannelId.Value, cancellationToken);
+            if (canonical == null)
+                throw new InvalidOperationException($"CanonicalChannel {canonicalChannelId} not found.");
+        }
+
+        group.Name = name;
+        group.CanonicalChannelId = canonicalChannelId;
+        group.CountryCode = countryCode;
+        group.UpdatedAtUtc = DateTime.UtcNow;
+
+        context.AffinityMembers.RemoveRange(group.Members);
+        group.Members.Clear();
+
+        var now = DateTime.UtcNow;
+        foreach (var m in normalizedMembers.Where(m => !string.IsNullOrWhiteSpace(m)))
+        {
+            group.Members.Add(new AffinityMemberEntity
+            {
+                NormalizedMember = m.Trim(),
+                AffinityGroupId = group.Id,
+                CreatedAtUtc = now,
+            });
+        }
+
+        await context.SaveChangesAsync(cancellationToken);
+        return group;
+    }
+
+    public async Task<bool> DeleteAffinityGroupAsync(
+        long groupId,
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var group = await context.AffinityGroups
+            .FirstOrDefaultAsync(g => g.Id == groupId, cancellationToken);
+        if (group == null) return false;
+
+        context.AffinityGroups.Remove(group);
+        await context.SaveChangesAsync(cancellationToken);
+        return true;
+    }
+
+    /// <summary>
+    /// Approva um item de revisão (ReviewItemState.Approved) e
+    /// opcionalmente regista o canal canónico aprovado.
+    /// </summary>
+    public async Task<ReviewItemEntity?> ApproveReviewAsync(
+        string fingerprint,
+        long? approvedCanonicalChannelId,
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var item = await context.ReviewItems
+            .FirstOrDefaultAsync(r => r.Fingerprint == fingerprint, cancellationToken);
+        if (item == null) return null;
+
+        item.State = ReviewItemState.Approved;
+        item.ResolvedAtUtc = DateTime.UtcNow;
+        item.UpdatedAtUtc = DateTime.UtcNow;
+        item.ApprovedCanonicalChannelId = approvedCanonicalChannelId;
+        await context.SaveChangesAsync(cancellationToken);
+        return item;
+    }
+
+    /// <summary>
+    /// Exclui um item de revisão (ReviewItemState.Excluded).
+    /// </summary>
+    public async Task<ReviewItemEntity?> ExcludeReviewAsync(
+        string fingerprint,
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var item = await context.ReviewItems
+            .FirstOrDefaultAsync(r => r.Fingerprint == fingerprint, cancellationToken);
+        if (item == null) return null;
+
+        item.State = ReviewItemState.Excluded;
+        item.ResolvedAtUtc = DateTime.UtcNow;
+        item.UpdatedAtUtc = DateTime.UtcNow;
+        await context.SaveChangesAsync(cancellationToken);
+        return item;
+    }
+
+    /// <summary>
+    /// Lista todos os SyncRun ordenados por StartedAtUtc
+    /// (mais recentes primeiro).
+    /// </summary>
+    public async Task<IReadOnlyList<SyncRunEntity>> ListSyncRunsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.SyncRuns
+            .AsNoTracking()
+            .OrderByDescending(r => r.StartedAtUtc)
+            .ToListAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Lista todos os PendingCountryApproval ordenados por data
+    /// de criação (mais antigos primeiro, para review FIFO).
+    /// </summary>
+    public async Task<IReadOnlyList<PendingCountryApprovalEntity>> ListPendingCountryApprovalsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.PendingCountryApprovals
+            .AsNoTracking()
+            .OrderBy(r => r.CreatedAtUtc)
+            .ToListAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Regista um novo canal pendente de aprovação. Idempotente:
+    /// se já existir um registo Open com a mesma (NormalizedIdentity,
+    /// CountryCode, ReasonSignature), não cria duplicado.
+    /// </summary>
+    public async Task<PendingCountryApprovalEntity> UpsertPendingCountryApprovalAsync(
+        string normalizedIdentity,
+        string originalTitle,
+        string countryCode,
+        string sanitizedStreamUrl,
+        string? sourceGroup,
+        string reasonSignature,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(normalizedIdentity))
+            throw new ArgumentException("normalizedIdentity required", nameof(normalizedIdentity));
+
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+
+        var existing = await context.PendingCountryApprovals
+            .FirstOrDefaultAsync(r =>
+                r.NormalizedIdentity == normalizedIdentity &&
+                r.CountryCode == countryCode &&
+                r.ReasonSignature == reasonSignature &&
+                r.State == PendingApprovalState.Open,
+                cancellationToken);
+
+        if (existing != null)
+            return existing;
+
+        var now = DateTime.UtcNow;
+        var entry = new PendingCountryApprovalEntity
+        {
+            NormalizedIdentity = normalizedIdentity,
+            OriginalTitle = originalTitle ?? string.Empty,
+            CountryCode = countryCode ?? string.Empty,
+            StreamUrl = sanitizedStreamUrl ?? string.Empty,
+            SourceGroup = sourceGroup,
+            ReasonSignature = reasonSignature ?? string.Empty,
+            State = PendingApprovalState.Open,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+        };
+        context.PendingCountryApprovals.Add(entry);
+        await context.SaveChangesAsync(cancellationToken);
+        return entry;
+    }
+
+    /// <summary>
+    /// Aprova um canal pendente: cria IdentityRule com CreateEligible
+    /// e marca o pending como Approved. Opcionalmente adiciona o membro
+    /// ao grupo de afinidade do país (criando o grupo se não existir).
+    /// </summary>
+    public async Task<PendingCountryApprovalEntity?> ApprovePendingCountryApprovalAsync(
+        long id,
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var item = await context.PendingCountryApprovals
+            .FirstOrDefaultAsync(r => r.Id == id, cancellationToken);
+        if (item == null) return null;
+
+        var existingRule = await context.IdentityRules
+            .FirstOrDefaultAsync(r => r.NormalizedIdentity == item.NormalizedIdentity, cancellationToken);
+        if (existingRule == null)
+        {
+            var now = DateTime.UtcNow;
+            context.IdentityRules.Add(new IdentityRuleEntity
+            {
+                NormalizedIdentity = item.NormalizedIdentity,
+                Disposition = RuleDisposition.ReviewOnly,
+                Reason = $"Approved from PendingCountryApproval #{id} ({item.ReasonSignature})",
+                CreatedAtUtc = now,
+                UpdatedAtUtc = now,
+            });
+        }
+
+        item.State = PendingApprovalState.Approved;
+        item.ResolvedAtUtc = DateTime.UtcNow;
+        item.UpdatedAtUtc = DateTime.UtcNow;
+        await context.SaveChangesAsync(cancellationToken);
+        return item;
+    }
+
+    /// <summary>
+    /// Reprova um canal pendente: cria IdentityRule com Excluded
+    /// e marca o pending como Rejected.
+    /// </summary>
+    public async Task<PendingCountryApprovalEntity?> RejectPendingCountryApprovalAsync(
+        long id,
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var item = await context.PendingCountryApprovals
+            .FirstOrDefaultAsync(r => r.Id == id, cancellationToken);
+        if (item == null) return null;
+
+        var existingRule = await context.IdentityRules
+            .FirstOrDefaultAsync(r => r.NormalizedIdentity == item.NormalizedIdentity, cancellationToken);
+        if (existingRule == null)
+        {
+            var now = DateTime.UtcNow;
+            context.IdentityRules.Add(new IdentityRuleEntity
+            {
+                NormalizedIdentity = item.NormalizedIdentity,
+                Disposition = RuleDisposition.Excluded,
+                Reason = $"Rejected from PendingCountryApproval #{id} ({item.ReasonSignature})",
+                CreatedAtUtc = now,
+                UpdatedAtUtc = now,
+            });
+        }
+
+        item.State = PendingApprovalState.Rejected;
+        item.ResolvedAtUtc = DateTime.UtcNow;
+        item.UpdatedAtUtc = DateTime.UtcNow;
+        await context.SaveChangesAsync(cancellationToken);
+        return item;
+    }
+
+    /// <summary>
+    /// Estatísticas agregadas do catálogo: contagens por tabela.
+    /// </summary>
+    public async Task<CatalogStats> GetStatsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var now = DateTime.UtcNow;
+        return new CatalogStats
+        {
+            CanonicalChannels = await context.CanonicalChannels.AsNoTracking().CountAsync(cancellationToken),
+            ChannelAliases = await context.ChannelAliases.AsNoTracking().CountAsync(cancellationToken),
+            IdentityRules = await context.IdentityRules.AsNoTracking().CountAsync(cancellationToken),
+            AffinityGroups = await context.AffinityGroups.AsNoTracking().CountAsync(cancellationToken),
+            AffinityMembers = await context.AffinityMembers.AsNoTracking().CountAsync(cancellationToken),
+            DispatcharrChannelOwnerships = await context.DispatcharrChannelOwnerships.AsNoTracking().CountAsync(cancellationToken),
+            DispatcharrStreamOwnerships = await context.DispatcharrStreamOwnerships.AsNoTracking().CountAsync(cancellationToken),
+            ReviewItemsOpen = await context.ReviewItems.AsNoTracking().CountAsync(r => r.State == ReviewItemState.Open, cancellationToken),
+            ReviewItemsApproved = await context.ReviewItems.AsNoTracking().CountAsync(r => r.State == ReviewItemState.Approved, cancellationToken),
+            ReviewItemsExcluded = await context.ReviewItems.AsNoTracking().CountAsync(r => r.State == ReviewItemState.Excluded, cancellationToken),
+            SyncRuns = await context.SyncRuns.AsNoTracking().CountAsync(cancellationToken),
+            PendingCountryApprovals = await context.PendingCountryApprovals.AsNoTracking().CountAsync(cancellationToken),
+            PendingCountryApprovalsOpen = await context.PendingCountryApprovals.AsNoTracking().CountAsync(r => r.State == PendingApprovalState.Open, cancellationToken),
+            DbPath = _dbPath,
+            GeneratedAtUtc = now,
+        };
+    }
+}
+
+public sealed class CatalogStats
+{
+    public int CanonicalChannels { get; set; }
+    public int ChannelAliases { get; set; }
+    public int IdentityRules { get; set; }
+    public int AffinityGroups { get; set; }
+    public int AffinityMembers { get; set; }
+    public int DispatcharrChannelOwnerships { get; set; }
+    public int DispatcharrStreamOwnerships { get; set; }
+    public int ReviewItemsOpen { get; set; }
+    public int ReviewItemsApproved { get; set; }
+    public int ReviewItemsExcluded { get; set; }
+    public int SyncRuns { get; set; }
+    public int PendingCountryApprovals { get; set; }
+    public int PendingCountryApprovalsOpen { get; set; }
+    public string DbPath { get; set; } = string.Empty;
+    public DateTime GeneratedAtUtc { get; set; }
 }
 
 /// <summary>

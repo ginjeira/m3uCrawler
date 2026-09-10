@@ -1,5 +1,8 @@
 using m3uCrawler.Build;
 using m3uCrawler.Services;
+using m3uCrawler.Services.Catalog;
+using m3uCrawler.Services.Matching;
+using m3uCrawler.Services.SourceOrdering;
 using m3uCrawler.Models;
 using System.Text;
 using System.Net;
@@ -40,10 +43,23 @@ namespace m3uCrawler
             }
             string? webToken = webEnabled ? GetOptionValue(args, "--web-token") : null;
             Task? webTask = null;
+            CatalogResolver? webCatalogResolver = null;
             if (webEnabled)
             {
                 var dashboardOutputDir = GetOptionValue(args, "--output-dir") ?? "output";
                 var dashboardHistoryService = new ImportHistoryService(dashboardOutputDir);
+
+                try
+                {
+                    webCatalogResolver = await InitializeCatalogAsync(
+                        ResolveCatalogDbPath(args), CancellationToken.None);
+                    WebDashboardService.SetCatalogResolver(webCatalogResolver);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"⚠️ Catálogo não disponível para o dashboard: {ex.Message}");
+                }
+
                 webTask = WebDashboardService.RunDashboardAsync(dashboardOutputDir, webPort, dashboardHistoryService, webToken, CancellationToken.None);
                 _ = webTask.ContinueWith(t =>
                 {
@@ -58,6 +74,18 @@ namespace m3uCrawler
             {
                 var scraper = new TelegramScraperService();
                 await scraper.LoginAsync();
+
+                var catalogDbPath = ResolveCatalogDbPath(args);
+                CatalogResolver? catalogForAffinity = null;
+                try
+                {
+                    catalogForAffinity = await InitializeCatalogAsync(catalogDbPath, CancellationToken.None);
+                    await InjectAffinityMembersToValidatorAsync(catalogForAffinity);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"⚠️ Catálogo não disponível para injeção de afinidades: {ex.Message}");
+                }
 
                 // Get search term from arguments or prompt user
                 string term = "";
@@ -137,6 +165,7 @@ namespace m3uCrawler
                             telegramMaxStreams,
                             domainFilter,
                             telegramHistoryHours,
+                            args,
                             countryCode,
                             Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries"));
                     }
@@ -192,7 +221,7 @@ namespace m3uCrawler
                             Console.WriteLine("❌ Nenhum stream funcional encontrado no Telegram.");
                         }
 
-                        await TrySyncToDispatcharrAsync(playlistPath, outputDir);
+                        await TrySyncToDispatcharrAsync(playlistPath, outputDir, args);
 
                         await importHistoryService.RecordImportAsync(new ImportHistoryEntry
                         {
@@ -255,7 +284,7 @@ namespace m3uCrawler
                     return;
                 }
 
-                await TrySyncToDispatcharrAsync(playlistPath, outputDir);
+                await TrySyncToDispatcharrAsync(playlistPath, outputDir, args);
                 return;
             }
 
@@ -572,6 +601,7 @@ namespace m3uCrawler
             int telegramMaxStreams,
             string? domainFilter,
             int telegramHistoryHours,
+            string[] args,
             string countryCode = "pt",
             string? countriesDir = null)
         {
@@ -646,7 +676,7 @@ namespace m3uCrawler
             await playlistManager.SaveToJsonReport(finalStreams, reportPath);
             await SaveRunReportAsync(outputDir, runReport);
 
-            await TrySyncToDispatcharrAsync(mainPath, outputDir);
+            await TrySyncToDispatcharrAsync(mainPath, outputDir, args);
 
             var historyEntry = new ImportHistoryEntry
             {
@@ -680,6 +710,27 @@ namespace m3uCrawler
             Console.WriteLine($"   • Relatório de execução: {Path.Combine(outputDir, "telegram_run_report.json")}");
         }
 
+        static async Task InjectAffinityMembersToValidatorAsync(CatalogResolver catalog)
+        {
+            var groups = await catalog.ListAffinityGroupsAsync();
+            var byCountry = groups
+                .Where(g => !string.IsNullOrWhiteSpace(g.CountryCode))
+                .GroupBy(g => g.CountryCode!.ToLowerInvariant());
+            foreach (var group in byCountry)
+            {
+                var members = group
+                    .SelectMany(g => g.Members)
+                    .Select(m => m.NormalizedMember)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+                if (members.Count > 0)
+                {
+                    CountryChannelValidator.SetAffinityMembersStatic(group.Key, members);
+                    Console.WriteLine($"  [{group.Key}] {members.Count} membro(s) de afinidade injetados");
+                }
+            }
+        }
+
         static async Task SaveRunReportAsync(string outputDir, RunReport report)
         {
             try
@@ -698,13 +749,81 @@ namespace m3uCrawler
             }
         }
 
-        static async Task TrySyncToDispatcharrAsync(string playlistPath, string outputDir)
+        /// <summary>
+        /// Caminho por defeito do ficheiro SQLite do catálogo de
+        /// canais. Em produção (container) é <c>/data/channel-catalog.db</c>
+        /// (mesmo directório de <c>wtelegram.config</c> e
+        /// <c>session.dat</c>, montado como bind mount). Pode ser
+        /// sobreposto por <c>--catalog-db PATH</c> em testes.
+        /// </summary>
+        const string DefaultCatalogDbPath = "/data/channel-catalog.db";
+
+        static string ResolveCatalogDbPath(string[] args)
+        {
+            for (int i = 0; i < args.Length - 1; i++)
+            {
+                if (args[i] == "--catalog-db")
+                {
+                    return args[i + 1];
+                }
+            }
+            return DefaultCatalogDbPath;
+        }
+
+        /// <summary>
+        /// Inicializa o catálogo persistente e devolve um
+        /// <see cref="CatalogResolver"/> pronto a injectar no
+        /// <c>ChannelMatcher</c> e no <c>DispatcharrSyncService</c>.
+        /// </summary>
+        /// <remarks>
+        /// Se o bootstrap ou a migration falhar, aborta com
+        /// exception — não continuamos em modo "legacy" silencioso.
+        /// Em produção a primeira falha de migration é tratada
+        /// como erro fatal (ver requisito 2 do brief).
+        /// </remarks>
+        static async Task<CatalogResolver> InitializeCatalogAsync(
+            string dbPath, CancellationToken ct)
+        {
+            Console.WriteLine($"📦 Inicializando catálogo persistente: {dbPath}");
+            var bootstrapper = new ChannelCatalogBootstrapper(dbPath);
+            await using var context = await bootstrapper.InitializeAsync(ct);
+            await context.DisposeAsync();
+            var factory = new RuntimeChannelCatalogDbContextFactory(dbPath);
+            return new CatalogResolver(factory, dbPath);
+        }
+
+        static async Task TrySyncToDispatcharrAsync(
+            string playlistPath, string outputDir, string[] args)
         {
             var cfg = DispatcharrConfigLoader.Load();
             if (!cfg.Enabled) return;
+
+            CatalogResolver catalog;
             try
             {
-                var sync = new m3uCrawler.Services.Sync.DispatcharrSyncService(cfg, outputDir);
+                catalog = await InitializeCatalogAsync(
+                    ResolveCatalogDbPath(args), CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine(
+                    $"❌ Catálogo falhou a inicializar em '{ResolveCatalogDbPath(args)}'. " +
+                    $"Sincronização Dispatcharr abortada antes de qualquer escrita HTTP. " +
+                    $"Erro: {ex.Message}");
+                throw;
+            }
+
+            try
+            {
+                var aliases = AliasResolver.FromFile(cfg.AliasFile);
+                var ordering = new StreamOrderingPolicy(cfg.ProviderPriority);
+                var matcher = new ChannelMatcher(aliases, null, catalog);
+                var sync = new m3uCrawler.Services.Sync.DispatcharrSyncService(
+                    cfg, outputDir,
+                    aliases: aliases,
+                    ordering: ordering,
+                    matcher: matcher,
+                    catalog: catalog);
                 await sync.RunAsync(playlistPath);
             }
             catch (Exception ex)

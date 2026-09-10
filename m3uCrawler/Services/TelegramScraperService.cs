@@ -147,8 +147,9 @@ namespace m3uCrawler.Services
 
             try
             {
-                foreach (var candidate in candidates)
+                for (int ci = 0; ci < candidates.Count; ci++)
                 {
+                    var candidate = candidates[ci];
                     string? content = candidate.Content;
                     if (content == null)
                     {
@@ -157,8 +158,37 @@ namespace m3uCrawler.Services
 
                     // URLs sem extensão (.m3u/.m3u8) detetados por heurística só são tratados como
                     // playlist se o conteúdo HTTP for efectivamente #EXTM3U.
+                    // Caso contrario, pode ser uma publicacao HTML com cards Xtream
+                    // (resolver dedicado identifica contas e faz fan-out).
                     if (candidate.RequiresContentVerification && !_detector.LooksLikePlaylistContent(content))
                     {
+                        if (LooksLikeHtmlPublication(content))
+                        {
+                            var accounts = XtreamPublicationResolver.ResolveFromHtml(
+                                content!, candidate.Url ?? string.Empty);
+                            if (accounts.Count == 0)
+                            {
+                                // Pagina HTML sem cards Xtream validas: nao incrementa
+                                // PlaylistsInvalid (a pagina existe; simplesmente nao e
+                                // uma publicacao Xtream). Apenas diagnostico sanitizado.
+                                rep.RejectionReasons.Add(
+                                    $"{CredentialSanitizer.SanitizeUrl(candidate.Url) ?? candidate.Source}: no xtream cards found");
+                                continue;
+                            }
+
+                            // Fan-out: cada conta -> CandidatePlaylist com playlist Xtream.
+                            foreach (var acc in accounts)
+                            {
+                                var playlistUrl = acc.M3uUrl ?? BuildXtreamPlaylistUrl(acc);
+                                var promoted = PromoteXtreamAccount(playlistUrl, candidate.Url ?? string.Empty);
+                                if (promoted != null)
+                                {
+                                    candidates.Add(promoted);
+                                }
+                            }
+                            continue;
+                        }
+
                         rep.PlaylistsInvalid++;
                         rep.RejectionReasons.Add($"{CredentialSanitizer.SanitizeUrl(candidate.Url) ?? candidate.Source}: conteúdo não é uma playlist M3U");
                         continue;
@@ -262,6 +292,11 @@ namespace m3uCrawler.Services
             string keyword, int limit = 200, int historyHours = 48)
         {
             var candidates = new List<CandidatePlaylist>();
+            // Publicacoes descobertas em qualquer mensagem: referencias Telegram
+            // (t.me/c/...) e URLs HTTP publicas nao capturadas pelo detector.
+            // Sao resolvidas apos o loop principal, usando o cache de access_hash
+            // construido a partir dos dialogos.
+            var discoveredPublications = new List<TelegramPublicationRef>();
             int messagesAnalyzed = 0;
 
             // Idempotente: se já autenticado, não faz nada
@@ -273,6 +308,12 @@ namespace m3uCrawler.Services
             Dialog[] dialogList;
             Dictionary<long, ChatBase> chatsDict;
             Dictionary<long, User> usersDict;
+
+            Channel? ResolveChannel(long channelId)
+            {
+                if (chatsDict.TryGetValue(channelId, out var ch) && ch is Channel c) return c;
+                return null;
+            }
 
             switch (dialogsBase)
             {
@@ -370,6 +411,41 @@ namespace m3uCrawler.Services
                         // Descoberta NÃO depende da keyword: deteta por URL, nome de anexo ou conteúdo.
                         var found = _detector.DetectFromMessage(text, filename).ToList();
 
+                        // URLs HTTP genericas (nao captadas pelo detector) sao candidatas a
+                        // publicacao HTML com cards Xtream. Marcadas para que o loop principal
+                        // encaminhe para XtreamPublicationResolver quando o conteudo nao for
+                        // #EXTM3U.
+                        foreach (var pubUrl in ExtractRemainingHttpUrls(text, found))
+                        {
+                            found.Add(new CandidatePlaylist
+                            {
+                                Kind = CandidateSourceKind.Url,
+                                Url = pubUrl,
+                                SourceText = text,
+                                DetectedFrom = "xtream publication url",
+                                RequiresContentVerification = true
+                            });
+                        }
+
+                        // Descoberta de publicacoes Telegram (t.me/c/<channel>/<message>)
+                        // e URLs HTTP publicas adicionais. As primeiras exigem resolucao
+                        // via WTelegram apos o loop principal (precisamos de access_hash do
+                        // cache de dialogos); as URLs HTTP serao processadas como
+                        // publicacoes URL pelo mesmo pipeline.
+                        var pubs = TelegramPublicationDiscovery.DiscoverFromText(text, chatTitle);
+                        foreach (var p in pubs)
+                        {
+                            // Evitar duplicados dentro do mesmo ciclo (mesma referencia
+                            // pode aparecer em varias mensagens).
+                            if (!discoveredPublications.Any(d =>
+                                    d.ReferenceUrl == p.ReferenceUrl &&
+                                    d.ChannelId == p.ChannelId &&
+                                    d.MessageId == p.MessageId))
+                            {
+                                discoveredPublications.Add(p);
+                            }
+                        }
+
                         bool hasAttachment = m.media is MessageMediaDocument media2 && media2.document is Document;
                         Document? attachmentDocument = hasAttachment
                             ? (Document)((MessageMediaDocument)m.media!).document
@@ -399,7 +475,139 @@ namespace m3uCrawler.Services
                 await Task.Delay(500);
             }
 
+            // Resolver publicacoes Telegram descobertas (t.me/c/...) usando o
+            // canal cache construido a partir dos dialogos. URLs HTTP publicas
+            // capturadas pelo discovery sao processadas pelo loop principal
+            // (download HTTP -> XtreamPublicationResolver). Apenas referencias
+            // Telegram precisam do passo de resolucao aqui.
+            var telegramRefs = discoveredPublications
+                .Where(p => p.ChannelId.HasValue && p.MessageId.HasValue)
+                .ToList();
+            if (telegramRefs.Count > 0)
+            {
+                var fetcher = BuildTelegramFetcher(ResolveChannel);
+                var resolutions = await TelegramPublicationResolver.ResolveAsync(
+                    telegramRefs, fetcher);
+
+                // Promover cada conta Xtream descoberta a CandidatePlaylist e
+                // anexar ao mesmo loop do pipeline.
+                foreach (var res in resolutions)
+                {
+                    if (res.XtreamAccounts.Count == 0) continue;
+                    foreach (var acc in res.XtreamAccounts)
+                    {
+                        var playlistUrl = acc.M3uUrl ?? BuildXtreamPlaylistUrl(acc);
+                        var promoted = PromoteXtreamAccount(playlistUrl, res.ReferenceUrl);
+                        if (promoted != null)
+                        {
+                            candidates.Add(promoted);
+                        }
+                    }
+                }
+            }
+
             return (messagesAnalyzed, candidates);
+        }
+
+        /// <summary>
+        /// Constrói um TelegramMessageFetcher que invoca WTelegram
+        /// Channels_GetMessages / Messages_GetMessages com o (channelId, messageId)
+        /// recebido, usando o cache de dialogos para obter access_hash. Devolve
+        /// null se a mensagem nao for acessivel (canal nao nos dialogos, FLOOD_WAIT
+        /// persistente, etc.).
+        /// </summary>
+        private TelegramMessageFetcher BuildTelegramFetcher(Func<long, Channel?> resolveChannel)
+        {
+            return async (long channelId, int messageId, CancellationToken ct) =>
+            {
+                ct.ThrowIfCancellationRequested();
+                var channel = resolveChannel(channelId);
+                if (channel == null) return null;
+                try
+                {
+                    var inputChannel = new InputChannel(channel.id, channel.access_hash);
+                    var ids = new InputMessage[] { new InputMessageID { id = messageId } };
+                    var response = await _client.Channels_GetMessages(inputChannel, ids);
+                    if (response is Messages_ChannelMessages mcm && mcm.messages != null && mcm.messages.Length > 0)
+                    {
+                        var msg = mcm.messages[0] as Message;
+                        if (msg == null) return null;
+                        return await BuildResolvedFromMessage(msg);
+                    }
+                    return null;
+                }
+                catch (WTelegram.WTException ex) when (ex.Message.Contains("FLOOD_WAIT", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Re-throw para que o resolver trate FLOOD_WAIT com retry.
+                    throw;
+                }
+                catch (WTelegram.WTException)
+                {
+                    // CHANNEL_INVALID, MESSAGE_ID_INVALID, etc. Devolve null
+                    // para que o resolver marque a publicacao como ResolutionFailed.
+                    return null;
+                }
+            };
+        }
+
+        /// <summary>
+        /// Converte um TL.Message (obtido via WTelegram) num ResolvedPublication
+        /// para o TelegramPublicationResolver. Suporta texto + media (Document).
+        /// </summary>
+        private async Task<ResolvedPublication?> BuildResolvedFromMessage(Message m)
+        {
+            var text = m.message ?? string.Empty;
+
+            string? filename = null;
+            byte[]? mediaContent = null;
+            string kind = "text";
+
+            if (m.media is MessageMediaDocument mediaDoc && mediaDoc.document is Document doc)
+            {
+                foreach (var attr in doc.attributes)
+                {
+                    if (attr is DocumentAttributeFilename fn)
+                    {
+                        filename = fn.file_name ?? string.Empty;
+                        break;
+                    }
+                }
+
+                if (!string.IsNullOrEmpty(filename))
+                {
+                    kind = ClassifyAttachmentForFetcher(filename);
+                    try
+                    {
+                        using var ms = new MemoryStream();
+                        await _client.DownloadFileAsync(doc, ms);
+                        mediaContent = ms.ToArray();
+                    }
+                    catch
+                    {
+                        // Download falhou; sem media content. O resolver fara'
+                        // o seu trabalho so' com o texto.
+                        mediaContent = null;
+                    }
+                }
+            }
+
+            return new ResolvedPublication
+            {
+                Text = text,
+                Filename = filename,
+                MediaContent = mediaContent,
+                Kind = kind,
+                ChannelId = m.Peer is PeerChannel pc ? pc.channel_id : null,
+                MessageId = m.ID
+            };
+        }
+
+        private static string ClassifyAttachmentForFetcher(string filename)
+        {
+            var f = filename.ToLowerInvariant();
+            if (System.Text.RegularExpressions.Regex.IsMatch(f, @"\.html?$")) return "html attachment";
+            if (System.Text.RegularExpressions.Regex.IsMatch(f, @"\.m3u8?$")) return "m3u attachment";
+            return "other attachment";
         }
 
         internal static async Task ProcessAttachmentCandidatesAsync(
@@ -543,6 +751,116 @@ namespace m3uCrawler.Services
 
             // Algumas exceções chegam mascaradas como FLOOD_WAIT_X sem número.
             return message.Contains("FLOOD_WAIT", StringComparison.OrdinalIgnoreCase) ? 180 : 30;
+        }
+
+        // ====================================================================
+        // Publication HTML -> Xtream accounts (descoberta por fan-out)
+        // ====================================================================
+
+        // URLs HTTP publicas normais. Exclui t.me/c/<channel>/<message> porque
+        // essas referencias sao tratadas pelo TelegramPublicationResolver
+        // (atribuida a publicacao Telegram, nao a pagina HTML publica).
+        private static readonly Regex _httpUrlRegexPublication = new(
+            @"https?://(?!t\.me/)[^\s<>""'()]+",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+        // Quando o M3uCandidateDetector captura uma URL Xtream (/live/USER/PASS/...),
+        // emite um candidato com Url=<get.php resolvido>. Para evitar republicar
+        // a URL original como candidata a publicacao, tambem a marcamos como
+        // "ja detetada".
+        private static readonly Regex _xtreamServerUrlForPublication = new(
+            @"https?://[^/\s]+/(live|movie|series)/[^/\s]+/[^/\s]+",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+        /// <summary>
+        /// Extrai URLs HTTP/HTTPS do texto que NAO foram capturadas pelo detector.
+        /// Usado para identificar URLs de publicacao HTML que o detector, por
+        /// design, nao classifica como playlist (URLs sem pista 'xtream|playlist|m3u|...'
+        /// no path/query). Apenas estas URLs chegam ao XtreamPublicationResolver.
+        /// </summary>
+        internal static IReadOnlyList<string> ExtractRemainingHttpUrls(
+            string? text,
+            IReadOnlyList<CandidatePlaylist> alreadyDetected)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return Array.Empty<string>();
+
+            var detectedUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var c in alreadyDetected)
+            {
+                if (!string.IsNullOrWhiteSpace(c.Url)) detectedUrls.Add(c.Url);
+            }
+
+            var result = new List<string>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (Match m in _httpUrlRegexPublication.Matches(text))
+            {
+                var url = m.Value.TrimEnd('.', ',', ')', ']', ';');
+                if (url.Length == 0) continue;
+                if (seen.Contains(url)) continue;
+                // Ja detetada directamente (m3u, xtream playlist).
+                if (detectedUrls.Contains(url)) continue;
+                // Ja detetada indirectamente (xtream server: o Url do candidato e'
+                // a playlist resolvida, mas a URL original ja foi consumida).
+                if (_xtreamServerUrlForPublication.IsMatch(url)) continue;
+                seen.Add(url);
+                result.Add(url);
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// Reconhece se um conteudo descarregado parece uma publicacao HTML.
+        /// NAO valida estrutura Xtream (isso e' tarefa do XtreamPublicationResolver).
+        /// </summary>
+        internal static bool LooksLikeHtmlPublication(string? content)
+        {
+            if (string.IsNullOrWhiteSpace(content)) return false;
+            var trimmed = content.TrimStart();
+            return trimmed.StartsWith("<!DOCTYPE", StringComparison.OrdinalIgnoreCase)
+                || trimmed.StartsWith("<html", StringComparison.OrdinalIgnoreCase)
+                || trimmed.StartsWith("<HTML", StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// Constroi a URL da playlist Xtream para uma conta, reutilizando a logica
+        /// canonica existente em M3uCandidateDetector.ResolveXtreamPlaylistUrl.
+        /// Cria uma URL de servidor sintetica (/live/USER/PASS/0.ts) e deixa o
+        /// resolver canonico produzir a URL de playlist (get.php). Garante que
+        /// existe uma UNICA forma de construir URLs Xtream no projeto.
+        /// </summary>
+        internal static string? BuildXtreamPlaylistUrl(XtreamAccountInfo acc)
+        {
+            return BuildPlaylistUrlForTest(acc);
+        }
+
+        /// <summary>
+        /// Wrapper publico-interno (mantido para testes) com nome mais curto.
+        /// </summary>
+        internal static string? BuildPlaylistUrlForTest(XtreamAccountInfo acc)
+        {
+            var detector = new M3uCandidateDetector();
+            var scheme = string.IsNullOrWhiteSpace(acc.Scheme) ? "http" : acc.Scheme.ToLowerInvariant();
+            var syntheticServer = $"{scheme}://{acc.Host}:{acc.Port}/live/{Uri.EscapeDataString(acc.Username)}/{Uri.EscapeDataString(acc.Password)}/0.ts";
+            return detector.ResolveXtreamPlaylistUrl(syntheticServer);
+        }
+
+        /// <summary>
+        /// Promove uma conta Xtream descoberta a CandidatePlaylist, pronta para
+        /// entrar no pipeline Xtream/M3U existente. O Source e' o URL publico da
+        /// publicacao (sem credenciais) para que DiscoveredPlaylists/RunReport nao
+        /// exponham segredos.
+        /// </summary>
+        internal static CandidatePlaylist? PromoteXtreamAccount(string? playlistUrl, string publicationUrl)
+        {
+            if (string.IsNullOrWhiteSpace(playlistUrl)) return null;
+            return new CandidatePlaylist
+            {
+                Kind = CandidateSourceKind.Url,
+                Url = playlistUrl,
+                Source = $"xtream publication: {publicationUrl}",
+                DetectedFrom = "xtream publication",
+                RequiresContentVerification = true
+            };
         }
     }
 }

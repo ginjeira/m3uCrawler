@@ -13,10 +13,13 @@ public sealed class ChannelCatalogDbContext : DbContext
     public DbSet<CanonicalChannelEntity> CanonicalChannels => Set<CanonicalChannelEntity>();
     public DbSet<ChannelAliasEntity> ChannelAliases => Set<ChannelAliasEntity>();
     public DbSet<IdentityRuleEntity> IdentityRules => Set<IdentityRuleEntity>();
+    public DbSet<AffinityGroupEntity> AffinityGroups => Set<AffinityGroupEntity>();
+    public DbSet<AffinityMemberEntity> AffinityMembers => Set<AffinityMemberEntity>();
     public DbSet<DispatcharrChannelOwnershipEntity> DispatcharrChannelOwnerships => Set<DispatcharrChannelOwnershipEntity>();
     public DbSet<DispatcharrStreamOwnershipEntity> DispatcharrStreamOwnerships => Set<DispatcharrStreamOwnershipEntity>();
     public DbSet<ReviewItemEntity> ReviewItems => Set<ReviewItemEntity>();
     public DbSet<SyncRunEntity> SyncRuns => Set<SyncRunEntity>();
+    public DbSet<PendingCountryApprovalEntity> PendingCountryApprovals => Set<PendingCountryApprovalEntity>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -65,6 +68,45 @@ public sealed class ChannelCatalogDbContext : DbContext
             e.Property(x => x.CreatedAtUtc).IsRequired();
             e.Property(x => x.UpdatedAtUtc).IsRequired();
             e.HasIndex(x => x.NormalizedIdentity).IsUnique();
+        });
+
+        // AffinityGroup
+        modelBuilder.Entity<AffinityGroupEntity>(e =>
+        {
+            e.ToTable("affinity_groups");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Id).ValueGeneratedOnAdd();
+            e.Property(x => x.Name).IsRequired().HasMaxLength(200);
+            e.Property(x => x.CountryCode).HasMaxLength(10);
+            e.Property(x => x.CanonicalChannelId).IsRequired(false);
+            e.Property(x => x.CreatedAtUtc).IsRequired();
+            e.Property(x => x.UpdatedAtUtc).IsRequired();
+            e.HasIndex(x => x.Name).IsUnique();
+            e.HasIndex(x => x.CountryCode);
+            e.HasOne(x => x.CanonicalChannel)
+                .WithMany()
+                .HasForeignKey(x => x.CanonicalChannelId)
+                .OnDelete(DeleteBehavior.SetNull);
+            e.HasMany(x => x.Members)
+                .WithOne(m => m.AffinityGroup)
+                .HasForeignKey(m => m.AffinityGroupId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        // AffinityMember
+        modelBuilder.Entity<AffinityMemberEntity>(e =>
+        {
+            e.ToTable("affinity_members");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Id).ValueGeneratedOnAdd();
+            e.Property(x => x.NormalizedMember).IsRequired().HasMaxLength(200);
+            e.Property(x => x.AffinityGroupId).IsRequired();
+            e.Property(x => x.CreatedAtUtc).IsRequired();
+            e.HasIndex(x => x.NormalizedMember).IsUnique();
+            e.HasOne(x => x.AffinityGroup)
+                .WithMany(g => g.Members)
+                .HasForeignKey(x => x.AffinityGroupId)
+                .OnDelete(DeleteBehavior.Cascade);
         });
 
         // DispatcharrChannelOwnership
@@ -133,6 +175,27 @@ public sealed class ChannelCatalogDbContext : DbContext
             e.Property(x => x.FinishedAtUtc).IsRequired();
             e.Property(x => x.AppVersion).IsRequired().HasMaxLength(40);
             e.Property(x => x.Result).IsRequired().HasMaxLength(200);
+        });
+
+        // PendingCountryApproval
+        modelBuilder.Entity<PendingCountryApprovalEntity>(e =>
+        {
+            e.ToTable("pending_country_approvals");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Id).ValueGeneratedOnAdd();
+            e.Property(x => x.NormalizedIdentity).IsRequired().HasMaxLength(200);
+            e.Property(x => x.OriginalTitle).IsRequired().HasMaxLength(500);
+            e.Property(x => x.CountryCode).IsRequired().HasMaxLength(10);
+            e.Property(x => x.StreamUrl).IsRequired().HasMaxLength(1000);
+            e.Property(x => x.SourceGroup).HasMaxLength(200);
+            e.Property(x => x.ReasonSignature).IsRequired().HasMaxLength(120);
+            e.Property(x => x.State).HasConversion<int>();
+            e.Property(x => x.CreatedAtUtc).IsRequired();
+            e.Property(x => x.UpdatedAtUtc).IsRequired();
+            e.Property(x => x.ResolvedAtUtc);
+            e.HasIndex(x => x.NormalizedIdentity);
+            e.HasIndex(x => x.CountryCode);
+            e.HasIndex(x => x.State);
         });
     }
 }

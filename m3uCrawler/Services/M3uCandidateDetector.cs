@@ -54,6 +54,19 @@ namespace m3uCrawler.Services
         }
 
         /// <summary>
+        /// Reconhece filenames terminados em .html ou .htm (case-insensitive).
+        /// Usado para marcar anexos HTML como candidatos a inspeccao: o conteudo
+        /// do ficheiro e' descarregado por ProcessAttachmentCandidatesAsync e
+        /// entregue ao XtreamPublicationResolver. O detector NAO faz parsing
+        /// HTML — apenas identifica o filename como candidato.
+        /// </summary>
+        public bool IsHtmlFilename(string? filename)
+        {
+            if (string.IsNullOrWhiteSpace(filename)) return false;
+            return Regex.IsMatch(filename, @"\.html?$", RegexOptions.IgnoreCase);
+        }
+
+        /// <summary>
         /// Um URL http(s) SEM extensão .m3u/.m3u8 é considerado candidato a inspeccionar apenas
         /// quando há uma razão plausível (dica de playlist no caminho/query). Não classifica URLs
         /// HTTP arbitrários como playlist apenas por serem HTTP.
@@ -184,6 +197,26 @@ namespace m3uCrawler.Services
                     SourceText = text,
                     Content = attachmentContent,
                     DetectedFrom = "attachment filename"
+                });
+            }
+
+            // Anexo HTML: nao sabemos se o conteudo e' uma publicacao Xtream ate
+            // o descarregar e inspeccionar. Requer verificacao de conteudo
+            // (RequiresContentVerification=true) para que o branch novo em
+            // SearchAndTestM3UInTelegramAsync (LooksLikeHtmlPublication ->
+            // XtreamPublicationResolver) seja activado. O download e' feito por
+            // ProcessAttachmentCandidatesAsync / DownloadTelegramDocumentTextAsync
+            // exactamente como para anexos .m3u.
+            if (IsHtmlFilename(filename))
+            {
+                candidates.Add(new CandidatePlaylist
+                {
+                    Kind = CandidateSourceKind.Attachment,
+                    FileName = filename,
+                    SourceText = text,
+                    Content = attachmentContent,
+                    DetectedFrom = "html attachment",
+                    RequiresContentVerification = true
                 });
             }
 

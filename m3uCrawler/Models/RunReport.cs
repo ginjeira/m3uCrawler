@@ -1,5 +1,34 @@
+using m3uCrawler.Services;
+
 namespace m3uCrawler.Models
 {
+    /// <summary>
+    /// Entrada de triagem no RunReport. Regista o que aconteceu a uma
+    /// publicacao descoberta (Telegram ref ou URL HTTP) sem nunca expor
+    /// credenciais ou informacao sensivel.
+    /// </summary>
+    public class PublicationTriageEntry
+    {
+        public string Kind { get; set; } = string.Empty;
+        public string Reference { get; set; } = string.Empty;
+        public long? ChannelId { get; set; }
+        public int? MessageId { get; set; }
+        public PublicationState State { get; set; }
+        public string? Reason { get; set; }
+        public int XtreamAccountsFound { get; set; }
+
+        public override string ToString()
+        {
+            // Nunca incluir password/credentials; o Reference e' sanitizado via
+            // CredentialSanitizer.SanitizeUrl (cobre http(s):// com userinfo,
+            // /live/USER/PASS/, e parametros username/password/token). Reason
+            // deve estar sanitizado antes de chegar aqui.
+            var sanitizedRef = CredentialSanitizer.SanitizeUrl(Reference ?? string.Empty);
+            return $"{Kind} ref={sanitizedRef} state={State} accounts={XtreamAccountsFound}"
+                 + (Reason != null ? $" reason={CredentialSanitizer.SanitizeText(Reason)}" : "");
+        }
+    }
+
     /// <summary>
     /// Resumo de uma playlist descoberta numa execução, para o relatório detalhado e para o dashboard.
     /// </summary>
@@ -53,7 +82,37 @@ namespace m3uCrawler.Models
         public int StreamsWorking { get; set; }
         public int StreamsFailed { get; set; }
 
+        // === Publicacao Discovery / Resolution (introduzido 2026-09-09) ===
+
+        // Total de referencias Telegram + URLs HTTP publicas descobertas.
+        public int PublicationsDiscovered { get; set; }
+
+        // Publicacoes cujo conteudo foi obtido com sucesso (texto, attachment, etc.).
+        public int PublicationsResolved { get; set; }
+
+        // Publicacoes que nao puderam ser resolvidas (FLOOD_WAIT persistente,
+        // canal inexistente, mensagem inacessivel).
+        public int PublicationsResolutionFailed { get; set; }
+
+        // Publicacoes resolvidas cujo conteudo nao tinha nada util.
+        public int PublicationsUnsupported { get; set; }
+
+        // Publicacoes que precisam de revisao humana (e.g. HTML sem cards Xtream).
+        public int PublicationsRequiresReview { get; set; }
+
+        // === XtreamPublicationResolver fan-out ===
+
+        // Total de cards Xtream descobertas no HTML (antes de dedup).
+        public int XtreamAccountsDiscovered { get; set; }
+
+        // Apos dedup por identidade logica (endpoint + username).
+        public int XtreamAccountsAfterDedup { get; set; }
+
+        // Promovidas a CandidatePlaylist que entraram no pipeline existente.
+        public int XtreamAccountsForwarded { get; set; }
+
         public List<string> RejectionReasons { get; set; } = new();
         public List<DiscoveredPlaylist> DiscoveredPlaylists { get; set; } = new();
+        public List<PublicationTriageEntry> PublicationsTriageLog { get; set; } = new();
     }
 }

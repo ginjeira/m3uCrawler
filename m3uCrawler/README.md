@@ -122,6 +122,120 @@ O pipeline reconhece candidatos Xtream Codes sem depender de keyword:
 
 Estes candidatos são tratados exactamente como os outros: passam pelo mesmo gate de verificação de conteúdo (`#EXTM3U`), validação por país, extracção e teste de streams — **não há uma segunda pipeline paralela**. A descoberta permanece independente de keyword.
 
+### Publicações HTML com cards Xtream
+
+Uma mensagem Telegram pode conter um URL `http(s)` genérico (sem pista `playlist|m3u|iptv|list|xtream|channel|canal|live|getplaylist` no path/query) que aponta para uma página HTML com uma ou várias "cards" Xtream — listas visuais do tipo:
+
+```text
+Host: example.com:80
+User: alice
+Pass: secret1
+M3U: http://example.com:80/get.php?username=alice&password=secret1&type=m3u_plus
+EPG: http://example.com:80/xmltv.php?username=alice&password=secret1
+```
+
+O detector (`M3uCandidateDetector`) **não** trata URLs genéricas como playlist (para evitar downloads indiscriminados de páginas não relacionadas). A captura deste caso é feita exclusivamente em `TelegramScraperService.ExtractRemainingHttpUrls` que:
+
+1. Extrai todas as URLs HTTP/HTTPS do texto da mensagem;
+2. Descarta as que já foram capturadas pelo detector (m3u, xtream playlist, plausíveis);
+3. Descarta URLs Xtream servidor (`/live/USER/PASS/...`) indirectamente consumidas pelo detector;
+4. Promove as restantes a `CandidatePlaylist { DetectedFrom = "xtream publication url", RequiresContentVerification = true }`.
+
+No `for` principal de `SearchAndTestM3UInTelegramAsync`, quando o conteúdo HTTP descarregado **não** começa por `#EXTM3U` mas **parece** HTML (`<!DOCTYPE` ou `<html`), o `XtreamPublicationResolver.ResolveFromHtml` é invocado. A estratégia é adaptativa — **não depende de cosmética específica de um publisher**.
+
+#### Parser adaptativo (commits `e963a7a` → `4df856e`)
+
+O parser funciona em duas camadas:
+
+1. **Caminho DOM-based** (preservado): segmentação por estrutura HTML explícita — `<table>` (>=2 linhas de `<tr>`), `<div|section|article|li class='card'>`, ou `<hr>` no body. Cards dentro de cada segmento são parseadas com tolerância a capitalização (`Host`/`HOST`/`host`), espaços, HTML entities (`&amp;`, `&lt;`), `<a href>` (captura `href` em vez do texto do link) e labels alternativos (`Server`, `Username`, `Password`).
+
+2. **Caminho flat-text fallback** (novo): se o caminho DOM não produz contas mas o `InnerText` tem ≥ 50 chars, o `ResolveFromFlatText` é invocado. Este caminho:
+   - Strip de ruído cosmético: box-drawing (U+2500..U+25FF), símbolos (U+2600..U+27BF), math (U+2200..U+23FF), pares surrogate (U+D800..U+DFFF), ANSI escape codes, sequências longas de chars repetidos.
+   - Transliteração de glyphs fancy para ASCII: modifier letters U+1D00..U+1D7F (small caps `ᴜ`, `ᴇ`, `ᴄ`, …), IPA U+0260..U+029F (`ɢ`, `ɪ`, `ɴ`, …), Latin-1 supplement U+00C0..U+00FF (`á`, `ç`, `ñ`, …), mathematical double-struck digits U+1D7D0..U+1D7D9. Aplica-se em pares surrogate (mathematical `3` é codepoint U+1D7D3).
+   - Anchor detection via regex tolerante: labels conhecidos (`host`, `user`, `pass`, `m3u`, `epg`, `expires`, `port`, `server`, `playlist`, etc.) seguidos de separador (`:`, `=`, `→`, `➢`, `|`, `-` ou apenas whitespace) + valor.
+   - **Clustering com boundary explícito em `host`**: cada `host` repetido FECHA o cluster anterior e ABRE um novo. Isto resolve a fusão de cards adjacentes mesmo quando estão dentro da janela de proximidade (1000 chars). Janela conservadora calibrada para o caso iptvgold onde `Host` fica no topo e `M3U`/`EPG` no fundo (≈700-800 chars de distância).
+   - Validação de host: `LooksLikeValidHost` rejeita texto livre sem `.` ou TLD — protege contra falsos positivos em texto que mencione `Host:`/`User:`/`Pass:` sem ser uma publicação real.
+   - Apenas são produzidas contas com **Host + User + Pass** presentes. Cards incompletas são descartadas silenciosamente.
+   - Deduplicação determinística por **identidade lógica = `scheme://host:port/username`** (normalizado, case-insensitive em scheme/host; password **nunca** participa). Múltiplas contas no mesmo servidor com usernames diferentes permanecem como fontes independentes; contas repetidas colapsam para uma única.
+   - Páginas HTML sem nenhuma card Xtream válida geram um único registo em `RunReport.RejectionReasons` (sanitizado), mas **não** incrementam `PlaylistsInvalid`.
+
+**Validado em produção** (servidor `192.168.68.142`, container `m3ucrawler:sha-4df856e`, single-cycle `--history-hours 24`): descobriu 10 contas Xtream distintas do HTML da msg `110705` (canal `1635952193`, publisher `neorcqds.top:8080`), testou streams funcionais e integrou canais portugueses na `playlist.m3u`. Unitariamente, o fixture `m3uCrawler.Tests/Fixtures/iptvgold_07-09-2026.html` (msg `110658`, 70 contas Xtream em `iptvgold.online:8880`) é parseada correctamente num único `ResolveFromHtml` call.
+
+#### Limitações conhecidas do parser adaptativo
+
+- **Cards adjacentes que partilham labels** com metadata externa (e.g. `CHANNELS`/`MOVIES`/`SERIES` numa MEDIA LIST entre cards) podem fundir-se num cluster único. A heurística `host`-boundary mitiga mas não elimina o caso onde anchors de media list se misturam com labels do card no intervalo.
+- **`Label -> Value`** (seta colada sem espaço) não suportado — separador requer pelo menos 1 espaço.
+- Variantes FR/ES (`Serveur`/`Mot de passe`, `Servidor`/`Contraseña`) não estão no vocabulário actual; expansão é trivial quando houver procura real.
+
+Cada conta válida é promovida a `CandidatePlaylist { Url = acc.M3uUrl ?? BuildXtreamPlaylistUrl(acc), DetectedFrom = "xtream publication", RequiresContentVerification = true }` e entra no **mesmo loop** do pipeline M3U/Xtream existente (`AnalyzePlaylist` → `Parse` → `ValidateStreams` → `TestStreamsAsync` → `RunReport`). **Não há uma segunda pipeline paralela**.
+
+#### Múltiplas contas no mesmo servidor
+
+Duas contas diferentes no mesmo servidor — e.g. `server.example:80` com `User=A` e `User=B` — permanecem como **duas fontes independentes** no pipeline. Esta é uma escolha deliberada para suportar redundância, fallback, health scoring e selecção da melhor fonte em iterações futuras. O modelo de identidade é **`endpoint + username`** (a password é um segredo operacional que pode mudar sem afectar a identidade da fonte).
+
+#### Limitação conhecida: a "MEDIA LIST" não é fonte de canais
+
+Algumas publicações apresentam listas resumidas como:
+
+```text
+MEDIA LIST
+PORTUGAL
+SIC
+TVI
+RTP
+SPORT TV
+…
+```
+
+Esta lista é **publicidade/resumo da conta**, não a lista real de canais. O resolver nunca a trata como fonte de canais: extrai apenas labels semânticos (`Host|Server|Endpoint`, `User|Username`, `Pass|Password`, `M3U`, `EPG`, `Expires`, `Max Connections`). A lista real de canais/vod/séries continua a vir da ingestão real (`get.php`/`m3u_plus`) através do pipeline M3U/Xtream. Proibido por invariante do projecto: nunca adicionar canais directamente a partir de texto HTML não verificado.
+
+#### Construção da URL Xtream
+
+`BuildXtreamPlaylistUrl` (em `TelegramScraperService`) **não** cria uma segunda implementação de `get.php`. Quando a card fornece uma URL M3U explícita, essa URL tem prioridade. Caso contrário, é sintetizada uma URL de servidor `http://host:port/live/USER/PASS/0.ts` e delegada a `M3uCandidateDetector.ResolveXtreamPlaylistUrl` — a única forma canónica de produzir `get.php?username=…&password=…&type=m3u_plus` no projecto. Existe uma outra construção independente em `M3uCrawlerService.ScanDomainForPlaylists` para o modo `--scan-domain`; é código pré-existente e **não** foi alterado por esta funcionalidade.
+
+#### Anexos HTML (`m3u@host.html`) — segundo mecanismo
+
+A mesma capacidade é exercida quando a mensagem Telegram traz um **anexo `.html` ou `.htm`** em vez de uma URL pública. O detector emite, sem I/O:
+
+```csharp
+CandidatePlaylist {
+  Kind = Attachment,
+  FileName = "m3u@host.example_07-09-2026.html",
+  DetectedFrom = "html attachment",
+  RequiresContentVerification = true,
+  Content = null   // downloaded by ProcessAttachmentCandidatesAsync
+}
+```
+
+A partir daqui o download, a gate `LooksLikeHtmlPublication`, a chamada ao `XtreamPublicationResolver`, a promoção a `CandidatePlaylist { DetectedFrom = "xtream publication" }` e o fan-out no pipeline M3U/Xtream são **idênticos** ao caso URL pública acima. **Não há um parser novo** — apenas uma fonte adicional para o mesmo `XtreamPublicationResolver`.
+
+Detecções suportadas pelo `M3uCandidateDetector.IsHtmlFilename`:
+
+| Filename | Detectado? |
+|---|---|
+| `m3u@host.example_07-09-2026.html` | sim |
+| `m3u@host.example_07-09-2026.htm` | sim |
+| `foo.HTML`, `foo.HTM`, `foo.HtMl`, `foo.HtM` | sim (case-insensitive) |
+| `page.htmx`, `nothtml.txt`, `script.js` | não |
+| `null` / `""` | não |
+
+#### Referências `t.me/c/<channel>/<message>` — caminho Telegram
+
+Deep links do Telegram (e.g. `https://t.me/c/1635952193/110637`) **são suportados**. O `TelegramPublicationDiscovery` identifica-os a partir do texto da mensagem e o `TelegramPublicationResolver` resolve-os via `WTelegram.Channels_GetMessages(inputChannel, [InputMessageID])` usando o `access_hash` cacheado a partir dos diálogos do `_client.Messages_GetAllDialogs()`.
+
+Casos cobertos:
+
+- Mensagem resolvida contém **texto com URL HTTP pública** → sub-publicação reportada no `ChildPublications`, tratada pelo pipeline de URL existente.
+- Mensagem resolvida contém **attachment HTML `.html`/`.htm`** com cards Xtream → aplica-se o `XtreamPublicationResolver.ResolveFromHtml`, devolvendo 0..N `XtreamAccountInfo`. Cada conta é promovida a `CandidatePlaylist { DetectedFrom="xtream publication" }` que re-entra no loop principal do pipeline M3U/Xtream.
+- Mensagem resolvida contém **attachment M3U** → o conteúdo é entregue como `Content` no `CandidatePlaylist` (sem mudança adicional).
+- Mensagem contém **outras referências Telegram** (`https://t.me/c/...`) → recursão controlada com depth-limit (`MaxResolutionDepth = 3`) e seen-set.
+- Mensagem contém **attachment desconhecido** (e.g. `.pdf`) → `PublicationState.RequiresReview`.
+- Mensagem **sem nada útil** → `PublicationState.Unsupported`.
+- Mensagem **inacessível** (canal inexistente, FLOOD_WAIT persistente, `CHANNEL_INVALID`) → `PublicationState.ResolutionFailed` com `Reason` sanitizado. **A mensagem não desaparece silenciosamente**: é registada no `RunReport.PublicationsTriageLog`.
+
+Telegram publication URLs (`https://t.me/<username>/<message>`) sem canal id explícito **não** são suportadas nesta iteração — apenas o formato `t.me/c/<channel>/<message>`. Esta decisão evita resolver usernames via `Messages_ResolveUsername` (que adiciona uma chamada API e mais um ponto de falha).
+
+
 #### Sanitização de credenciais
 
 A URL interna do candidato Xtream contém credenciais (necessárias para o download HTTP). O projecto distingue explicitamente entre **artefactos funcionais** e **artefactos de diagnóstico** para não quebrar a reprodução Xtream nem expor credenciais:
@@ -151,27 +265,81 @@ Fluxo real do modo Telegram:
 Telegram messages
    ↓
 M3uCandidateDetector.DetectFromMessage
+   ├─ m3u/m3u8 URL ou filename → CandidatePlaylist M3U
+   ├─ Xtream URL → CandidatePlaylist Xtream (resolve para get.php)
+   ├─ "url (inspect)" → CandidatePlaylist com RequiresContentVerification
+   ├─ .html / .htm attachment → CandidatePlaylist { DetectedFrom="html attachment",
+   │                                                    RequiresContentVerification=true }
+   ↓
+TelegramScraperService.ExtractRemainingHttpUrls
+(URLs HTTP genéricas -> candidatas a publicação HTML)
+   ↓
+TelegramPublicationDiscovery.DiscoverFromText
+   ├─ https://t.me/c/<channel>/<message> → TelegramPublicationRef
+   │       (referencia Telegram; resolvida via WTelegram Channels_GetMessages)
+   └─ outras URLs HTTP → TelegramPublicationRef (processadas como publicacao URL)
+   ↓
+TelegramPublicationResolver.ResolveAsync
+   - dado um TelegramMessageFetcher injetado (testavel)
+   - aplica depth-limit (MaxResolutionDepth=3) e seen-set para evitar ciclos
+   - classifica resultado: Resolved / ResolutionFailed / RequiresReview / Unsupported
+   - para mensagens com attachment HTML: aplica XtreamPublicationResolver.ResolveFromHtml
+   - cada conta Xtream descoberta -> promoted a CandidatePlaylist (mesmo fan-out)
    ↓
 CandidatePlaylist
    ↓
 DownloadPlaylistContentAsync (URL) / DownloadTelegramDocumentTextAsync (anexo)
    ↓
-[M3U detection] — se RequiresContentVerification, o conteúdo HTTP tem de começar por #EXTM3U
-   ↓
-M3uParserService.Parse
+[Gate #EXTM3U / HTML]
+   ├─ começa por #EXTM3U → pipeline M3U/Xtream (AnalyzePlaylist → Parse → ValidateStreams → TestStreams)
+   ├─ parece HTML (<!DOCTYPE / <html) → XtreamPublicationResolver.ResolveFromHtml
+   │      ↓
+   │   N XtreamAccountCandidate (uma por card: endpoint + user; password fora da identidade)
+   │      ↓
+   │   cada conta → CandidatePlaylist (DetectedFrom = "xtream publication")
+   │      ↓
+   │   re-entra no mesmo pipeline M3U/Xtream acima
+   └─ outro conteúdo → rejeitado (conteúdo não é playlist M3U)
    ↓
 CountryChannelValidator.AnalyzePlaylist(content, countryCode, threshold: 3)
    ↓
    ├─ País alvo (≥3 canais distintos) → M3uTesterService.TestM3u8Stream
    └─ País não corresponde / playlist inválida → rejeitada, sem testar streams
    ↓
-RunReport (métricas + motivos de rejeição)
+RunReport (métricas + motivos de rejeição + triage de publicações)
    ↓
 ImportHistoryService.RecordImportAsync
    ↓
 PlaylistManagerService.SaveToM3uPlaylist / SaveToJsonReport
    ↓
 output/telegram_run_report.json  +  output/playlist*.m3u
+```
+
+### Camadas de descoberta e resolução (introduzido 2026-09-09)
+
+A nova capacidade introduz três camadas distintas com responsabilidades separadas:
+
+1. **TelegramPublicationDiscovery** — parsing puro (sem I/O). Identifica:
+   - `https://t.me/c/<channel_id>/<message_id>` (referência Telegram com (channel, message) resolvíveis via WTelegram).
+   - Outras URLs HTTP genéricas no texto (mecanismo já existente).
+2. **TelegramPublicationResolver** — recebe uma lista de `TelegramPublicationRef` e um `TelegramMessageFetcher` (delegate injectado, testável sem WTelegram). Para cada referência:
+   - Resolve a mensagem (texto + attachment).
+   - Classifica resultado (`Resolved`, `ResolutionFailed`, `RequiresReview`, `Unsupported`).
+   - Para attachment HTML, aplica `XtreamPublicationResolver.ResolveFromHtml` e devolve `IReadOnlyList<XtreamAccountInfo>`.
+   - Para mensagens com sub-referências no texto, recursa com depth-limit (`MaxResolutionDepth=3`) e seen-set.
+3. **TelegramPublicationReference** no `TelegramScraperService` — orquestrador: integra as duas camadas no loop principal, converte contas Xtream em `CandidatePlaylist { DetectedFrom="xtream publication" }` que entram no pipeline M3U/Xtream existente (zero duplicação).
+
+Estados de triagem expostos no `RunReport`:
+
+- `PublicationsDiscovered` — total de referências + URLs HTTP captadas.
+- `PublicationsResolved` — cujo conteúdo foi obtido com sucesso.
+- `PublicationsResolutionFailed` — canal inexistente, mensagem inacessível, FLOOD_WAIT persistente.
+- `PublicationsRequiresReview` — HTML sem cards Xtream / attachment desconhecido.
+- `PublicationsUnsupported` — texto sem URLs nem anexos úteis.
+- `XtreamAccountsDiscovered` / `XtreamAccountsAfterDedup` / `XtreamAccountsForwarded` — fan-out.
+
+Cada entrada inclui `PublicationTriageEntry { Kind, Reference, ChannelId, MessageId, State, Reason, XtreamAccountsFound }`. `Reference` é sempre URL público (t.me/c/...) ou URL de página HTTP sem credenciais. `Reason` é sanitizado contra credenciais antes de ser persistido.
+
 ```
 
 Método principal: `TelegramScraperService.SearchAndTestM3UInTelegramAsync`.
@@ -291,10 +459,54 @@ O dashboard (`Services/WebDashboardService.cs`, `HttpListener`) serve a UI em `h
 | `/api/run-report` | `RunReport` da última execução (sanitizado). |
 | `/api/discovered-playlists` | Lista de playlists descobertas na última execução (sanitizado). |
 
-A UI mostra:
+### Navegação do Dashboard
 
-- **Diagnóstico da última execução**: última execução, estado, mensagens, candidatos, playlists, playlists do país, streams encontrados/testados/funcionais/falhados, duração.
-- **Últimas playlists descobertas**: origem, nome, país detectado, canais reconhecidos, número de streams, streams funcionais, estado.
+O dashboard tem os seguintes separadores principais:
+
+- **Overview**: resumo do sistema com métricas da última execução, carteiras de streams e estado do Dispatcharr.
+- **Execuções**: histórico detalhado das últimas 72h com métricas por execução.
+- **Descoberta**: playlists descobertas com filtros por estado, origem e país.
+- **Canais / Países**: validação da playlist actual por país e gestão das listas de aliases.
+- **Playlist**: visualização da playlist actual com links para download funcional.
+- **Dispatcharr**: estado da última sincronização e detalhes do plano/report.
+- **Catálogo**: gestão completa do catálogo de canais (ver secção abaixo).
+- **Diagnóstico**: inventário de ficheiros, RunReport completo e glossário de métricas.
+
+### Catálogo de Canais
+
+O catálogo (`ChannelCatalogDbContext`, SQLite em `/data/channel-catalog.db`) gere:
+
+| Separador | Conteúdo |
+|---|---|
+| **Visão Geral** | Estatísticas agregadas do catálogo (canais, aliases, regras, pending approvals). |
+| **Canais** | Lista de canais canónicos com DisplayName, Key, Categoria, Grupo editorial, Política de publicação, Activo, Aliases. |
+| **Regras** | IdentityRules explícitas que sobrepõem o matching automático. Criar regra com `ReviewOnly` permite fuzzy matching futuro; `Excluded` bloqueia o canal permanentemente. |
+| **Afinidades** | Grupos de afinidade (e.g. "TVI" com membros "tvi24", "tvi 24", "tvi noticias"). Os membros são injetados no `CountryChannelValidator` como aliases adicionais para country-level targeting. |
+| **Reviews** | Itens de revisão do Dispatcharr (decisões ambíguas ou uncertainas pendentes de decisão humana). |
+| **Sync Runs** | Histórico de sincronizações Dispatcharr com contadores de created/merged/protected/removed. |
+| **Pending** | Canais que geraram dúvida no country-level targeting e aguardam decisão manual (ver secção seguinte). |
+
+### Pending Country Approvals
+
+Esta funcionalidade permite ao utilizador decidir manualmente sobre canais que geraram dúvida durante o country-level targeting.
+
+**Quando surge um canal para aprovação manual?**
+
+Quando um stream tem indicadores de país (e.g. "PT" no título ou group-title) mas:
+- Não bate num canal canónico conhecido
+- Não corresponde a nenhum grupo de afinidade
+- O matching fuzzy também não encontra correspondência clara
+
+**Motivos de dúvida:**
+- `weak_country_match`: o canal tem indicação de país mas não bate em nada conhecido (e.g. "RTP Africa", "PT Sports Channel")
+- `affinity_no_channel`: o canal corresponde a um grupo de afinidade mas o grupo não tem canal canónico associado
+
+**Como funciona a aprovação manual:**
+
+1. **Aprovar** → Cria uma `IdentityRule` com `ReviewOnly` que permite fuzzy matching futuro. O canal fica elegível para ser criado automaticamente em sincronizações futuras.
+2. **Reprovar** → Cria uma `IdentityRule` com `Excluded` que impede o canal de ser aceite. Útil para descartar canais extranjeros que usam indicadores de país enganosos.
+
+**Nota de segurança**: As URLs mostradas na lista de pending approvals são sanitizadas antes de guardar (`CredentialSanitizer.SanitizeUrl`), pelo que nunca expõem credenciais Xtream.
 
 ### Modelo de segurança do dashboard
 
@@ -358,7 +570,7 @@ Uma playlist estrangeira (ex.: apenas canais `La 1`, `Antena 3`, `Telecinco`) é
 ## Estado dos testes
 
 - Build: `dotnet build m3uCrawler.sln --configuration Release` → **0 warnings, 0 errors**.
-- Testes: `dotnet test m3uCrawler.Tests/m3uCrawler.Tests.csproj --configuration Release --no-build --nologo` → **977 testes, 977 passados, 0 falhados** (verificado em 2026-09-03 com `dotnet 9.0.317`).
+- Testes: `dotnet test m3uCrawler.Tests/m3uCrawler.Tests.csproj --configuration Release --no-build --nologo` → **1066 testes, 1066 passados, 0 falhados** (verificado em 2026-09-06 com `dotnet 9.0.317`).
 - O runner descobre e executa todos os testes; não há testes que passem sem realmente exercitar o comportamento (detector, parser, validação por país com threshold/famílias/falsos-positivos, merge de manutenção).
 - Não há teste de integração de rede (Telegram/HTTP); os testes são unitários e independentes de infra-estrutura externa.
 
@@ -369,6 +581,7 @@ m3uCrawler/
 ├── Models/
 │   ├── M3uStream.cs                 # Modelo de stream M3U (URL, título, group, logo, OriginalExtInf).
 │   ├── CandidatePlaylist.cs         # Candidato a playlist (URL/anexo, content, RequiresContentVerification).
+│   ├── XtreamAccountInfo.cs         # DTO intermediário para uma conta Xtream descoberta via publicação HTML (sem serialização; password nunca na identidade).
 │   ├── DiscoveredPlaylist.cs        # Resumo de uma playlist para o RunReport.
 │   ├── RunReport.cs                 # Relatório detalhado de uma execução.
 │   └── ImportHistoryEntry.cs        # Entrada de histórico (inclui métricas de discovery).
@@ -377,9 +590,10 @@ m3uCrawler/
 │   ├── M3uTesterService.cs          # Teste de streams M3U8.
 │   ├── M3uParserService.cs          # Parser M3U centralizado (preserva EXTINF).
 │   ├── M3uCandidateDetector.cs      # Descoberta de candidatos (URL/anexo/conteúdo).
+│   ├── XtreamPublicationResolver.cs # Resolver de publicações HTML com cards Xtream (sem I/O).
 │   ├── PlaylistManagerService.cs    # Gestão e escrita de playlists M3U/JSON.
 │   ├── ImportHistoryService.cs      # Persistência do histórico.
-│   ├── TelegramScraperService.cs    # Pipeline Telegram (discovery→parser→país→teste).
+│   ├── TelegramScraperService.cs    # Pipeline Telegram (discovery→parser→país→teste) + orquestração de fan-out Xtream.
 │   ├── CountryChannelValidator.cs   # Validação por país (AnalyzePlaylist + legacy ValidatePlaylist/ValidateStreams).
 │   ├── CountryChannelListService.cs # Gestão das listas de canais por país (preservada).
 │   └── WebDashboardService.cs       # Dashboard web (HttpListener) e endpoints JSON.
