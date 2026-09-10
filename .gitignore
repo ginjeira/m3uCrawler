@@ -23,3 +23,7 @@ m3uCrawler/runtime-data/*
 TestResults/
 **/TestResults/
 
+# Real-world Telegram publication fixtures (may contain real credentials).
+m3uCrawler.Tests/Fixtures/
+
+

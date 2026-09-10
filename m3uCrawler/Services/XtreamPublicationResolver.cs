@@ -37,11 +37,13 @@ namespace m3uCrawler.Services
         };
         private static readonly string[] M3uLabels =
         {
-            "m3u", "m3u url", "m3u_url", "playlist", "playlist url"
+            "m3u", "m3u url", "m3u_url", "playlist", "playlist url",
+            "host m3u", "real m3u", "m3u host", "m3u real"
         };
         private static readonly string[] EpgLabels =
         {
-            "epg", "epg url", "epg_url", "xmltv", "xmltv url", "guide"
+            "epg", "epg url", "epg_url", "xmltv", "xmltv url", "guide",
+            "epg link", "epg lnk"
         };
         private static readonly string[] ExpiresLabels =
         {
@@ -124,8 +126,46 @@ namespace m3uCrawler.Services
                 if (account != null) accounts.Add(account);
             }
 
+            // Fallback adaptativo: se o caminho DOM nao extraiu nenhuma conta,
+            // tentar o parser flat-text baseado em clustering de ancora. Isto
+            // absorve formatos onde o publisher nao usa estrutura HTML (cosmetic
+            // Unicode, sem <table>/<hr>/class=card). Ver ResolveFromFlatText para
+            // detalhes. O threshold minimo de tamanho e' baixo (50 chars) porque
+            // o proprio ResolveFromFlatText ja descarta inputs muito pequenos.
+            if (accounts.Count == 0)
+            {
+                var flatText = HtmlEntity.DeEntitize(doc.DocumentNode.InnerText ?? string.Empty);
+                var flatAccounts = ResolveFromFlatText(
+                    flatText,
+                    sourcePublicationUrl,
+                    sourceTelegramMessageId,
+                    sourceTelegramChannel);
+                if (flatAccounts.Count > 0)
+                {
+                    return Deduplicate(flatAccounts.ToList());
+                }
+            }
+
             return Deduplicate(accounts);
         }
+
+        // Tamanho minimo do texto plano para activar o fallback adaptativo.
+        // ResolveFromFlatText faz a sua propria gating em 50 chars.
+        private const int MinFlatTextLengthForFallback = 50;
+
+        // Janela maxima (em caracteres) entre duas ancora consecutivas que
+        // pertencem ao mesmo card. Acima desta distancia, considera-se que
+        // comeca um novo card.
+        //
+        // NOTA: o parser adaptativo tem um trade-off fundamental. Publishers
+        // que intercalam metadata (e.g. "MEDIA LIST" com labels como CHANNELS,
+        // MOVIES, SERIES) entre cards Xtream tornam impossivel distinguir
+        // essas metadata labels de labels do card sem heuristicas especifica
+        // do publisher. Para esses casos, o parser produz menos contas do
+        // que existem (cards que partilham labels sao fundidos num so').
+        // Janela conservadora (500) minimiza fundicoes a custo de perder
+        // alguns M3U/EPG labels que ficam fora do card.
+        private const int AnchorClusterWindowChars = 500;
 
         private static List<HtmlNode> ExtractCardContainers(HtmlDocument doc)
         {
@@ -532,7 +572,8 @@ namespace m3uCrawler.Services
                 scheme = uri.Scheme.ToLowerInvariant();
                 host = uri.Host;
                 port = uri.IsDefaultPort ? DefaultPortFor(scheme) : uri.Port;
-                return !string.IsNullOrWhiteSpace(host);
+                if (string.IsNullOrWhiteSpace(host)) return false;
+                return LooksLikeValidHost(host);
             }
 
             // Formato "host:port" sem esquema.
@@ -553,6 +594,30 @@ namespace m3uCrawler.Services
             if (slash >= 0) hostPart = hostPart[..slash];
             host = hostPart.Trim().ToLowerInvariant();
             if (host.Length == 0) return false;
+            return LooksLikeValidHost(host);
+        }
+
+        /// <summary>
+        /// Validacao minima de um host string. Deve conter pelo menos um '.'
+        /// (formato DNS valido) OU ser um IPv4 literal. Rejeita texto livre
+        /// como "not-a-real-host" (com hifens) ou "example" (sem TLD).
+        /// </summary>
+        private static bool LooksLikeValidHost(string host)
+        {
+            if (string.IsNullOrWhiteSpace(host)) return false;
+            // IPv4: 4 grupos de 1-3 digitos separados por '.'.
+            if (System.Net.IPAddress.TryParse(host, out _)) return true;
+            // Hostname: alfanumerico + '-', deve conter pelo menos um '.'.
+            if (!host.Contains('.')) return false;
+            // Cada label entre pontos deve ter pelo menos 1 char alfanumerico.
+            foreach (var part in host.Split('.'))
+            {
+                if (part.Length == 0) return false;
+                foreach (var c in part)
+                {
+                    if (!(char.IsLetterOrDigit(c) || c == '-')) return false;
+                }
+            }
             return true;
         }
 
@@ -599,6 +664,486 @@ namespace m3uCrawler.Services
                 if (seen.Add(id)) result.Add(a);
             }
             return result;
+        }
+
+        /// <summary>
+        /// Parser flat-text adaptativo. Usado como fallback quando o caminho DOM
+        /// nao produz contas mas o texto e' significativo. Nao depende de estrutura
+        /// HTML especifica (sem <table>, <hr>, class=card). Em vez disso:
+        ///
+        ///   1. Strip de ruido cosmico (emoji, linhas decorativas, fancy glyphs
+        ///      que nao sao letras/digitos).
+        ///   2. Deteccao de ANCORAS: posicoes no texto onde um label conhecido
+        ///      do vocabulario Xtream aparece (com qualquer separador).
+        ///   3. Clustering de ancora por proximidade: duas ancora dentro de
+        ///      AnchorClusterWindowChars pertencem ao mesmo card; fora disso,
+        ///      novo card.
+        ///   4. Extraccao de valores por ancora dentro de cada cluster:
+        ///      primeiro tenta mesma-linha, depois linha seguinte ate proxima
+        ///      ancora.
+        ///   5. Co-ocorrencia obrigatoria H+U+P; senao card descartado.
+        ///
+        /// O vocabulario de labels e' estavel (conceitos Xtream), portanto este
+        /// parser absorve variacoes cosmicas (fontes Unicode, separadores
+        /// exoticos, layouts diferentes) sem alteracao de codigo.
+        /// </summary>
+        internal static IReadOnlyList<XtreamAccountInfo> ResolveFromFlatText(
+            string flatText,
+            string sourcePublicationUrl,
+            string sourceTelegramMessageId = "",
+            string sourceTelegramChannel = "")
+        {
+            if (string.IsNullOrWhiteSpace(flatText)) return Array.Empty<XtreamAccountInfo>();
+
+            var cleaned = StripCosmeticNoise(flatText);
+            if (cleaned.Length < 50) return Array.Empty<XtreamAccountInfo>();
+
+            var anchors = FindAnchors(cleaned);
+            if (anchors.Count < 3) return Array.Empty<XtreamAccountInfo>();
+
+            var clusters = ClusterAnchors(anchors, AnchorClusterWindowChars);
+            if (clusters.Count == 0) return Array.Empty<XtreamAccountInfo>();
+
+            var accounts = new List<XtreamAccountInfo>();
+            foreach (var cluster in clusters)
+            {
+                var fields = ExtractFieldsFromCluster(cluster, cleaned);
+                var account = BuildAccount(
+                    fields,
+                    sourcePublicationUrl,
+                    sourceTelegramMessageId,
+                    sourceTelegramChannel);
+                if (account != null) accounts.Add(account);
+            }
+            return accounts;
+        }
+
+        /// <summary>
+        /// Strip de ruido cosmico. Remove:
+        ///   * ANSI escape codes (terminal coloring);
+        ///   * box-drawing chars (U+2500..U+25FF);
+        ///   * symbols/misc/dingbats (U+2600..U+27BF, U+2900..U+2BFF);
+        ///   * sequencias longas de chars repetidos (divisores ━━━━━ ou /////);
+        ///   * emojis (pares surrogate U+D800..U+DFFF + U+1F000..U+1FAFF);
+        ///   * zero-width chars.
+        /// Mantem letras, digitos, pontuacao util (: = > | - _) e espacos.
+        ///
+        /// IMPORTANTE: a transliteracao fancy->ASCII acontece ANTES do strip,
+        /// para que pares surrogate de chars matematicos (e.g. U+1D7B
+        /// "MATEMATICAL DOUBLE-STRUCK DIGIT THREE" = surrogate pair D835 DFF9)
+        /// sejam convertidos em ASCII '3' antes do strip os apanhar.
+        /// </summary>
+        private static string StripCosmeticNoise(string raw)
+        {
+            if (string.IsNullOrEmpty(raw)) return string.Empty;
+            // Normalizar quebras de linha para \n.
+            var s = raw.Replace("\r\n", "\n").Replace('\r', '\n');
+
+            var lines = s.Split('\n');
+            var sb = new StringBuilder(s.Length);
+            foreach (var originalLine in lines)
+            {
+                // 0. Transliterar pares surrogate (math chars) para ASCII antes de strip.
+                var line = TransliterateSupplementPlaneToAscii(originalLine);
+                // 1. Strip ANSI escape codes (CSI sequences: ESC[ ... letter).
+                line = Regex.Replace(line, @"\x1B\[[0-?]*[ -/]*[@-~]", " ");
+                // 2. Strip box-drawing chars (U+2500..U+257F) e block elements (U+2580..U+259F).
+                line = Regex.Replace(line, @"[\u2500-\u259F]+", " ");
+                // 3. Strip geometric shapes + dingbats + arrows + symbols (U+25A0..U+27BF).
+                line = Regex.Replace(line, @"[\u25A0-\u27BF]+", " ");
+                // 4. Strip supplemental arrows + misc symbols + math (U+2900..U+2BFF).
+                line = Regex.Replace(line, @"[\u2900-\u2BFF]+", " ");
+                // 4b. Strip math operators (U+2200..U+22FF) e misc technical (U+2300..U+23FF).
+                line = Regex.Replace(line, @"[\u2200-\u23FF]+", " ");
+                // 5. Strip emoji / surrogate pairs (U+D800..U+DFFF + supplementary plane chars).
+                line = Regex.Replace(line, @"[\uD800-\uDBFF\uDC00-\uDFFF]+", " ");
+                line = Regex.Replace(line, @"[\uF000-\uFFFD]+", " ");
+                // 6. Strip sequencias longas do mesmo char (>= 4) que nao sejam letras/digitos.
+                line = Regex.Replace(line, @"([^\w\s])\1{3,}", " ");
+                // 7. Strip zero-width chars.
+                line = Regex.Replace(line, @"[\u200B-\u200F\uFEFF]+", "");
+
+                var trimmed = line.Trim();
+                if (trimmed.Length == 0) continue;
+
+                // 8. Descartar linhas que so' tinham box-drawing/emoji no original.
+                //    Heuristica: se depois do strip a linha tem < 2 chars alfanum,
+                //    provavelmente era decoracao.
+                var alphanum = Regex.Replace(trimmed, @"[^A-Za-z0-9]+", "");
+                if (alphanum.Length < 2) continue;
+
+                sb.Append(trimmed).Append('\n');
+            }
+            return sb.ToString();
+        }
+
+        /// <summary>
+        /// Transliterate codepoints em supplementary plane (U+10000..U+10FFFF,
+        /// sempre codificados como surrogate pair) para ASCII. Usado antes
+        /// do strip para que chars matematicos como U+1D7B (MATEMATICAL
+        /// DOUBLE-STRUCK DIGIT THREE = surrogate D835 DFF9) nao sejam
+        /// removidos como se fossem emoji.
+        /// </summary>
+        private static string TransliterateSupplementPlaneToAscii(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return string.Empty;
+            var sb = new StringBuilder(s.Length);
+            int i = 0;
+            while (i < s.Length)
+            {
+                int codePoint;
+                int charCount;
+                if (char.IsHighSurrogate(s[i]) && i + 1 < s.Length && char.IsLowSurrogate(s[i + 1]))
+                {
+                    codePoint = char.ConvertToUtf32(s[i], s[i + 1]);
+                    charCount = 2;
+                }
+                else
+                {
+                    codePoint = s[i];
+                    charCount = 1;
+                }
+
+                // Apenas mapeamos o que e' estritamente necessario: digits duplos
+                // e symbols especificos usados por publicacoes IPTV.
+                // Nota: o codepoint real do "double-struck 3" e' U+1D7D3 (e nao
+                // U+1D7F9 como aparece quando vejo o surrogate pair errado).
+                // Mapeamos APENAS o range oficial U+1D7D0..U+1D7D9 (0..9).
+                if (codePoint >= 0x1D7D0 && codePoint <= 0x1D7D9)
+                {
+                    // Mathematical double-struck digits 0..9 (U+1D7D0..U+1D7D9).
+                    sb.Append((char)('0' + (codePoint - 0x1D7D0)));
+                }
+                else if (codePoint == 0x1D7F9 || codePoint == 0x1D7D3)
+                {
+                    // Defensive: alguns renderers usam U+1D7F9 para "3". Mapeamos para '3'.
+                    sb.Append('3');
+                }
+                else
+                {
+                    for (int j = 0; j < charCount; j++) sb.Append(s[i + j]);
+                }
+                i += charCount;
+            }
+            return sb.ToString();
+        }
+
+        /// <summary>
+        /// Encontra posicoes de labels conhecidos seguidos de um separador.
+        /// Separadores suportados: : = > | - ➢ → em qualquer combinacao (1-3 chars).
+        /// O label capturado e' normalizado (lowercase, fancy glyphs colapsados).
+        /// </summary>
+        private static List<Anchor> FindAnchors(string cleaned)
+        {
+            var result = new List<Anchor>();
+
+            // Regex sobre label+separador+inicio de valor.
+            // Label: 1-30 chars (letras latinas + Latin-1 supplement U+00C0..U+00FF
+            //   para acentos PT/ES/FR + modifier letters U+1D00..U+1D7F
+            //   + IPA extensions U+0260..U+029F usados em small caps / fonte estilizada)
+            //   com pelo menos 1 char ASCII no inicio.
+            // Separador: espacos OU : = > | - ➢ → (1-3 chars). Espacos sao
+            //   separadores validos quando o publisher usa apenas whitespace
+            //   (ex.: "Host   http://example.com").
+            // NOTA: nao usamos negative lookahead aqui (causa falsos negativos
+            //   quando o valor comeca por uma letra, e.g. URL "http://...").
+            //   A proteccao contra labels compostos (e.g. "Active Connections"
+            //   -> "Active" + "Connections") e' feita via clustering por
+            //   proximidade + split em labels repetidas, ver ClusterAnchors.
+            var pattern = new Regex(
+                @"(?<label>[A-Za-z][A-Za-z0-9 _\-\.\u00C0-\u00FF\u1D00-\u1D7F\u0260-\u029F]{0,30}?[A-Za-z0-9\u00C0-\u00FF\u1D00-\u1D7F\u0260-\u029F])\s*[:=➢→|>\-]{0,3}\s+",
+                RegexOptions.Compiled);
+            var matches = pattern.Matches(cleaned);
+            foreach (Match m in matches)
+            {
+                var rawLabel = m.Groups["label"].Value;
+                var canonical = CanonicalLabelKey(rawLabel);
+                if (canonical.Length == 0) continue;
+                if (!IsKnownLabelAny(canonical)) continue;
+                result.Add(new Anchor
+                {
+                    Position = m.Index,
+                    LabelEndPosition = m.Index + m.Length,
+                    RawLabel = rawLabel,
+                    CanonicalLabel = canonical,
+                });
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// Clusteriza ancora por proximidade. Cada cluster = conjunto de
+        /// ancora separadas por menos de windowChars. NAO partimos o cluster
+        /// em labels repetidas: em vez disso, ExtractFieldsFromCluster usa
+        /// `if (!dict.ContainsKey(label))` para ficar com o primeiro valor
+        /// de cada label. A janela de 800 chars acomoda publishers estilo
+        /// "iptvgold" onde Host+User+Pass ficam no topo e M3U/EPG no fundo
+        /// do card; publishers mais compactos continuam a funcionar porque
+        /// ExtractFieldsFromCluster e' ganancioso dentro do cluster.
+        ///
+        /// Um cluster so' produz conta se tiver H+U+P (ver BuildAccount).
+        /// Clusters que falham este gate sao descartados silenciosamente.
+        /// </summary>
+        private static List<List<Anchor>> ClusterAnchors(List<Anchor> anchors, int windowChars)
+        {
+            var result = new List<List<Anchor>>();
+            if (anchors.Count == 0) return result;
+
+            var current = new List<Anchor>();
+            int lastPos = -windowChars;
+
+            foreach (var a in anchors)
+            {
+                if (current.Count > 0 && (a.Position - lastPos) > windowChars)
+                {
+                    // Gap grande: fecha cluster actual e inicia novo.
+                    result.Add(current);
+                    current = new List<Anchor>();
+                }
+                current.Add(a);
+                lastPos = a.Position;
+            }
+            if (current.Count > 0) result.Add(current);
+
+            return result;
+        }
+
+        /// <summary>
+        /// Extrai pares label/valor de um cluster. Para cada ancora:
+        ///   1. Tenta valor na mesma linha (depois do separador ate fim da linha).
+        ///   2. Se vazio, tenta concatenar linhas seguintes ate proxima ancora
+        ///      ou fim do cluster.
+        /// </summary>
+        private static Dictionary<string, string> ExtractFieldsFromCluster(
+            List<Anchor> cluster, string cleaned)
+        {
+            var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (cluster.Count == 0) return dict;
+
+            var lines = cleaned.Split('\n');
+            var lineOffsets = ComputeLineOffsets(cleaned);
+
+            for (int i = 0; i < cluster.Count; i++)
+            {
+                var anchor = cluster[i];
+                var nextAnchor = i + 1 < cluster.Count ? cluster[i + 1] : null;
+
+                // Mapear posicao do anchor para linha.
+                int lineIdx = FindLineIndex(anchor.LabelEndPosition, lineOffsets);
+                if (lineIdx < 0) continue;
+
+                // 1) Valor na mesma linha.
+                string value = ExtractValueFromLineAfterPosition(lines[lineIdx], anchor.LabelEndPosition - lineOffsets[lineIdx]);
+
+                // 2) Se vazio, tentar concatenar proximas linhas ate proxima ancora.
+                if (string.IsNullOrWhiteSpace(value) && nextAnchor != null)
+                {
+                    int nextLineIdx = FindLineIndex(nextAnchor.Position, lineOffsets);
+                    if (nextLineIdx > lineIdx + 1)
+                    {
+                        var sb = new StringBuilder();
+                        for (int j = lineIdx + 1; j < nextLineIdx; j++)
+                        {
+                            var l = lines[j].Trim();
+                            if (l.Length == 0) continue;
+                            if (sb.Length > 0) sb.Append(' ');
+                            sb.Append(l);
+                        }
+                        value = sb.ToString();
+                    }
+                }
+
+                value = value?.Trim() ?? string.Empty;
+                if (value.Length == 0) continue;
+                if (!dict.ContainsKey(anchor.CanonicalLabel)) dict[anchor.CanonicalLabel] = value;
+            }
+
+            return dict;
+        }
+
+        private static int[] ComputeLineOffsets(string text)
+        {
+            var offsets = new List<int> { 0 };
+            for (int i = 0; i < text.Length; i++)
+            {
+                if (text[i] == '\n') offsets.Add(i + 1);
+            }
+            return offsets.ToArray();
+        }
+
+        private static int FindLineIndex(int charPos, int[] lineOffsets)
+        {
+            // Binary search: devolve indice da linha onde charPos cai.
+            int lo = 0, hi = lineOffsets.Length - 1;
+            while (lo <= hi)
+            {
+                int mid = (lo + hi) / 2;
+                int start = lineOffsets[mid];
+                int end = mid + 1 < lineOffsets.Length ? lineOffsets[mid + 1] - 1 : int.MaxValue;
+                if (charPos < start) hi = mid - 1;
+                else if (charPos > end) lo = mid + 1;
+                else return mid;
+            }
+            return Math.Min(Math.Max(lo, 0), lineOffsets.Length - 1);
+        }
+
+        private static string ExtractValueFromLineAfterPosition(string line, int relPos)
+        {
+            if (relPos < 0 || relPos >= line.Length) return string.Empty;
+            var v = line.Substring(relPos).Trim();
+            // Strip leading separator-like chars que tenham ficado no valor
+            // (ex.: "Host -> http://..." produz valor "-> http://...").
+            // Iterar ate' nao haver mais desses chars no inicio.
+            while (v.Length > 0)
+            {
+                var c = v[0];
+                if (c == '-' || c == '=' || c == '|' || c == '>' || c == '➢' || c == '→' || c == ':')
+                {
+                    v = v.Substring(1).TrimStart();
+                }
+                else
+                {
+                    break;
+                }
+            }
+            return v;
+        }
+
+        /// <summary>
+        /// Canonicaliza uma label: colapsa fancy glyphs Unicode para ASCII,
+        /// lowercasa, remove chars nao-alfanumericos (excepto espaco),
+        /// colapsa espacos.
+        /// Resultado: chave normalizada para usar em IsKnownLabelAny.
+        /// "Usᴇʀ" -> "user", "Hᴏsᴛ" -> "host", "Pᴀss" -> "pass",
+        /// "M𝟹ᴜ" -> "m u" (chars privados desaparecem), "Eᴘɢ Lɪɴᴋ" -> "epg lnk".
+        /// </summary>
+        private static string CanonicalLabelKey(string raw)
+        {
+            if (string.IsNullOrWhiteSpace(raw)) return string.Empty;
+            // Transliterate cobre apenas o que foi mapeado em TryMapFancyToAscii.
+            // O resto (incluindo chars fora do nosso mapa) e' simplesmente descartado
+            // na fase final deste metodo.
+            var s = TransliterateToAscii(raw.Trim().ToLowerInvariant());
+            // Strip tudo o que nao seja a-z / 0-9 / espaco.
+            var sb = new StringBuilder(s.Length);
+            foreach (var c in s)
+            {
+                if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == ' ')
+                {
+                    sb.Append(c);
+                }
+            }
+            var collapsed = Regex.Replace(sb.ToString(), @"\s+", " ").Trim();
+            return collapsed;
+        }
+
+        /// <summary>
+        /// Tenta mapear chars Unicode "fancy" (modifier letters, small caps,
+        /// subscript digits, etc.) para ASCII equivalente. Nao captura todos
+        /// os casos (ha' milhares de glifos Unicode) mas abrange os mais
+        /// comuns em publicacoes IPTV (U+1D00..U+1D7F, U+2090..U+209F).
+        /// </summary>
+        private static string TransliterateToAscii(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return string.Empty;
+            // Modifier letters usados em "small caps" estilo fancy.
+            var sb = new StringBuilder(s.Length);
+            foreach (var c in s)
+            {
+                char ascii;
+                if (TryMapFancyToAscii(c, out ascii))
+                {
+                    sb.Append(ascii);
+                }
+                else
+                {
+                    sb.Append(c);
+                }
+            }
+            return sb.ToString();
+        }
+
+        private static bool TryMapFancyToAscii(char c, out char ascii)
+        {
+            switch (c)
+            {
+                // Latin small letter modifier (U+1D00..U+1D6F) usados em small caps.
+                case '\u1D00': ascii = 'a'; return true; // ᴀ
+                case '\u1D04': ascii = 'c'; return true; // ᴄ
+                case '\u1D05': ascii = 'd'; return true; // ᴅ
+                case '\u1D07': ascii = 'e'; return true; // ᴇ
+                case '\u1D0B': ascii = 'k'; return true; // ᴋ
+                case '\u1D0D': ascii = 'm'; return true; // ᴍ
+                case '\u1D0F': ascii = 'o'; return true; // ᴏ
+                case '\u1D18': ascii = 'p'; return true; // ᴘ
+                case '\u1D1B': ascii = 't'; return true; // ᴛ
+                case '\u1D1C': ascii = 'u'; return true; // ᴜ
+                case '\u1D20': ascii = 'v'; return true; // ᴠ
+                // Latin Extended-B / IPA Extensions usados em small caps ou fontes estilizadas.
+                case '\u0262': ascii = 'g'; return true; // ɢ
+                case '\u026A': ascii = 'i'; return true; // ɪ
+                case '\u0274': ascii = 'n'; return true; // ɴ
+                case '\u0280': ascii = 'r'; return true; // ʀ
+                case '\u028B': ascii = 'v'; return true; // ʋ
+                case '\u028F': ascii = 'y'; return true; // ʏ
+                case '\u029C': ascii = 'h'; return true; // ʜ
+                case '\u029F': ascii = 'l'; return true; // ʟ
+                // Latin-1 supplement: chars acentuados comuns em PT/ES/FR.
+                // Sao "folded" para a sua base ASCII.
+                case '\u00E0': ascii = 'a'; return true; // à
+                case '\u00E1': ascii = 'a'; return true; // á
+                case '\u00E2': ascii = 'a'; return true; // â
+                case '\u00E3': ascii = 'a'; return true; // ã
+                case '\u00E4': ascii = 'a'; return true; // ä
+                case '\u00E5': ascii = 'a'; return true; // å
+                case '\u00E7': ascii = 'c'; return true; // ç
+                case '\u00E8': ascii = 'e'; return true; // è
+                case '\u00E9': ascii = 'e'; return true; // é
+                case '\u00EA': ascii = 'e'; return true; // ê
+                case '\u00EB': ascii = 'e'; return true; // ë
+                case '\u00EC': ascii = 'i'; return true; // ì
+                case '\u00ED': ascii = 'i'; return true; // í
+                case '\u00EE': ascii = 'i'; return true; // î
+                case '\u00EF': ascii = 'i'; return true; // ï
+                case '\u00F1': ascii = 'n'; return true; // ñ
+                case '\u00F2': ascii = 'o'; return true; // ò
+                case '\u00F3': ascii = 'o'; return true; // ó
+                case '\u00F4': ascii = 'o'; return true; // ô
+                case '\u00F5': ascii = 'o'; return true; // õ
+                case '\u00F6': ascii = 'o'; return true; // ö
+                case '\u00F9': ascii = 'u'; return true; // ù
+                case '\u00FA': ascii = 'u'; return true; // ú
+                case '\u00FB': ascii = 'u'; return true; // û
+                case '\u00FC': ascii = 'u'; return true; // ü
+                // Modifier letter digits (superscripts/subscripts).
+                case '\u1D7B': ascii = '3'; return true; // 𝟹 (legacy)
+                case '\u2070': ascii = '0'; return true; // ⁰
+                case '\u00B9': ascii = '1'; return true; // ¹
+                case '\u00B2': ascii = '2'; return true; // ²
+                case '\u00B3': ascii = '3'; return true; // ³
+                case '\u2074': ascii = '4'; return true; // ⁴
+                case '\u2075': ascii = '5'; return true; // ⁵
+                case '\u2076': ascii = '6'; return true; // ⁶
+                case '\u2077': ascii = '7'; return true; // ⁷
+                case '\u2078': ascii = '8'; return true; // ⁸
+                case '\u2079': ascii = '9'; return true; // ⁹
+                // Double-struck letters usadas em "𝓒 𝓗 𝓝" (CHANNELS etc).
+                case '\u2102': ascii = 'c'; return true; // ℂ
+                case '\u210D': ascii = 'h'; return true; // ℍ
+                case '\u2115': ascii = 'n'; return true; // ℕ
+                default:
+                    ascii = '\0';
+                    return false;
+            }
+        }
+
+        private sealed class Anchor
+        {
+            public int Position { get; init; }
+            public int LabelEndPosition { get; init; }
+            public string RawLabel { get; init; } = string.Empty;
+            public string CanonicalLabel { get; init; } = string.Empty;
         }
     }
 }
