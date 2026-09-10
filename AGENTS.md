@@ -22,7 +22,7 @@ Para tarefas triviais (typo numa doc, mudança de uma flag) o plano pode ser dis
 
 ## 2. Arquitectura e invariantes do projecto
 
-- **Linguagem e framework**: C# em .NET 9.0 (`m3uCrawler/m3uCrawler.csproj`, `m3uCrawler.Tests/m3uCrawler.Tests.csproj`). Não há `global.json` nem `Directory.Build.props`/`Directory.Build.targets`.
+- **Linguagem e framework**: C# em .NET 9.0 (`m3uCrawler/m3uCrawler.csproj`, `m3uCrawler.Tests/m3uCrawler.Tests.csproj`). Não há `global.json`. `Directory.Build.props`/`Directory.Build.targets` existem na raiz e são a fonte canónica do versionamento SemVer e dos metadados de build (consumidos por `BuildInfo` e pelo Dockerfile — ver `m3uCrawler/Build/BuildInfo.cs`).
 - **Solução**: `m3uCrawler.sln` agrega `m3uCrawler/` (app) e `m3uCrawler.Tests/` (testes xUnit).
 - **Ponto de entrada**: `m3uCrawler/Program.cs`. CLI, ciclo de manutenção, gravação do `RunReport` em `output/telegram_run_report.json`.
 - **Pipeline canónico** (ver `m3uCrawler/README.md` para detalhe):
@@ -55,7 +55,7 @@ Para tarefas triviais (typo numa doc, mudança de uma flag) o plano pode ser dis
 - `CredentialSanitizer.SanitizeUrl` e `SanitizeM3uContent` aplicam-se a **todos** os pontos de saída: consola, `RunReport`, JSONs de relatório, preview do dashboard, mensagens de erro. **Nunca** passar uma URL Xtream com credenciais a `Console.WriteLine`, `JsonSerializer.Serialize`, `SaveToJsonReport` ou ao endpoint de preview sem sanitizar.
 - A playlist M3U funcional (`output/playlist.m3u`, `output/playlist_temp.m3u`, `GET /api/playlist`) preserva URLs Xtream reais — é o único artefacto onde credenciais são intencionais. Endpoints de **preview** usam sanitização.
 - O modo manutenção (`--telegram-maintain`) **nunca** apaga `playlist.m3u` por ausência de novos candidatos: `MergeStreams(stillWorkingMain, [])` devolve `stillWorkingMain`.
-- O `HttpListener` do dashboard só arranca **depois** de `WTelegram.LoginAsync` no branch `--telegram`, e só escuta no branch `--web` (verificado em `Program.cs` e `WebDashboardService.cs`). O dashboard não pode ser iniciado de forma standalone.
+- O `HttpListener` do dashboard (`--web`/`--web-port`/`--web-token`) é arrancado no **top-level** de `Main` em `m3uCrawler/Program.cs:34-71`, **independente** da pipeline Telegram (que continua condicionada a `args.Contains("--telegram")` na linha 73). O dashboard **pode** ser iniciado de forma **standalone** (apenas `--web [--web-port N] [--web-token T]`) sem precisar de `--telegram` nem de `WTelegram.LoginAsync`. A autenticação opcional com `--web-token` usa `CryptographicOperations.FixedTimeEquals` para timing-attack safety.
 - `m3uCrawler/runtime-data/` é apenas um **placeholder commitado** (contém `channel-indicators.json`, `countries/pt.json`, `.gitkeep`). Em produção, `runtime-data` é montado como **bind mount** a partir de `/opt/m3ucrawler/runtime-data`, que vive fora do repositório e da imagem.
 
 ---
@@ -79,6 +79,7 @@ Os ficheiros abaixo **não** devem ser alterados sem necessidade directa, e qual
 - `.github/workflows/build-and-test.yml` — gate de CI em push/PR para `main`.
 - `.github/workflows/package.yml` — artefacto `.tar.gz` para deploy manual.
 - `.github/workflows/ci.yml` — **untracked, não tocar** (trabalho de outra pessoa).
+- `Directory.Build.props`, `Directory.Build.targets` — fonte canónica do versionamento SemVer e dos metadados de build (consumidos por `m3uCrawler/Build/BuildInfo.cs` em runtime e pelo `Dockerfile` em build context). Alterações têm impacto no contrato `/api/version` ↔ OCI labels (ver `DockerBuildInfoContractTests`).
 
 ### Ficheiros de credenciais e dados (protegidos por convenção)
 
@@ -136,6 +137,26 @@ São já cobertos por `m3uCrawler/.dockerignore`. A pasta `m3uCrawler/runtime-da
 - **`ROADMAP.md`** — estado do projecto e direcção. Não é fonte de verdade técnica.
 - **`STREAM_LIMIT_GUIDE.md`**, **`EXEMPLOS.md`** — documentos pré-pipeline; podem estar obsoletos. Em caso de dúvida, preferir `m3uCrawler/README.md`.
 - **`CONTRIBUTING.md`** — guia de contribuição para humanos (issue, PR). As regras detalhadas para agentes vivem aqui em `AGENTS.md`; `CONTRIBUTING.md` deve apenas referenciar este ficheiro para o detalhe técnico.
+- **`docs/architecture/*`** — descreve a arquitectura existente do catálogo, matching, Dispatcharr sync e ownership. **Não** é ainda uma arquitectura normativa agregadora (cada doc trata um tema específico). Wave futura introduzirá `ARCHITECTURE.md` consolidando invariantes transversais.
+
+### Documentação como critério de aceitação (Definition of Done)
+
+Uma alteração **funcional** só está concluída quando:
+
+1. **Código** implementado.
+2. **Testes** actualizados e a passar.
+3. **Documentação afectada** actualizada (`m3uCrawler/README.md` para API, `docs/architecture/*` para decisões, `DEPLOYMENT.md`/`OPERATIONS.md` para ops).
+4. **`CHANGELOG.md`** actualizado (secção `[Unreleased]`) **apenas** se a alteração for funcional/relevante para release — refactors puramente internos ou alterações só documentais não obrigam nova entrada.
+5. **`ROADMAP.md`** actualizado **apenas** se o estado de uma iniciativa muda (concluído, em curso, replaneado).
+6. **Revisão final** (opcional: `/review`) antes do commit.
+
+Esta regra evita simultaneamente:
+- regressão documental silenciosa ("a implementação evoluiu, a doc ficou para trás");
+- burocracia inútil (entradas de changelog/refactor interno).
+
+**Não** contar o número exacto de testes como propriedade permanente da arquitectura. Quando o número for necessário, identificá-lo como estado volátil datado, e preferir o comando `dotnet test ... --no-build --nologo` como referência operacional. O mesmo se aplica a `SHA` actual, `digest` imutável da imagem, datas exactas de validação, versões de ferramentas: data-os quando necessário, não os espalhe pelo documento.
+
+**Não** duplicar conteúdo entre `README.md`, `m3uCrawler/README.md`, `ROADMAP.md`, `CHANGELOG.md` e `docs/architecture/*` — preferir cross-references.
 
 ---
 

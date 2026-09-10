@@ -1,5 +1,9 @@
 # 📖 Exemplos de Uso - m3uCrawler v2.1
 
+> **DEPRECATED** — este documento descreve o comportamento pré-pipeline Telegram (v2.1) e é mantido apenas para referência histórica. Os exemplos CLI aqui (e.g. `dotnet run -- "iptv portugal"`, `--fast`, `--high-performance`, `--max-streams`) referem-se ao legacy M3U8-search que **não** é o pipeline actual.
+>
+> Para o comportamento actual consultar `m3uCrawler/README.md` e `DEPLOYMENT.md` §9.1 (argumentos CLI suportados).
+
 ## 🚀 Uso Básico
 
 ### 1. Execução Simples

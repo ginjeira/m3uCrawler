@@ -1,5 +1,9 @@
 # 🎯 m3uCrawler v2.1 - Stream Limit Enhancement Summary
 
+> **DEPRECATED** — este documento descreve cenários e comportamento da versão pré-pipeline Telegram (v2.1) e é mantido apenas para referência histórica. O pipeline actual é Telegram-first (`--telegram portugal --telegram-maintain`), e o `--max-streams` aplica-se de forma diferente da descrita aqui.
+>
+> Para o comportamento actual consultar `m3uCrawler/README.md` e `DEPLOYMENT.md` §9.1 (argumentos CLI suportados).
+
 ## 📊 What Changed: From 100 to Unlimited Streams
 
 ### 🔍 **Why Only 100 Streams Before?**

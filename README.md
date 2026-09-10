@@ -15,9 +15,9 @@ Crawler em C# (.NET 9) para descobrir, validar e testar playlists M3U/M3U8 em fo
 
 ## Estado actual
 
-- `dotnet build m3uCrawler.sln --configuration Release` → 0 warnings, 0 errors.
-- `dotnet test m3uCrawler.Tests/m3uCrawler.Tests.csproj --configuration Release` → 1066 testes, todos passados.
-- Deployment em produção via **Docker Compose** com imagem `ghcr.io/ginjeira/m3ucrawler:latest`. Ver `DEPLOYMENT.md`.
+- Build em Release: 0 warnings, 0 errors.
+- Suíte de testes (linha de comando abaixo) — referência operacional sempre actualizada, não uma propriedade arquitectural permanente.
+- Deployment em produção via **Docker Compose** com imagem `ghcr.io/ginjeira/m3ucrawler`. Ver `DEPLOYMENT.md`.
 
 ## Início rápido
 

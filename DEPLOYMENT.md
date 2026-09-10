@@ -313,6 +313,75 @@ Isto restaura byte-a-byte o estado anterior: bind mounts idênticos, mesma image
 
 ---
 
+## 9.1 Argumentos CLI relevantes para deployment
+
+Lista das flags que afectam o comportamento do container, com referência ao help text em `m3uCrawler/Program.cs:544-572`. **Não** constitui referência exaustiva de todos os argumentos (consultar `dotnet m3uCrawler.dll --help` para a lista completa).
+
+| Flag | Onde é processada | Efeito |
+|---|---|---|
+| `--web` | `Program.cs:37` | Activa o dashboard web. |
+| `--web-port N` | `Program.cs:39-43` | Porta do dashboard (padrão: `5000`). |
+| `--web-token TOKEN` | `Program.cs:44` | Bearer token para `Authorization` no dashboard. **Recomendado em produção.** `HttpListener` usa `CryptographicOperations.FixedTimeEquals` para timing-attack safety. |
+| `--telegram` | `Program.cs:73` | Activa o pipeline Telegram. |
+| `--telegram-maintain` | `Program.cs:139` | Modo manutenção (preserva `playlist.m3u`; ver `AGENTS.md`). |
+| `--history-hours N` | `Program.cs:131-137` | Janela de pesquisa Telegram (padrão: `48`, cap `24*30`). |
+| `--loop-hours N` | `Program.cs:141-145` | Repete a cada N horas (loop infinito). |
+| `--max-streams N` | `Program.cs:124-128` (Telegram) / `:310-315` (scan-domain) | Limite de streams a testar (padrão Telegram: `500`, cap `5000`). |
+| `--country CODE` | config regional | País a usar na validação (ex.: `pt`). |
+| `--domain DOMINIO` | `Program.cs` | Filtra resultados por domínio. |
+| `--output-dir PATH` | vários | Onde guardar playlists e relatórios (padrão: `output`). Em produção: `/opt/playlists` (bind mount). |
+| `--dispatcharr-sync` | `Program.cs` | Sync standalone de uma playlist existente com Dispatcharr. |
+| `--playlist PATH` | `Program.cs` | Playlist a sincronizar (default: `<output-dir>/playlist.m3u`). |
+| `--scan-domain D` | `Program.cs:317-320` | Scan directo ao domínio sem Telegram. Suporta `--user`, `--pass`. |
+| `--user USER` | `Program.cs:317` | Credenciais Xtream para `--scan-domain`. |
+| `--pass PASS` | `Program.cs:318` | Password Xtream para `--scan-domain`. |
+| `--fast`, `--high-performance` | `Program.cs:431` | Legacy M3U8-search (não aplicável ao pipeline Telegram). |
+
+> A string `--max-results` aparece **apenas** na lista interna `skipWithValue` em `Program.cs:398` (para ser ignorada como search term no legacy M3U8-search). **Não** é uma flag funcional actualmente.
+
+### Dashboard em modo standalone (`--web` sem `--telegram`)
+
+O `HttpListener` do dashboard é arrancado no **top-level** de `Main` em `m3uCrawler/Program.cs:34-71`. Quando o container é iniciado com `--web [--web-port N] [--web-token T]` **sem** `--telegram`, o dashboard arranca **independentemente** de `WTelegram.LoginAsync`. Útil para:
+
+- Inspecção histórica via dashboard sem ciclo Telegram.
+- Diagnóstico em cenários onde a autenticação Telegram falha mas a BD local está disponível.
+- Servidor de API para integração externa.
+
+Em standalone, o processo permanece vivo enquanto o dashboard estiver a responder (await de `webTask`).
+
+### Exemplos de invocação (placeholders, sem credenciais reais)
+
+```bash
+# Modo produção típico (Telegram loop + dashboard)
+m3uCrawler \
+  --telegram portugal \
+  --telegram-maintain \
+  --loop-hours 24 \
+  --history-hours 360 \
+  --max-streams 500 \
+  --output-dir /opt/playlists \
+  --web \
+  --web-port 5000 \
+  --web-token "<bearer-token-aqui>"
+
+# Dashboard standalone (sem Telegram)
+m3uCrawler \
+  --web \
+  --web-port 5000 \
+  --web-token "<bearer-token-aqui>" \
+  --output-dir /opt/playlists
+
+# Scan de domínio com credenciais Xtream (placeholder)
+m3uCrawler \
+  --scan-domain exemplo.com \
+  --user UTILIZADOR \
+  --pass PALAVRA-PASSE
+```
+
+**Nunca** colocar credenciais reais, tokens ou passwords em exemplos documentados, scripts versionados, ou em logs. Usar placeholders.
+
+---
+
 ## 10. Verificação adicional: alinhamento `latest` ↔ `main`
 
 A imagem `:latest` é mutável: é re-apontada em cada push a `main`. Existe o risco (baixo, mas real) de o workflow `docker-ghcr.yml` ter falhado silenciosamente após um push, deixando o `latest` dessincronizado.

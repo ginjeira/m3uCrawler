@@ -153,13 +153,11 @@ public static readonly IReadOnlyList<IdentityRuleSeed> IdentityRules = ...
 A função `ValidateSeedConsistency()` confirma que não há sobreposições
 de alias entre canais (um alias não pode aparecer em dois canais).
 
-### Seed obrigatório
-
-| Identity normalizada | Disposition | Reason |
-|---|---|---|
-| `sport tv nba` | `ReviewOnly` | `not-approved-in-publication-catalog` |
-| `pt sport tv nba` | `ReviewOnly` | `not-approved-in-publication-catalog` |
-| `sport tv nba hevc pt` | `ReviewOnly` | `not-approved-in-publication-catalog` |
+> O seed actualmente **não** define `IdentityRule`s obrigatórias
+> (`CatalogSeed.IdentityRules = Array.Empty<IdentityRuleSeed>()`).
+> Casos que em iterações anteriores precisaram de uma regra
+> `ReviewOnly` (e.g. SPORT TV NBA) subiram entretanto para canais
+> canónicos com `CreateEligible`; ver §8 abaixo.
 
 ### Channels curados
 

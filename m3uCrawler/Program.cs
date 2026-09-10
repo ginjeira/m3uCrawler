@@ -261,8 +261,16 @@ namespace m3uCrawler
             {
                 Console.WriteLine("🤖 Iniciando Telegram Bot...");
 
+                var botToken = GetOptionValue(args, "--bot-token")
+                    ?? Environment.GetEnvironmentVariable("M3U_BOT_TOKEN");
+                if (string.IsNullOrWhiteSpace(botToken))
+                {
+                    Console.Error.WriteLine("❌ Token do bot Telegram em falta. Fornece via --bot-token <token> ou variavel de ambiente M3U_BOT_TOKEN.");
+                    return;
+                }
+
                 var botcrawler = new M3uCrawlerService();
-                var bot = new TelegramBotService("8959431945:AAG961d6CDUEXKnFMBt_QxaEvElBuy6fIeg", botcrawler);
+                var bot = new TelegramBotService(botToken, botcrawler);
 
                 bot.Start();
 
@@ -395,7 +403,7 @@ namespace m3uCrawler
                 
                 // Filter out known options from args to get search term
                 var searchArgs = new List<string>();
-                var skipWithValue = new HashSet<string> { "--max-streams", "--domain", "--web-port", "--web-token", "--loop-hours", "--history-hours", "--max-results", "--user", "--pass" };
+                var skipWithValue = new HashSet<string> { "--max-streams", "--domain", "--web-port", "--web-token", "--bot-token", "--loop-hours", "--history-hours", "--max-results", "--user", "--pass" };
                 for (int i = 0; i < args.Length; i++)
                 {
                     if (skipWithValue.Contains(args[i]))
@@ -546,6 +554,9 @@ namespace m3uCrawler
             Console.WriteLine("  --output-dir PATH  Diretório onde guardar playlists e relatórios (padrão: output)");
             Console.WriteLine("  --web             Ativa uma interface web para ver histórico e playlist");
             Console.WriteLine("  --web-port N      Porta do servidor web (padrão: 5000)");
+            Console.WriteLine("  --web-token TOKEN Bearer token para autorização no dashboard (protege timing-attack via FixedTimeEquals)");
+            Console.WriteLine("  --bot             Modo bot Telegram (legacy M3U8-search)");
+            Console.WriteLine("  --bot-token TOKEN Token do bot Telegram (também via M3U_BOT_TOKEN); obrigatorio com --bot");
             Console.WriteLine("  --scan-domain D   Faz scan direto ao domínio para procurar playlists (sem Telegram)");
             Console.WriteLine("  --telegram-maintain Mantém output/playlist.m3u com base no Telegram e remove links mortos");
             Console.WriteLine("  --history-hours N Janela (em horas) para pesquisar mensagens no Telegram (padrão: 48)");

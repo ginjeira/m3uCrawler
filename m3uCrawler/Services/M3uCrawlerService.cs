@@ -105,7 +105,7 @@ namespace m3uCrawler.Services
                 if (!string.IsNullOrWhiteSpace(username) && !string.IsNullOrWhiteSpace(password))
                 {
                     var m3uUrl = $"{origin}/get.php?username={Uri.EscapeDataString(username)}&password={Uri.EscapeDataString(password)}&type=m3u_plus";
-                    Console.WriteLine($"🔑 A tentar playlist autenticada: {m3uUrl}");
+                    Console.WriteLine($"🔑 A tentar playlist autenticada: {CredentialSanitizer.SanitizeUrl(m3uUrl)}");
                     try
                     {
                         using var r = await _httpClient.GetAsync(m3uUrl);
@@ -115,7 +115,7 @@ namespace m3uCrawler.Services
                             if (body.Contains("#EXTM3U", StringComparison.OrdinalIgnoreCase))
                             {
                                 playlistUrls.Add(m3uUrl);
-                                Console.WriteLine($"✅ Playlist autenticada encontrada: {m3uUrl}");
+                                Console.WriteLine($"✅ Playlist autenticada encontrada: {CredentialSanitizer.SanitizeUrl(m3uUrl)}");
                             }
                         }
                     }
