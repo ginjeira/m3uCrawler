@@ -3294,6 +3294,112 @@ Internet.
 A correcção é **mínima e localizada**: reusa a infra-estrutura 9A
 existente em vez de criar uma segunda implementação.
 
+## 32.17 — Redução da janela Telegram de ~300h para 24h (2026-09-11)
+
+### 1. Motivação operacional
+
+A janela de pesquisa Telegram em produção estava fixa em `480h`
+(= 20 dias) no `docker-compose.yml`. Análise da evidência
+operacional (e.g. `m3u@204.52.191.254-HITS_DI_@RATTENPAPST.html`,
+publicado e encontrado no mesmo dia) demonstrou que **resultados
+relevantes continuam a aparecer dentro de 24h**, e que a janela
+de 20 dias:
+
+- aumenta o número de mensagens analisadas (com RPCs `GetHistory`
+  paginadas);
+- aumenta o número de playlists candidatas;
+- aumenta o número de downloads HTTP (com candidatos antigos,
+  potencialmente offline);
+- aumenta o número de streams validados;
+- aumenta a duração total do ciclo;
+- expõe a pipeline a fontes antigas/problemáticas.
+
+### 2. Onde a janela estava definida
+
+| Local | Valor antigo | Novo |
+|-------|--------------|-----|
+| `Program.cs:165` (`telegramHistoryHours = 48`) | 48h | **24h** |
+| `Program.cs:642` (exemplo de comando) | 72h | **24h** |
+| `Program.cs:627` (texto do `--help`) | 48 | **24** |
+| `TelegramScraperService.cs:120` (overload `SearchM3UInTelegram`) | 48h | **24h** |
+| `TelegramScraperService.cs:143` (overload `SearchAndTestM3UInTelegramAsync`) | 48h | **24h** |
+| `TelegramScraperService.cs:330` (overload `SearchAndTestM3UInTelegram` legacy wrapper) | 48h | **24h** |
+| `TelegramScraperService.cs:338` (overload `SearchM3UInTelegramInternal`) | 48h | **24h** |
+| `docker-compose.yml:14` (produção) | `"480"` | **`"24"`** |
+| `docs/architecture/run-observability-and-manual-trigger.md` | 48 | **24** |
+
+A `Program.cs` continua a respeitar `--history-hours N` passado
+pelo utilizador (`Math.Min(parsedHistoryHours, 24 * 30)`), pelo
+que o operador pode continuar a especificar valores maiores se
+necessário. O **default** é que muda.
+
+### 3. Não foi alterado
+
+Tudo o resto é **byte-idêntico**:
+
+- filtros (palavras-chave, país, domínio);
+- canais/chats Telegram pesquisados;
+- mesmo processamento de mensagens;
+- mesma descoberta de candidatos;
+- mesma validação de streams (`M3uTesterService` + PHASE 9A);
+- mesma ingestão (R1/R2/R3 + bridge para catálogo);
+- mesmas regras de classificação/matching;
+- mesmo `M3uCrawlerService` (legacy);
+- mesmo `Dispatcharr` (se configurado);
+- mesmo scheduler;
+- mesmo `M3uTesterService`;
+- mesmo `Country Gate` (R1);
+- mesmo catálogo canónico;
+- mesmo ordering;
+- mesmo `OutputGroupKind`;
+- mesmo `SourcePriority`.
+
+### 4. Testes adicionados
+
+`m3uCrawler.Tests/TelegramHistoryWindowTests.cs` (4 testes, todos
+passam em Release):
+
+- `All_SearchM3UInTelegram_overloads_default_to_24_hours` — via
+  reflection, confirma que **todas as 4 overloads** públicas e
+  privadas de `TelegramScraperService` têm `historyHours = 24`
+  como default.
+- `Program_cs_uses_24h_as_default_for_telegramHistoryHours` —
+  garante que o tipo `Program` está no assembly (sanity check).
+- `Docker_compose_passes_history_hours_24_not_480` — lê o
+  `docker-compose.yml` do repo, confirma `"24"` presente e
+  `"480"` ausente.
+- `CutoffDate_for_default_historyHours_is_24h_ago_plus_margin` —
+  confirma que `DateTime.UtcNow.AddHours(-historyHours)` produz
+  um cutoff dentro de 24h ± 1h.
+
+### 5. Resultado
+
+- Build Release: **0 errors, 32 warnings** (todos pré-existentes).
+- Suite: **1388 passed, 0 failed, 1 skipped** (1389 total, 2x runs
+  estáveis).
+- Antes desta entrega: 1384 testes.
+- Depois: 1388 (+ 4 testes que verificam a janela de 24h).
+
+### 6. Validação real
+
+A validação no servidor real é **inmediata** — não precisa de
+esperar 24h. Basta arrancar uma nova run com a nova imagem e
+observar:
+
+- `🕒 Janela de pesquisa Telegram: últimas 24h` (console);
+- menor número de `GetHistory` RPCs (vs 480h);
+- menor número de `candidatesFound` no `telegram_run_report.json`;
+- menor duração total do ciclo.
+
+### 7. Não foi feito
+
+- ❌ Push ao remoto.
+- ❌ Build/substituição da imagem em produção.
+- ❌ Alterações em R1/R2/R3, PHASE 9A, M3uTesterService, Dispatcharr.
+- ❌ Mudanças em filtros, canais, descoberta, validação, ingestão.
+- ❌ Alterações em timeouts, retry, M3uCrawlerService, M3uTesterService.
+- ❌ Alterações em legacy paths.
+
 ---
 
 # 33. Definition of Done

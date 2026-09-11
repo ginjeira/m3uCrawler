@@ -162,7 +162,12 @@ namespace m3uCrawler
                     telegramMaxStreams = Math.Min(telegramParsedMax, 5000);
                 }
 
-                int telegramHistoryHours = 48;
+                // Janela de pesquisa Telegram: 24h por defeito.
+                // 24h cobre ciclos diários sem aumentar desnecessariamente
+                // o volume (mensagens analisadas, downloads HTTP, validação).
+                // Confirmado em produção: resultados relevantes continuam
+                // a aparecer dentro de 24h (ex: 2026-09-11 — m3u@…-HITS_DI_…html).
+                int telegramHistoryHours = 24;
                 var historyArg = GetOptionValue(args, "--history-hours");
                 if (int.TryParse(historyArg, out int parsedHistoryHours) && parsedHistoryHours > 0)
                 {
@@ -619,7 +624,7 @@ namespace m3uCrawler
             Console.WriteLine("  --bot-token TOKEN Token do bot Telegram (também via M3U_BOT_TOKEN); obrigatorio com --bot");
             Console.WriteLine("  --scan-domain D   Faz scan direto ao domínio para procurar playlists (sem Telegram)");
             Console.WriteLine("  --telegram-maintain Mantém output/playlist.m3u com base no Telegram e remove links mortos");
-            Console.WriteLine("  --history-hours N Janela (em horas) para pesquisar mensagens no Telegram (padrão: 48)");
+            Console.WriteLine("  --history-hours N Janela (em horas) para pesquisar mensagens no Telegram (padrão: 24)");
             Console.WriteLine("  --loop-hours N    Repete execução a cada N horas (ex: 24)");
             Console.WriteLine("  --fast            Modo alta performance (20 conexões paralelas)");
             Console.WriteLine("  --high-performance Mesmo que --fast");
@@ -634,7 +639,7 @@ namespace m3uCrawler
             Console.WriteLine("  m3uCrawler \"canais tv\" --fast --max-streams 1000");
             Console.WriteLine("  m3uCrawler \"iptv\" --domain exemplo.com");
             Console.WriteLine("  m3uCrawler --scan-domain exemplo.com --max-streams 300");
-            Console.WriteLine("  m3uCrawler --telegram portugal --telegram-maintain --loop-hours 24 --history-hours 72");
+            Console.WriteLine("  m3uCrawler --telegram portugal --telegram-maintain --loop-hours 24 --history-hours 24");
             Console.WriteLine();
             Console.WriteLine("CONFIGURAÇÃO:");
             Console.WriteLine("  • Edite config.json para configurações avançadas");

@@ -117,7 +117,7 @@ namespace m3uCrawler.Services
         }
 
         // Resultado legível de uma pesquisa (mantido para compatibilidade de API).
-        public async Task<List<string>> SearchM3UInTelegram(string keyword, int limit = 200, int historyHours = 48)
+        public async Task<List<string>> SearchM3UInTelegram(string keyword, int limit = 200, int historyHours = 24)
         {
             var (_, candidates) = await SearchM3UInTelegramInternal(keyword, limit, historyHours);
             return candidates
@@ -140,7 +140,7 @@ namespace m3uCrawler.Services
             int limit = 200,
             int maxConcurrency = 5,
             int maxUrlsToTest = 500,
-            int historyHours = 48,
+            int historyHours = 24,
             string countryCode = "pt",
             string? countriesDir = null,
             RunReport? report = null,
@@ -327,7 +327,7 @@ namespace m3uCrawler.Services
 
         // Wrapper que preserva a assinatura pública anterior (devolve só os streams funcionais).
         public async Task<List<M3uStream>> SearchAndTestM3UInTelegram(
-            string keyword, int limit = 200, int maxConcurrency = 5, int maxUrlsToTest = 500, int historyHours = 48)
+            string keyword, int limit = 200, int maxConcurrency = 5, int maxUrlsToTest = 500, int historyHours = 24)
         {
             var (working, _) = await SearchAndTestM3UInTelegramAsync(
                 keyword, limit, maxConcurrency, maxUrlsToTest, historyHours, "pt", null, null);
@@ -335,7 +335,7 @@ namespace m3uCrawler.Services
         }
 
         private async Task<(int MessagesAnalyzed, List<CandidatePlaylist> Candidates)> SearchM3UInTelegramInternal(
-            string keyword, int limit = 200, int historyHours = 48)
+            string keyword, int limit = 200, int historyHours = 24)
         {
             var candidates = new List<CandidatePlaylist>();
             // Publicacoes descobertas em qualquer mensagem: referencias Telegram

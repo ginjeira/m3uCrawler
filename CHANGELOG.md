@@ -58,6 +58,19 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 - **Não foi feito**: novo retry-limit/circuit-breaker, `--telegram-once`, alterações a R1/R2/R3, push ao remoto, substituição da imagem em produção.
 - Documentado como `PHASE 9A — Autópsia do bloqueio HTTP` em `docs/IMPLEMENTATION_ROADMAP.md` secção 32.16.
 
+### 🛠 Redução da janela Telegram de ~300h para 24h (2026-09-11)
+- **Motivação**: evidência operacional mostrou que resultados relevantes continuam a aparecer dentro de 24h (ex: `m3u@204.52.191.254-HITS_DI_@RATTENPAPST.html`, encontrada no mesmo dia). Janela de ~480h (20 dias) no `docker-compose.yml` de produção era desnecessariamente grande.
+- **Alterações (cirúrgicas, apenas no `historyHours`)**:
+  - `Program.cs:165` — default de `telegramHistoryHours` de `48` para `24`.
+  - `Program.cs:642` — exemplo no `--help` actualizado para `--history-hours 24`.
+  - `Program.cs:627` — mensagem de `--help` indica "(padrão: 24)".
+  - `TelegramScraperService.cs` (4 overloads) — defaults de `historyHours` de `48` para `24`.
+  - `docker-compose.yml:14` — `--history-hours "480"` → `"24"`.
+  - `docs/architecture/run-observability-and-manual-trigger.md` — snippets com `48` → `24`.
+- **Não alterado**: filtros, canais, descoberta, validação, ingestão, bridge para catálogo, R1/R2/R3, PHASE 9A, timeouts, M3uTesterService, Dispatcharr, scheduler, catálogo canónico, matching, ordering, legacy paths.
+- **Testes adicionados** (`TelegramHistoryWindowTests.cs`, 4 testes): `All_SearchM3UInTelegram_overloads_default_to_24_hours`, `Program_cs_uses_24h_as_default_for_telegramHistoryHours`, `Docker_compose_passes_history_hours_24_not_480`, `CutoffDate_for_default_historyHours_is_24h_ago_plus_margin`.
+- **Resultado**: 1384 → **1388 testes** em Release (4 novos), 0 falhas, 2x runs estáveis. Build: 0 errors, 0 warnings novos.
+
 ### 🛠 PHASE-Bridge / R2 — saneamento do catálogo canónico PT (2026-09-11)
 - **Gap fechado (suportado por código)**: a validação end-to-end identificou divergências entre o `CatalogSeed` programático e o JSON baseline canónico (`docs/catalog/m3ucrawler_pt_canonical_catalog.json`). O `CatalogSeed` criava duplicações para o mesmo canal lógico (`rtp1`/`rtp-1`, `cnn`/`cnnportugal`, `benfica-tv`/`btv`, etc.).
 - **`CatalogSeed.Channels` saneado**: removidos canais duplicados pela baseline JSON (RTP 1-3, SIC, TVI, SIC Notícias, RTP Notícias, CNN, CMTV, News Now, Canal 11, V+ TVI, RTP Memória, Porto Canal, Sport TV 1, Eurosport 1, SIC K, Panda, Cartoon Network, Hollywood, Cinemundo, AXN, Discovery, NatGeo, Globo). Mantidos apenas canais não cobertos pela baseline: Sport TV 2-7, Sport TV NBA, TVI 24, TVI Internacional, SIC Mulher, SIC Radical, Baby TV, Canal Panda (key legada), Odisseia, BTV (key alinhada).
