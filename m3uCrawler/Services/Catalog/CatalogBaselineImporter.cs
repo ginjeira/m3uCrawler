@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.EntityFrameworkCore;
+using m3uCrawler.Services.Matching;
 
 namespace m3uCrawler.Services.Catalog;
 
@@ -269,10 +270,18 @@ public static class CatalogBaselineImporter
             // matcher resolver o título principal. Aliases
             // adicionais cobrem variantes listadas no JSON.
             //
-            // Construímos a lista: primeiro o alias principal
-            // (idêntico ao nome), depois os aliases explícitos do
-            // JSON. Isto garante que o matching funcione mesmo para
-            // títulos canónicos (e.g. "RTP 1", "CNN Portugal").
+            // Construímos a lista:
+            //   1. alias principal (idêntico ao nome);
+            //   2. aliases explícitos do JSON;
+            //   3. variantes normalizadas de cada um (sem tokens de
+            //      país / qualidade / etc.) — necessário porque o
+            //      <see cref="ChannelNormalizer"/> remove esses tokens
+            //      do título antes de o matcher consultar o catálogo,
+            //      e.g. "CNN Portugal" → "cnn" (resolve para
+            //      cnnportugal), "RTP 1" → "rtp 1" (idem).
+            //
+            // Isto garante que o matching funcione mesmo para
+            // títulos canónicos que o normalizer transforma.
             var channelNameNormalized = channel.DisplayName.Trim().ToLowerInvariant();
             var aliasesToProcess = new List<string>();
             if (!string.IsNullOrEmpty(channelNameNormalized))
@@ -284,10 +293,24 @@ public static class CatalogBaselineImporter
                 if (string.IsNullOrWhiteSpace(alias)) continue;
                 var normalized = alias.Trim().ToLowerInvariant();
                 if (normalized.Length == 0) continue;
-                // Deduplicar dentro da própria lista do canal.
                 if (!aliasesToProcess.Contains(normalized))
                 {
                     aliasesToProcess.Add(normalized);
+                }
+            }
+
+            // Para cada alias, gerar também a versão normalizada pelo
+            // ChannelNormalizer (que remove tokens de país, qualidade,
+            // etc.) e adicioná-la se ainda não existir. Isto alinha o
+            // catálogo com o que o matcher realmente consulta.
+            foreach (var alias in new List<string>(aliasesToProcess))
+            {
+                var nrm = ChannelNormalizer.Normalize(alias);
+                if (string.IsNullOrWhiteSpace(nrm)) continue;
+                if (nrm == alias) continue; // já temos
+                if (!aliasesToProcess.Contains(nrm))
+                {
+                    aliasesToProcess.Add(nrm);
                 }
             }
 

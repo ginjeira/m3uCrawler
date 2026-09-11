@@ -11,7 +11,7 @@ namespace m3uCrawler.Services.Matching
         private static readonly Regex GeoPrefix = new(@"^(?:[A-Za-z]{2,3})[:\|]\s*", RegexOptions.Compiled);
         private static readonly Regex QualityTag = new(@"\b(?:4K|UHD|FHD|HD|SD|HDR|HEVC)\b", RegexOptions.Compiled);
         private static readonly Regex RegionTag = new(@"\b(?:East|West|North|South|Pacific|Mountain|Central|Leste|Oeste|Norte|Sul)\b", RegexOptions.Compiled);
-        private static readonly Regex CountryToken = new(@"\b(?:Portugal|España|Spain|France|Italia|Brasil|Brazil|US|UK|DE|FR|IT|ES|PT|BR)\b", RegexOptions.Compiled);
+        private static readonly Regex CountryToken = new(@"\b(?:Portugal|España|Spain|France|Italia|Brasil|Brazil|US|UK|DE|FR|IT|ES|PT|BR)\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
         private static readonly Regex MultiSpace = new(@"\s+", RegexOptions.Compiled);
         private static readonly Regex DiacriticsFormD = new(@"\p{Mn}", RegexOptions.Compiled);
         private static readonly Regex LetterDigitSplit = new(@"([A-Za-zÀ-ÿ])(\d)", RegexOptions.Compiled);

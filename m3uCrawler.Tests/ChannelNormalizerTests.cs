@@ -41,6 +41,27 @@ public class ChannelNormalizerTests
         Assert.Equal(expected, ChannelNormalizer.Normalize(raw));
     }
 
+    // R3-hardening: o normalizer deve remover tokens de país tanto em
+    // maiúsculas como em minúsculas. Anteriormente, "cnn portugal"
+    // (já lowercase) não era reduzido para "cnn" porque o regex
+    // CountryToken exigia capitalização. Isto causava inconsistência
+    // entre o título raw que o utilizador vê e a forma normalizada
+    // que o matcher consulta no catálogo.
+    [Theory]
+    [InlineData("CNN Portugal", "cnn")]
+    [InlineData("cnn portugal", "cnn")]
+    [InlineData("SIC notícias", "sic noticias")]
+    [InlineData("rtp notícias", "rtp noticias")]
+    [InlineData("Porto Canal", "porto canal")]
+    [InlineData("porto canal", "porto canal")]
+    // ES (Espanha) e BR (Brasil) são tokens de país — são removidos.
+    [InlineData("ES La 1", "la 1")]
+    [InlineData("BR Globo News", "globo news")]
+    public void Normalize_strips_country_tokens_case_insensitively(string raw, string expected)
+    {
+        Assert.Equal(expected, ChannelNormalizer.Normalize(raw));
+    }
+
     [Fact]
     public void Tokens_returns_lowercase_split()
     {

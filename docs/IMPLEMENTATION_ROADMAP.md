@@ -3118,6 +3118,68 @@ fuzzy matching novo.
 Total: 1357 → **1370 testes** em Release (13 novos), 0 falhas,
 3x runs estáveis. Build: 0 errors, 0 warnings novos.
 
+## 32.15 — PHASE-Bridge / R3-hardening — normalizer case-insensitive (2026-09-11)
+
+Última correcção de hardening antes da primeira execução em
+produção. Resolve a inconsistência entre a forma normalizada
+dos títulos canónicos (`"CNN Portugal"` → `"cnn"`) e o que o
+catálogo persistente (`"cnn portugal"`) — mas o bug era mais
+subtil: o `ChannelNormalizer.CountryToken` regex exigia
+**capitalização** (`Portugal`, `BR`, `ES`) para bater; quando o
+input era já lowercase (`"cnn portugal"`), o token não era
+removido e o normalizer mantinha-se intacto. Isto criava
+inconsistências:
+
+- `"CNN Portugal"` → normalizer → `"cnn"` (resolve para
+  `cnnportugal` ✓).
+- `"cnn portugal"` → normalizer → `"cnn portugal"` (não bate
+  em `cnnportugal`).
+
+**Causa exacta**: a regex `CountryToken` em
+`ChannelNormalizer` não tinha `RegexOptions.IgnoreCase`.
+
+**Correcção**: adicionada `RegexOptions.IgnoreCase` ao
+`CountryToken`. Agora todas as variantes (capitalizadas,
+lowercase, mistas) são removidas consistentemente.
+
+Adicionalmente:
+
+- **`CatalogBaselineImporter`** persiste também as versões
+  normalizadas de cada alias (sem tokens de país/qualidade). Esta
+  camada defensiva é redundante com a correcção principal mas
+  protege contra futuros canais cujo `DisplayName` contenha
+  tokens não-removíveis.
+- **`ChannelNormalizerTests.Normalize_strips_country_tokens_case_insensitively`** (novo): cobre `CNN Portugal → cnn`,
+  `cnn portugal → cnn`, `SIC notícias → sic noticias`, etc.
+
+**Resultado do matching pós-R3**:
+
+- `ResolveAsync("cnn")` → `Canonical cnnportugal` ✓
+- `ResolveAsync("rtp 3")` → `Canonical rtpnoticias` (alias do JSON) ✓
+- `ResolveAsync("benfica tv")` → `Canonical btv` ✓
+- `Permutation_produces_deterministic_result` ✓ (RTP 1 e CNN
+  Portugal ambos resolvidos, ambos NewChannel decisions).
+
+**Resultado do diagnóstico 27 streams pós-R3**:
+
+| Métrica | Pré-R1 | Pós-R1 | Pós-R2 | **Pós-R3** |
+|---------|--------|--------|--------|------------|
+| Catalogo seedado | 56 | 56 | 46 | **46** |
+| Streams ingested | 27 | 21 | 21 | **21** |
+| Streams REJECTED | 0 | 6 | 6 | **6** |
+| Streams matched | 19 | 18 | 18 | **19** |
+| Streams auto-created | 8 | 3 | 3 | **2** |
+| Catalogo poluído com estrangeiros | Sim | Não | Não | **Não** |
+| Confidence média matching | 0.85 | 0.85 | 0.85 | **0.95** |
+
+A ligeira melhoria em `matched` (18 → 19) e `auto-created` (3 → 2)
+resulta do `ChannelNormalizer` agora resolver correctamente o caso
+`CNN Portugal` para `cnnportugal` (que estava em `UnknownReviewRequired`).
+
+Total: 1370 → **1378 testes** em Release (8 novos do
+`Normalize_strips_country_tokens_case_insensitively`), 0 falhas,
+3x runs estáveis. Build: 0 errors, 0 warnings novos.
+
 ---
 
 # 33. Definition of Done
