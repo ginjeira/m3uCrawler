@@ -1,7 +1,9 @@
 using m3uCrawler.Build;
 using m3uCrawler.Models;
+using m3uCrawler.Services.Automation;
 using m3uCrawler.Services.Catalog;
 using m3uCrawler.Services.Sync;
+using m3uCrawler.Services.Validation;
 using System.Net;
 using System.Security.Cryptography;
 using System.Text;
@@ -13,10 +15,23 @@ namespace m3uCrawler.Services
     public static class WebDashboardService
     {
         private static CatalogResolver? _catalogResolver;
+        private static IReadOnlyList<IScheduledAction>? _scheduledActions;
 
         public static void SetCatalogResolver(CatalogResolver resolver)
         {
             _catalogResolver = resolver;
+        }
+
+        /// <summary>
+        /// Regista a lista de <see cref="IScheduledAction"/> resolvidas
+        /// pelo <c>ScheduledAutomationHost</c> para que o formulário
+        /// de Scheduled Jobs apresente opções válidas. Mantém-se
+        /// retro-compatibilidade: se não for chamado, o formulário
+        /// aceita qualquer <c>actionName</c> livre.
+        /// </summary>
+        public static void SetScheduledActions(IEnumerable<IScheduledAction> actions)
+        {
+            _scheduledActions = actions.ToArray();
         }
 
         public static async Task RunDashboardAsync(string outputDir, int port, ImportHistoryService historyService, string? webToken = null, CancellationToken cancellationToken = default)
@@ -56,6 +71,53 @@ namespace m3uCrawler.Services
             }
 
             listener.Stop();
+        }
+
+        /// <summary>
+        /// Variante testável: executa o handler para um único
+        /// <see cref="HttpListenerContext"/>, com <see cref="CatalogResolver"/>
+        /// e <see cref="PlaylistComposerService"/> injetados. Permite
+        /// isolar cada teste num DbContext próprio sem tocar no
+        /// resolver estático global.
+        /// </summary>
+        public static async Task HandleRequestOnTestAsync(
+            HttpListenerContext context,
+            string outputDir,
+            CatalogResolver resolver,
+            PlaylistComposerService composer,
+            ImportHistoryService historyService,
+            string? webToken = null)
+        {
+            using var scope = new StaticResolverScope(resolver);
+            await HandleRequestAsync(context, outputDir, historyService, webToken);
+        }
+
+        /// <summary>
+        /// Variante testável do runner: arranca o <see cref="HttpListener"/>
+        /// em loopback com factory e runtimeDir fornecidos.
+        /// </summary>
+        public static async Task RunDashboardForTestsAsync(
+            string outputDir,
+            int port,
+            CatalogResolver resolver,
+            PlaylistComposerService composer,
+            ImportHistoryService historyService,
+            string? webToken = null,
+            CancellationToken cancellationToken = default)
+        {
+            using var scope = new StaticResolverScope(resolver);
+            await RunDashboardAsync(outputDir, port, historyService, webToken, cancellationToken);
+        }
+
+        private sealed class StaticResolverScope : IDisposable
+        {
+            private readonly CatalogResolver? _previous;
+            public StaticResolverScope(CatalogResolver resolver)
+            {
+                _previous = _catalogResolver;
+                _catalogResolver = resolver;
+            }
+            public void Dispose() => _catalogResolver = _previous;
         }
 
         private static async Task HandleRequestAsync(HttpListenerContext context, string outputDir, ImportHistoryService historyService, string? webToken = null)
@@ -411,17 +473,7 @@ namespace m3uCrawler.Services
             if (requestPath.Equals("/api/catalog/channels", StringComparison.OrdinalIgnoreCase))
             {
                 var channels = await _catalogResolver.ListCanonicalChannelsAsync();
-                await WriteJsonAsync(context.Response, channels.Select(c => new
-                {
-                    id = c.Id,
-                    key = c.Key,
-                    displayName = c.DisplayName,
-                    editorialCategory = c.EditorialCategory.ToString(),
-                    editorialGroup = c.EditorialGroup.ToString(),
-                    publicationPolicy = c.PublicationPolicy.ToString(),
-                    isEnabled = c.IsEnabled,
-                    aliases = c.Aliases.Select(a => a.NormalizedAlias).ToList(),
-                }).ToList());
+                await WriteJsonAsync(context.Response, channels.Select(ChannelToJson).ToList());
                 return;
             }
 
@@ -772,6 +824,59 @@ namespace m3uCrawler.Services
                 return;
             }
 
+            // PHASE 11 — Per-step breakdown de uma SyncRun.
+            // GET /api/catalog/sync-runs/{id}/steps
+            // POST /api/catalog/sync-runs/{id}/steps
+            if (requestPath.StartsWith("/api/catalog/sync-runs/", StringComparison.OrdinalIgnoreCase))
+            {
+                var tail = requestPath.Substring("/api/catalog/sync-runs/".Length);
+                var segments = tail.Split('/', StringSplitOptions.RemoveEmptyEntries);
+                if (segments.Length == 2 && segments[1].Equals("steps", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!long.TryParse(segments[0], out var runId))
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                        await WriteJsonAsync(context.Response, new { error = "ID inválido." });
+                        return;
+                    }
+                    if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var steps = await _catalogResolver.GetSyncRunStepsAsync(runId);
+                        await WriteJsonAsync(context.Response, steps.Select(SyncRunStepToJson));
+                        return;
+                    }
+                    if (context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                    {
+                        try
+                        {
+                            using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
+                            var body = await reader.ReadToEndAsync();
+                            var payload = JsonSerializer.Deserialize<SyncRunStepPayload>(body, JsonOptions);
+                            if (payload == null || string.IsNullOrWhiteSpace(payload.Step))
+                            {
+                                context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                                await WriteJsonAsync(context.Response, new { error = "Payload inválido." });
+                                return;
+                            }
+                            var started = payload.StartedAtUtc ?? DateTime.UtcNow;
+                            var finished = payload.FinishedAtUtc ?? DateTime.UtcNow;
+                            var saved = await _catalogResolver.RecordSyncRunStepAsync(
+                                runId, payload.Step, started, finished,
+                                payload.ItemsProcessed, payload.ItemsSucceeded, payload.ItemsFailed,
+                                payload.Result ?? "ok");
+                            await WriteJsonAsync(context.Response, SyncRunStepToJson(saved));
+                            return;
+                        }
+                        catch (Exception ex)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = ex.Message });
+                            return;
+                        }
+                    }
+                }
+            }
+
             // Pending country approvals
             if (requestPath.Equals("/api/catalog/pending-country-approvals", StringComparison.OrdinalIgnoreCase))
             {
@@ -843,7 +948,1211 @@ namespace m3uCrawler.Services
                 return;
             }
 
+            // === PHASE 5 — Ordering Lists API ===
+            // GET    /api/catalog/ordering-lists
+            // POST   /api/catalog/ordering-lists
+            // GET    /api/catalog/ordering-lists/{id}
+            // POST   /api/catalog/ordering-lists/{id}/duplicate
+            // DELETE /api/catalog/ordering-lists/{id}
+            // POST   /api/catalog/ordering-lists/{id}/items
+            // PUT    /api/catalog/ordering-items/{id}
+            // DELETE /api/catalog/ordering-items/{id}
+            // GET    /api/catalog/ordering-lists/{id}/preview
+            if (requestPath.Equals("/api/catalog/ordering-lists", StringComparison.OrdinalIgnoreCase))
+            {
+                if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteJsonAsync(context.Response, (await _catalogResolver.ListOrderingListsAsync()).Select(OrderingListSummaryToJson));
+                    return;
+                }
+                if (context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
+                        var body = await reader.ReadToEndAsync();
+                        var payload = JsonSerializer.Deserialize<OrderingListPayload>(body, JsonOptions);
+                        if (payload == null || string.IsNullOrWhiteSpace(payload.Key) || string.IsNullOrWhiteSpace(payload.Name))
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "Payload inválido: Key e Name são obrigatórios." });
+                            return;
+                        }
+                        var list = await _catalogResolver.CreateOrderingListAsync(
+                            payload.Key, payload.Name, payload.Country, payload.Description, payload.IsEnabled);
+                        await WriteJsonAsync(context.Response, OrderingListSummaryToJson(list), HttpStatusCode.Created);
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                        await WriteJsonAsync(context.Response, new { error = ex.Message });
+                        return;
+                    }
+                }
+                context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
+                return;
+            }
+
+            if (requestPath.StartsWith("/api/catalog/ordering-lists/", StringComparison.OrdinalIgnoreCase))
+            {
+                var tail = requestPath.Substring("/api/catalog/ordering-lists/".Length);
+                var segments = tail.Split('/', StringSplitOptions.RemoveEmptyEntries);
+                if (segments.Length == 0)
+                {
+                    context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                    return;
+                }
+                if (!long.TryParse(segments[0], out var listId))
+                {
+                    context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                    await WriteJsonAsync(context.Response, new { error = "ID inválido." });
+                    return;
+                }
+
+                if (segments.Length == 1)
+                {
+                    if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var list = await _catalogResolver.GetOrderingListAsync(listId, includeItems: true);
+                        if (list == null)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                            await WriteJsonAsync(context.Response, new { error = $"OrderingList #{listId} não encontrada." });
+                            return;
+                        }
+                        await WriteJsonAsync(context.Response, OrderingListDetailToJson(list));
+                        return;
+                    }
+                    if (context.Request.HttpMethod.Equals("DELETE", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var ok = await _catalogResolver.DeleteOrderingListAsync(listId);
+                        if (!ok)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                            await WriteJsonAsync(context.Response, new { error = $"OrderingList #{listId} não encontrada." });
+                            return;
+                        }
+                        await WriteJsonAsync(context.Response, new { deleted = true, id = listId });
+                        return;
+                    }
+                }
+
+                if (segments.Length == 2 && segments[1].Equals("duplicate", StringComparison.OrdinalIgnoreCase)
+                    && context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
+                        var body = await reader.ReadToEndAsync();
+                        var payload = JsonSerializer.Deserialize<OrderingListDuplicatePayload>(body, JsonOptions);
+                        if (payload == null || string.IsNullOrWhiteSpace(payload.NewKey))
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "Payload inválido: newKey obrigatório." });
+                            return;
+                        }
+                        var clone = await _catalogResolver.DuplicateOrderingListAsync(listId, payload.NewKey, payload.NewName);
+                        await WriteJsonAsync(context.Response, OrderingListSummaryToJson(clone), HttpStatusCode.Created);
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                        await WriteJsonAsync(context.Response, new { error = ex.Message });
+                        return;
+                    }
+                }
+
+                if (segments.Length == 2 && segments[1].Equals("items", StringComparison.OrdinalIgnoreCase)
+                    && context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
+                        var body = await reader.ReadToEndAsync();
+                        var payload = JsonSerializer.Deserialize<OrderingItemAddPayload>(body, JsonOptions);
+                        if (payload == null || payload.CanonicalChannelId <= 0)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "Payload inválido: canonicalChannelId obrigatório." });
+                            return;
+                        }
+                        var item = await _catalogResolver.AddOrderingItemAsync(
+                            listId, payload.CanonicalChannelId, payload.Position, payload.IsEnabled);
+                        await WriteJsonAsync(context.Response, OrderingItemToJson(item), HttpStatusCode.Created);
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                        await WriteJsonAsync(context.Response, new { error = ex.Message });
+                        return;
+                    }
+                }
+
+                if (segments.Length == 2 && segments[1].Equals("preview", StringComparison.OrdinalIgnoreCase)
+                    && context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    var composer = new PlaylistComposerService(_catalogResolver.GetFactory());
+                    var composition = await composer.ComposeAsync(listId);
+                    await WriteJsonAsync(context.Response, PlaylistCompositionToJson(composition));
+                    return;
+                }
+
+                context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                return;
+            }
+
+            if (requestPath.StartsWith("/api/catalog/ordering-items/", StringComparison.OrdinalIgnoreCase))
+            {
+                var idStr = requestPath.Substring("/api/catalog/ordering-items/".Length);
+                if (!long.TryParse(idStr, out var itemId))
+                {
+                    context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                    await WriteJsonAsync(context.Response, new { error = "ID inválido." });
+                    return;
+                }
+
+                if (context.Request.HttpMethod.Equals("DELETE", StringComparison.OrdinalIgnoreCase))
+                {
+                    var ok = await _catalogResolver.RemoveOrderingItemAsync(itemId);
+                    if (!ok)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                        await WriteJsonAsync(context.Response, new { error = $"OrderingItem #{itemId} não encontrado." });
+                        return;
+                    }
+                    await WriteJsonAsync(context.Response, new { deleted = true, id = itemId });
+                    return;
+                }
+                if (context.Request.HttpMethod.Equals("PUT", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
+                        var body = await reader.ReadToEndAsync();
+                        var payload = JsonSerializer.Deserialize<OrderingItemUpdatePayload>(body, JsonOptions);
+                        if (payload == null)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "Payload inválido." });
+                            return;
+                        }
+                        if (payload.Position.HasValue)
+                        {
+                            await _catalogResolver.MoveOrderingItemAsync(itemId, payload.Position.Value);
+                        }
+                        if (payload.IsEnabled.HasValue)
+                        {
+                            await _catalogResolver.SetOrderingItemEnabledAsync(itemId, payload.IsEnabled.Value);
+                        }
+                        await WriteJsonAsync(context.Response, new { updated = true, id = itemId });
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                        await WriteJsonAsync(context.Response, new { error = ex.Message });
+                        return;
+                    }
+                }
+                context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
+                return;
+            }
+
+            // === PHASE 6 — Source Priority API ===
+            // GET  /api/catalog/priority-policies?channelId={id}
+            // POST /api/catalog/priority-policies
+            if (requestPath.Equals("/api/catalog/priority-policies", StringComparison.OrdinalIgnoreCase))
+            {
+                if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    var global = await _catalogResolver.GetOrCreateGlobalPriorityPolicyAsync();
+                    object result = global;
+                    var channelIdRaw = context.Request.QueryString["channelId"];
+                    if (!string.IsNullOrWhiteSpace(channelIdRaw) && long.TryParse(channelIdRaw, out var chId))
+                    {
+                        var per = await _catalogResolver.GetChannelPriorityPolicyAsync(chId);
+                        if (per != null) result = per;
+                    }
+                    await WriteJsonAsync(context.Response, result);
+                    return;
+                }
+                if (context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
+                        var body = await reader.ReadToEndAsync();
+                        var payload = JsonSerializer.Deserialize<PriorityPolicyPayload>(body, JsonOptions);
+                        if (payload == null || string.IsNullOrWhiteSpace(payload.Scope))
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "Payload inválido." });
+                            return;
+                        }
+                        var saved = await _catalogResolver.UpsertPriorityPolicyAsync(
+                            payload.Scope, payload.CanonicalChannelId,
+                            payload.CriteriaJson ?? "[]", payload.PreferredQuality ?? "",
+                            payload.AllowFallback);
+                        await WriteJsonAsync(context.Response, PriorityPolicyToJson(saved));
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                        await WriteJsonAsync(context.Response, new { error = ex.Message });
+                        return;
+                    }
+                }
+                context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
+                return;
+            }
+
+            // === PHASE 9 — Stream degradation dashboard ===
+            // GET /api/catalog/degradation/recent?lookbackMinutes={n}&limit={n}
+            // GET /api/catalog/degradation/stats?lookbackMinutes={n}
+            if (requestPath.Equals("/api/catalog/degradation/recent", StringComparison.OrdinalIgnoreCase)
+                && context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+            {
+                int lookbackMinutes = 60 * 24 * 7;
+                int limit = 200;
+                var rawLookback = context.Request.QueryString["lookbackMinutes"];
+                if (!string.IsNullOrWhiteSpace(rawLookback) && int.TryParse(rawLookback, out var pl))
+                {
+                    lookbackMinutes = pl;
+                }
+                var rawLimit = context.Request.QueryString["limit"];
+                if (!string.IsNullOrWhiteSpace(rawLimit) && int.TryParse(rawLimit, out var pl2))
+                {
+                    limit = pl2;
+                }
+                var list = await _catalogResolver.GetDegradedStreamsAsync(lookbackMinutes, limit);
+                await WriteJsonAsync(context.Response, list.Select(DegradedStreamToJson));
+                return;
+            }
+            if (requestPath.Equals("/api/catalog/degradation/stats", StringComparison.OrdinalIgnoreCase)
+                && context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+            {
+                int lookbackMinutes = 60 * 24;
+                var rawLookback = context.Request.QueryString["lookbackMinutes"];
+                if (!string.IsNullOrWhiteSpace(rawLookback) && int.TryParse(rawLookback, out var pl))
+                {
+                    lookbackMinutes = pl;
+                }
+                var stats = await _catalogResolver.GetDegradationStatsAsync(lookbackMinutes);
+                await WriteJsonAsync(context.Response, stats);
+                return;
+            }
+
+            // === PHASE 12 — Scheduled Jobs API ===
+            // GET    /api/scheduled-actions       — lista as IScheduledAction disponíveis
+            // GET    /api/catalog/scheduled-jobs
+            // POST   /api/catalog/scheduled-jobs
+            // PUT    /api/catalog/scheduled-jobs/{id}/enabled
+            // DELETE /api/catalog/scheduled-jobs/{id}
+            if (requestPath.Equals("/api/scheduled-actions", StringComparison.OrdinalIgnoreCase)
+                && context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+            {
+                var names = _scheduledActions is null
+                    ? Array.Empty<string>()
+                    : _scheduledActions.Select(a => a.Name).ToArray();
+                await WriteJsonAsync(context.Response, names);
+                return;
+            }
+            if (requestPath.Equals("/api/catalog/scheduled-jobs", StringComparison.OrdinalIgnoreCase))
+            {
+                if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteJsonAsync(context.Response, (await _catalogResolver.ListScheduledJobsAsync()).Select(ScheduledJobToJson));
+                    return;
+                }
+                if (context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
+                        var body = await reader.ReadToEndAsync();
+                        var payload = JsonSerializer.Deserialize<ScheduledJobPayload>(body, JsonOptions);
+                        if (payload == null || string.IsNullOrWhiteSpace(payload.Name) || string.IsNullOrWhiteSpace(payload.CronExpression) || string.IsNullOrWhiteSpace(payload.ActionName))
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "Payload inválido: Name, CronExpression e ActionName obrigatórios." });
+                            return;
+                        }
+                        var saved = await _catalogResolver.UpsertScheduledJobAsync(
+                            payload.Name, payload.CronExpression, payload.ActionName, payload.IsEnabled);
+                        await WriteJsonAsync(context.Response, ScheduledJobToJson(saved));
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                        await WriteJsonAsync(context.Response, new { error = ex.Message });
+                        return;
+                    }
+                }
+                context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
+                return;
+            }
+            if (requestPath.StartsWith("/api/catalog/scheduled-jobs/", StringComparison.OrdinalIgnoreCase))
+            {
+                var tail = requestPath.Substring("/api/catalog/scheduled-jobs/".Length);
+                var segments = tail.Split('/', StringSplitOptions.RemoveEmptyEntries);
+                if (segments.Length != 2 || segments[1] != "enabled")
+                {
+                    // DELETE
+                    if (segments.Length == 1 && context.Request.HttpMethod.Equals("DELETE", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (!long.TryParse(segments[0], out var jid))
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "ID inválido." });
+                            return;
+                        }
+                        var ok = await _catalogResolver.DeleteScheduledJobAsync(jid);
+                        if (!ok)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                            return;
+                        }
+                        await WriteJsonAsync(context.Response, new { deleted = true, id = jid });
+                        return;
+                    }
+                }
+                else if (segments.Length == 2 && context.Request.HttpMethod.Equals("PUT", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!long.TryParse(segments[0], out var jid))
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                        return;
+                    }
+                    try
+                    {
+                        using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
+                        var body = await reader.ReadToEndAsync();
+                        var payload = JsonSerializer.Deserialize<ScheduledJobEnablePayload>(body, JsonOptions);
+                        if (payload == null)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            return;
+                        }
+                        var ok = await _catalogResolver.SetScheduledJobEnabledAsync(jid, payload.IsEnabled);
+                        if (!ok)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                            return;
+                        }
+                        await WriteJsonAsync(context.Response, new { updated = true, id = jid, isEnabled = payload.IsEnabled });
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                        await WriteJsonAsync(context.Response, new { error = ex.Message });
+                        return;
+                    }
+                }
+            }
+
+            // === PHASE 3 — Matching observability ===
+            // GET /api/catalog/matching/recent?channelId={id}&limit={n}
+            // GET /api/catalog/matching/stats
+            if (requestPath.Equals("/api/catalog/matching/recent", StringComparison.OrdinalIgnoreCase)
+                && context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+            {
+                long? channelId = null;
+                int limit = 100;
+                var rawChannel = context.Request.QueryString["channelId"];
+                if (!string.IsNullOrWhiteSpace(rawChannel) && long.TryParse(rawChannel, out var parsed))
+                {
+                    channelId = parsed;
+                }
+                var rawLimit = context.Request.QueryString["limit"];
+                if (!string.IsNullOrWhiteSpace(rawLimit) && int.TryParse(rawLimit, out var parsedLimit))
+                {
+                    limit = parsedLimit;
+                }
+                var list = await _catalogResolver.GetRecentMatchingAuditsAsync(limit, channelId);
+                await WriteJsonAsync(context.Response, list.Select(MatchingAuditToJson));
+                return;
+            }
+
+            if (requestPath.Equals("/api/catalog/matching/stats", StringComparison.OrdinalIgnoreCase)
+                && context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+            {
+                var stats = await _catalogResolver.GetMatchingAuditStatsAsync();
+                await WriteJsonAsync(context.Response, stats);
+                return;
+            }
+
+            // === PHASE 8 — Import Policies + Canonical Groups + Group Mappings ===
+            // GET    /api/catalog/import-policies
+            // POST   /api/catalog/import-policies
+            // GET    /api/catalog/canonical-groups
+            // POST   /api/catalog/canonical-groups
+            // DELETE /api/catalog/canonical-groups/{id}
+            // GET    /api/catalog/group-mappings
+            // POST   /api/catalog/group-mappings
+            // DELETE /api/catalog/group-mappings/{id}
+            if (requestPath.Equals("/api/catalog/import-policies", StringComparison.OrdinalIgnoreCase))
+            {
+                if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteJsonAsync(context.Response, (await _catalogResolver.ListImportPoliciesAsync()).Select(ImportPolicyToJson));
+                    return;
+                }
+                if (context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
+                        var body = await reader.ReadToEndAsync();
+                        var payload = JsonSerializer.Deserialize<ImportPolicyPayload>(body, JsonOptions);
+                        if (payload == null || !Enum.TryParse<MediaKind>(payload.MediaKind, true, out var kind))
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "Payload inválido." });
+                            return;
+                        }
+                        if (!Enum.TryParse<VodPolicy>(payload.VodPolicy ?? "ExcludeVod", true, out var vod))
+                        {
+                            vod = VodPolicy.ExcludeVod;
+                        }
+                        var saved = await _catalogResolver.UpsertImportPolicyAsync(
+                            kind, vod, payload.TargetGroupsCsv ?? string.Empty,
+                            payload.ExcludedGroupsCsv ?? string.Empty, payload.IsEnabled);
+                        await WriteJsonAsync(context.Response, ImportPolicyToJson(saved));
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                        await WriteJsonAsync(context.Response, new { error = ex.Message });
+                        return;
+                    }
+                }
+                context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
+                return;
+            }
+
+            if (requestPath.Equals("/api/catalog/canonical-groups", StringComparison.OrdinalIgnoreCase))
+            {
+                if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteJsonAsync(context.Response, (await _catalogResolver.ListCanonicalGroupsAsync()).Select(CanonicalGroupToJson));
+                    return;
+                }
+                if (context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
+                        var body = await reader.ReadToEndAsync();
+                        var payload = JsonSerializer.Deserialize<CanonicalGroupPayload>(body, JsonOptions);
+                        if (payload == null || string.IsNullOrWhiteSpace(payload.Key) || string.IsNullOrWhiteSpace(payload.DisplayName))
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "Payload inválido: Key e DisplayName obrigatórios." });
+                            return;
+                        }
+                        var saved = await _catalogResolver.UpsertCanonicalGroupAsync(
+                            payload.Key, payload.DisplayName, payload.Country,
+                            payload.Order, payload.IsEnabled, payload.IsDefault);
+                        await WriteJsonAsync(context.Response, CanonicalGroupToJson(saved));
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                        await WriteJsonAsync(context.Response, new { error = ex.Message });
+                        return;
+                    }
+                }
+                context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
+                return;
+            }
+
+            if (requestPath.StartsWith("/api/catalog/canonical-groups/", StringComparison.OrdinalIgnoreCase))
+            {
+                var idStr = requestPath.Substring("/api/catalog/canonical-groups/".Length);
+                if (!long.TryParse(idStr, out var gid))
+                {
+                    context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                    await WriteJsonAsync(context.Response, new { error = "ID inválido." });
+                    return;
+                }
+                if (context.Request.HttpMethod.Equals("DELETE", StringComparison.OrdinalIgnoreCase))
+                {
+                    var ok = await _catalogResolver.DeleteCanonicalGroupAsync(gid);
+                    if (!ok)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                        await WriteJsonAsync(context.Response, new { error = $"CanonicalGroup #{gid} não encontrada." });
+                        return;
+                    }
+                    await WriteJsonAsync(context.Response, new { deleted = true, id = gid });
+                    return;
+                }
+            }
+
+            if (requestPath.Equals("/api/catalog/group-mappings", StringComparison.OrdinalIgnoreCase))
+            {
+                if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteJsonAsync(context.Response, (await _catalogResolver.ListGroupMappingsAsync()).Select(GroupMappingToJson));
+                    return;
+                }
+                if (context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
+                        var body = await reader.ReadToEndAsync();
+                        var payload = JsonSerializer.Deserialize<GroupMappingPayload>(body, JsonOptions);
+                        if (payload == null
+                            || !Enum.TryParse<SourceKind>(payload.SourceKind, true, out var sk)
+                            || string.IsNullOrWhiteSpace(payload.SourceGroupTitle)
+                            || payload.CanonicalGroupId <= 0)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "Payload inválido." });
+                            return;
+                        }
+                        var saved = await _catalogResolver.UpsertGroupMappingAsync(
+                            sk, payload.SourceGroupTitle, payload.CanonicalGroupId, payload.IsEnabled);
+                        await WriteJsonAsync(context.Response, GroupMappingToJson(saved));
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                        await WriteJsonAsync(context.Response, new { error = ex.Message });
+                        return;
+                    }
+                }
+                context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
+                return;
+            }
+
+            if (requestPath.StartsWith("/api/catalog/group-mappings/", StringComparison.OrdinalIgnoreCase))
+            {
+                var idStr = requestPath.Substring("/api/catalog/group-mappings/".Length);
+                if (!long.TryParse(idStr, out var mid))
+                {
+                    context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                    await WriteJsonAsync(context.Response, new { error = "ID inválido." });
+                    return;
+                }
+                if (context.Request.HttpMethod.Equals("DELETE", StringComparison.OrdinalIgnoreCase))
+                {
+                    var ok = await _catalogResolver.DeleteGroupMappingAsync(mid);
+                    if (!ok)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                        await WriteJsonAsync(context.Response, new { error = $"GroupMapping #{mid} não encontrado." });
+                        return;
+                    }
+                    await WriteJsonAsync(context.Response, new { deleted = true, id = mid });
+                    return;
+                }
+            }
+
+            // === PHASE 9 b — ChannelSource observation history ===
+            // GET /api/catalog/channel-sources/{id}/observations?limit={n}
+            // POST /api/catalog/channel-sources/{id}/observations
+            if (requestPath.StartsWith("/api/catalog/channel-sources/", StringComparison.OrdinalIgnoreCase)
+                && context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+            {
+                var tail = requestPath.Substring("/api/catalog/channel-sources/".Length);
+                var segments = tail.Split('/', StringSplitOptions.RemoveEmptyEntries);
+                if (segments.Length == 2 && segments[1].Equals("observations", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!long.TryParse(segments[0], out var csId))
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                        await WriteJsonAsync(context.Response, new { error = "ID inválido." });
+                        return;
+                    }
+                    int limit = 200;
+                    var rawLimit = context.Request.QueryString["limit"];
+                    if (!string.IsNullOrWhiteSpace(rawLimit) && int.TryParse(rawLimit, out var parsed))
+                    {
+                        limit = parsed;
+                    }
+                    var list = await _catalogResolver.GetChannelSourceObservationsAsync(csId, limit);
+                    await WriteJsonAsync(context.Response, list.Select(ChannelSourceObservationToJson));
+                    return;
+                }
+            }
+            if (requestPath.StartsWith("/api/catalog/channel-sources/", StringComparison.OrdinalIgnoreCase)
+                && context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+            {
+                var tail = requestPath.Substring("/api/catalog/channel-sources/".Length);
+                var segments = tail.Split('/', StringSplitOptions.RemoveEmptyEntries);
+                if (segments.Length == 2 && segments[1].Equals("observations", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!long.TryParse(segments[0], out var csId))
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                        await WriteJsonAsync(context.Response, new { error = "ID inválido." });
+                        return;
+                    }
+                    try
+                    {
+                        using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
+                        var body = await reader.ReadToEndAsync();
+                        var payload = JsonSerializer.Deserialize<ChannelSourceObservationPayload>(body, JsonOptions);
+                        if (payload == null)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "Payload inválido." });
+                            return;
+                        }
+                        if (!Enum.TryParse<StreamQuality>(payload.Quality, true, out var quality)) quality = StreamQuality.Unknown;
+                        if (!Enum.TryParse<EpgState>(payload.Epg, true, out var epg)) epg = EpgState.Unknown;
+                        if (!Enum.TryParse<AvailabilityState>(payload.Availability, true, out var availability)) availability = AvailabilityState.Discovered;
+                        await _catalogResolver.RecordChannelSourceObservationAsync(csId, quality, epg, availability, payload.ResponseTimeMs);
+                        await WriteJsonAsync(context.Response, new { recorded = true });
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                        await WriteJsonAsync(context.Response, new { error = ex.Message });
+                        return;
+                    }
+                }
+            }
+
+            // === PHASE 4 — Sources & ChannelSources API ===
+            // GET    /api/catalog/sources
+            // POST   /api/catalog/sources
+            // DELETE /api/catalog/sources/{id}
+            // GET    /api/catalog/sources/{id}/streams?channelId={id}
+            // POST   /api/catalog/sources/{id}/streams
+            // DELETE /api/catalog/channel-sources/{id}
+            // PUT    /api/catalog/channel-sources/{id}
+            if (requestPath.Equals("/api/catalog/sources", StringComparison.OrdinalIgnoreCase))
+            {
+                if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteJsonAsync(context.Response, (await _catalogResolver.ListSourcesAsync()).Select(SourceToJson));
+                    return;
+                }
+                if (context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
+                        var body = await reader.ReadToEndAsync();
+                        var payload = JsonSerializer.Deserialize<SourcePayload>(body, JsonOptions);
+                        if (payload == null || string.IsNullOrWhiteSpace(payload.Key) || string.IsNullOrWhiteSpace(payload.Name))
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "Payload inválido: Key e Name são obrigatórios." });
+                            return;
+                        }
+                        if (!Enum.TryParse<SourceKind>(payload.Kind, true, out var kind))
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = $"Kind inválido: '{payload.Kind}'." });
+                            return;
+                        }
+                        var source = await _catalogResolver.EnsureSourceAsync(
+                            payload.Key, payload.Name, kind, payload.Origin ?? string.Empty,
+                            payload.Priority, payload.IsEnabled);
+                        await WriteJsonAsync(context.Response, SourceToJson(source), HttpStatusCode.Created);
+                        return;
+                    }
+                    catch (ArgumentException ex)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                        await WriteJsonAsync(context.Response, new { error = ex.Message });
+                        return;
+                    }
+                }
+                context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
+                return;
+            }
+
+            if (requestPath.StartsWith("/api/catalog/sources/", StringComparison.OrdinalIgnoreCase))
+            {
+                var tail = requestPath.Substring("/api/catalog/sources/".Length);
+                var segments = tail.Split('/', StringSplitOptions.RemoveEmptyEntries);
+                if (segments.Length == 0)
+                {
+                    context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                    return;
+                }
+                if (!long.TryParse(segments[0], out var sourceId))
+                {
+                    context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                    await WriteJsonAsync(context.Response, new { error = "ID de source inválido." });
+                    return;
+                }
+
+                if (segments.Length == 1 && context.Request.HttpMethod.Equals("DELETE", StringComparison.OrdinalIgnoreCase))
+                {
+                    var ok = await _catalogResolver.DeleteSourceAsync(sourceId);
+                    if (!ok)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                        await WriteJsonAsync(context.Response, new { error = $"Source #{sourceId} não encontrada." });
+                        return;
+                    }
+                    await WriteJsonAsync(context.Response, new { deleted = true, id = sourceId });
+                    return;
+                }
+
+                // /api/catalog/sources/{id}/streams
+                if (segments.Length >= 2 && segments[1].Equals("streams", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                    {
+                        long? channelId = null;
+                        var rawChannel = context.Request.QueryString["channelId"];
+                        if (!string.IsNullOrWhiteSpace(rawChannel) && long.TryParse(rawChannel, out var parsed))
+                        {
+                            channelId = parsed;
+                        }
+                        var streams = await _catalogResolver.ListChannelSourcesAsync(canonicalChannelId: channelId, sourceId: sourceId);
+                        await WriteJsonAsync(context.Response, streams.Select(ChannelSourceToJson));
+                        return;
+                    }
+                    if (segments.Length == 2 && context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                    {
+                        try
+                        {
+                            using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
+                            var body = await reader.ReadToEndAsync();
+                            var payload = JsonSerializer.Deserialize<ChannelSourcePayload>(body, JsonOptions);
+                            if (payload == null || payload.CanonicalChannelId <= 0 || string.IsNullOrWhiteSpace(payload.StreamUrl))
+                            {
+                                context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                                await WriteJsonAsync(context.Response, new { error = "Payload inválido." });
+                                return;
+                            }
+                            if (!Enum.TryParse<StreamQuality>(payload.Quality, true, out var quality)) quality = StreamQuality.Unknown;
+                            if (!Enum.TryParse<EpgState>(payload.Epg, true, out var epg)) epg = EpgState.Unknown;
+                            if (!Enum.TryParse<AvailabilityState>(payload.Availability, true, out var availability)) availability = AvailabilityState.Discovered;
+                            var cs = await _catalogResolver.RecordChannelSourceAsync(
+                                payload.CanonicalChannelId, sourceId, payload.StreamUrl,
+                                quality, epg, availability, payload.MatchConfidence,
+                                payload.MatchMethod ?? "unknown",
+                                payload.ExternalStreamId,
+                                payload.IsEnabled);
+                            await WriteJsonAsync(context.Response, ChannelSourceToJson(cs), HttpStatusCode.Created);
+                            return;
+                        }
+                        catch (ArgumentException ex)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = ex.Message });
+                            return;
+                        }
+                    }
+                }
+
+                context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                return;
+            }
+
+            if (requestPath.StartsWith("/api/catalog/channel-sources/", StringComparison.OrdinalIgnoreCase))
+            {
+                var idStr = requestPath.Substring("/api/catalog/channel-sources/".Length);
+                if (!long.TryParse(idStr, out var csId))
+                {
+                    context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                    await WriteJsonAsync(context.Response, new { error = "ID inválido." });
+                    return;
+                }
+                if (context.Request.HttpMethod.Equals("DELETE", StringComparison.OrdinalIgnoreCase))
+                {
+                    var ok = await _catalogResolver.DeleteChannelSourceAsync(csId);
+                    if (!ok)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                        await WriteJsonAsync(context.Response, new { error = $"ChannelSource #{csId} não encontrada." });
+                        return;
+                    }
+                    await WriteJsonAsync(context.Response, new { deleted = true, id = csId });
+                    return;
+                }
+                if (context.Request.HttpMethod.Equals("PUT", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
+                        var body = await reader.ReadToEndAsync();
+                        var payload = JsonSerializer.Deserialize<ChannelSourceUpdatePayload>(body, JsonOptions);
+                        if (payload == null)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "Payload inválido." });
+                            return;
+                        }
+                        var ok = await _catalogResolver.SetChannelSourceEnabledAsync(csId, payload.IsEnabled);
+                        if (!ok)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                            await WriteJsonAsync(context.Response, new { error = $"ChannelSource #{csId} não encontrada." });
+                            return;
+                        }
+                        await WriteJsonAsync(context.Response, new { updated = true, id = csId, isEnabled = payload.IsEnabled });
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                        await WriteJsonAsync(context.Response, new { error = ex.Message });
+                        return;
+                    }
+                }
+                context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
+                return;
+            }
+
+            // === Channels admin API (PHASE 2 — Dashboard Control Plane) ===
+            // GET    /api/catalog/channels/{id}
+            // POST   /api/catalog/channels
+            // PUT    /api/catalog/channels/{id}
+            // DELETE /api/catalog/channels/{id}
+            // POST   /api/catalog/channels/{id}/aliases
+            // DELETE /api/catalog/channels/{id}/aliases/{alias}
+            if (requestPath.StartsWith("/api/catalog/channels/", StringComparison.OrdinalIgnoreCase))
+            {
+                var tail = requestPath.Substring("/api/catalog/channels/".Length);
+                var segments = tail.Split('/', StringSplitOptions.RemoveEmptyEntries);
+                if (segments.Length == 0)
+                {
+                    context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                    await WriteJsonAsync(context.Response, new { error = "Path incompleto." });
+                    return;
+                }
+                if (!long.TryParse(segments[0], out var channelId))
+                {
+                    context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                    await WriteJsonAsync(context.Response, new { error = "ID de canal inválido." });
+                    return;
+                }
+
+                // /api/catalog/channels/{id} (singular)
+                if (segments.Length == 1)
+                {
+                    if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var ch = await _catalogResolver.GetCanonicalChannelAsync(channelId);
+                        if (ch == null)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                            await WriteJsonAsync(context.Response, new { error = $"Canal #{channelId} não encontrado." });
+                            return;
+                        }
+                        await WriteJsonAsync(context.Response, ChannelToJson(ch));
+                        return;
+                    }
+
+                    if (context.Request.HttpMethod.Equals("PUT", StringComparison.OrdinalIgnoreCase))
+                    {
+                        try
+                        {
+                            using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
+                            var body = await reader.ReadToEndAsync();
+                            var payload = JsonSerializer.Deserialize<UpdateChannelPayload>(body, JsonOptions);
+                            if (payload == null)
+                            {
+                                context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                                await WriteJsonAsync(context.Response, new { error = "Payload inválido." });
+                                return;
+                            }
+                            if (string.IsNullOrWhiteSpace(payload.DisplayName))
+                            {
+                                context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                                await WriteJsonAsync(context.Response, new { error = "DisplayName é obrigatório." });
+                                return;
+                            }
+                            if (!Enum.TryParse<EditorialCategory>(payload.EditorialCategory, true, out var editorialCategory))
+                            {
+                                context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                                await WriteJsonAsync(context.Response, new { error = $"EditorialCategory inválido: '{payload.EditorialCategory}'." });
+                                return;
+                            }
+                            if (!Enum.TryParse<CanonicalEditorialGroup>(payload.EditorialGroup, true, out var editorialGroup))
+                            {
+                                context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                                await WriteJsonAsync(context.Response, new { error = $"EditorialGroup inválido: '{payload.EditorialGroup}'." });
+                                return;
+                            }
+                            if (!Enum.TryParse<PublicationPolicy>(payload.PublicationPolicy, true, out var publicationPolicy))
+                            {
+                                context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                                await WriteJsonAsync(context.Response, new { error = $"PublicationPolicy inválido: '{payload.PublicationPolicy}'." });
+                                return;
+                            }
+                            var isEnabled = payload.IsEnabled ?? true;
+                            var updated = await _catalogResolver.UpdateCanonicalChannelAsync(
+                                channelId, payload.DisplayName, editorialCategory,
+                                editorialGroup, publicationPolicy, isEnabled);
+                            if (updated == null)
+                            {
+                                context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                                await WriteJsonAsync(context.Response, new { error = $"Canal #{channelId} não encontrado." });
+                                return;
+                            }
+                            var reloaded = await _catalogResolver.GetCanonicalChannelAsync(channelId);
+                            await WriteJsonAsync(context.Response, ChannelToJson(reloaded!));
+                            return;
+                        }
+                        catch (ChannelAdministrationException ex)
+                        {
+                            await WriteChannelAdminError(context.Response, ex);
+                            return;
+                        }
+                    }
+
+                    if (context.Request.HttpMethod.Equals("DELETE", StringComparison.OrdinalIgnoreCase))
+                    {
+                        try
+                        {
+                            var deleted = await _catalogResolver.DeleteCanonicalChannelAsync(channelId);
+                            if (!deleted)
+                            {
+                                context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                                await WriteJsonAsync(context.Response, new { error = $"Canal #{channelId} não encontrado." });
+                                return;
+                            }
+                            await WriteJsonAsync(context.Response, new { deleted = true, id = channelId });
+                            return;
+                        }
+                        catch (ChannelAdministrationException ex)
+                        {
+                            await WriteChannelAdminError(context.Response, ex);
+                            return;
+                        }
+                    }
+
+                    context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
+                    await WriteJsonAsync(context.Response, new { error = "Método não permitido." });
+                    return;
+                }
+
+                // /api/catalog/channels/{id}/aliases  or  .../aliases/{alias}
+                if (segments.Length >= 2 && segments[1].Equals("aliases", StringComparison.OrdinalIgnoreCase))
+                {
+                    // POST .../aliases
+                    if (segments.Length == 2 && context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                    {
+                        try
+                        {
+                            using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
+                            var body = await reader.ReadToEndAsync();
+                            var payload = JsonSerializer.Deserialize<AddAliasPayload>(body, JsonOptions);
+                            if (payload == null || string.IsNullOrWhiteSpace(payload.NormalizedAlias))
+                            {
+                                context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                                await WriteJsonAsync(context.Response, new { error = "Payload inválido: NormalizedAlias é obrigatório." });
+                                return;
+                            }
+                            var alias = await _catalogResolver.AddAliasAsync(channelId, payload.NormalizedAlias);
+                            await WriteJsonAsync(context.Response, new
+                            {
+                                id = alias.Id,
+                                normalizedAlias = alias.NormalizedAlias,
+                                canonicalChannelId = alias.CanonicalChannelId,
+                                createdAtUtc = alias.CreatedAtUtc.ToString("o"),
+                            }, HttpStatusCode.Created);
+                            return;
+                        }
+                        catch (ChannelAdministrationException ex)
+                        {
+                            await WriteChannelAdminError(context.Response, ex);
+                            return;
+                        }
+                    }
+
+                    // DELETE .../aliases/{alias}
+                    if (segments.Length == 3 && context.Request.HttpMethod.Equals("DELETE", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var alias = Uri.UnescapeDataString(segments[2]);
+                        var removed = await _catalogResolver.RemoveAliasAsync(channelId, alias);
+                        if (!removed)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                            await WriteJsonAsync(context.Response, new { error = $"Alias '{alias}' não encontrado no canal #{channelId}." });
+                            return;
+                        }
+                        await WriteJsonAsync(context.Response, new { deleted = true, channelId, alias });
+                        return;
+                    }
+
+                    context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
+                    await WriteJsonAsync(context.Response, new { error = "Método não permitido para /aliases." });
+                    return;
+                }
+
+                context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                await WriteJsonAsync(context.Response, new { error = "Sub-path desconhecido." });
+                return;
+            }
+
+            // POST /api/catalog/channels
+            if (requestPath.Equals("/api/catalog/channels", StringComparison.OrdinalIgnoreCase)
+                && context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
+                    var body = await reader.ReadToEndAsync();
+                    var payload = JsonSerializer.Deserialize<CreateChannelPayload>(body, JsonOptions);
+                    if (payload == null || string.IsNullOrWhiteSpace(payload.Key) || string.IsNullOrWhiteSpace(payload.DisplayName))
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                        await WriteJsonAsync(context.Response, new { error = "Payload inválido: Key e DisplayName são obrigatórios." });
+                        return;
+                    }
+                    if (!Enum.TryParse<EditorialCategory>(payload.EditorialCategory, true, out var editorialCategory))
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                        await WriteJsonAsync(context.Response, new { error = $"EditorialCategory inválido: '{payload.EditorialCategory}'." });
+                        return;
+                    }
+                    if (!Enum.TryParse<CanonicalEditorialGroup>(payload.EditorialGroup, true, out var editorialGroup))
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                        await WriteJsonAsync(context.Response, new { error = $"EditorialGroup inválido: '{payload.EditorialGroup}'." });
+                        return;
+                    }
+                    if (!Enum.TryParse<PublicationPolicy>(payload.PublicationPolicy, true, out var publicationPolicy))
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                        await WriteJsonAsync(context.Response, new { error = $"PublicationPolicy inválido: '{payload.PublicationPolicy}'." });
+                        return;
+                    }
+                    var aliases = (payload.Aliases ?? new List<string>())
+                        .Where(a => !string.IsNullOrWhiteSpace(a))
+                        .Select(a => a.Trim())
+                        .ToList();
+                    var created = await _catalogResolver.CreateCanonicalChannelAsync(
+                        payload.Key.Trim(), payload.DisplayName,
+                        editorialCategory, editorialGroup, publicationPolicy,
+                        payload.IsEnabled, aliases);
+                    var reloaded = await _catalogResolver.GetCanonicalChannelAsync(created.Id);
+                    await WriteJsonAsync(context.Response, ChannelToJson(reloaded!), HttpStatusCode.Created);
+                    return;
+                }
+                catch (ChannelAdministrationException ex)
+                {
+                    await WriteChannelAdminError(context.Response, ex);
+                    return;
+                }
+            }
+
+            // === Stream Validation Policy (PHASE 9A) ===
+            // GET  /api/validation/policy
+            // POST /api/validation/policy
+            // POST /api/validation/test (dry-run contra URLs de exemplo; útil para tunar)
+            if (requestPath.Equals("/api/validation/policy", StringComparison.OrdinalIgnoreCase))
+            {
+                var runtimeDir = Path.Combine(Directory.GetCurrentDirectory(), "runtime-data");
+                var store = new StreamValidationPolicyStore(runtimeDir);
+                if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    var current = store.Load();
+                    await WriteJsonAsync(context.Response, current);
+                    return;
+                }
+                if (context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
+                        var body = await reader.ReadToEndAsync();
+                        var incoming = JsonSerializer.Deserialize<StreamValidationOptions>(body, JsonOptions);
+                        if (incoming == null)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "Payload inválido." });
+                            return;
+                        }
+                        var saved = store.Save(incoming);
+                        await WriteJsonAsync(context.Response, saved);
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                        await WriteJsonAsync(context.Response, new { error = ex.Message });
+                        return;
+                    }
+                }
+                context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
+                return;
+            }
+
+            if (requestPath.Equals("/api/validation/test", StringComparison.OrdinalIgnoreCase)
+                && context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
+                    var body = await reader.ReadToEndAsync();
+                    var payload = JsonSerializer.Deserialize<ValidationTestPayload>(body, JsonOptions);
+                    if (payload == null || payload.Urls == null || payload.Urls.Count == 0)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                        await WriteJsonAsync(context.Response, new { error = "Payload inválido: campo 'urls' é obrigatório." });
+                        return;
+                    }
+                    var runtimeDir = Path.Combine(Directory.GetCurrentDirectory(), "runtime-data");
+                    var store = new StreamValidationPolicyStore(runtimeDir);
+                    var options = payload.Options ?? store.Load();
+                    options.Sanitize();
+
+                    using var tester = new M3uTesterService(options);
+                    var outcomes = await tester.RunAsync(payload.Urls, options);
+                    var metrics = tester.LastMetrics;
+                    await WriteJsonAsync(context.Response, new
+                    {
+                        options = options,
+                        outcomes = outcomes,
+                        metrics = metrics?.ToAnonymousObject(),
+                    });
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                    await WriteJsonAsync(context.Response, new { error = ex.Message });
+                    return;
+                }
+            }
+
             await WriteHtmlAsync(context.Response, BuildHtmlPage());
+        }
+
+        private sealed class ValidationTestPayload
+        {
+            [JsonPropertyName("urls")]
+            public List<string>? Urls { get; set; }
+            [JsonPropertyName("options")]
+            public StreamValidationOptions? Options { get; set; }
+        }
+
+        private static async Task WriteChannelAdminError(HttpListenerResponse response, ChannelAdministrationException ex)
+        {
+            var status = ex.Error switch
+            {
+                ChannelAdministrationError.DuplicateKey => HttpStatusCode.Conflict,
+                ChannelAdministrationError.AliasConflict => HttpStatusCode.Conflict,
+                ChannelAdministrationError.AlreadyExists => HttpStatusCode.Conflict,
+                ChannelAdministrationError.ChannelNotFound => HttpStatusCode.NotFound,
+                ChannelAdministrationError.HasOwnership => HttpStatusCode.Conflict,
+                _ => HttpStatusCode.BadRequest,
+            };
+            response.StatusCode = (int)status;
+            await WriteJsonAsync(response, new { error = ex.Message, code = ex.Error.ToString() });
         }
 
         // Opções JSON partilhadas por todos os endpoints do dashboard: serializam
@@ -970,6 +2279,459 @@ namespace m3uCrawler.Services
         public long? ApprovedCanonicalChannelId { get; set; }
     }
 
+    private sealed class CreateChannelPayload
+    {
+        [JsonPropertyName("key")]
+        public string? Key { get; set; }
+        [JsonPropertyName("displayName")]
+        public string? DisplayName { get; set; }
+        [JsonPropertyName("editorialCategory")]
+        public string? EditorialCategory { get; set; }
+        [JsonPropertyName("editorialGroup")]
+        public string? EditorialGroup { get; set; }
+        [JsonPropertyName("publicationPolicy")]
+        public string? PublicationPolicy { get; set; }
+        [JsonPropertyName("isEnabled")]
+        public bool IsEnabled { get; set; } = true;
+        [JsonPropertyName("aliases")]
+        public List<string>? Aliases { get; set; }
+    }
+
+    private sealed class UpdateChannelPayload
+    {
+        [JsonPropertyName("displayName")]
+        public string? DisplayName { get; set; }
+        [JsonPropertyName("editorialCategory")]
+        public string? EditorialCategory { get; set; }
+        [JsonPropertyName("editorialGroup")]
+        public string? EditorialGroup { get; set; }
+        [JsonPropertyName("publicationPolicy")]
+        public string? PublicationPolicy { get; set; }
+        [JsonPropertyName("isEnabled")]
+        public bool? IsEnabled { get; set; }
+    }
+
+    private sealed class AddAliasPayload
+    {
+        [JsonPropertyName("normalizedAlias")]
+        public string? NormalizedAlias { get; set; }
+    }
+
+    private static object ChannelToJson(CanonicalChannelEntity c)
+    {
+        return new
+        {
+            id = c.Id,
+            key = c.Key,
+            displayName = c.DisplayName,
+            editorialCategory = c.EditorialCategory.ToString(),
+            editorialGroup = c.EditorialGroup.ToString(),
+            publicationPolicy = c.PublicationPolicy.ToString(),
+            isEnabled = c.IsEnabled,
+            aliases = c.Aliases.OrderBy(a => a.NormalizedAlias, StringComparer.Ordinal)
+                .Select(a => a.NormalizedAlias).ToList(),
+            createdAtUtc = c.CreatedAtUtc.ToString("o"),
+            updatedAtUtc = c.UpdatedAtUtc.ToString("o"),
+        };
+    }
+
+    // === PHASE 4 — Sources & ChannelSources payloads ===
+    private sealed class SourcePayload
+    {
+        [JsonPropertyName("key")] public string? Key { get; set; }
+        [JsonPropertyName("name")] public string? Name { get; set; }
+        [JsonPropertyName("kind")] public string? Kind { get; set; }
+        [JsonPropertyName("origin")] public string? Origin { get; set; }
+        [JsonPropertyName("priority")] public int Priority { get; set; }
+        [JsonPropertyName("isEnabled")] public bool IsEnabled { get; set; } = true;
+    }
+
+    private sealed class ChannelSourcePayload
+    {
+        [JsonPropertyName("canonicalChannelId")] public long CanonicalChannelId { get; set; }
+        [JsonPropertyName("streamUrl")] public string? StreamUrl { get; set; }
+        [JsonPropertyName("externalStreamId")] public string? ExternalStreamId { get; set; }
+        [JsonPropertyName("quality")] public string? Quality { get; set; }
+        [JsonPropertyName("epg")] public string? Epg { get; set; }
+        [JsonPropertyName("availability")] public string? Availability { get; set; }
+        [JsonPropertyName("matchConfidence")] public double MatchConfidence { get; set; }
+        [JsonPropertyName("matchMethod")] public string? MatchMethod { get; set; }
+        [JsonPropertyName("isEnabled")] public bool IsEnabled { get; set; } = true;
+    }
+
+    private sealed class ChannelSourceUpdatePayload
+    {
+        [JsonPropertyName("isEnabled")] public bool IsEnabled { get; set; } = true;
+    }
+
+    // === PHASE 9 b — ChannelSource observation payloads ===
+    private sealed class ChannelSourceObservationPayload
+    {
+        [JsonPropertyName("quality")] public string? Quality { get; set; }
+        [JsonPropertyName("epg")] public string? Epg { get; set; }
+        [JsonPropertyName("availability")] public string? Availability { get; set; }
+        [JsonPropertyName("responseTimeMs")] public long ResponseTimeMs { get; set; }
+    }
+
+    // === PHASE 11 — SyncRunStep payloads ===
+    private sealed class SyncRunStepPayload
+    {
+        [JsonPropertyName("step")] public string? Step { get; set; }
+        [JsonPropertyName("startedAtUtc")] public DateTime? StartedAtUtc { get; set; }
+        [JsonPropertyName("finishedAtUtc")] public DateTime? FinishedAtUtc { get; set; }
+        [JsonPropertyName("itemsProcessed")] public int ItemsProcessed { get; set; }
+        [JsonPropertyName("itemsSucceeded")] public int ItemsSucceeded { get; set; }
+        [JsonPropertyName("itemsFailed")] public int ItemsFailed { get; set; }
+        [JsonPropertyName("result")] public string? Result { get; set; }
+    }
+
+    // === PHASE 12 — Scheduled Job payloads ===
+    private sealed class ScheduledJobPayload
+    {
+        [JsonPropertyName("name")] public string? Name { get; set; }
+        [JsonPropertyName("cronExpression")] public string? CronExpression { get; set; }
+        [JsonPropertyName("actionName")] public string? ActionName { get; set; }
+        [JsonPropertyName("isEnabled")] public bool IsEnabled { get; set; } = true;
+    }
+
+    private sealed class ScheduledJobEnablePayload
+    {
+        [JsonPropertyName("isEnabled")] public bool IsEnabled { get; set; } = true;
+    }
+
+    private static object SourceToJson(SourceEntity s)
+    {
+        return new
+        {
+            id = s.Id,
+            key = s.Key,
+            name = s.Name,
+            kind = s.Kind.ToString(),
+            origin = s.Origin,
+            priority = s.Priority,
+            isEnabled = s.IsEnabled,
+            lastDiscoveryAtUtc = s.LastDiscoveryAtUtc?.ToString("o"),
+            lastValidationAtUtc = s.LastValidationAtUtc?.ToString("o"),
+            createdAtUtc = s.CreatedAtUtc.ToString("o"),
+            updatedAtUtc = s.UpdatedAtUtc.ToString("o"),
+        };
+    }
+
+    private static object ChannelSourceToJson(ChannelSourceEntity cs)
+    {
+        return new
+        {
+            id = cs.Id,
+            canonicalChannelId = cs.CanonicalChannelId,
+            sourceId = cs.SourceId,
+            streamUrl = cs.StreamUrl,
+            externalStreamId = cs.ExternalStreamId,
+            quality = cs.Quality.ToString(),
+            epg = cs.Epg.ToString(),
+            availability = cs.Availability.ToString(),
+            matchConfidence = cs.MatchConfidence,
+            matchMethod = cs.MatchMethod,
+            isEnabled = cs.IsEnabled,
+            firstSeenAtUtc = cs.FirstSeenAtUtc.ToString("o"),
+            lastSeenAtUtc = cs.LastSeenAtUtc.ToString("o"),
+            lastTestedAtUtc = cs.LastTestedAtUtc.ToString("o"),
+            lastResponseTimeMs = cs.LastResponseTimeMs,
+            createdAtUtc = cs.CreatedAtUtc.ToString("o"),
+            updatedAtUtc = cs.UpdatedAtUtc.ToString("o"),
+        };
+    }
+
+    // === PHASE 5 — Ordering payloads ===
+    private sealed class OrderingListPayload
+    {
+        [JsonPropertyName("key")] public string? Key { get; set; }
+        [JsonPropertyName("name")] public string? Name { get; set; }
+        [JsonPropertyName("country")] public string? Country { get; set; }
+        [JsonPropertyName("description")] public string? Description { get; set; }
+        [JsonPropertyName("isEnabled")] public bool IsEnabled { get; set; } = true;
+    }
+
+    private sealed class OrderingListDuplicatePayload
+    {
+        [JsonPropertyName("newKey")] public string? NewKey { get; set; }
+        [JsonPropertyName("newName")] public string? NewName { get; set; }
+    }
+
+    private sealed class OrderingItemAddPayload
+    {
+        [JsonPropertyName("canonicalChannelId")] public long CanonicalChannelId { get; set; }
+        [JsonPropertyName("position")] public int? Position { get; set; }
+        [JsonPropertyName("isEnabled")] public bool IsEnabled { get; set; } = true;
+    }
+
+    private sealed class OrderingItemUpdatePayload
+    {
+        [JsonPropertyName("position")] public int? Position { get; set; }
+        [JsonPropertyName("isEnabled")] public bool? IsEnabled { get; set; }
+    }
+
+    // === PHASE 6 — Priority Policy payloads ===
+    private sealed class PriorityPolicyPayload
+    {
+        [JsonPropertyName("scope")] public string? Scope { get; set; }
+        [JsonPropertyName("canonicalChannelId")] public long? CanonicalChannelId { get; set; }
+        [JsonPropertyName("criteriaJson")] public string? CriteriaJson { get; set; }
+        [JsonPropertyName("preferredQuality")] public string? PreferredQuality { get; set; }
+        [JsonPropertyName("allowFallback")] public bool AllowFallback { get; set; } = true;
+    }
+
+    // === PHASE 8 — payloads ===
+    private sealed class ImportPolicyPayload
+    {
+        [JsonPropertyName("mediaKind")] public string? MediaKind { get; set; }
+        [JsonPropertyName("vodPolicy")] public string? VodPolicy { get; set; }
+        [JsonPropertyName("targetGroupsCsv")] public string? TargetGroupsCsv { get; set; }
+        [JsonPropertyName("excludedGroupsCsv")] public string? ExcludedGroupsCsv { get; set; }
+        [JsonPropertyName("isEnabled")] public bool IsEnabled { get; set; } = true;
+    }
+
+    private sealed class CanonicalGroupPayload
+    {
+        [JsonPropertyName("key")] public string? Key { get; set; }
+        [JsonPropertyName("displayName")] public string? DisplayName { get; set; }
+        [JsonPropertyName("country")] public string? Country { get; set; }
+        [JsonPropertyName("order")] public int Order { get; set; }
+        [JsonPropertyName("isEnabled")] public bool IsEnabled { get; set; } = true;
+        [JsonPropertyName("isDefault")] public bool IsDefault { get; set; }
+    }
+
+    private sealed class GroupMappingPayload
+    {
+        [JsonPropertyName("sourceKind")] public string? SourceKind { get; set; }
+        [JsonPropertyName("sourceGroupTitle")] public string? SourceGroupTitle { get; set; }
+        [JsonPropertyName("canonicalGroupId")] public long CanonicalGroupId { get; set; }
+        [JsonPropertyName("isEnabled")] public bool IsEnabled { get; set; } = true;
+    }
+
+    private static object ImportPolicyToJson(ImportPolicyEntity p)
+    {
+        return new
+        {
+            id = p.Id,
+            mediaKind = p.MediaKind.ToString(),
+            vodPolicy = p.VodPolicy.ToString(),
+            targetGroupsCsv = p.TargetGroupsCsv,
+            excludedGroupsCsv = p.ExcludedGroupsCsv,
+            isEnabled = p.IsEnabled,
+            createdAtUtc = p.CreatedAtUtc.ToString("o"),
+            updatedAtUtc = p.UpdatedAtUtc.ToString("o"),
+        };
+    }
+
+    private static object CanonicalGroupToJson(CanonicalGroupEntity g)
+    {
+        return new
+        {
+            id = g.Id,
+            key = g.Key,
+            displayName = g.DisplayName,
+            country = g.Country,
+            order = g.Order,
+            isEnabled = g.IsEnabled,
+            isDefault = g.IsDefault,
+            createdAtUtc = g.CreatedAtUtc.ToString("o"),
+            updatedAtUtc = g.UpdatedAtUtc.ToString("o"),
+        };
+    }
+
+    private static object GroupMappingToJson(GroupMappingEntity m)
+    {
+        return new
+        {
+            id = m.Id,
+            sourceKind = m.SourceKind.ToString(),
+            sourceGroupTitle = m.SourceGroupTitle,
+            canonicalGroupId = m.CanonicalGroupId,
+            canonicalGroupKey = m.CanonicalGroup?.Key,
+            canonicalGroupDisplayName = m.CanonicalGroup?.DisplayName,
+            isEnabled = m.IsEnabled,
+            createdAtUtc = m.CreatedAtUtc.ToString("o"),
+            updatedAtUtc = m.UpdatedAtUtc.ToString("o"),
+        };
+    }
+
+    private static object MatchingAuditToJson(MatchingAuditEntity a)
+    {
+        return new
+        {
+            id = a.Id,
+            normalizedIdentity = a.NormalizedIdentity,
+            originalTitle = a.OriginalTitle,
+            sourceGroup = a.SourceGroup,
+            resolutionKind = a.ResolutionKind,
+            canonicalChannelId = a.CanonicalChannelId,
+            confidence = a.Confidence,
+            reasonSignature = a.ReasonSignature,
+            atUtc = a.AtUtc.ToString("o"),
+        };
+    }
+
+    private static object ChannelSourceObservationToJson(ChannelSourceObservationEntity o)
+    {
+        return new
+        {
+            id = o.Id,
+            channelSourceId = o.ChannelSourceId,
+            quality = o.Quality.ToString(),
+            epg = o.Epg.ToString(),
+            availability = o.Availability.ToString(),
+            responseTimeMs = o.ResponseTimeMs,
+            observedAtUtc = o.ObservedAtUtc.ToString("o"),
+        };
+    }
+
+    private static object SyncRunStepToJson(SyncRunStepEntity s)
+    {
+        return new
+        {
+            id = s.Id,
+            syncRunId = s.SyncRunId,
+            step = s.Step,
+            startedAtUtc = s.StartedAtUtc.ToString("o"),
+            finishedAtUtc = s.FinishedAtUtc.ToString("o"),
+            durationMs = s.DurationMs,
+            itemsProcessed = s.ItemsProcessed,
+            itemsSucceeded = s.ItemsSucceeded,
+            itemsFailed = s.ItemsFailed,
+            result = s.Result,
+        };
+    }
+
+    private static object ScheduledJobToJson(ScheduledJobEntity j)
+    {
+        return new
+        {
+            id = j.Id,
+            name = j.Name,
+            cronExpression = j.CronExpression,
+            actionName = j.ActionName,
+            isEnabled = j.IsEnabled,
+            lastRunAtUtc = j.LastRunAtUtc?.ToString("o"),
+            nextRunAtUtc = j.NextRunAtUtc?.ToString("o"),
+            lastResult = j.LastResult,
+            createdAtUtc = j.CreatedAtUtc.ToString("o"),
+            updatedAtUtc = j.UpdatedAtUtc.ToString("o"),
+        };
+    }
+
+    private static object DegradedStreamToJson(DegradedStreamSummary d)
+    {
+        return new
+        {
+            channelSourceId = d.ChannelSourceId,
+            canonicalChannelId = d.CanonicalChannelId,
+            sourceId = d.SourceId,
+            sourceName = d.SourceName,
+            latestAvailability = d.LatestAvailability.ToString(),
+            latestObservedAtUtc = d.LatestObservedAtUtc.ToString("o"),
+            latestResponseMs = d.LatestResponseMs,
+            lastHealthyAtUtc = d.LastHealthyAtUtc?.ToString("o"),
+            totalSamples = d.TotalSamples,
+            failedSamples = d.FailedSamples,
+            failureRate = d.FailureRate,
+            quality = d.Quality.ToString(),
+            epg = d.Epg.ToString(),
+        };
+    }
+
+    private static object OrderingListSummaryToJson(OrderingListEntity l)
+    {
+        return new
+        {
+            id = l.Id,
+            key = l.Key,
+            name = l.Name,
+            country = l.Country,
+            description = l.Description,
+            isEnabled = l.IsEnabled,
+            itemCount = l.Items?.Count ?? 0,
+            createdAtUtc = l.CreatedAtUtc.ToString("o"),
+            updatedAtUtc = l.UpdatedAtUtc.ToString("o"),
+        };
+    }
+
+    private static object OrderingListDetailToJson(OrderingListEntity l)
+    {
+        return new
+        {
+            id = l.Id,
+            key = l.Key,
+            name = l.Name,
+            country = l.Country,
+            description = l.Description,
+            isEnabled = l.IsEnabled,
+            items = (l.Items ?? new List<OrderingItemEntity>())
+                .OrderBy(i => i.Position)
+                .Select(OrderingItemToJson),
+            createdAtUtc = l.CreatedAtUtc.ToString("o"),
+            updatedAtUtc = l.UpdatedAtUtc.ToString("o"),
+        };
+    }
+
+    private static object OrderingItemToJson(OrderingItemEntity i)
+    {
+        return new
+        {
+            id = i.Id,
+            orderingListId = i.OrderingListId,
+            canonicalChannelId = i.CanonicalChannelId,
+            canonicalChannelKey = i.CanonicalChannel?.Key,
+            canonicalChannelDisplayName = i.CanonicalChannel?.DisplayName,
+            position = i.Position,
+            isEnabled = i.IsEnabled,
+            createdAtUtc = i.CreatedAtUtc.ToString("o"),
+            updatedAtUtc = i.UpdatedAtUtc.ToString("o"),
+        };
+    }
+
+    private static object PriorityPolicyToJson(SourcePriorityPolicyEntity p)
+    {
+        return new
+        {
+            id = p.Id,
+            scope = p.Scope,
+            canonicalChannelId = p.CanonicalChannelId,
+            criteriaJson = p.CriteriaJson,
+            preferredQuality = p.PreferredQuality,
+            allowFallback = p.AllowFallback,
+            createdAtUtc = p.CreatedAtUtc.ToString("o"),
+            updatedAtUtc = p.UpdatedAtUtc.ToString("o"),
+        };
+    }
+
+    // === PHASE 7 — Playlist Composer JSON ===
+    private static object PlaylistCompositionToJson(PlaylistComposition c)
+    {
+        return new
+        {
+            orderingListId = c.OrderingListId,
+            orderingListName = c.OrderingListName,
+            totalEntries = c.TotalEntries,
+            entries = c.Entries.Select(e => new
+            {
+                canonicalChannelId = e.CanonicalChannelId,
+                canonicalKey = e.CanonicalKey,
+                displayName = e.DisplayName,
+                group = e.Group,
+                streamUrl = e.StreamUrl,
+                chosenChannelSourceId = e.ChosenChannelSourceId,
+                sourceId = e.SourceId,
+                sourceName = e.SourceName,
+                quality = e.Quality,
+            }),
+            missingChannels = c.MissingChannels.Select(m => new
+            {
+                canonicalChannelId = m.CanonicalChannelId,
+                reason = m.Reason,
+            }),
+        };
+    }
+
     private static string BuildDashboardHtml()
         {
             string s = """
@@ -1054,6 +2816,7 @@ namespace m3uCrawler.Services
     <button data-view='playlist'>Playlist</button>
     <button data-view='dispatcharr'>Dispatcharr</button>
     <button data-view='catalog'>Catálogo</button>
+    <button data-view='validation'>Stream Validation</button>
     <button data-view='diagnostics'>Diagnóstico</button>
   </nav>
 
@@ -1150,6 +2913,14 @@ namespace m3uCrawler.Services
         <button data-ctab='channels' style='padding:8px 14px;'>Canais</button>
         <button data-ctab='rules' style='padding:8px 14px;'>Regras</button>
         <button data-ctab='affinity' style='padding:8px 14px;'>Afinidades</button>
+        <button data-ctab='sources' style='padding:8px 14px;'>Sources</button>
+        <button data-ctab='ordering' style='padding:8px 14px;'>Ordering</button>
+        <button data-ctab='priority' style='padding:8px 14px;'>Source Priority</button>
+        <button data-ctab='matching' style='padding:8px 14px;'>Matching</button>
+        <button data-ctab='degradation' style='padding:8px 14px;'>Degradação</button>
+        <button data-ctab='scheduled' style='padding:8px 14px;'>Scheduled Jobs</button>
+        <button data-ctab='policies' style='padding:8px 14px;'>Import Policies</button>
+        <button data-ctab='groups' style='padding:8px 14px;'>Grupos</button>
         <button data-ctab='reviews' style='padding:8px 14px;'>Reviews</button>
         <button data-ctab='syncruns' style='padding:8px 14px;'>Sync Runs</button>
         <button data-ctab='pending' style='padding:8px 14px;'>Pending <span id='pendingBadge' class='badge warn' style='margin-left:4px;padding:1px 6px;border-radius:999px;font-size:10px;display:none;'>0</span></button>
@@ -1166,7 +2937,99 @@ namespace m3uCrawler.Services
       <!-- TAB: Canais -->
       <div id='ctab-channels' hidden>
         <div style='margin-top:16px;'>
+          <div class='toolbar'>
+            <span class='muted' id='channelsCount'></span>
+            <input id='channelsSearch' type='text' placeholder='Pesquisar por display name, key ou alias…' style='flex:1;min-width:200px;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+            <label class='muted'>Categoria:</label>
+            <select id='channelsCategoryFilter'>
+              <option value=''>todas</option>
+              <option value='Live'>Live</option>
+              <option value='Entretenimento'>Entretenimento</option>
+              <option value='Desporto'>Desporto</option>
+              <option value='Infantil'>Infantil</option>
+              <option value='Documentarios'>Documentarios</option>
+            </select>
+            <label class='muted'>Estado:</label>
+            <select id='channelsStatusFilter'>
+              <option value=''>todos</option>
+              <option value='enabled'>activos</option>
+              <option value='disabled'>inactivos</option>
+            </select>
+            <label class='muted'>Política:</label>
+            <select id='channelsPolicyFilter'>
+              <option value=''>todas</option>
+              <option value='CreateEligible'>CreateEligible</option>
+              <option value='MergeOnly'>MergeOnly</option>
+              <option value='ReviewOnly'>ReviewOnly</option>
+              <option value='Excluded'>Excluded</option>
+            </select>
+            <button onclick='showCreateChannelForm()'>+ Novo Canal</button>
+          </div>
+          <div id='createChannelForm' hidden style='margin-bottom:16px;'>
+            <div class='card'>
+              <h3>Novo Canal Canónico</h3>
+              <div style='display:grid;gap:10px;grid-template-columns:1fr 1fr;'>
+                <div>
+                  <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Key (slug único, imutável)</label>
+                  <input id='newChannelKey' type='text' placeholder='ex: rtp-memoria' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                </div>
+                <div>
+                  <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Display Name</label>
+                  <input id='newChannelDisplayName' type='text' placeholder='ex: RTP Memória' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                </div>
+                <div>
+                  <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Categoria</label>
+                  <select id='newChannelCategory' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                    <option value='Live'>Live</option>
+                    <option value='Entretenimento'>Entretenimento</option>
+                    <option value='Desporto'>Desporto</option>
+                    <option value='Infantil'>Infantil</option>
+                    <option value='Documentarios'>Documentarios</option>
+                  </select>
+                </div>
+                <div>
+                  <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Grupo Editorial</label>
+                  <select id='newChannelGroup' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                    <option value='PortugalLive'>PortugalLive</option>
+                    <option value='PortugalFilmes24_7'>PortugalFilmes24_7</option>
+                    <option value='PortugalEntretenimento'>PortugalEntretenimento</option>
+                    <option value='PortugalDesporto'>PortugalDesporto</option>
+                    <option value='PortugalInfantil'>PortugalInfantil</option>
+                    <option value='PortugalDocumentarios'>PortugalDocumentarios</option>
+                    <option value='PortugalPPV'>PortugalPPV</option>
+                    <option value='Foreign'>Foreign</option>
+                    <option value='Other'>Other</option>
+                  </select>
+                </div>
+                <div>
+                  <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Política de Publicação</label>
+                  <select id='newChannelPolicy' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                    <option value='CreateEligible'>CreateEligible</option>
+                    <option value='MergeOnly'>MergeOnly</option>
+                    <option value='ReviewOnly'>ReviewOnly</option>
+                    <option value='Excluded'>Excluded</option>
+                  </select>
+                </div>
+                <div>
+                  <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Activo</label>
+                  <select id='newChannelEnabled' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                    <option value='true'>sim</option>
+                    <option value='false'>não</option>
+                  </select>
+                </div>
+                <div style='grid-column:1/-1;'>
+                  <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Aliases normalizados (um por linha)</label>
+                  <textarea id='newChannelAliases' rows='4' placeholder='rtp memoria' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;resize:vertical;'></textarea>
+                </div>
+              </div>
+              <div style='margin-top:10px;display:flex;gap:8px;'>
+                <button onclick='submitCreateChannel()'>Guardar</button>
+                <button class='secondary' onclick='hideCreateChannelForm()'>Cancelar</button>
+              </div>
+            </div>
+          </div>
           <div id='catalogChannelsTable'></div>
+          <div id='channelDetailPanel' style='margin-top:24px;'></div>
         </div>
       </div>
 
@@ -1262,6 +3125,289 @@ tvi noticias' style='width:100%;background:var(--panel-2);color:var(--text);bord
         <div id='catalogSyncRunsTable'></div>
       </div>
 
+      <!-- TAB: Sources (PHASE 4) -->
+      <div id='ctab-sources' hidden>
+        <div class='card' style='margin-top:16px;'>
+          <h3>Sources externas</h3>
+          <p class='muted'>Cada <i>source</i> é uma origem (Telegram, M3U, Xtream, HTTP, ficheiro, manual) que contribui streams para o catálogo canónico. As credenciais são sanitizadas antes de persistir.</p>
+          <div id='sourcesTable'></div>
+          <div style='margin-top:16px;'>
+            <h4 style='margin:0 0 8px 0;'>Registar source</h4>
+            <div style='display:grid;gap:8px;grid-template-columns:1fr 1fr 1fr;'>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Key (slug único)</label>
+                <input id='sourceKey' placeholder='ex: telegram-m3u8-pt' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              </div>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Nome</label>
+                <input id='sourceName' placeholder='ex: Telegram canal m3u8-pt' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              </div>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Tipo</label>
+                <select id='sourceKind' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                  <option value='M3U'>M3U</option>
+                  <option value='Xtream'>Xtream</option>
+                  <option value='Telegram'>Telegram</option>
+                  <option value='Http'>Http</option>
+                  <option value='File'>File</option>
+                  <option value='Manual'>Manual</option>
+                </select>
+              </div>
+              <div style='grid-column:1/-1;'>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Origem (URL/path/chat id)</label>
+                <input id='sourceOrigin' placeholder='ex: https://example.com/playlist.m3u8' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              </div>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Priority</label>
+                <input id='sourcePriority' type='number' value='100' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              </div>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Activo</label>
+                <select id='sourceEnabled' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                  <option value='true'>sim</option>
+                  <option value='false'>não</option>
+                </select>
+              </div>
+            </div>
+            <div style='margin-top:10px;display:flex;gap:8px;'>
+              <button onclick='submitCreateSource()'>Guardar</button>
+            </div>
+          </div>
+        </div>
+        <div class='card' style='margin-top:16px;'>
+          <h3>Streams associadas (Channel Sources)</h3>
+          <p class='muted'>Cada <i>channel source</i> representa uma stream concreta, proveniente de uma source, associada a um canal canónico.</p>
+          <div class='toolbar'>
+            <label class='muted'>Source:</label>
+            <select id='channelSourceSourceFilter'>
+              <option value=''>todas</option>
+            </select>
+            <button class='secondary' onclick='loadChannelSources()'>Recarregar</button>
+          </div>
+          <div id='channelSourcesTable'></div>
+        </div>
+      </div>
+
+      <!-- TAB: Ordering Lists (PHASE 5) -->
+      <div id='ctab-ordering' hidden>
+        <div class='card' style='margin-top:16px;'>
+          <h3>Ordering Lists</h3>
+          <p class='muted'>Listas que determinam a ordem dos canais na playlist gerada. Cada lista pode ser duplicada, editada e usada como entrada para a composição.</p>
+          <div id='orderingListsTable'></div>
+          <div style='margin-top:16px;'>
+            <h4 style='margin:0 0 8px 0;'>Nova lista</h4>
+            <div style='display:grid;gap:8px;grid-template-columns:1fr 1fr 1fr;'>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Key (slug único)</label>
+                <input data-ordering-create='key' placeholder='ex: pt-principal' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              </div>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Nome</label>
+                <input data-ordering-create='name' placeholder='ex: PT Principal' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              </div>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>País (ISO)</label>
+                <input data-ordering-create='country' placeholder='pt' maxlength='10' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              </div>
+            </div>
+            <div style='margin-top:10px;display:flex;gap:8px;'>
+              <button onclick='submitCreateOrderingList()'>Guardar</button>
+            </div>
+          </div>
+        </div>
+        <div class='card' style='margin-top:16px;'>
+          <h3>Detalhe da lista</h3>
+          <div id='orderingDetail'></div>
+        </div>
+        <div class='card' style='margin-top:16px;'>
+          <h3>Preview da playlist</h3>
+          <p class='muted'>Aplica a política de Source Priority corrente sobre o conteúdo desta lista.</p>
+          <div id='orderingPreview'></div>
+        </div>
+      </div>
+
+      <!-- TAB: Source Priority (PHASE 6) -->
+      <div id='ctab-priority' hidden>
+        <div class='card' style='margin-top:16px;'>
+          <h3>Política global</h3>
+          <p class='muted'>Aplica-se por defeito a todos os canais quando não há override por canal. Critérios são aplicados por ordem; o primeiro critério com resultados diferentes decide.</p>
+          <div id='globalPriorityForm' style='display:grid;gap:8px;grid-template-columns:1fr 1fr;'></div>
+          <div style='margin-top:10px;display:flex;gap:8px;'>
+            <button onclick='saveGlobalPriority()'>Guardar política global</button>
+          </div>
+        </div>
+        <div class='card' style='margin-top:16px;'>
+          <h3>Override por canal</h3>
+          <p class='muted'>Quando definido, este override substitui a política global para o canal seleccionado.</p>
+          <div style='display:flex;gap:8px;align-items:center;margin-bottom:8px;'>
+            <label class='muted'>Canal ID:</label>
+            <input id='priorityChannelId' type='number' placeholder='ex: 1' style='background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+            <button class='secondary' onclick='loadChannelPriority()'>Carregar</button>
+          </div>
+          <div id='channelPriorityForm' style='display:grid;gap:8px;grid-template-columns:1fr 1fr;'></div>
+          <div style='margin-top:10px;display:flex;gap:8px;'>
+            <button onclick='saveChannelPriority()'>Guardar override</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- TAB: Matching (PHASE 3) -->
+      <div id='ctab-matching' hidden>
+        <div class='card' style='margin-top:16px;'>
+          <h3>Observabilidade de Matching</h3>
+          <p class='muted'>Cada resolução de identidade por <code>CatalogResolver.ResolveAsync</code> é auditada. Esta página mostra as últimas decisões e a sua distribuição por caminho de decisão (Canonical / Alias / Rule / Unknown).</p>
+          <div class='toolbar'>
+            <label class='muted'>Canal ID:</label>
+            <input id='matchingChannelId' type='number' placeholder='opcional' style='background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+            <label class='muted'>Limite:</label>
+            <input id='matchingLimit' type='number' value='200' style='background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+            <button class='secondary' onclick='loadMatchingAudits()'>Aplicar</button>
+            <button class='secondary' onclick='loadMatchingAudits()'>Recarregar</button>
+          </div>
+          <div id='matchingStats' class='muted' style='margin-top:10px;'></div>
+        </div>
+        <div class='card' style='margin-top:16px;'>
+          <h3>Últimas decisões</h3>
+          <div id='matchingAuditsTable'></div>
+        </div>
+      </div>
+
+      <!-- TAB: Stream Degradation (PHASE 9 visão agregada) -->
+      <div id='ctab-degradation' hidden>
+        <div class='card' style='margin-top:16px;'>
+          <h3>Streams degradados</h3>
+          <p class='muted'>Observações de <code>ChannelSource</code> que transitaram de saudável (<code>Validated/Reachable</code>) para terminal (<code>Dead/Unreachable/Timeout</code>) no lookback seleccionado. Ordenado por observação mais recente.</p>
+          <div class='toolbar'>
+            <label class='muted'>Lookback (min):</label>
+            <input id='degLookback' type='number' value='10080' min='1' style='background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+            <label class='muted'>Limite:</label>
+            <input id='degLimit' type='number' value='200' min='1' max='2000' style='background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+            <button class='secondary' onclick='loadDegradation()'>Aplicar</button>
+            <button class='secondary' onclick='loadDegradation()'>Recarregar</button>
+          </div>
+          <div id='degradationStats' class='muted' style='margin-top:10px;'></div>
+        </div>
+        <div class='card' style='margin-top:16px;'>
+          <h3>Streams com degradação</h3>
+          <div id='degradationTable'></div>
+        </div>
+      </div>
+
+      <!-- TAB: Scheduled Jobs (PHASE 12) -->
+      <div id='ctab-scheduled' hidden>
+        <div class='card' style='margin-top:16px;'>
+          <h3>Scheduled Jobs</h3>
+          <p class='muted'>Jobs persistidos em SQLite. O scheduler calcula o próximo tick a partir da expressão cron (5 campos) e persiste <code>lastRunAtUtc</code> + <code>nextRunAtUtc</code>.</p>
+          <div id='scheduledJobsTable'></div>
+          <div style='margin-top:16px;'>
+            <h4 style='margin:0 0 8px 0;'>Novo / actualizar job</h4>
+            <div style='display:grid;gap:8px;grid-template-columns:1fr 1fr 1fr 1fr;'>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Name (único)</label>
+                <input data-sched-create='name' placeholder='ex: hourly-telegram' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              </div>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Cron (5 campos)</label>
+                <input data-sched-create='cron' placeholder='ex: 0 * * * *' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              </div>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Action Name</label>
+                <input data-sched-create='action' placeholder='ex: discoverTelegram' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                <select data-sched-create='action-select' style='display:none;width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'></select>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Action Name</label>
+                <input data-sched-create='action' placeholder='ex: discoverTelegram' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                <select data-sched-create='action-select' style='display:none;width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'></select>
+              </div>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Activo</label>
+                <select data-sched-create='enabled' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                  <option value='true'>sim</option>
+                  <option value='false'>não</option>
+                </select>
+              </div>
+            </div>
+            <div style='margin-top:10px;display:flex;gap:8px;'>
+              <button onclick='submitCreateScheduledJob()'>Guardar</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- TAB: Import Policies (PHASE 8) -->
+      <div id='ctab-policies' hidden>
+        <div class='card' style='margin-top:16px;'>
+          <h3>Import Policies (Live / Radio / VOD)</h3>
+          <p class='muted'>Define, por tipo de media, quais os grupos alvo e quais os excluídos. VOD tem ainda a política <i>Import / Keep / Exclude</i> separada de Linear TV.</p>
+          <div id='importPoliciesTable'></div>
+        </div>
+      </div>
+
+      <!-- TAB: Groups (PHASE 8) -->
+      <div id='ctab-groups' hidden>
+        <div class='card' style='margin-top:16px;'>
+          <h3>Grupos canónicos</h3>
+          <p class='muted'>Os grupos canónicos deixam de ser apenas enums rígidos. São entidades persistentes, configuráveis e associáveis a group-titles de cada source via mapping explícito.</p>
+          <div id='canonicalGroupsTable'></div>
+          <div style='margin-top:16px;'>
+            <h4 style='margin:0 0 8px 0;'>Novo grupo</h4>
+            <div style='display:grid;gap:8px;grid-template-columns:1fr 1fr 1fr 1fr;'>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Key</label>
+                <input data-group-create='key' placeholder='ex: portugal-live' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              </div>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Display Name</label>
+                <input data-group-create='name' placeholder='ex: Portugal Live' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              </div>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>País (ISO)</label>
+                <input data-group-create='country' placeholder='pt' maxlength='10' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              </div>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Ordem</label>
+                <input data-group-create='order' type='number' value='100' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              </div>
+            </div>
+            <div style='margin-top:10px;display:flex;gap:8px;'>
+              <button onclick='submitCreateGroup()'>Guardar</button>
+            </div>
+          </div>
+        </div>
+        <div class='card' style='margin-top:16px;'>
+          <h3>Group Mappings</h3>
+          <p class='muted'>Associa <i>group-titles</i> de uma source a um grupo canónico. Nunca é automático — exige mapping explícito.</p>
+          <div id='groupMappingsTable'></div>
+          <div style='margin-top:16px;'>
+            <h4 style='margin:0 0 8px 0;'>Novo mapping</h4>
+            <div style='display:grid;gap:8px;grid-template-columns:1fr 1fr 1fr;'>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Source Kind</label>
+                <select data-mapping-create='kind'>
+                  <option value='M3U'>M3U</option>
+                  <option value='Xtream'>Xtream</option>
+                  <option value='Telegram'>Telegram</option>
+                  <option value='Http'>Http</option>
+                  <option value='File'>File</option>
+                  <option value='Manual'>Manual</option>
+                </select>
+              </div>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Source Group Title</label>
+                <input data-mapping-create='title' placeholder='ex: PORTUGAL SPORTS' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              </div>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Canonical Group ID</label>
+                <input data-mapping-create='groupId' type='number' placeholder='id' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              </div>
+            </div>
+            <div style='margin-top:10px;display:flex;gap:8px;'>
+              <button onclick='submitCreateGroupMapping()'>Guardar</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <!-- TAB: Pending Country Approvals -->
       <div id='ctab-pending' hidden>
         <div class='card' style='margin-top:16px;'>
@@ -1273,6 +3419,30 @@ tvi noticias' style='width:100%;background:var(--panel-2);color:var(--text);bord
           <button class='secondary' onclick='loadPendingCountryApprovals()'>Recarregar</button>
         </div>
         <div id='pendingCountryApprovalsTable'></div>
+      </div>
+    </section>
+
+    <!-- STREAM VALIDATION (PHASE 9A) -->
+    <section id='view-validation' hidden>
+      <h2 style='font-size:18px;margin-top:0;'>Stream Validation</h2>
+      <p class='muted'>Política operacional do teste de streams. Os valores são persistidos em <code>runtime-data/stream_validation_policy.json</code>.</p>
+      <div class='card'>
+        <h3>Política de validação</h3>
+        <div id='validationPolicyForm' style='display:grid;gap:12px;grid-template-columns:1fr 1fr;'></div>
+        <div style='margin-top:12px;display:flex;gap:8px;'>
+          <button onclick='saveValidationPolicy()'>Guardar política</button>
+          <button class='secondary' onclick='loadValidationPolicy()'>Recarregar</button>
+        </div>
+        <div id='validationPolicyStatus' class='muted' style='margin-top:8px;'></div>
+      </div>
+      <div class='card' style='margin-top:16px;'>
+        <h3>Dry-run</h3>
+        <p class='muted'>Testa uma lista de URLs com a política corrente. Útil para afinar concorrência/TTL/early-exit.</p>
+        <textarea id='validationTestUrls' rows='4' placeholder='https://example.com/stream.ts (uma por linha)' style='width:100%;'></textarea>
+        <div style='margin-top:8px;display:flex;gap:8px;'>
+          <button onclick='runValidationTest()'>Testar URLs</button>
+        </div>
+        <div id='validationTestResult' class='muted' style='margin-top:8px;'></div>
       </div>
     </section>
 
@@ -1700,6 +3870,16 @@ const rows = Object.entries(inv).map(([k, v]) => {
       cards.push(metricCard('Ownership canais', nfmt(stats.dispatcharrChannelOwnerships || 0), '', 'Canais do Dispatcharr registados.'));
       cards.push(metricCard('Ownership streams', nfmt(stats.dispatcharrStreamOwnerships || 0), '', 'Streams do Dispatcharr registadas.'));
       cards.push(metricCard('Sync runs', nfmt(stats.syncRuns || 0), '', 'Execuções de sync gravadas.'));
+      cards.push(metricCard('Sources', nfmt(stats.sources || 0), '', 'Origens externas activas (Telegram, M3U, Xtream, HTTP, File, Manual).'));
+      cards.push(metricCard('Channel Sources', nfmt(stats.channelSources || 0), '', 'Associações canal-canónico ↔ stream ↔ source.'));
+      cards.push(metricCard('Ordering Lists', nfmt(stats.orderingLists || 0) + ' · ' + nfmt(stats.orderingItems || 0) + ' items', '', 'Listas de ordenação e respectivos items.'));
+      cards.push(metricCard('Priority Policies', nfmt(stats.sourcePriorityPolicies || 0), '', 'Políticas de Source Priority persistidas (global + overrides).'));
+      cards.push(metricCard('Import Policies', nfmt(stats.importPolicies || 0), '', 'Live/Radio/VOD policies configuráveis.'));
+      cards.push(metricCard('Canonical Groups', nfmt(stats.canonicalGroups || 0) + ' · ' + nfmt(stats.groupMappings || 0) + ' mappings', '', 'Grupos canónicos persistentes e mappings source→canónico.'));
+      cards.push(metricCard('Matching Audits', nfmt(stats.matchingAudits || 0), '', 'Auditoria de cada resolução do CatalogResolver (PHASE 3).'));
+      cards.push(metricCard('ChannelSource Observations', nfmt(stats.channelSourceObservations || 0), '', 'Histórico Quality/EPG/Availability por ChannelSource (PHASE 9 b).'));
+      cards.push(metricCard('Sync Run Steps', nfmt(stats.syncRunSteps || 0), '', 'Passos detalhados por SyncRun (PHASE 11).'));
+      cards.push(metricCard('Scheduled Jobs', nfmt(stats.scheduledJobs || 0), '', 'Jobs agendados persistentes (PHASE 12).'));
       cards.push(metricCard('Pending (País)', nfmt(stats.pendingCountryApprovalsOpen || 0), `<span class='badge warn'>${nfmt(stats.pendingCountryApprovalsOpen || 0)}</span>`, 'Canais pendentes de aprovação manual por país.'));
       document.getElementById('catalogStats').innerHTML = cards.join('');
       console.log('[DEBUG] catalogStats innerHTML set, cards:', cards.length);
@@ -1722,20 +3902,58 @@ const rows = Object.entries(inv).map(([k, v]) => {
       if (tab === 'channels') loadCatalogChannels();
       else if (tab === 'rules') loadCatalogRules();
       else if (tab === 'affinity') loadAffinityGroups();
+      else if (tab === 'sources') { loadSources(); loadChannelSources(); }
+      else if (tab === 'ordering') loadOrderingLists();
+      else if (tab === 'priority') loadGlobalPriority();
+      else if (tab === 'matching') loadMatchingAudits();
+      else if (tab === 'degradation') loadDegradation();
+      else if (tab === 'scheduled') { loadScheduledActions(); loadScheduledJobs(); }
+      else if (tab === 'policies') loadImportPolicies();
+      else if (tab === 'groups') { loadCanonicalGroups(); loadGroupMappings(); }
       else if (tab === 'reviews') loadCatalogReviews();
       else if (tab === 'syncruns') loadCatalogSyncRuns();
       else if (tab === 'pending') loadPendingCountryApprovals();
     }
 
+    let _channelsCache = [];
+    let _selectedChannelId = null;
+
     async function loadCatalogChannels() {
       const channels = await safeFetchJson('/api/catalog/channels', []);
       if (!Array.isArray(channels)) { document.getElementById('catalogChannelsTable').innerHTML = '<p class="muted">Erro ao carregar canais.</p>'; return; }
-      if (!channels.length) { document.getElementById('catalogChannelsTable').innerHTML = '<p class="muted">Nenhum canal canónico.</p>'; return; }
-      const rows = channels.map(c => {
+      _channelsCache = channels;
+      document.getElementById('channelsCount').textContent = `${channels.length} canal(is).`;
+      renderChannelsTable();
+      renderChannelDetail();
+    }
+
+    function renderChannelsTable() {
+      const search = (document.getElementById('channelsSearch').value || '').toLowerCase().trim();
+      const cat = document.getElementById('channelsCategoryFilter').value;
+      const status = document.getElementById('channelsStatusFilter').value;
+      const policy = document.getElementById('channelsPolicyFilter').value;
+      const filtered = _channelsCache.filter(c => {
+        if (cat && c.editorialCategory !== cat) return false;
+        if (status === 'enabled' && !c.isEnabled) return false;
+        if (status === 'disabled' && c.isEnabled) return false;
+        if (policy && c.publicationPolicy !== policy) return false;
+        if (search) {
+          const hay = [c.displayName, c.key, ...(c.aliases || [])].filter(Boolean).join(' ').toLowerCase();
+          if (!hay.includes(search)) return false;
+        }
+        return true;
+      });
+      const sorted = filtered.slice().sort((a, b) => (a.displayName || '').localeCompare(b.displayName || ''));
+      if (!sorted.length) {
+        document.getElementById('catalogChannelsTable').innerHTML = '<p class="muted">Nenhum canal corresponde aos filtros.</p>';
+        return;
+      }
+      const rows = sorted.map(c => {
         const aliases = (c.aliases || []).join(', ') || '—';
-        const policyBadge = `<span class='badge ${c.publicationPolicy === 'CreateEligible' ? 'ok' : (c.publicationPolicy === 'Excluded' ? 'err' : 'muted')}'>${c.publicationPolicy}</span>`;
-        return `<tr>
-          <td>${c.displayName || '—'}</td>
+        const policyBadge = `<span class='badge ${c.publicationPolicy === 'CreateEligible' ? 'ok' : (c.publicationPolicy === 'Excluded' ? 'err' : (c.publicationPolicy === 'ReviewOnly' ? 'warn' : 'muted'))}'>${c.publicationPolicy}</span>`;
+        const selected = c.id === _selectedChannelId ? ' style="background:rgba(47,129,247,0.12);"' : '';
+        return `<tr${selected}>
+          <td><a href='#' onclick='event.preventDefault(); selectChannel(${c.id});'>${c.displayName || '—'}</a></td>
           <td><code>${c.key || '—'}</code></td>
           <td>${c.editorialCategory || '—'}</td>
           <td>${c.editorialGroup || '—'}</td>
@@ -1746,6 +3964,326 @@ const rows = Object.entries(inv).map(([k, v]) => {
       }).join('');
       document.getElementById('catalogChannelsTable').innerHTML = `
         <table><thead><tr><th>Display Name</th><th>Key</th><th>Categoria</th><th>Grupo</th><th>Política</th><th>Activo</th><th>Aliases</th></tr></thead><tbody>${rows}</tbody></table>`;
+    }
+
+    async function selectChannel(id) {
+      _selectedChannelId = id;
+      renderChannelsTable();
+      renderChannelDetail();
+    }
+
+    function renderChannelDetail() {
+      const target = document.getElementById('channelDetailPanel');
+      if (!target) return;
+      if (!_selectedChannelId) {
+        target.innerHTML = '<p class="muted">Seleccione um canal na tabela para ver o detalhe.</p>';
+        return;
+      }
+      const c = _channelsCache.find(x => x.id === _selectedChannelId);
+      if (!c) {
+        target.innerHTML = '<p class="muted">Canal não encontrado (recargue a lista).</p>';
+        return;
+      }
+      const policyBadge = `<span class='badge ${c.publicationPolicy === 'CreateEligible' ? 'ok' : (c.publicationPolicy === 'Excluded' ? 'err' : (c.publicationPolicy === 'ReviewOnly' ? 'warn' : 'muted'))}'>${c.publicationPolicy}</span>`;
+      const aliases = c.aliases || [];
+      target.innerHTML = `
+        <div class='card'>
+          <h3>Detalhe do canal</h3>
+          <div style='display:grid;gap:10px;grid-template-columns:1fr 1fr;'>
+            <div><strong>Canonical ID:</strong> <code>${c.key}</code></div>
+            <div><strong>Estado:</strong> ${c.isEnabled ? '<span class="badge ok">activo</span>' : '<span class="badge err">inactivo</span>'}</div>
+            <div><strong>Display Name:</strong> <span id='detailDisplayName'>${escapeHtml(c.displayName)}</span></div>
+            <div><strong>Política:</strong> <span id='detailPolicyBadge'>${policyBadge}</span> <code>${c.publicationPolicy}</code></div>
+            <div><strong>Categoria:</strong> ${c.editorialCategory}</div>
+            <div><strong>Grupo Editorial:</strong> ${c.editorialGroup}</div>
+            <div><strong>Criado:</strong> <span class="muted">${tsLocal(c.createdAtUtc)}</span></div>
+            <div><strong>Actualizado:</strong> <span class="muted">${tsLocal(c.updatedAtUtc)}</span></div>
+          </div>
+          <div style='margin-top:14px;'>
+            <h4 style='margin:0 0 6px 0;font-size:13px;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em;'>Aliases (${aliases.length})</h4>
+            <ul id='detailAliasesList' style='margin:0;padding-left:18px;'>${aliases.length ? aliases.map(a => `<li><code>${escapeHtml(a)}</code> <button class='secondary' style='padding:2px 6px;font-size:11px;' onclick="removeAliasFromDetail(${c.id}, '${escapeAttr(a)}')">remover</button></li>`).join('') : '<li class="muted">—</li>'}</ul>
+            <div style='display:flex;gap:8px;margin-top:8px;'>
+              <input id='detailNewAlias' type='text' placeholder='alias normalizado…' style='flex:1;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:4px 8px;border-radius:6px;font:inherit;'>
+              <button onclick='addAliasFromDetail(${c.id})'>+ Alias</button>
+            </div>
+          </div>
+          <div style='margin-top:14px;display:flex;gap:8px;flex-wrap:wrap;'>
+            <button onclick='toggleChannelEnabled(${c.id}, ${!c.isEnabled})'>${c.isEnabled ? 'Desactivar' : 'Activar'}</button>
+            <button class='secondary' onclick='toggleChannelPolicy(${c.id}, "${c.publicationPolicy}")'>Alterar Política…</button>
+            <button class='secondary' onclick='editChannelInline(${c.id})'>Editar</button>
+            <button class='secondary' onclick='deleteChannel(${c.id})' style='color:var(--err);'>Eliminar</button>
+          </div>
+        </div>`;
+    }
+
+    function escapeHtml(s) {
+      if (s == null) return '';
+      return String(s).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+    }
+    function escapeAttr(s) {
+      return escapeHtml(s).replace(/`/g, '&#96;');
+    }
+
+    async function reloadChannelDetail(id) {
+      const fresh = await safeFetchJson('/api/catalog/channels/' + id, null);
+      if (!fresh || fresh.error) { alert('Erro ao recarregar canal: ' + (fresh && fresh.error || 'desconhecido')); return; }
+      const idx = _channelsCache.findIndex(x => x.id === id);
+      if (idx >= 0) _channelsCache[idx] = fresh;
+      renderChannelsTable();
+      renderChannelDetail();
+    }
+
+    async function addAliasFromDetail(channelId) {
+      const input = document.getElementById('detailNewAlias');
+      const alias = (input.value || '').trim();
+      if (!alias) { alert('Alias é obrigatório.'); return; }
+      const r = await fetch('/api/catalog/channels/' + channelId + '/aliases', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ normalizedAlias: alias })
+      });
+      if (r.ok) {
+        input.value = '';
+        await reloadChannelDetail(channelId);
+      } else {
+        const err = await r.json();
+        alert('Erro: ' + (err.error || r.status));
+      }
+    }
+
+    async function removeAliasFromDetail(channelId, alias) {
+      if (!confirm('Remover alias "' + alias + '"?')) return;
+      const r = await fetch('/api/catalog/channels/' + channelId + '/aliases/' + encodeURIComponent(alias), { method: 'DELETE' });
+      if (r.ok) await reloadChannelDetail(channelId);
+      else alert('Erro: ' + r.status);
+    }
+
+    async function toggleChannelEnabled(channelId, nextValue) {
+      const c = _channelsCache.find(x => x.id === channelId);
+      if (!c) return;
+      const payload = {
+        displayName: c.displayName,
+        editorialCategory: c.editorialCategory,
+        editorialGroup: c.editorialGroup,
+        publicationPolicy: c.publicationPolicy,
+        isEnabled: nextValue
+      };
+      const r = await fetch('/api/catalog/channels/' + channelId, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (r.ok) {
+        await reloadChannelDetail(channelId);
+        if (typeof loadCatalog === 'function') loadCatalog();
+      } else {
+        const err = await r.json();
+        alert('Erro: ' + (err.error || r.status));
+      }
+    }
+
+    async function toggleChannelPolicy(channelId, currentPolicy) {
+      const order = ['CreateEligible', 'MergeOnly', 'ReviewOnly', 'Excluded'];
+      const next = { CreateEligible: 'MergeOnly', MergeOnly: 'ReviewOnly', ReviewOnly: 'Excluded', Excluded: 'CreateEligible' };
+      const choice = prompt('Política actual: ' + currentPolicy + '\nNova política (' + order.join(' | ') + '):', next[currentPolicy] || 'CreateEligible');
+      if (!choice) return;
+      const c = _channelsCache.find(x => x.id === channelId);
+      if (!c) return;
+      const payload = {
+        displayName: c.displayName,
+        editorialCategory: c.editorialCategory,
+        editorialGroup: c.editorialGroup,
+        publicationPolicy: choice.trim(),
+        isEnabled: c.isEnabled
+      };
+      const r = await fetch('/api/catalog/channels/' + channelId, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (r.ok) {
+        await reloadChannelDetail(channelId);
+      } else {
+        const err = await r.json();
+        alert('Erro: ' + (err.error || r.status));
+      }
+    }
+
+    async function editChannelInline(channelId) {
+      const c = _channelsCache.find(x => x.id === channelId);
+      if (!c) return;
+      const newDisplay = prompt('Display Name:', c.displayName);
+      if (newDisplay == null) return;
+      const payload = {
+        displayName: newDisplay,
+        editorialCategory: c.editorialCategory,
+        editorialGroup: c.editorialGroup,
+        publicationPolicy: c.publicationPolicy,
+        isEnabled: c.isEnabled
+      };
+      const r = await fetch('/api/catalog/channels/' + channelId, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (r.ok) await reloadChannelDetail(channelId);
+      else {
+        const err = await r.json();
+        alert('Erro: ' + (err.error || r.status));
+      }
+    }
+
+    async function deleteChannel(channelId) {
+      const c = _channelsCache.find(x => x.id === channelId);
+      if (!c) return;
+      if (!confirm('Eliminar o canal "' + (c.displayName || c.key) + '" (#' + channelId + ')? Esta operação remove também os aliases.')) return;
+      const r = await fetch('/api/catalog/channels/' + channelId, { method: 'DELETE' });
+      if (r.ok) {
+        _selectedChannelId = null;
+        await loadCatalogChannels();
+        if (typeof loadCatalog === 'function') loadCatalog();
+      } else {
+        const err = await r.json();
+        alert('Erro: ' + (err.error || r.status));
+      }
+    }
+
+    function showCreateChannelForm() {
+      document.getElementById('newChannelKey').value = '';
+      document.getElementById('newChannelDisplayName').value = '';
+      document.getElementById('newChannelCategory').value = 'Live';
+      document.getElementById('newChannelGroup').value = 'PortugalLive';
+      document.getElementById('newChannelPolicy').value = 'CreateEligible';
+      document.getElementById('newChannelEnabled').value = 'true';
+      document.getElementById('newChannelAliases').value = '';
+      document.getElementById('createChannelForm').hidden = false;
+      document.getElementById('createChannelForm').scrollIntoView({ behavior: 'smooth' });
+    }
+    function hideCreateChannelForm() { document.getElementById('createChannelForm').hidden = true; }
+
+    async function submitCreateChannel() {
+      const payload = {
+        key: document.getElementById('newChannelKey').value.trim(),
+        displayName: document.getElementById('newChannelDisplayName').value.trim(),
+        editorialCategory: document.getElementById('newChannelCategory').value,
+        editorialGroup: document.getElementById('newChannelGroup').value,
+        publicationPolicy: document.getElementById('newChannelPolicy').value,
+        isEnabled: document.getElementById('newChannelEnabled').value === 'true',
+        aliases: document.getElementById('newChannelAliases').value.split(/\r?\n/).map(a => a.trim()).filter(Boolean),
+      };
+      if (!payload.key) { alert('Key é obrigatória.'); return; }
+      if (!payload.displayName) { alert('Display Name é obrigatório.'); return; }
+      const r = await fetch('/api/catalog/channels', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (r.ok) {
+        const created = await r.json();
+        hideCreateChannelForm();
+        await loadCatalogChannels();
+        _selectedChannelId = created.id;
+        renderChannelsTable();
+        renderChannelDetail();
+        if (typeof loadCatalog === 'function') loadCatalog();
+      } else {
+        const err = await r.json();
+        alert('Erro: ' + (err.error || r.status));
+      }
+    }
+
+    document.getElementById('channelsSearch').addEventListener('input', renderChannelsTable);
+    document.getElementById('channelsCategoryFilter').addEventListener('change', renderChannelsTable);
+    document.getElementById('channelsStatusFilter').addEventListener('change', renderChannelsTable);
+    document.getElementById('channelsPolicyFilter').addEventListener('change', renderChannelsTable);
+
+    // === PHASE 9A — Stream Validation ===
+    const _validationFields = [
+      ['maxConcurrency', 'Concorrência máxima', 'number'],
+      ['connectionTimeoutSeconds', 'Connection Timeout (s)', 'number'],
+      ['readTimeoutSeconds', 'Read Timeout (s)', 'number'],
+      ['overallTimeoutSeconds', 'Overall Timeout (s)', 'number'],
+      ['maxRetries', 'Max retries', 'number'],
+      ['retryDelayMilliseconds', 'Retry delay (ms)', 'number'],
+      ['successCacheTtlSeconds', 'Cache TTL sucesso (s)', 'number'],
+      ['failureCacheTtlSeconds', 'Cache TTL falha (s)', 'number'],
+      ['earlyExit', 'Early exit', 'select'],
+      ['earlyExitThreshold', 'Early exit threshold', 'number'],
+      ['hostFailure', 'Host failure policy', 'select'],
+      ['hostFailureThreshold', 'Host failure threshold', 'number'],
+    ];
+
+    async function loadValidationPolicy() {
+      const policy = await safeFetchJson('/api/validation/policy', null);
+      const status = document.getElementById('validationPolicyStatus');
+      if (!policy) { status.textContent = 'Erro ao carregar política.'; return; }
+      const form = document.getElementById('validationPolicyForm');
+      form.innerHTML = _validationFields.map(([k, label, kind]) => {
+        const v = policy[k];
+        if (kind === 'select') {
+          const opts = (k === 'earlyExit'
+            ? [['TestAll','TestAll'],['StopAfterFirstValid','StopAfterFirstValid'],['StopAfterNValid','StopAfterNValid']]
+            : [['Off','Off'],['ShortCircuitOnHostFailure','ShortCircuitOnHostFailure']]
+          ).map(([val, lbl]) => `<option value="${val}" ${v===val?'selected':''}>${lbl}</option>`).join('');
+          return `<div><label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>${label}</label><select data-vp-key="${k}">${opts}</select></div>`;
+        }
+        return `<div><label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>${label}</label><input data-vp-key="${k}" type='${kind}' value='${v ?? ''}'></div>`;
+      }).join('');
+      status.textContent = 'Política carregada.';
+    }
+
+    function readValidationPolicyForm() {
+      const p = {};
+      const inputs = document.querySelectorAll('#validationPolicyForm [data-vp-key]');
+      inputs.forEach(el => {
+        const k = el.getAttribute('data-vp-key');
+        const raw = el.value;
+        if (el.tagName === 'INPUT' && el.type === 'number') {
+          const n = parseInt(raw, 10);
+          p[k] = Number.isFinite(n) ? n : 0;
+        } else {
+          p[k] = raw;
+        }
+      });
+      return p;
+    }
+
+    async function saveValidationPolicy() {
+      const payload = readValidationPolicyForm();
+      const r = await fetch('/api/validation/policy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const status = document.getElementById('validationPolicyStatus');
+      if (r.ok) {
+        status.textContent = 'Política guardada.';
+      } else {
+        const err = await r.json();
+        status.textContent = 'Erro: ' + (err.error || r.status);
+      }
+    }
+
+    async function runValidationTest() {
+      const textarea = document.getElementById('validationTestUrls');
+      const urls = (textarea.value || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+      const out = document.getElementById('validationTestResult');
+      if (!urls.length) { out.textContent = 'Fornece URLs.'; return; }
+      out.textContent = 'A testar ' + urls.length + ' URL(s)…';
+      const r = await fetch('/api/validation/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ urls }),
+      });
+      if (!r.ok) {
+        const err = await r.json();
+        out.textContent = 'Erro: ' + (err.error || r.status);
+        return;
+      }
+      const body = await r.json();
+      const m = body.metrics || {};
+      const ok = m.succeeded || 0, total = m.tested || 0, cached = m.cached || 0, retries = m.retries || 0, peak = m.actualPeakConcurrency || 0;
+      out.innerHTML = `<pre>tested=${total} succeeded=${ok} cached=${cached} retries=${retries} peak=${peak}\n${JSON.stringify(body.outcomes, null, 2).slice(0, 4000)}</pre>`;
     }
 
     async function loadCatalogRules() {
@@ -1796,6 +4334,652 @@ const rows = Object.entries(inv).map(([k, v]) => {
         <table><thead><tr><th>Fingerprint</th><th>Identidade</th><th>Source Group</th><th>Razão</th><th>Estado</th><th>Nota</th><th>Criado</th><th>Ações</th></tr></thead><tbody>${rows}</tbody></table>`;
     }
 
+    async function loadSources() {
+      const sources = await safeFetchJson('/api/catalog/sources', []);
+      if (!Array.isArray(sources)) { document.getElementById('sourcesTable').innerHTML = '<p class="muted">Erro ao carregar sources.</p>'; return; }
+      const filter = document.getElementById('channelSourceSourceFilter');
+      const selected = filter.value;
+      filter.innerHTML = '<option value="">todas</option>' + sources.map(s => `<option value="${s.id}" ${String(s.id)===selected?'selected':''}>${escapeHtml(s.name)} (${s.kind})</option>`).join('');
+      if (!sources.length) { document.getElementById('sourcesTable').innerHTML = '<p class="muted">Nenhuma source registada.</p>'; return; }
+      const rows = sources.map(s => {
+        const badge = s.isEnabled ? '<span class="badge ok">activo</span>' : '<span class="badge err">inactivo</span>';
+        const lastD = s.lastDiscoveryAtUtc ? tsLocal(s.lastDiscoveryAtUtc) : '—';
+        const lastV = s.lastValidationAtUtc ? tsLocal(s.lastValidationAtUtc) : '—';
+        return `<tr>
+          <td><code>${s.id}</code></td>
+          <td><code>${escapeHtml(s.key)}</code></td>
+          <td>${escapeHtml(s.name)}</td>
+          <td>${s.kind}</td>
+          <td>${s.priority}</td>
+          <td>${badge}</td>
+          <td>${escapeHtml(s.origin || '—')}</td>
+          <td>${lastD}</td>
+          <td>${lastV}</td>
+          <td><button class='secondary' onclick='deleteSource(${s.id})'>Eliminar</button></td>
+        </tr>`;
+      }).join('');
+      document.getElementById('sourcesTable').innerHTML = `<table><thead><tr><th>#</th><th>Key</th><th>Nome</th><th>Tipo</th><th>Priority</th><th>Estado</th><th>Origem</th><th>Última descoberta</th><th>Última validação</th><th>Acções</th></tr></thead><tbody>${rows}</tbody></table>`;
+    }
+
+    async function submitCreateSource() {
+      const payload = {
+        key: document.getElementById('sourceKey').value.trim(),
+        name: document.getElementById('sourceName').value.trim(),
+        kind: document.getElementById('sourceKind').value,
+        origin: document.getElementById('sourceOrigin').value.trim(),
+        priority: parseInt(document.getElementById('sourcePriority').value, 10) || 0,
+        isEnabled: document.getElementById('sourceEnabled').value === 'true',
+      };
+      if (!payload.key) { alert('Key é obrigatória.'); return; }
+      if (!payload.name) { alert('Name é obrigatório.'); return; }
+      const r = await fetch('/api/catalog/sources', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (r.ok) {
+        document.getElementById('sourceKey').value = '';
+        document.getElementById('sourceName').value = '';
+        document.getElementById('sourceOrigin').value = '';
+        await loadSources();
+        await loadChannelSources();
+      } else {
+        const err = await r.json();
+        alert('Erro: ' + (err.error || r.status));
+      }
+    }
+
+    async function deleteSource(id) {
+      if (!confirm('Eliminar a source #' + id + '? Os ChannelSources associados serão removidos em cascata.')) return;
+      const r = await fetch('/api/catalog/sources/' + id, { method: 'DELETE' });
+      if (r.ok) { await loadSources(); await loadChannelSources(); }
+      else { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
+    }
+
+    async function loadChannelSources() {
+      const filter = document.getElementById('channelSourceSourceFilter').value;
+      const url = filter ? '/api/catalog/sources/' + filter + '/streams' : '/api/catalog/sources/0/streams';
+      // Quando filter vazio, listamos via primeira source ou via 0 (devolve lista vazia). Para "todas" usamos múltiplas chamadas.
+      let allStreams = [];
+      if (filter) {
+        const r = await safeFetchJson(url, []);
+        if (Array.isArray(r)) allStreams = r;
+      } else {
+        const sources = await safeFetchJson('/api/catalog/sources', []);
+        if (Array.isArray(sources)) {
+          for (const s of sources) {
+            const r = await safeFetchJson('/api/catalog/sources/' + s.id + '/streams', []);
+            if (Array.isArray(r)) allStreams = allStreams.concat(r);
+          }
+        }
+      }
+      if (!allStreams.length) {
+        document.getElementById('channelSourcesTable').innerHTML = '<p class="muted">Nenhum channel source registado.</p>';
+        return;
+      }
+      const rows = allStreams.map(cs => {
+        const url = escapeHtml(cs.streamUrl || '');
+        return `<tr>
+          <td><code>${cs.id}</code></td>
+          <td>${cs.canonicalChannelId}</td>
+          <td>${cs.sourceId}</td>
+          <td><code>${url}</code></td>
+          <td>${cs.quality}</td>
+          <td>${cs.epg}</td>
+          <td>${cs.availability}</td>
+          <td>${(cs.matchConfidence || 0).toFixed(2)}</td>
+          <td>${escapeHtml(cs.matchMethod || '—')}</td>
+          <td>${cs.isEnabled ? '<span class="badge ok">sim</span>' : '<span class="badge err">não</span>'}</td>
+          <td><button class='secondary' onclick='toggleChannelSource(${cs.id}, ${!cs.isEnabled})'>${cs.isEnabled ? 'Desactivar' : 'Activar'}</button>
+              <button class='secondary' onclick='deleteChannelSource(${cs.id})' style='color:var(--err);'>Eliminar</button></td>
+        </tr>`;
+      }).join('');
+      document.getElementById('channelSourcesTable').innerHTML = `<table><thead><tr><th>#</th><th>Canal</th><th>Source</th><th>URL</th><th>Quality</th><th>EPG</th><th>Availability</th><th>Conf.</th><th>Método</th><th>Activo</th><th>Acções</th></tr></thead><tbody>${rows}</tbody></table>`;
+    }
+
+    async function toggleChannelSource(id, next) {
+      const r = await fetch('/api/catalog/channel-sources/' + id, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ isEnabled: next }),
+      });
+      if (r.ok) { await loadChannelSources(); }
+      else { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
+    }
+
+    async function deleteChannelSource(id) {
+      if (!confirm('Eliminar o channel source #' + id + '?')) return;
+      const r = await fetch('/api/catalog/channel-sources/' + id, { method: 'DELETE' });
+      if (r.ok) { await loadChannelSources(); }
+      else { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
+    }
+
+    document.getElementById('channelSourceSourceFilter').addEventListener('change', loadChannelSources);
+
+    let _orderingListsCache = [];
+    let _orderingListDetailCache = null;
+    let _orderingChannelsCache = [];
+
+    async function loadOrderingLists() {
+      const lists = await safeFetchJson('/api/catalog/ordering-lists', []);
+      if (!Array.isArray(lists)) { document.getElementById('orderingListsTable').innerHTML = '<p class="muted">Erro.</p>'; return; }
+      _orderingListsCache = lists;
+      if (!lists.length) { document.getElementById('orderingListsTable').innerHTML = '<p class="muted">Nenhuma ordering list.</p>'; return; }
+      const rows = lists.map(l => `<tr${_orderingListDetailCache && _orderingListDetailCache.id === l.id ? ' style="background:rgba(47,129,247,0.12);"' : ''}>
+        <td><code>${l.id}</code></td>
+        <td><code>${escapeHtml(l.key)}</code></td>
+        <td><a href='#' onclick='event.preventDefault(); openOrderingList(${l.id});'>${escapeHtml(l.name)}</a></td>
+        <td>${escapeHtml(l.country || '—')}</td>
+        <td>${l.itemCount || 0}</td>
+        <td>${l.isEnabled ? '<span class="badge ok">sim</span>' : '<span class="badge err">não</span>'}</td>
+        <td>
+          <button class='secondary' onclick='previewOrderingList(${l.id})'>Preview</button>
+          <button class='secondary' onclick='duplicateOrderingList(${l.id}, "${escapeHtml(l.key)}")'>Duplicar</button>
+          <button class='secondary' style='color:var(--err);' onclick='deleteOrderingList(${l.id})'>Eliminar</button>
+        </td>
+      </tr>`).join('');
+      document.getElementById('orderingListsTable').innerHTML = `<table><thead><tr><th>#</th><th>Key</th><th>Nome</th><th>País</th><th>Items</th><th>Activo</th><th>Acções</th></tr></thead><tbody>${rows}</tbody></table>`;
+    }
+
+    async function submitCreateOrderingList() {
+      const payload = {
+        key: document.querySelector("[data-ordering-create='key']").value.trim(),
+        name: document.querySelector("[data-ordering-create='name']").value.trim(),
+        country: document.querySelector("[data-ordering-create='country']").value.trim() || null,
+        description: null,
+        isEnabled: true,
+      };
+      if (!payload.key || !payload.name) { alert('Key e Name são obrigatórios.'); return; }
+      const r = await fetch('/api/catalog/ordering-lists', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (r.ok) {
+        document.querySelector("[data-ordering-create='key']").value = '';
+        document.querySelector("[data-ordering-create='name']").value = '';
+        document.querySelector("[data-ordering-create='country']").value = '';
+        await loadOrderingLists();
+      } else {
+        const err = await r.json();
+        alert('Erro: ' + (err.error || r.status));
+      }
+    }
+
+    async function openOrderingList(id) {
+      const detail = await safeFetchJson('/api/catalog/ordering-lists/' + id, null);
+      if (!detail || detail.error) { alert('Erro: ' + (detail && detail.error || '?')); return; }
+      _orderingListDetailCache = detail;
+
+      // Carrega também todos os canais canónicos para o select de adicionar.
+      const channels = await safeFetchJson('/api/catalog/channels', []);
+      _orderingChannelsCache = Array.isArray(channels) ? channels : [];
+
+      const detailDiv = document.getElementById('orderingDetail');
+      const items = (detail.items || []).slice().sort((a, b) => a.position - b.position);
+      const itemRows = items.map(i => `<tr>
+        <td>${i.position}</td>
+        <td><code>${i.canonicalChannelId}</code></td>
+        <td>${escapeHtml((i.canonicalChannelDisplayName || '') + (i.canonicalChannelKey ? ' (' + i.canonicalChannelKey + ')' : ''))}</td>
+        <td>${i.isEnabled ? '<span class="badge ok">sim</span>' : '<span class="badge err">não</span>'}</td>
+        <td>
+          <button class='secondary' onclick='moveOrderingItem(${i.id}, ${i.position - 1})' ${i.position === 0 ? 'disabled' : ''}>↑</button>
+          <button class='secondary' onclick='moveOrderingItem(${i.id}, ${i.position + 1})' ${i.position === items.length - 1 ? 'disabled' : ''}>↓</button>
+          <button class='secondary' onclick='toggleOrderingItem(${i.id}, ${!i.isEnabled})'>${i.isEnabled ? 'Desactivar' : 'Activar'}</button>
+          <button class='secondary' style='color:var(--err);' onclick='removeOrderingItem(${i.id})'>Remover</button>
+        </td>
+      </tr>`).join('');
+      const channelOptions = _orderingChannelsCache
+        .filter(c => !items.some(i => i.canonicalChannelId === c.id))
+        .map(c => `<option value="${c.id}">${escapeHtml(c.displayName || c.key)} (${escapeHtml(c.key)})</option>`).join('');
+      detailDiv.innerHTML = `
+        <div style='margin-bottom:8px;'><strong>${escapeHtml(detail.name)}</strong> · ${detail.items ? detail.items.length : 0} itens · <span class='muted'>${detail.isEnabled ? 'activo' : 'inactivo'}</span></div>
+        <table><thead><tr><th>#</th><th>Canal</th><th>Display</th><th>Activo</th><th>Acções</th></tr></thead><tbody>${itemRows}</tbody></table>
+        <div style='margin-top:10px;display:flex;gap:8px;align-items:center;'>
+          <select id='addItemChannel'>${channelOptions}</select>
+          <button onclick='addOrderingItem(${detail.id})'>+ Adicionar</button>
+        </div>
+      `;
+      await loadOrderingLists();
+    }
+
+    async function previewOrderingList(id) {
+      const preview = await safeFetchJson('/api/catalog/ordering-lists/' + id + '/preview', null);
+      const out = document.getElementById('orderingPreview');
+      if (!preview) { out.innerHTML = '<p class="muted">Erro.</p>'; return; }
+      const entries = preview.entries || [];
+      const missing = preview.missingChannels || [];
+      out.innerHTML = `<p class='muted'>${preview.totalEntries || 0} entradas geradas · ${missing.length} canais sem stream.</p>
+        ${entries.length ? `<table><thead><tr><th>#</th><th>Key</th><th>Display</th><th>Group</th><th>Source</th><th>Quality</th><th>URL</th></tr></thead><tbody>${entries.map((e, i) => `<tr>
+          <td>${i + 1}</td>
+          <td><code>${escapeHtml(e.canonicalKey)}</code></td>
+          <td>${escapeHtml(e.displayName)}</td>
+          <td>${escapeHtml(e.group)}</td>
+          <td>${escapeHtml(e.sourceName)}</td>
+          <td>${escapeHtml(e.quality)}</td>
+          <td><code>${escapeHtml(e.streamUrl)}</code></td>
+        </tr>`).join('')}</tbody></table>` : '<p class="muted">Lista vazia.</p>'}
+        ${missing.length ? `<p class='muted' style='margin-top:8px;'>Canais sem stream: ${missing.map(m => '#' + m.canonicalChannelId + ' (' + m.reason + ')').join(', ')}</p>` : ''}
+      `;
+    }
+
+    async function duplicateOrderingList(id, originalKey) {
+      const newKey = prompt('Key da nova lista (slug único):', originalKey + '-copy');
+      if (!newKey) return;
+      const r = await fetch('/api/catalog/ordering-lists/' + id + '/duplicate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ newKey }),
+      });
+      if (r.ok) { await loadOrderingLists(); }
+      else { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
+    }
+
+    async function deleteOrderingList(id) {
+      if (!confirm('Eliminar a ordering list #' + id + '?')) return;
+      const r = await fetch('/api/catalog/ordering-lists/' + id, { method: 'DELETE' });
+      if (r.ok) { _orderingListDetailCache = null; document.getElementById('orderingDetail').innerHTML = ''; await loadOrderingLists(); }
+      else { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
+    }
+
+    async function addOrderingItem(listId) {
+      const sel = document.getElementById('addItemChannel');
+      if (!sel || !sel.value) { alert('Escolhe um canal.'); return; }
+      const r = await fetch('/api/catalog/ordering-lists/' + listId + '/items', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ canonicalChannelId: parseInt(sel.value, 10), isEnabled: true }),
+      });
+      if (r.ok) { await openOrderingList(listId); }
+      else { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
+    }
+
+    async function moveOrderingItem(itemId, newPos) {
+      const r = await fetch('/api/catalog/ordering-items/' + itemId, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ position: newPos }),
+      });
+      if (r.ok && _orderingListDetailCache) await openOrderingList(_orderingListDetailCache.id);
+      else if (!r.ok) { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
+    }
+
+    async function toggleOrderingItem(itemId, next) {
+      const r = await fetch('/api/catalog/ordering-items/' + itemId, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ isEnabled: next }),
+      });
+      if (r.ok && _orderingListDetailCache) await openOrderingList(_orderingListDetailCache.id);
+    }
+
+    async function removeOrderingItem(itemId) {
+      if (!confirm('Remover o item?')) return;
+      const r = await fetch('/api/catalog/ordering-items/' + itemId, { method: 'DELETE' });
+      if (r.ok && _orderingListDetailCache) await openOrderingList(_orderingListDetailCache.id);
+    }
+
+    async function loadGlobalPriority() {
+      const p = await safeFetchJson('/api/catalog/priority-policies', null);
+      const form = document.getElementById('globalPriorityForm');
+      if (!p) { form.innerHTML = '<p class="muted">Erro.</p>'; return; }
+      form.innerHTML = `
+        <div><label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Criteria JSON (ordem)</label><input id='gp_criteria' value='${escapeHtml(p.criteriaJson)}'></div>
+        <div><label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Preferred Quality (CSV)</label><input id='gp_quality' value='${escapeHtml(p.preferredQuality || "")}'></div>
+        <div><label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Allow fallback</label>
+          <select id='gp_fallback'><option value='true' ${p.allowFallback?'selected':''}>sim</option><option value='false' ${!p.allowFallback?'selected':''}>não</option></select>
+        </div>
+      `;
+    }
+
+    async function saveGlobalPriority() {
+      const payload = {
+        scope: 'global',
+        canonicalChannelId: null,
+        criteriaJson: document.getElementById('gp_criteria').value,
+        preferredQuality: document.getElementById('gp_quality').value,
+        allowFallback: document.getElementById('gp_fallback').value === 'true',
+      };
+      const r = await fetch('/api/catalog/priority-policies', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (r.ok) alert('Política global guardada.');
+      else { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
+    }
+
+    async function loadChannelPriority() {
+      const id = parseInt(document.getElementById('priorityChannelId').value, 10);
+      if (!id) { alert('Indica um channel ID.'); return; }
+      const p = await safeFetchJson('/api/catalog/priority-policies?channelId=' + id, null);
+      const form = document.getElementById('channelPriorityForm');
+      if (!p) { form.innerHTML = '<p class="muted">Sem override; aplicar-se-á a política global.</p>'; return; }
+      form.innerHTML = `
+        <div><label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Scope</label><input value='channel' disabled></div>
+        <div><label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Channel ID</label><input value='${p.canonicalChannelId || id}' disabled></div>
+        <div><label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Criteria JSON</label><input id='cp_criteria' value='${escapeHtml(p.criteriaJson)}'></div>
+        <div><label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Preferred Quality (CSV)</label><input id='cp_quality' value='${escapeHtml(p.preferredQuality || "")}'></div>
+        <div><label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Allow fallback</label>
+          <select id='cp_fallback'><option value='true' ${p.allowFallback?'selected':''}>sim</option><option value='false' ${!p.allowFallback?'selected':''}>não</option></select>
+        </div>
+      `;
+    }
+
+    async function saveChannelPriority() {
+      const id = parseInt(document.getElementById('priorityChannelId').value, 10);
+      if (!id) { alert('Indica um channel ID.'); return; }
+      const payload = {
+        scope: 'channel',
+        canonicalChannelId: id,
+        criteriaJson: document.getElementById('cp_criteria').value,
+        preferredQuality: document.getElementById('cp_quality').value,
+        allowFallback: document.getElementById('cp_fallback').value === 'true',
+      };
+      const r = await fetch('/api/catalog/priority-policies', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (r.ok) alert('Override guardado.');
+      else { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
+    }
+
+    async function loadImportPolicies() {
+      const list = await safeFetchJson('/api/catalog/import-policies', []);
+      if (!Array.isArray(list)) { document.getElementById('importPoliciesTable').innerHTML = '<p class="muted">Erro.</p>'; return; }
+      if (!list.length) { document.getElementById('importPoliciesTable').innerHTML = '<p class="muted">Nenhuma política. Cria abaixo (Live, Radio, VOD).</p>'; return; }
+      const rows = list.map(p => `<tr>
+        <td><code>${p.id}</code></td>
+        <td>${p.mediaKind}</td>
+        <td>${p.vodPolicy}</td>
+        <td><code>${escapeHtml(p.targetGroupsCsv || '')}</code></td>
+        <td><code>${escapeHtml(p.excludedGroupsCsv || '')}</code></td>
+        <td>${p.isEnabled ? '<span class="badge ok">sim</span>' : '<span class="badge err">não</span>'}</td>
+        <td>
+          <select data-import-edit-vod data-row-key='${p.id}'>
+            <option value='ImportVod' ${p.vodPolicy==='ImportVod'?'selected':''}>ImportVod</option>
+            <option value='KeepVod' ${p.vodPolicy==='KeepVod'?'selected':''}>KeepVod</option>
+            <option value='ExcludeVod' ${p.vodPolicy==='ExcludeVod'?'selected':''}>ExcludeVod</option>
+          </select>
+          <input data-import-edit-target data-row-key='${p.id}' value='${escapeHtml(p.targetGroupsCsv||"")}' placeholder='targets' style='margin-left:4px;width:140px;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:4px 6px;border-radius:6px;font:inherit;'>
+          <input data-import-edit-excluded data-row-key='${p.id}' value='${escapeHtml(p.excludedGroupsCsv||"")}' placeholder='excluded' style='margin-left:4px;width:140px;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:4px 6px;border-radius:6px;font:inherit;'>
+          <button class='secondary' onclick='saveImportPolicy(` + p.id + `, "` + p.mediaKind + `")'>Guardar</button>
+        </td>
+      </tr>`).join('');
+      document.getElementById('importPoliciesTable').innerHTML = `<table><thead><tr><th>#</th><th>MediaKind</th><th>VodPolicy</th><th>Targets (CSV)</th><th>Excluded (CSV)</th><th>Activo</th><th>Editar</th></tr></thead><tbody>${rows}</tbody></table>`;
+    }
+
+    async function saveImportPolicy(policyId, mediaKind) {
+      const sel = "[data-import-edit-vod][data-row-key='" + policyId + "']";
+      const vod = document.querySelector(sel).value;
+      const target = document.querySelector("[data-import-edit-target][data-row-key='" + policyId + "']").value;
+      const excluded = document.querySelector("[data-import-edit-excluded][data-row-key='" + policyId + "']").value;
+      const r = await fetch('/api/catalog/import-policies', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mediaKind, vodPolicy: vod, targetGroupsCsv: target, excludedGroupsCsv: excluded, isEnabled: true }),
+      });
+      if (r.ok) { alert('Política guardada.'); await loadImportPolicies(); }
+      else { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
+    }
+
+    async function loadCanonicalGroups() {
+      const groups = await safeFetchJson('/api/catalog/canonical-groups', []);
+      if (!Array.isArray(groups)) { document.getElementById('canonicalGroupsTable').innerHTML = '<p class="muted">Erro.</p>'; return; }
+      if (!groups.length) { document.getElementById('canonicalGroupsTable').innerHTML = '<p class="muted">Nenhum grupo canónico. Cria abaixo.</p>'; return; }
+      const rows = groups.map(g => `<tr>
+        <td><code>${g.id}</code></td>
+        <td><code>${escapeHtml(g.key)}</code></td>
+        <td>${escapeHtml(g.displayName)}</td>
+        <td>${escapeHtml(g.country || '—')}</td>
+        <td>${g.order}</td>
+        <td>${g.isDefault ? '<span class="badge ok">default</span>' : '—'}</td>
+        <td>${g.isEnabled ? '<span class="badge ok">sim</span>' : '<span class="badge err">não</span>'}</td>
+        <td><button class='secondary' style='color:var(--err);' onclick='deleteCanonicalGroup(${g.id})'>Eliminar</button></td>
+      </tr>`).join('');
+      document.getElementById('canonicalGroupsTable').innerHTML = `<table><thead><tr><th>#</th><th>Key</th><th>Display</th><th>País</th><th>Ordem</th><th>Default</th><th>Activo</th><th>Acções</th></tr></thead><tbody>${rows}</tbody></table>`;
+    }
+
+    async function submitCreateGroup() {
+      const payload = {
+        key: document.querySelector("[data-group-create='key']").value.trim(),
+        displayName: document.querySelector("[data-group-create='name']").value.trim(),
+        country: document.querySelector("[data-group-create='country']").value.trim() || null,
+        order: parseInt(document.querySelector("[data-group-create='order']").value, 10) || 0,
+        isEnabled: true,
+        isDefault: false,
+      };
+      if (!payload.key || !payload.displayName) { alert('Key e Display Name obrigatórios.'); return; }
+      const r = await fetch('/api/catalog/canonical-groups', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (r.ok) {
+        document.querySelector("[data-group-create='key']").value = '';
+        document.querySelector("[data-group-create='name']").value = '';
+        document.querySelector("[data-group-create='country']").value = '';
+        await loadCanonicalGroups();
+      } else {
+        const err = await r.json();
+        alert('Erro: ' + (err.error || r.status));
+      }
+    }
+
+    async function deleteCanonicalGroup(id) {
+      if (!confirm('Eliminar o grupo #' + id + '?')) return;
+      const r = await fetch('/api/catalog/canonical-groups/' + id, { method: 'DELETE' });
+      if (r.ok) await loadCanonicalGroups();
+      else { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
+    }
+
+    async function loadGroupMappings() {
+      const list = await safeFetchJson('/api/catalog/group-mappings', []);
+      if (!Array.isArray(list)) { document.getElementById('groupMappingsTable').innerHTML = '<p class="muted">Erro.</p>'; return; }
+      if (!list.length) { document.getElementById('groupMappingsTable').innerHTML = '<p class="muted">Nenhum mapping. Cria abaixo.</p>'; return; }
+      const rows = list.map(m => `<tr>
+        <td><code>${m.id}</code></td>
+        <td>${m.sourceKind}</td>
+        <td><code>${escapeHtml(m.sourceGroupTitle)}</code></td>
+        <td>${m.canonicalGroupKey ? `<code>${escapeHtml(m.canonicalGroupKey)}</code>` : m.canonicalGroupId}</td>
+        <td>${escapeHtml(m.canonicalGroupDisplayName || '')}</td>
+        <td>${m.isEnabled ? '<span class="badge ok">sim</span>' : '<span class="badge err">não</span>'}</td>
+        <td><button class='secondary' style='color:var(--err);' onclick='deleteGroupMapping(${m.id})'>Eliminar</button></td>
+      </tr>`).join('');
+      document.getElementById('groupMappingsTable').innerHTML = `<table><thead><tr><th>#</th><th>Source</th><th>Group Title</th><th>Canonical Key</th><th>Display</th><th>Activo</th><th>Acções</th></tr></thead><tbody>${rows}</tbody></table>`;
+    }
+
+    async function submitCreateGroupMapping() {
+      const payload = {
+        sourceKind: document.querySelector("[data-mapping-create='kind']").value,
+        sourceGroupTitle: document.querySelector("[data-mapping-create='title']").value.trim(),
+        canonicalGroupId: parseInt(document.querySelector("[data-mapping-create='groupId']").value, 10),
+        isEnabled: true,
+      };
+      if (!payload.sourceGroupTitle || !payload.canonicalGroupId) { alert('Group title e groupId obrigatórios.'); return; }
+      const r = await fetch('/api/catalog/group-mappings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (r.ok) {
+        document.querySelector("[data-mapping-create='title']").value = '';
+        document.querySelector("[data-mapping-create='groupId']").value = '';
+        await loadGroupMappings();
+      } else {
+        const err = await r.json();
+        alert('Erro: ' + (err.error || r.status));
+      }
+    }
+
+    async function deleteGroupMapping(id) {
+      if (!confirm('Eliminar o mapping #' + id + '?')) return;
+      const r = await fetch('/api/catalog/group-mappings/' + id, { method: 'DELETE' });
+      if (r.ok) await loadGroupMappings();
+      else { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
+    }
+
+    async function loadDegradation() {
+      const lookback = parseInt((document.getElementById('degLookback') || {value: '10080'}).value, 10) || 10080;
+      const limit = parseInt((document.getElementById('degLimit') || {value: '200'}).value, 10) || 200;
+      const params = new URLSearchParams();
+      params.set('lookbackMinutes', String(lookback));
+      params.set('limit', String(limit));
+
+      const list = await safeFetchJson('/api/catalog/degradation/recent?' + params.toString(), []);
+      const stats = await safeFetchJson('/api/catalog/degradation/stats?lookbackMinutes=' + lookback, null);
+
+      if (stats) {
+        const rate = (stats.terminalRate * 100).toFixed(1);
+        document.getElementById('degradationStats').innerHTML =
+          `<strong>Lookback:</strong> ${stats.lookbackMinutes} min · ` +
+          `<strong>Validated:</strong> ${stats.validatedSamples} · ` +
+          `<strong>Reachable:</strong> ${stats.reachableSamples} · ` +
+          `<strong>Timeout:</strong> ${stats.timeoutSamples} · ` +
+          `<strong>Unreachable:</strong> ${stats.unreachableSamples} · ` +
+          `<strong>Dead:</strong> ${stats.deadSamples} · ` +
+          `<strong>Taxa terminal:</strong> ${rate}%`;
+      }
+
+      if (!Array.isArray(list)) { document.getElementById('degradationTable').innerHTML = '<p class="muted">Erro ao carregar degradação.</p>'; return; }
+      if (!list.length) { document.getElementById('degradationTable').innerHTML = '<p class="muted">Sem streams degradados no lookback seleccionado.</p>'; return; }
+      const rows = list.map(d => {
+        const rate = (d.failureRate * 100).toFixed(0);
+        const lastHealthy = d.lastHealthyAtUtc ? tsLocal(d.lastHealthyAtUtc) : '—';
+        const availability = d.latestAvailability;
+        const badge = availability === 'Dead' ? 'err'
+          : availability === 'Unreachable' ? 'err'
+          : availability === 'Timeout' ? 'warn' : 'ok';
+        return `<tr>
+          <td><code>${d.channelSourceId}</code></td>
+          <td>${d.canonicalChannelId}</td>
+          <td>${escapeHtml(d.sourceName)}</td>
+          <td><span class='badge ${badge}'>${availability}</span></td>
+          <td>${d.quality}</td>
+          <td>${d.latestResponseMs} ms</td>
+          <td>${tsLocal(d.latestObservedAtUtc)}</td>
+          <td>${lastHealthy}</td>
+          <td>${d.failedSamples}/${d.totalSamples} (${rate}%)</td>
+        </tr>`;
+      }).join('');
+      document.getElementById('degradationTable').innerHTML = `<table><thead><tr><th>CS</th><th>Canal</th><th>Source</th><th>Estado</th><th>Quality</th><th>Response</th><th>Última observação</th><th>Última saudável</th><th>Falhas</th></tr></thead><tbody>${rows}</tbody></table>`;
+    }
+
+    async function loadScheduledActions() {
+      const actions = await safeFetchJson('/api/scheduled-actions', []);
+      if (!actions || actions.length === 0) return;
+      const input = document.querySelector("[data-sched-create='action']");
+      const select = document.querySelector("[data-sched-create='action-select']");
+      if (!input || !select) return;
+      select.innerHTML = actions.map(a => `<option value='${escapeHtml(a)}'>${escapeHtml(a)}</option>`).join('');
+      input.style.display = 'none';
+      select.style.display = 'block';
+    }
+    async function loadScheduledJobs() {
+      const list = await safeFetchJson('/api/catalog/scheduled-jobs', []);
+      if (!Array.isArray(list)) { document.getElementById('scheduledJobsTable').innerHTML = '<p class="muted">Erro.</p>'; return; }
+      if (!list.length) { document.getElementById('scheduledJobsTable').innerHTML = '<p class="muted">Sem jobs agendados.</p>'; return; }
+      const rows = list.map(j => `<tr>
+        <td><code>${j.id}</code></td>
+        <td><code>${escapeHtml(j.name)}</code></td>
+        <td><code>${escapeHtml(j.cronExpression)}</code></td>
+        <td>${escapeHtml(j.actionName)}</td>
+        <td>${j.isEnabled ? '<span class="badge ok">sim</span>' : '<span class="badge err">não</span>'}</td>
+        <td>${j.lastRunAtUtc ? tsLocal(j.lastRunAtUtc) : '—'}</td>
+        <td>${j.nextRunAtUtc ? tsLocal(j.nextRunAtUtc) : '—'}</td>
+        <td>${escapeHtml(j.lastResult || '—')}</td>
+        <td>
+          <button class='secondary' onclick='toggleScheduledJob(${j.id}, ${!j.isEnabled})'>${j.isEnabled ? 'Desactivar' : 'Activar'}</button>
+          <button class='secondary' style='color:var(--err);' onclick='deleteScheduledJob(${j.id})'>Eliminar</button>
+        </td>
+      </tr>`).join('');
+      document.getElementById('scheduledJobsTable').innerHTML = `<table><thead><tr><th>#</th><th>Name</th><th>Cron</th><th>Action</th><th>Activo</th><th>Último</th><th>Próximo</th><th>Resultado</th><th>Acções</th></tr></thead><tbody>${rows}</tbody></table>`;
+    }
+
+    async function submitCreateScheduledJob() {
+      const actionInput = document.querySelector("[data-sched-create='action']");
+      const actionSelect = document.querySelector("[data-sched-create='action-select']");
+      const actionName = (actionSelect && actionSelect.style.display !== 'none')
+        ? actionSelect.value.trim()
+        : actionInput.value.trim();
+      const payload = {
+        name: document.querySelector("[data-sched-create='name']").value.trim(),
+        cronExpression: document.querySelector("[data-sched-create='cron']").value.trim(),
+        actionName: actionName,
+        isEnabled: document.querySelector("[data-sched-create='enabled']").value === 'true',
+      };
+      if (!payload.name || !payload.cronExpression || !payload.actionName) {
+        alert('Name, Cron e Action são obrigatórios.'); return;
+      }
+      const r = await fetch('/api/catalog/scheduled-jobs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (r.ok) {
+        document.querySelector("[data-sched-create='name']").value = '';
+        document.querySelector("[data-sched-create='cron']").value = '';
+        actionInput.value = '';
+        if (actionSelect) actionSelect.value = '';
+        await loadScheduledJobs();
+      } else {
+        const err = await r.json();
+        alert('Erro: ' + (err.error || r.status));
+      }
+    }
+
+    async function toggleScheduledJob(id, next) {
+      const r = await fetch('/api/catalog/scheduled-jobs/' + id + '/enabled', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ isEnabled: next }),
+      });
+      if (r.ok) { await loadScheduledJobs(); }
+      else { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
+    }
+
+    async function deleteScheduledJob(id) {
+      if (!confirm('Eliminar o scheduled job #' + id + '?')) return;
+      const r = await fetch('/api/catalog/scheduled-jobs/' + id, { method: 'DELETE' });
+      if (r.ok) { await loadScheduledJobs(); }
+      else { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
+    }
+
+    async function loadMatchingAudits() {
+      const channelEl = document.getElementById('matchingChannelId');
+      const limitEl = document.getElementById('matchingLimit');
+      const channelId = channelEl && channelEl.value ? parseInt(channelEl.value, 10) : null;
+      const limit = limitEl ? parseInt(limitEl.value, 10) : 200;
+      const params = new URLSearchParams();
+      if (channelId) params.set('channelId', String(channelId));
+      if (limit) params.set('limit', String(limit));
+
+      const list = await safeFetchJson('/api/catalog/matching/recent?' + params.toString(), []);
+      const stats = await safeFetchJson('/api/catalog/matching/stats', null);
+      if (!Array.isArray(list)) { document.getElementById('matchingAuditsTable').innerHTML = '<p class="muted">Erro ao carregar decisões.</p>'; return; }
+
+      if (stats) {
+        document.getElementById('matchingStats').innerHTML = `
+          <strong>Total:</strong> ${stats.total} · <strong>Canonical:</strong> ${stats.canonical} ·
+          <strong>Alias:</strong> ${stats.alias} · <strong>Rule:</strong> ${stats.rule} ·
+          <strong>Unknown:</strong> ${stats.unknown} · <strong>Últimas 24h:</strong> ${stats.last24h}`;
+      }
+
+      if (!list.length) { document.getElementById('matchingAuditsTable').innerHTML = '<p class="muted">Nenhuma decisão registada.</p>'; return; }
+      const rows = list.map(a => `<tr>
+        <td>${tsLocal(a.atUtc)}</td>
+        <td><code>${escapeHtml(a.normalizedIdentity)}</code></td>
+        <td>${escapeHtml(a.originalTitle || '—')}</td>
+        <td>${escapeHtml(a.sourceGroup || '—')}</td>
+        <td>${a.resolutionKind}</td>
+        <td>${a.canonicalChannelId ?? '—'}</td>
+        <td>${(a.confidence || 0).toFixed(2)}</td>
+        <td><code>${escapeHtml(a.reasonSignature || '—')}</code></td>
+      </tr>`).join('');
+      document.getElementById('matchingAuditsTable').innerHTML = `<table><thead><tr><th>Quando</th><th>Identidade</th><th>Título</th><th>Group</th><th>Decisão</th><th>Canal</th><th>Conf.</th><th>Razão</th></tr></thead><tbody>${rows}</tbody></table>`;
+    }
+
     async function loadCatalogSyncRuns() {
       const runs = await safeFetchJson('/api/catalog/sync-runs', []);
       if (!Array.isArray(runs)) { document.getElementById('catalogSyncRunsTable').innerHTML = '<p class="muted">Erro ao carregar sync runs.</p>'; return; }
@@ -1817,10 +5001,27 @@ const rows = Object.entries(inv).map(([k, v]) => {
           <td>${nfmt(r.countReviewRequired || 0)}</td>
           <td>${nfmt(r.countExcluded || 0)}</td>
           <td>${resultBadge}</td>
+          <td><button class='secondary' onclick='loadSyncRunSteps(${r.id})'>Passos</button></td>
         </tr>`;
       }).join('');
       document.getElementById('catalogSyncRunsTable').innerHTML = `
-        <table><thead><tr><th>ID</th><th>Início</th><th>Fim</th><th>Versão</th><th>Created</th><th>Merged</th><th>Protected</th><th>Removed</th><th>Review</th><th>Excluded</th><th>Resultado</th></tr></thead><tbody>${rows}</tbody></table>`;
+        <table><thead><tr><th>ID</th><th>Início</th><th>Fim</th><th>Versão</th><th>Created</th><th>Merged</th><th>Protected</th><th>Removed</th><th>Review</th><th>Excluded</th><th>Resultado</th><th>Acções</th></tr></thead><tbody>${rows}</tbody></table>
+        <div id='syncRunStepsDetail' style='margin-top:12px;'></div>`;
+    }
+
+    async function loadSyncRunSteps(runId) {
+      const steps = await safeFetchJson('/api/catalog/sync-runs/' + runId + '/steps', []);
+      const out = document.getElementById('syncRunStepsDetail');
+      if (!Array.isArray(steps)) { out.innerHTML = '<p class="muted">Erro.</p>'; return; }
+      if (!steps.length) { out.innerHTML = '<p class="muted">Sem passos detalhados para esta execução.</p>'; return; }
+      const rows = steps.map(s => `<tr>
+        <td><code>${escapeHtml(s.step)}</code></td>
+        <td>${tsLocal(s.startedAtUtc)}</td>
+        <td>${s.durationMs} ms</td>
+        <td>${nfmt(s.itemsProcessed)} (${nfmt(s.itemsSucceeded)} ok · ${nfmt(s.itemsFailed)} fail)</td>
+        <td>${escapeHtml(s.result)}</td>
+      </tr>`).join('');
+      out.innerHTML = `<div class='card'><h4>Passos da execução #${runId}</h4><table><thead><tr><th>Passo</th><th>Início</th><th>Duração</th><th>Itens</th><th>Resultado</th></tr></thead><tbody>${rows}</tbody></table></div>`;
     }
 
     async function loadPendingCountryApprovals() {
@@ -2045,6 +5246,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
         case 'playlist': loadPlaylist(); break;
         case 'dispatcharr': loadDispatcharr(); break;
         case 'catalog': loadCatalog(); break;
+        case 'validation': loadValidationPolicy(); break;
         case 'diagnostics': loadDiagnostics(); break;
       }
     }

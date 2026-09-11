@@ -34,6 +34,18 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
   - **Sem mudança de comportamento do pipeline a jusante**: contas descobertas continuam a ser promovidas via `TelegramScraperService.PromoteXtreamAccount` (já existente) a `CandidatePlaylist { DetectedFrom = "xtream publication" }`. O `AnalyzePlaylist` → `M3uParserService.Parse` → `ValidateStreams` → `TestStreamsAsync` continua a ser o único caminho de teste e merge. **Zero duplicação de pipeline.**
   - **Fixture nova em testes**: `m3uCrawler.Tests/Fixtures/iptvgold_07-09-2026.html` (532 KB, 70 contas Xtream, gitignored — contém credenciais reais obtidas em runtime de publicação autorizada). Auto-copiada para `bin/Fixtures/` via `<None Update="Fixtures\*"/>` no `m3uCrawler.Tests.csproj`. MD5 verificado em download: `b8af67a21c7810fcd96868d7ae142a5d`.
 
+### 🛠 PHASE 12 — fecho da Automation / Scheduler (2026-09-11)
+- **Acções concretas `IScheduledAction`** (4 novas, todas reutilizam serviços existentes sem duplicar pipeline):
+  - `ScheduledM3uDiscoveryAction` (`discoverM3u`) — `M3uCrawlerService.SearchM3u8Files` + `M3uTesterService.TestMultipleStreams` → `output/playlist.m3u`.
+  - `ScheduledValidationAction` (`validatePlaylist`) — re-testa streams em `output/playlist.m3u` via `M3uTesterService.TestM3u8Stream`; remove as que falham.
+  - `ScheduledPlaylistGenerationAction` (`generatePlaylist`) — `PlaylistComposerService.ComposeAsync` sobre a primeira `OrderingListEntity` disponível → `PlaylistManagerService.WriteComposedAsync`.
+  - `ScheduledDispatcharrSyncAction` (`syncDispatcharr`) — `DispatcharrSyncService.RunAsync`; termina em `dispatcharr-disabled` quando `dispatcharr_enabled=false` (no-op silencioso sem HTTP nem ficheiros extra).
+- **`ScheduledAutomationHost`** (`Services/Automation/`): monta um `ServiceProvider` mínimo (DI já existente) que regista as 4 actions e devolve um `ScheduledJobRunner` pronto a arrancar. Expõe `RegisteredActions` para o Dashboard.
+- **Arranque em produção**: `Program.cs` constrói o `ScheduledAutomationHost` dentro do bloco `--web`, chama `Start()` e regista `Console.CancelKeyPress` para shutdown limpo. Quando `--web` não é passado, o scheduler não corre (não há segundo mecanismo de scheduling).
+- **Dashboard**: novo endpoint `GET /api/scheduled-actions` devolve a lista de actions registadas; o formulário `Scheduled Jobs` troca o input livre por `<select>` com essas opções quando o host está activo. Retro-compatível: sem host, o input livre continua.
+- **Testes** (12 novos, todos passam em Release): `ScheduledActionsTests` cobre resolução via DI, idempotência do `Start`, nomes estáveis/distintos, no-op quando Dispatcharr está disabled, no-op sem playlist, propagação de `CancellationToken`, tick do runner para jobs disabled / desconhecidos / existentes / não vencidos. Total agora: **1327 testes** (anterior: 1315).
+- **Documentação**: `docs/IMPLEMENTATION_ROADMAP.md` — PHASE 12 passa de `[parcial]` para `[concluído]` (secções 30, 32.1, 32.10 e apêndice actualizadas; nova secção 32.11 regista o fecho de gaps sem apagar o snapshot histórico de 32.10).
+
 ### 🔧 Alterado
 - **`TelegramScraperService.SearchM3UInTelegramInternal`**: depois de iterar os diálogos e mensagens, invoca o `TelegramPublicationResolver.ResolveAsync` para todas as `TelegramPublicationRef` capturadas. Usa o cache de `chatsDict` (já existente, construído a partir de `_client.Messages_GetAllDialogs()`) para obter `access_hash` por `channel_id`. As contas Xtream promovidas passam a integrar `candidates` no mesmo loop do pipeline M3U/Xtream existente. **Sem nova pipeline, sem duplicação.**
 - **`M3uCandidateDetector`**: inalterado. `M3uCandidateDetector` continua a tratar `.html`/`.htm` attachments e URLs genéricas como até aqui.

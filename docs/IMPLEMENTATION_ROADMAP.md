@@ -2068,24 +2068,38 @@ Dispatcharr sincronizado
 
 E o operador conseguir alterar as decisões sem alterar código.
 
-**Estado (2026-09-11)**: `[parcial]`.
+**Estado (2026-09-11)**: `[concluído]`.
 
 - `ScheduledJobEntity` persistente com `CronExpression` própria
   (5 campos, wildcards, ranges, listas, steps), validação eager
   no upsert.
 - `IScheduledAction` + `ScheduledJobRunner` (DI-based, manual
-  `TickOnceAsync()` para testes, loop opcional em produção).
+  `TickOnceAsync()` para testes, loop em produção arrancado pelo
+  `Program.cs` quando `--web` está activo).
+- Quatro `IScheduledAction` concretas implementadas e registadas
+  via `ScheduledAutomationHost`:
+  - `discoverM3u` — `M3uCrawlerService.SearchM3u8Files` +
+    `M3uTesterService.TestMultipleStreams`, escreve
+    `output/playlist.m3u`.
+  - `validatePlaylist` — re-testa streams em `output/playlist.m3u`
+    via `M3uTesterService.TestM3u8Stream` e remove as que falham.
+  - `generatePlaylist` — `PlaylistComposerService.ComposeAsync`
+    sobre a primeira `OrderingListEntity` disponível, grava em
+    `output/playlist.m3u` via `PlaylistManagerService.WriteComposedAsync`.
+  - `syncDispatcharr` — `DispatcharrSyncService.RunAsync` com a
+    config existente; termina precocemente em `dispatcharr-disabled`
+    se `dispatcharr_enabled=false` em `wtelegram.config`.
 - API: `GET/POST /api/catalog/scheduled-jobs`,
   `PUT /api/catalog/scheduled-jobs/{id}/enabled`,
-  `DELETE /api/catalog/scheduled-jobs/{id}`.
+  `DELETE /api/catalog/scheduled-jobs/{id}`,
+  `GET /api/scheduled-actions` (lista de actions registadas).
 - Dashboard tab `Scheduled Jobs` com tabela, formulário e
-  estatísticas.
-- 7 testes em `ScheduledJobsTests.cs`. Ver secção 32.10.
-- **Pendente**: registar acções concretas (`discoverTelegram`,
-  `runDispatcharrSync`, ...) implementando `IScheduledAction`
-  no `Program.cs` e arrancar o `ScheduledJobRunner` no boot.
-  O motor, scheduler e persistência estão prontos; a integração
-  em produção ainda não foi fechada.
+  estatísticas; o campo `Action Name` passa a `<select>` quando
+  há actions registadas.
+- 19 testes (7 em `ScheduledJobsTests.cs` + 12 em
+  `ScheduledActionsTests.cs`). Ver secção 32.10 e 32.11.
+- Shutdown limpo via `Console.CancelKeyPress` que cancela o
+  `ScheduledJobRunner` antes de a aplicação sair.
 
 ---
 
@@ -2232,7 +2246,7 @@ têm de ser fechados antes da consolidação final (PHASE 12).
 | **PHASE 9 b — ChannelSource observation history** | **`[concluído]`** | `ChannelSourceObservationEntity` + endpoint GET/POST; Dashboard em construção para mostrar timeline. Ver detalhes em 32.7. |
 | **PHASE 10 — Dispatcharr** | **`[concluído]`** | `ChannelMatcher.BuildPlanFromCompositionAsync` consome `PlaylistComposition` (PHASE 7 + 6 + 4). Ver detalhes em 32.8. |
 | **PHASE 11 — Runs dashboard detalhado** | **`[concluído]`** | `SyncRunStepEntity` + `GET/POST /api/catalog/sync-runs/{id}/steps` + Dashboard `Passos` por run. Ver detalhes em 32.9. |
-| **PHASE 12 — Automation / Scheduler** | **`[parcial]`** | `ScheduledJobEntity` + `CronExpression` (5 campos, `*`, ranges, listas, steps) + `ScheduledJobRunner` (DI-based actions) + Dashboard `Scheduled Jobs`. Ver detalhes em 32.10. Acções concretas e arranque em produção ainda pendentes. |
+| **PHASE 12 — Automation / Scheduler** | **`[concluído]`** | `ScheduledJobEntity` + `CronExpression` + `ScheduledJobRunner` + 4 actions concretas (`discoverM3u`, `validatePlaylist`, `generatePlaylist`, `syncDispatcharr`) + `ScheduledAutomationHost` + arranque em produção no `--web` + 19 testes. Ver detalhes em 32.10 e 32.11. |
 
 ---
 
@@ -2786,9 +2800,11 @@ SQLite.
   lists/ranges), validação (inválido), upsert (computes
   NextRun), `MarkScheduledJobRanAsync` (avança next), stats.
 
-Resultado: PHASE 12 passa a `[parcial]`.
+Resultado: PHASE 12 fica em `[parcial]` — infraestrutura completa
+e testada, mas as acções concretas e o arranque em produção
+ainda não estavam fechados.
 
-Notas de integração:
+Notas de integração (snapshot 2026-09-11):
 - O `ScheduledJobRunner` é alimentado via DI; caberia ao
   `Program.cs` arrancá-lo no boot se houver jobs activos. Os
   testes usam-no sem loop de background.
@@ -2796,6 +2812,72 @@ Notas de integração:
   ...) continuam por implementar — basta criar uma classe que
   implemente `IScheduledAction` com o `Name` correcto e
   registá-la no `ServiceCollection`.
+
+## 32.11 — PHASE 12 — fecho de gaps (acções concretas + arranque em produção)
+
+A `[parcial]` da 32.10 era motivada por duas lacunas:
+
+- **Lacuna 1 — acções concretas inexistentes.** A interface
+  `IScheduledAction` estava definida mas nenhuma classe a
+  implementava. `ScheduledJobRunner` resolvia sempre
+  `unknown-action:`.
+- **Lacuna 2 — runner não arrancado.** `ScheduledJobRunner`
+  ficava em modo de teste (`TickOnceAsync`) e nunca era
+  instanciado pelo `Program.cs`.
+
+Fecho entregue nesta entrega:
+
+- **Quatro `IScheduledAction` concretas**, cada uma chamada
+  `Scheduled<ActionName>Action` e exposta via DI através do
+  `ScheduledAutomationHost`:
+
+  | Action | Service existente | Output |
+  |--------|-------------------|--------|
+  | `discoverM3u` | `M3uCrawlerService.SearchM3u8Files` + `M3uTesterService.TestMultipleStreams` | `output/playlist.m3u` |
+  | `validatePlaylist` | `M3uTesterService.TestM3u8Stream` (re-testa streams da playlist) | reescreve `output/playlist.m3u` |
+  | `generatePlaylist` | `PlaylistComposerService.ComposeAsync` + `PlaylistManagerService.WriteComposedAsync` | `output/playlist.m3u` |
+  | `syncDispatcharr` | `DispatcharrSyncService.RunAsync` | `dispatcharr_plan_*.json` / `dispatcharr_report_*.json`; `dispatcharr-disabled` quando `dispatcharr_enabled=false` |
+
+  Nenhuma destas acções duplica o pipeline — cada uma delega
+  num serviço já existente. O dispatcher do runner é puramente
+  o `Name` da interface.
+
+- **`ScheduledAutomationHost`** (`Services/Automation/`) monta
+  um `ServiceProvider` mínimo com `ScheduledActionOptions`,
+  `CatalogResolver`, `DispatcharrConfig`, `PlaylistManagerService`,
+  `M3uCrawlerService`, `M3uTesterService`, `PlaylistComposerService`
+  e `AliasResolver`, e expõe `RegisteredActions` para o Dashboard.
+
+- **Arranque em produção.** No `Program.cs`, sempre que
+  `--web` é passado, o bloco de inicialização do dashboard
+  constrói o `ScheduledAutomationHost`, chama
+  `automationHost.Start()`, expõe as actions ao
+  `WebDashboardService.SetScheduledActions` e regista
+  `Console.CancelKeyPress` para shutdown limpo do runner.
+
+- **Dashboard.** Foi adicionado o endpoint `GET /api/scheduled-actions`
+  (devolve `string[]` com os nomes registados) e o JS do
+  formulário `Scheduled Jobs` troca o input livre por um
+  `<select>` com essas opções, sem quebrar retro-compatibilidade
+  (quando não há host activo, o input livre continua).
+
+- **Testes.** Novo ficheiro `m3uCrawler.Tests/ScheduledActionsTests.cs`
+  com 12 testes que cobrem:
+  - resolução de todas as 4 actions via DI (`ScheduledAutomationHost.Build`);
+  - idempotência do `Start()`;
+  - nomes estáveis e distintos;
+  - no-op quando Dispatcharr está `Enabled=false`;
+  - no-op quando a playlist não existe;
+  - excepção quando não há ordering list para `generatePlaylist`;
+  - propagação de `CancellationToken` no `validatePlaylist`;
+  - tick do runner: job disabled não corre;
+  - tick do runner: action desconhecida grava `unknown-action:…` e avança `NextRunAtUtc`;
+  - tick do runner: action existente executa e persiste `LastRunAtUtc`/`LastResult`/`NextRunAtUtc`;
+  - tick do runner: job não vencido não corre.
+
+  Total: 1315 → 1327 testes em Release, 0 falhas.
+
+Resultado: PHASE 12 passa a `[concluído]`.
 
 ---
 
@@ -2854,4 +2936,4 @@ Este documento define **como completar a evolução até ao sistema funcional pr
 | PHASE 9b — ChannelSource observations | `[concluído]` | ChannelSourceObservationEntity + API + 3 testes. Ver 32.7. |
 | PHASE 10 — Dispatcharr | `[concluído]` | BuildPlanFromCompositionAsync + 2 testes. Ver 32.8. |
 | PHASE 11 — Operations | `[concluído]` | SyncRunStepEntity + API + Dashboard Passos + 4 testes. Ver 32.9. |
-| PHASE 12 — Automation / Scheduler | `[parcial]` | ScheduledJobEntity + CronExpression + Runner + Dashboard + 7 testes. Ver 32.10. Acções concretas e arranque em produção ainda pendentes. |
+| PHASE 12 — Automation / Scheduler | `[concluído]` | ScheduledJobEntity + CronExpression + Runner + 4 actions concretas (`discoverM3u`, `validatePlaylist`, `generatePlaylist`, `syncDispatcharr`) + arranque em produção via `Program.cs --web` + 19 testes. Ver 32.10 e 32.11. |

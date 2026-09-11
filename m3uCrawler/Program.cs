@@ -1,5 +1,6 @@
 using m3uCrawler.Build;
 using m3uCrawler.Services;
+using m3uCrawler.Services.Automation;
 using m3uCrawler.Services.Catalog;
 using m3uCrawler.Services.Matching;
 using m3uCrawler.Services.SourceOrdering;
@@ -44,6 +45,7 @@ namespace m3uCrawler
             string? webToken = webEnabled ? GetOptionValue(args, "--web-token") : null;
             Task? webTask = null;
             CatalogResolver? webCatalogResolver = null;
+            ScheduledAutomationHost? automationHost = null;
             if (webEnabled)
             {
                 var dashboardOutputDir = GetOptionValue(args, "--output-dir") ?? "output";
@@ -54,6 +56,20 @@ namespace m3uCrawler
                     webCatalogResolver = await InitializeCatalogAsync(
                         ResolveCatalogDbPath(args), CancellationToken.None);
                     WebDashboardService.SetCatalogResolver(webCatalogResolver);
+
+                    // PHASE 12 — Construir e arrancar o scheduler. As actions
+                    // concretas ficam registadas para o formulário do Dashboard
+                    // e o runner entra em loop respeitando shutdown via Ctrl+C
+                    // (CancellationToken propagado pelo _cts interno).
+                    var dispatcharrConfig = DispatcharrConfigLoader.Load();
+                    automationHost = ScheduledAutomationHost.Build(
+                        webCatalogResolver,
+                        dashboardOutputDir,
+                        dispatcharrConfig);
+                    WebDashboardService.SetScheduledActions(automationHost.RegisteredActions);
+                    automationHost.Start();
+                    Console.WriteLine(
+                        $"🕒 ScheduledJobRunner activo ({automationHost.RegisteredActions.Count} actions registadas).");
                 }
                 catch (Exception ex)
                 {
@@ -68,6 +84,24 @@ namespace m3uCrawler
                         Console.WriteLine($"❌ Dashboard task falhou: {t.Exception.GetBaseException().Message}");
                     }
                 }, TaskContinuationOptions.OnlyOnFaulted);
+            }
+
+            // PHASE 12 — Shutdown limpo: Ctrl+C pára o runner antes da app sair.
+            if (automationHost is not null)
+            {
+                ConsoleCancelEventHandler cancelHandler = (_, e) =>
+                {
+                    e.Cancel = true;
+                    try
+                    {
+                        automationHost.StopAsync().GetAwaiter().GetResult();
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"⚠️ Erro ao parar ScheduledJobRunner: {ex.Message}");
+                    }
+                };
+                Console.CancelKeyPress += cancelHandler;
             }
 
             if (args.Contains("--telegram"))
@@ -384,6 +418,7 @@ namespace m3uCrawler
                 Console.WriteLine("🌐 Modo dashboard standalone activo. Aguardando pedidos em http://+:" + webPort + "/");
                 try { await webTask; }
                 catch (Exception ex) { Console.WriteLine($"❌ Dashboard task falhou: {ex.GetBaseException().Message}"); }
+                automationHost?.Dispose();
                 return;
             }
 
