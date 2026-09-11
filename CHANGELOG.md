@@ -37,8 +37,28 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 ### 🛠 Validação end-to-end do scheduler (2026-09-11)
 - **Novo ficheiro de testes** `m3uCrawler.Tests/SchedulerEndToEndTests.cs` (8 testes) que demonstram o encadeamento real das 4 actions do scheduler + composição com catálogo populado + idempotência de dispose.
 - **Validação confirmou**: `discoverM3u`, `validatePlaylist`, `generatePlaylist`, `syncDispatcharr` são resolvidas via DI, executam serviços reais, persistem `LastRunAtUtc`/`LastResult`/`NextRunAtUtc`, respeitam cancellation, capturam erros sem matar o runner, e são encadeáveis num único tick sequencial.
-- **Gap documentado (suportado por código)**: o pipeline real (`M3uCrawlerService.SearchM3u8Files` ou `TelegramScraperService.SearchAndTestM3UInTelegramAsync`) **NÃO** chama `EnsureSourceAsync`/`RecordChannelSourceAsync` — confirmado por grep. Após runs de produção, o catálogo canónico fica apenas com canais seedados pelo JSON baseline; nenhum `SourceEntity`/`ChannelSourceEntity` novo é acrescentado pelo pipeline. A bridge entre pipeline (Telegram/M3U) e catálogo é uma evolução futura fora do scope desta entrega. O teste `Real_pipeline_does_not_upsert_sources_or_channel_sources` regista este comportamento explicitamente.
+- **Gap documentado (suportado por código)**: o pipeline real (`M3uCrawlerService.SearchM3u8Files` ou `TelegramScraperService.SearchAndTestM3UInTelegramAsync`) **NÃO** chama `EnsureSourceAsync`/`RecordChannelSourceAsync` — confirmado por grep. Após runs de produção, o catálogo canónico fica apenas com canais seedados pelo JSON baseline; nenhum `SourceEntity`/`ChannelSourceEntity` novo é acrescentado pelo pipeline. O teste `Real_pipeline_does_not_upsert_sources_or_channel_sources` regista este comportamento explicitamente. **(Fechado em `PHASE-Bridge` abaixo.)**
 - **Total agora**: 1335 testes em Release (anterior: 1327), 0 falhas, 0 warnings novos.
+
+### 🛠 PHASE-Bridge — Pipeline real → Catálogo (2026-09-11)
+- **Gap fechado (suportado por código)**: a validação end-to-end anterior tinha identificado que `TelegramScraperService.SearchAndTestM3UInTelegramAsync` e o modo M3U8-search em `Program.cs` **não** escreviam no catálogo persistente. Esta entrega fecha o gap.
+- **`PipelineIngestionService`** (`m3uCrawler/Services/Catalog/PipelineIngestionService.cs`): bridge entre `IReadOnlyList<M3uStream>` já testados e o catálogo persistente. Para cada stream: `EnsureSourceAsync` (idempotente por Key) → `ResolveAsync` (mecanismo existente, sem segundo algoritmo de matching) → se Unknown: `EnsureCanonicalChannelAsync` com `CreateEligible` (canal permanece disponível para revisão via Dashboard, nunca eliminado) → `RecordChannelSourceAsync` (idempotente por `(channelId, sourceId, streamUrl)`) → `RecordMatchingAuditAsync`. Proveniência preservada em `SourceEntity.Origin` e `ChannelSourceEntity.MatchMethod`/`MatchConfidence`.
+- **`CatalogResolver.EnsureCanonicalChannelAsync`** (novo): upsert idempotente de `CanonicalChannelEntity` por Key. Cria canal com `CreateEligible` se não existir; devolve existente caso contrário. Adiciona alias normalizado se não colidir com outro canal.
+- **`TelegramScraperService.SearchAndTestM3UInTelegramAsync`** — dois parâmetros opcionais novos: `pipelineIngestor` (PipelineIngestionService?) e `pipelineSourceKey` (string?). Se fornecidos, o catálogo é alimentado antes do return; falha na ingestão é apanhada e logada, não é fatal (a playlist M3U continua a ser produzida). Construtor alternativo `TelegramScraperService(WTelegram.Client?)` permite testes sem credenciais reais.
+- **`Program.cs`**: ao entrar no bloco `--telegram` ou `--telegram-maintain`, inicializa `PipelineIngestionService` (se o catálogo estiver acessível) e passa-o nas duas chamadas `SearchAndTestM3UInTelegramAsync` e em `RunTelegramMaintenanceCycle`. Source key por defeito: `telegram-<slug do termo>`.
+- **Compatibilidade**: callers que não passam `pipelineIngestor` (testes legacy, modos não-Telegram) continuam a funcionar — o parâmetro é opcional. `IngestIntoCatalogAsync` é um novo método público separado.
+- **Testes TDD** (`m3uCrawler.Tests/PipelineIngestionBridgeTests.cs`, 9 testes, todos passam em Release):
+  - **A** — primeira descoberta cria Source + ChannelSource e usa canonical existente;
+  - **B** — segunda passagem idêntica não cria duplicados (idempotência);
+  - **C** — passagem actualiza Availability quando o stream muda de estado;
+  - **D** — canal desconhecido fica com `CreateEligible` e é visível no catálogo;
+  - **E** — matching via `CatalogResolver.ResolveAsync` (variantes batem no mesmo canal);
+  - **F** — proveniência preservada (`SourceEntity.Origin`, `ChannelSourceEntity.MatchMethod`/`MatchConfidence`);
+  - **G** — o caminho real de Telegram chama a bridge (via `TelegramScraperService.IngestIntoCatalogAsync`);
+  - **H** — dados ingeridos chegam ao `PlaylistComposerService`;
+  - **I** — `RecordChannelSourceObservationAsync` (PHASE 9b) continua a funcionar depois da bridge.
+- **Total agora**: 1335 → **1344 testes** em Release (anterior: 1335), 0 falhas, 0 warnings novos. Build em Release: 0 errors, 0 warnings novos.
+- **Não criação de PHASE 13**: o trabalho enquadra-se como subfase técnica de fecho das PHASES 1–10, sem introduzir novo conceito arquitectural. Documentado como `PHASE-Bridge` em `docs/IMPLEMENTATION_ROADMAP.md` secção 32.12.
 
 ### 🛠 PHASE 12 — fecho da Automation / Scheduler (2026-09-11)
 - **Acções concretas `IScheduledAction`** (4 novas, todas reutilizam serviços existentes sem duplicar pipeline):

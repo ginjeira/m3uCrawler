@@ -32,6 +32,13 @@ public sealed class CatalogResolver
     }
 
     /// <summary>
+    /// Exposição explícita da factory para serviços companheiros
+    /// (e.g. <see cref="PlaylistComposerService"/>). Não usar para
+    /// contornar a resolução do catálogo.
+    /// </summary>
+    public IDbContextFactory<ChannelCatalogDbContext> GetFactory() => _factory;
+
+    /// <summary>
     /// Resolve uma identidade normalizada para uma decisão
     /// completa: <c>(CanonicalKey, DisplayName, EditorialCategory,
     /// EditorialGroup, PublicationPolicy, CanonicalChannelId)</c>.
@@ -707,6 +714,347 @@ public sealed class CatalogResolver
         return item;
     }
 
+    public async Task<CanonicalChannelEntity?> GetCanonicalChannelAsync(
+        long id, CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.CanonicalChannels
+            .AsNoTracking()
+            .Include(c => c.Aliases)
+            .FirstOrDefaultAsync(c => c.Id == id, cancellationToken);
+    }
+
+    public async Task<CanonicalChannelEntity> CreateCanonicalChannelAsync(
+        string key,
+        string displayName,
+        EditorialCategory editorialCategory,
+        CanonicalEditorialGroup editorialGroup,
+        PublicationPolicy publicationPolicy,
+        bool isEnabled,
+        IReadOnlyList<string> normalizedAliases,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateKey(key);
+        ValidateDisplayName(displayName);
+        ValidateAliases(normalizedAliases);
+
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var normalizedKey = key.Trim();
+        var existingByKey = await context.CanonicalChannels
+            .FirstOrDefaultAsync(c => c.Key == normalizedKey, cancellationToken);
+        if (existingByKey != null)
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.DuplicateKey,
+                $"Já existe um canal canónico com a key '{key}' (id={existingByKey.Id}).");
+        }
+
+        var normalizedAliasSet = new HashSet<string>(
+            normalizedAliases.Select(a => a.Trim()), StringComparer.Ordinal);
+        if (normalizedAliasSet.Count != normalizedAliases.Count)
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.InvalidInput,
+                "Aliases duplicados no payload (cada alias deve aparecer uma única vez).");
+        }
+        var conflictAliases = await context.ChannelAliases
+            .Where(a => normalizedAliasSet.Contains(a.NormalizedAlias))
+            .Select(a => a.NormalizedAlias)
+            .ToListAsync(cancellationToken);
+        if (conflictAliases.Count > 0)
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.AliasConflict,
+                $"Os seguintes aliases já pertencem a outro canal: {string.Join(", ", conflictAliases)}");
+        }
+
+        var now = DateTime.UtcNow;
+        var channel = new CanonicalChannelEntity
+        {
+            Key = normalizedKey,
+            DisplayName = displayName.Trim(),
+            EditorialCategory = editorialCategory,
+            EditorialGroup = editorialGroup,
+            PublicationPolicy = publicationPolicy,
+            IsEnabled = isEnabled,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+        };
+        context.CanonicalChannels.Add(channel);
+        foreach (var alias in normalizedAliasSet)
+        {
+            context.ChannelAliases.Add(new ChannelAliasEntity
+            {
+                NormalizedAlias = alias,
+                CanonicalChannel = channel,
+                CreatedAtUtc = now,
+            });
+        }
+        await context.SaveChangesAsync(cancellationToken);
+        return channel;
+    }
+
+    public async Task<CanonicalChannelEntity?> UpdateCanonicalChannelAsync(
+        long id,
+        string displayName,
+        EditorialCategory editorialCategory,
+        CanonicalEditorialGroup editorialGroup,
+        PublicationPolicy publicationPolicy,
+        bool isEnabled,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateDisplayName(displayName);
+
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var channel = await context.CanonicalChannels
+            .FirstOrDefaultAsync(c => c.Id == id, cancellationToken);
+        if (channel == null) return null;
+
+        channel.DisplayName = displayName.Trim();
+        channel.EditorialCategory = editorialCategory;
+        channel.EditorialGroup = editorialGroup;
+        channel.PublicationPolicy = publicationPolicy;
+        channel.IsEnabled = isEnabled;
+        channel.UpdatedAtUtc = DateTime.UtcNow;
+        await context.SaveChangesAsync(cancellationToken);
+        return channel;
+    }
+
+    public async Task<bool> DeleteCanonicalChannelAsync(
+        long id, CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var channel = await context.CanonicalChannels
+            .Include(c => c.Aliases)
+            .FirstOrDefaultAsync(c => c.Id == id, cancellationToken);
+        if (channel == null) return false;
+
+        var ownershipCount = await context.DispatcharrChannelOwnerships
+            .CountAsync(o => o.CanonicalChannelId == id, cancellationToken);
+        if (ownershipCount > 0)
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.HasOwnership,
+                $"Não é possível eliminar o canal #{id}: existem {ownershipCount} registos de ownership do Dispatcharr.");
+        }
+
+        context.CanonicalChannels.Remove(channel);
+        await context.SaveChangesAsync(cancellationToken);
+        return true;
+    }
+
+    /// <summary>
+    /// Faz upsert idempotente de um <see cref="CanonicalChannelEntity"/>
+    /// identificado por <paramref name="key"/>. Se já existir, devolve
+    /// o existente (sem mexer em campos). Se não existir, cria um novo
+    /// canal com os parâmetros fornecidos, e adiciona
+    /// <paramref name="normalizedAlias"/> como alias se for não-vazio
+    /// e não colidir com nenhum alias já existente noutro canal.
+    /// Usado pela pipeline de ingestão (Telegram/M3U/M3U8-search) para
+    /// criar canais desconhecidos sem bloquear em duplicados.
+    /// </summary>
+    public async Task<(CanonicalChannelEntity Channel, bool Created)> EnsureCanonicalChannelAsync(
+        string key,
+        string displayName,
+        EditorialCategory editorialCategory,
+        CanonicalEditorialGroup editorialGroup,
+        PublicationPolicy publicationPolicy,
+        bool isEnabled,
+        string? normalizedAlias,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateKey(key);
+        if (string.IsNullOrWhiteSpace(displayName))
+            throw new ArgumentException("DisplayName obrigatório.", nameof(displayName));
+
+        var normalizedKey = key.Trim();
+
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var existing = await context.CanonicalChannels
+            .FirstOrDefaultAsync(c => c.Key == normalizedKey, cancellationToken);
+        if (existing != null)
+        {
+            return (existing, false);
+        }
+
+        // Conflicto de alias com outro canal? Ignorar silenciosamente
+        // (o alias será mantido no canal existente; este canal
+        // desconhecido fica sem o alias, mas é criado).
+        var now = DateTime.UtcNow;
+        var channel = new CanonicalChannelEntity
+        {
+            Key = normalizedKey,
+            DisplayName = displayName.Trim(),
+            EditorialCategory = editorialCategory,
+            EditorialGroup = editorialGroup,
+            PublicationPolicy = publicationPolicy,
+            IsEnabled = isEnabled,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+        };
+        context.CanonicalChannels.Add(channel);
+        await context.SaveChangesAsync(cancellationToken);
+
+        if (!string.IsNullOrWhiteSpace(normalizedAlias))
+        {
+            var alias = normalizedAlias.Trim();
+            var aliasConflict = await context.ChannelAliases
+                .AnyAsync(a => a.NormalizedAlias == alias, cancellationToken);
+            if (!aliasConflict)
+            {
+                context.ChannelAliases.Add(new ChannelAliasEntity
+                {
+                    NormalizedAlias = alias,
+                    CanonicalChannelId = channel.Id,
+                    CreatedAtUtc = now,
+                });
+                await context.SaveChangesAsync(cancellationToken);
+            }
+        }
+        return (channel, true);
+    }
+
+    public async Task<ChannelAliasEntity> AddAliasAsync(
+        long channelId,
+        string normalizedAlias,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(normalizedAlias))
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.InvalidInput,
+                "Alias é obrigatório.");
+        }
+        var alias = normalizedAlias.Trim();
+
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var channel = await context.CanonicalChannels
+            .FirstOrDefaultAsync(c => c.Id == channelId, cancellationToken);
+        if (channel == null)
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.ChannelNotFound,
+                $"Canal #{channelId} não encontrado.");
+        }
+
+        var alreadyOnChannel = await context.ChannelAliases
+            .AnyAsync(a => a.CanonicalChannelId == channelId && a.NormalizedAlias == alias, cancellationToken);
+        if (alreadyOnChannel)
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.AlreadyExists,
+                $"Alias '{alias}' já existe neste canal.");
+        }
+        var conflict = await context.ChannelAliases
+            .AnyAsync(a => a.NormalizedAlias == alias, cancellationToken);
+        if (conflict)
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.AliasConflict,
+                $"Alias '{alias}' já pertence a outro canal canónico.");
+        }
+
+        var entity = new ChannelAliasEntity
+        {
+            NormalizedAlias = alias,
+            CanonicalChannelId = channelId,
+            CreatedAtUtc = DateTime.UtcNow,
+        };
+        context.ChannelAliases.Add(entity);
+        channel.UpdatedAtUtc = DateTime.UtcNow;
+        await context.SaveChangesAsync(cancellationToken);
+        return entity;
+    }
+
+    public async Task<bool> RemoveAliasAsync(
+        long channelId,
+        string normalizedAlias,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(normalizedAlias)) return false;
+
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var alias = await context.ChannelAliases
+            .FirstOrDefaultAsync(a => a.CanonicalChannelId == channelId && a.NormalizedAlias == normalizedAlias, cancellationToken);
+        if (alias == null) return false;
+
+        context.ChannelAliases.Remove(alias);
+        var channel = await context.CanonicalChannels
+            .FirstOrDefaultAsync(c => c.Id == channelId, cancellationToken);
+        if (channel != null) channel.UpdatedAtUtc = DateTime.UtcNow;
+        await context.SaveChangesAsync(cancellationToken);
+        return true;
+    }
+
+    private static void ValidateKey(string key)
+    {
+        if (string.IsNullOrWhiteSpace(key))
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.InvalidInput,
+                "Key é obrigatória.");
+        }
+        var trimmed = key.Trim();
+        if (trimmed.Length > 120)
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.InvalidInput,
+                "Key excede 120 caracteres.");
+        }
+        foreach (var ch in trimmed)
+        {
+            if (!(char.IsLetterOrDigit(ch) || ch == '-' || ch == '_' || ch == '.'))
+            {
+                throw new ChannelAdministrationException(
+                    ChannelAdministrationError.InvalidInput,
+                    "Key contém caracteres inválidos. Use letras, dígitos, '-', '_' ou '.'.");
+            }
+        }
+    }
+
+    private static void ValidateDisplayName(string displayName)
+    {
+        if (string.IsNullOrWhiteSpace(displayName))
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.InvalidInput,
+                "DisplayName é obrigatório.");
+        }
+        if (displayName.Trim().Length > 200)
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.InvalidInput,
+                "DisplayName excede 200 caracteres.");
+        }
+    }
+
+    private static void ValidateAliases(IReadOnlyList<string>? aliases)
+    {
+        if (aliases == null) return;
+        foreach (var a in aliases)
+        {
+            if (a == null)
+            {
+                throw new ChannelAdministrationException(
+                    ChannelAdministrationError.InvalidInput,
+                    "Alias contém valor nulo.");
+            }
+            var trimmed = a.Trim();
+            if (trimmed.Length == 0)
+            {
+                throw new ChannelAdministrationException(
+                    ChannelAdministrationError.InvalidInput,
+                    "Alias não pode ser vazio.");
+            }
+            if (trimmed.Length > 200)
+            {
+                throw new ChannelAdministrationException(
+                    ChannelAdministrationError.InvalidInput,
+                    "Alias excede 200 caracteres.");
+            }
+        }
+    }
+
     /// <summary>
     /// Estatísticas agregadas do catálogo: contagens por tabela.
     /// </summary>
@@ -730,10 +1078,1175 @@ public sealed class CatalogResolver
             SyncRuns = await context.SyncRuns.AsNoTracking().CountAsync(cancellationToken),
             PendingCountryApprovals = await context.PendingCountryApprovals.AsNoTracking().CountAsync(cancellationToken),
             PendingCountryApprovalsOpen = await context.PendingCountryApprovals.AsNoTracking().CountAsync(r => r.State == PendingApprovalState.Open, cancellationToken),
+            Sources = await context.Sources.AsNoTracking().CountAsync(cancellationToken),
+            ChannelSources = await context.ChannelSources.AsNoTracking().CountAsync(cancellationToken),
+            OrderingLists = await context.OrderingLists.AsNoTracking().CountAsync(cancellationToken),
+            OrderingItems = await context.OrderingItems.AsNoTracking().CountAsync(cancellationToken),
+            SourcePriorityPolicies = await context.SourcePriorityPolicies.AsNoTracking().CountAsync(cancellationToken),
+            ImportPolicies = await context.ImportPolicies.AsNoTracking().CountAsync(cancellationToken),
+            CanonicalGroups = await context.CanonicalGroups.AsNoTracking().CountAsync(cancellationToken),
+            GroupMappings = await context.GroupMappings.AsNoTracking().CountAsync(cancellationToken),
+            MatchingAudits = await context.MatchingAudits.AsNoTracking().CountAsync(cancellationToken),
+            ChannelSourceObservations = await context.ChannelSourceObservations.AsNoTracking().CountAsync(cancellationToken),
+            SyncRunSteps = await context.SyncRunSteps.AsNoTracking().CountAsync(cancellationToken),
+            ScheduledJobs = await context.ScheduledJobs.AsNoTracking().CountAsync(cancellationToken),
             DbPath = _dbPath,
             GeneratedAtUtc = now,
         };
     }
+
+    // ============================================================================
+    // PHASE 4 — Sources & ChannelSource
+    // ============================================================================
+
+    public async Task<IReadOnlyList<SourceEntity>> ListSourcesAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.Sources
+            .AsNoTracking()
+            .OrderBy(s => s.Priority).ThenBy(s => s.Name)
+            .ToListAsync(cancellationToken);
+    }
+
+    public async Task<SourceEntity?> GetSourceAsync(long id, CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.Sources
+            .AsNoTracking()
+            .FirstOrDefaultAsync(s => s.Id == id, cancellationToken);
+    }
+
+    /// <summary>
+    /// Cria ou actualiza uma <see cref="SourceEntity"/> pela chave
+    /// (slug). A origem é sanitizada antes de ser persistida para
+    /// não guardar credenciais em claro.
+    /// </summary>
+    public async Task<SourceEntity> EnsureSourceAsync(
+        string key, string name, SourceKind kind, string origin, int priority,
+        bool isEnabled = true, CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(key)) throw new ArgumentException("Key é obrigatória.", nameof(key));
+        if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Name é obrigatório.", nameof(name));
+        if (key.Length > 120) throw new ArgumentException("Key excede 120 caracteres.", nameof(key));
+        if (name.Length > 200) throw new ArgumentException("Name excede 200 caracteres.", nameof(name));
+        if (origin.Length > 1000) throw new ArgumentException("Origin excede 1000 caracteres.", nameof(origin));
+
+        var sanitizedOrigin = CredentialSanitizer.SanitizeUrl(origin);
+        var normalizedKey = key.Trim();
+
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var now = DateTime.UtcNow;
+        var existing = await context.Sources
+            .FirstOrDefaultAsync(s => s.Key == normalizedKey, cancellationToken);
+
+        if (existing != null)
+        {
+            existing.Name = name.Trim();
+            existing.Kind = kind;
+            existing.Origin = sanitizedOrigin;
+            existing.Priority = priority;
+            existing.IsEnabled = isEnabled;
+            existing.UpdatedAtUtc = now;
+            await context.SaveChangesAsync(cancellationToken);
+            return existing;
+        }
+
+        var entity = new SourceEntity
+        {
+            Key = normalizedKey,
+            Name = name.Trim(),
+            Kind = kind,
+            Origin = sanitizedOrigin,
+            Priority = priority,
+            IsEnabled = isEnabled,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+        };
+        context.Sources.Add(entity);
+        await context.SaveChangesAsync(cancellationToken);
+        return entity;
+    }
+
+    public async Task<bool> DeleteSourceAsync(long id, CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var entity = await context.Sources.FirstOrDefaultAsync(s => s.Id == id, cancellationToken);
+        if (entity == null) return false;
+        context.Sources.Remove(entity);
+        await context.SaveChangesAsync(cancellationToken);
+        return true;
+    }
+
+    public async Task<bool> MarkSourceDiscoveryAsync(long id, DateTime whenUtc, CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var entity = await context.Sources.FirstOrDefaultAsync(s => s.Id == id, cancellationToken);
+        if (entity == null) return false;
+        entity.LastDiscoveryAtUtc = whenUtc;
+        entity.UpdatedAtUtc = DateTime.UtcNow;
+        await context.SaveChangesAsync(cancellationToken);
+        return true;
+    }
+
+    public async Task<bool> MarkSourceValidationAsync(long id, DateTime whenUtc, CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var entity = await context.Sources.FirstOrDefaultAsync(s => s.Id == id, cancellationToken);
+        if (entity == null) return false;
+        entity.LastValidationAtUtc = whenUtc;
+        entity.UpdatedAtUtc = DateTime.UtcNow;
+        await context.SaveChangesAsync(cancellationToken);
+        return true;
+    }
+
+    /// <summary>
+    /// Regista (ou actualiza) um <see cref="ChannelSourceEntity"/> —
+    /// a associação entre um canal canónico e uma stream concreta de
+    /// uma source. A URL é sanitizada antes de persistir.
+    /// </summary>
+    public async Task<ChannelSourceEntity> RecordChannelSourceAsync(
+        long canonicalChannelId,
+        long sourceId,
+        string streamUrl,
+        StreamQuality quality = StreamQuality.Unknown,
+        EpgState epg = EpgState.Unknown,
+        AvailabilityState availability = AvailabilityState.Discovered,
+        double matchConfidence = 0,
+        string matchMethod = "unknown",
+        string? externalStreamId = null,
+        bool isEnabled = true,
+        CancellationToken cancellationToken = default)
+    {
+        if (canonicalChannelId <= 0) throw new ArgumentException("CanonicalChannelId inválido.", nameof(canonicalChannelId));
+        if (sourceId <= 0) throw new ArgumentException("SourceId inválido.", nameof(sourceId));
+        if (string.IsNullOrWhiteSpace(streamUrl)) throw new ArgumentException("StreamUrl é obrigatória.", nameof(streamUrl));
+        if (matchMethod.Length > 80) throw new ArgumentException("MatchMethod excede 80 caracteres.", nameof(matchMethod));
+
+        var sanitizedUrl = CredentialSanitizer.SanitizeUrl(streamUrl);
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+
+        var existing = await context.ChannelSources
+            .FirstOrDefaultAsync(cs => cs.CanonicalChannelId == canonicalChannelId
+                                    && cs.SourceId == sourceId
+                                    && cs.StreamUrl == sanitizedUrl,
+                cancellationToken);
+
+        var now = DateTime.UtcNow;
+        if (existing != null)
+        {
+            existing.Quality = quality;
+            existing.Epg = epg;
+            existing.Availability = availability;
+            existing.MatchConfidence = matchConfidence;
+            existing.MatchMethod = matchMethod;
+            existing.ExternalStreamId = externalStreamId;
+            existing.IsEnabled = isEnabled;
+            existing.LastSeenAtUtc = now;
+            existing.LastTestedAtUtc = now;
+            existing.UpdatedAtUtc = now;
+            await context.SaveChangesAsync(cancellationToken);
+            return existing;
+        }
+
+        var entity = new ChannelSourceEntity
+        {
+            CanonicalChannelId = canonicalChannelId,
+            SourceId = sourceId,
+            StreamUrl = sanitizedUrl,
+            ExternalStreamId = externalStreamId,
+            Quality = quality,
+            Epg = epg,
+            Availability = availability,
+            MatchConfidence = matchConfidence,
+            MatchMethod = matchMethod,
+            FirstSeenAtUtc = now,
+            LastSeenAtUtc = now,
+            LastTestedAtUtc = now,
+            LastResponseTimeMs = 0,
+            IsEnabled = isEnabled,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+        };
+        context.ChannelSources.Add(entity);
+        await context.SaveChangesAsync(cancellationToken);
+        return entity;
+    }
+
+    public async Task<IReadOnlyList<ChannelSourceEntity>> ListChannelSourcesAsync(
+        long? canonicalChannelId = null,
+        long? sourceId = null,
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var query = context.ChannelSources.AsNoTracking().AsQueryable();
+        if (canonicalChannelId.HasValue) query = query.Where(cs => cs.CanonicalChannelId == canonicalChannelId.Value);
+        if (sourceId.HasValue) query = query.Where(cs => cs.SourceId == sourceId.Value);
+        return await query
+            .OrderBy(cs => cs.CanonicalChannelId).ThenBy(cs => cs.SourceId)
+            .ToListAsync(cancellationToken);
+    }
+
+    public async Task<bool> DeleteChannelSourceAsync(long id, CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var entity = await context.ChannelSources.FirstOrDefaultAsync(cs => cs.Id == id, cancellationToken);
+        if (entity == null) return false;
+        context.ChannelSources.Remove(entity);
+        await context.SaveChangesAsync(cancellationToken);
+        return true;
+    }
+
+    public async Task<bool> SetChannelSourceEnabledAsync(long id, bool isEnabled, CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var entity = await context.ChannelSources.FirstOrDefaultAsync(cs => cs.Id == id, cancellationToken);
+        if (entity == null) return false;
+        entity.IsEnabled = isEnabled;
+        entity.UpdatedAtUtc = DateTime.UtcNow;
+        await context.SaveChangesAsync(cancellationToken);
+        return true;
+    }
+
+    // ============================================================================
+    // PHASE 5 — Ordering Lists
+    // ============================================================================
+
+    public async Task<IReadOnlyList<OrderingListEntity>> ListOrderingListsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.OrderingLists
+            .AsNoTracking()
+            .OrderBy(l => l.Name)
+            .ToListAsync(cancellationToken);
+    }
+
+    public async Task<OrderingListEntity?> GetOrderingListAsync(long id, bool includeItems = false,
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var query = context.OrderingLists.AsNoTracking().AsQueryable();
+        if (includeItems)
+        {
+            query = query.Include(l => l.Items.OrderBy(i => i.Position));
+        }
+        return await query.FirstOrDefaultAsync(l => l.Id == id, cancellationToken);
+    }
+
+    public async Task<OrderingListEntity> CreateOrderingListAsync(
+        string key, string name, string? country, string? description,
+        bool isEnabled = true, CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(key)) throw new ArgumentException("Key é obrigatória.", nameof(key));
+        if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Name é obrigatório.", nameof(name));
+        if (key.Length > 120) throw new ArgumentException("Key excede 120 caracteres.", nameof(key));
+        if (name.Length > 200) throw new ArgumentException("Name excede 200 caracteres.", nameof(name));
+
+        var normalizedKey = key.Trim();
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        if (await context.OrderingLists.AnyAsync(l => l.Key == normalizedKey, cancellationToken))
+        {
+            throw new InvalidOperationException($"Já existe uma OrderingList com a key '{normalizedKey}'.");
+        }
+
+        var now = DateTime.UtcNow;
+        var entity = new OrderingListEntity
+        {
+            Key = normalizedKey,
+            Name = name.Trim(),
+            Country = string.IsNullOrWhiteSpace(country) ? null : country.Trim(),
+            Description = string.IsNullOrWhiteSpace(description) ? null : description.Trim(),
+            IsEnabled = isEnabled,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+        };
+        context.OrderingLists.Add(entity);
+        await context.SaveChangesAsync(cancellationToken);
+        return entity;
+    }
+
+    public async Task<OrderingListEntity> DuplicateOrderingListAsync(
+        long sourceListId, string newKey, string? newName = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(newKey)) throw new ArgumentException("Key é obrigatória.", nameof(newKey));
+
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var source = await context.OrderingLists
+            .Include(l => l.Items)
+            .FirstOrDefaultAsync(l => l.Id == sourceListId, cancellationToken);
+        if (source == null) throw new InvalidOperationException($"OrderingList #{sourceListId} não encontrada.");
+
+        if (await context.OrderingLists.AnyAsync(l => l.Key == newKey, cancellationToken))
+        {
+            throw new InvalidOperationException($"Já existe uma OrderingList com a key '{newKey}'.");
+        }
+
+        var now = DateTime.UtcNow;
+        var clone = new OrderingListEntity
+        {
+            Key = newKey.Trim(),
+            Name = string.IsNullOrWhiteSpace(newName) ? $"{source.Name} (cópia)" : newName.Trim(),
+            Country = source.Country,
+            Description = source.Description,
+            IsEnabled = source.IsEnabled,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+        };
+        context.OrderingLists.Add(clone);
+        await context.SaveChangesAsync(cancellationToken);
+
+        foreach (var item in source.Items.OrderBy(i => i.Position))
+        {
+            context.OrderingItems.Add(new OrderingItemEntity
+            {
+                OrderingListId = clone.Id,
+                CanonicalChannelId = item.CanonicalChannelId,
+                Position = item.Position,
+                IsEnabled = item.IsEnabled,
+                CreatedAtUtc = now,
+                UpdatedAtUtc = now,
+            });
+        }
+        await context.SaveChangesAsync(cancellationToken);
+        return clone;
+    }
+
+    public async Task<bool> DeleteOrderingListAsync(long id, CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var entity = await context.OrderingLists.FirstOrDefaultAsync(l => l.Id == id, cancellationToken);
+        if (entity == null) return false;
+        context.OrderingLists.Remove(entity);
+        await context.SaveChangesAsync(cancellationToken);
+        return true;
+    }
+
+    public async Task<OrderingItemEntity> AddOrderingItemAsync(
+        long orderingListId, long canonicalChannelId,
+        int? position = null, bool isEnabled = true,
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+
+        var list = await context.OrderingLists
+            .Include(l => l.Items)
+            .FirstOrDefaultAsync(l => l.Id == orderingListId, cancellationToken);
+        if (list == null) throw new InvalidOperationException($"OrderingList #{orderingListId} não encontrada.");
+
+        if (!await context.CanonicalChannels.AnyAsync(c => c.Id == canonicalChannelId, cancellationToken))
+        {
+            throw new InvalidOperationException($"Canal canónico #{canonicalChannelId} não encontrado.");
+        }
+
+        if (list.Items.Any(i => i.CanonicalChannelId == canonicalChannelId))
+        {
+            throw new InvalidOperationException($"Canal #{canonicalChannelId} já está na lista #{orderingListId}.");
+        }
+
+        var now = DateTime.UtcNow;
+        var insertPos = position ?? (list.Items.Count == 0 ? 0 : list.Items.Max(i => i.Position) + 1);
+        // Renumera items >= insertPos para manter a continuidade.
+        foreach (var existing in list.Items.Where(i => i.Position >= insertPos).OrderBy(i => i.Position).ToList())
+        {
+            existing.Position += 1;
+            existing.UpdatedAtUtc = now;
+        }
+
+        var item = new OrderingItemEntity
+        {
+            OrderingListId = orderingListId,
+            CanonicalChannelId = canonicalChannelId,
+            Position = insertPos,
+            IsEnabled = isEnabled,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+        };
+        context.OrderingItems.Add(item);
+        list.UpdatedAtUtc = now;
+        await context.SaveChangesAsync(cancellationToken);
+        return item;
+    }
+
+    public async Task<bool> RemoveOrderingItemAsync(long itemId, CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var item = await context.OrderingItems
+            .Include(i => i.OrderingList)
+            .FirstOrDefaultAsync(i => i.Id == itemId, cancellationToken);
+        if (item == null) return false;
+
+        var now = DateTime.UtcNow;
+        context.OrderingItems.Remove(item);
+        // Reaperta posições para evitar gaps.
+        var remaining = await context.OrderingItems
+            .Where(i => i.OrderingListId == item.OrderingListId && i.Position > item.Position)
+            .OrderBy(i => i.Position)
+            .ToListAsync(cancellationToken);
+        foreach (var r in remaining)
+        {
+            r.Position -= 1;
+            r.UpdatedAtUtc = now;
+        }
+        if (item.OrderingList != null) item.OrderingList.UpdatedAtUtc = now;
+        await context.SaveChangesAsync(cancellationToken);
+        return true;
+    }
+
+    public async Task<bool> MoveOrderingItemAsync(long itemId, int newPosition,
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var item = await context.OrderingItems
+            .FirstOrDefaultAsync(i => i.Id == itemId, cancellationToken);
+        if (item == null) return false;
+
+        var siblings = await context.OrderingItems
+            .Where(i => i.OrderingListId == item.OrderingListId && i.Id != item.Id)
+            .OrderBy(i => i.Position)
+            .ToListAsync(cancellationToken);
+
+        if (newPosition < 0 || newPosition > siblings.Count)
+        {
+            throw new ArgumentOutOfRangeException(nameof(newPosition),
+                $"newPosition tem de estar entre 0 e {siblings.Count}.");
+        }
+
+        // Renumera siblings excluindo a posição actual do item e
+        // depois atribui ao item a newPosition. Isto evita conflito
+        // temporário com o índice único (OrderingListId, Position).
+        var now = DateTime.UtcNow;
+        for (var i = 0; i < siblings.Count; i++)
+        {
+            var newSiblingPos = i >= newPosition ? i + 1 : i;
+            if (siblings[i].Position != newSiblingPos)
+            {
+                siblings[i].Position = newSiblingPos;
+                siblings[i].UpdatedAtUtc = now;
+            }
+        }
+
+        // Move o item para uma posição temporária fora do range
+        // para não colidir com índices únicos, depois para newPosition.
+        item.Position = siblings.Count + 1;
+        item.UpdatedAtUtc = now;
+        await context.SaveChangesAsync(cancellationToken);
+
+        item.Position = newPosition;
+        item.UpdatedAtUtc = now;
+        await context.SaveChangesAsync(cancellationToken);
+
+        // Actualiza UpdatedAtUtc da lista.
+        var list = await context.OrderingLists
+            .FirstOrDefaultAsync(l => l.Id == item.OrderingListId, cancellationToken);
+        if (list != null)
+        {
+            list.UpdatedAtUtc = now;
+            await context.SaveChangesAsync(cancellationToken);
+        }
+        return true;
+    }
+
+    public async Task<bool> SetOrderingItemEnabledAsync(long itemId, bool isEnabled,
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var item = await context.OrderingItems.FirstOrDefaultAsync(i => i.Id == itemId, cancellationToken);
+        if (item == null) return false;
+        item.IsEnabled = isEnabled;
+        item.UpdatedAtUtc = DateTime.UtcNow;
+        await context.SaveChangesAsync(cancellationToken);
+        return true;
+    }
+
+    // ============================================================================
+    // PHASE 6 — Source Priority
+    // ============================================================================
+
+    public async Task<SourcePriorityPolicyEntity> GetOrCreateGlobalPriorityPolicyAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var existing = await context.SourcePriorityPolicies
+            .FirstOrDefaultAsync(p => p.Scope == "global", cancellationToken);
+        if (existing != null) return existing;
+
+        var now = DateTime.UtcNow;
+        existing = new SourcePriorityPolicyEntity
+        {
+            Scope = "global",
+            CriteriaJson = "[\"Quality\",\"Reliability\",\"Availability\"]",
+            PreferredQuality = "UHD,FHD,HD,SD",
+            AllowFallback = true,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+        };
+        context.SourcePriorityPolicies.Add(existing);
+        await context.SaveChangesAsync(cancellationToken);
+        return existing;
+    }
+
+    public async Task<SourcePriorityPolicyEntity?> GetChannelPriorityPolicyAsync(
+        long canonicalChannelId, CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.SourcePriorityPolicies
+            .AsNoTracking()
+            .FirstOrDefaultAsync(p => p.CanonicalChannelId == canonicalChannelId, cancellationToken);
+    }
+
+    public async Task<SourcePriorityPolicyEntity> UpsertPriorityPolicyAsync(
+        string scope, long? canonicalChannelId,
+        string criteriaJson, string preferredQuality, bool allowFallback,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(scope)) throw new ArgumentException("Scope é obrigatório.", nameof(scope));
+        if (scope != "global" && canonicalChannelId == null)
+        {
+            throw new ArgumentException("Policies não-global requerem CanonicalChannelId.", nameof(canonicalChannelId));
+        }
+
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var now = DateTime.UtcNow;
+        var existing = await context.SourcePriorityPolicies
+            .FirstOrDefaultAsync(p => p.Scope == scope
+                && (canonicalChannelId == null
+                    ? p.CanonicalChannelId == null
+                    : p.CanonicalChannelId == canonicalChannelId),
+                cancellationToken);
+
+        if (existing != null)
+        {
+            existing.CriteriaJson = criteriaJson;
+            existing.PreferredQuality = preferredQuality ?? string.Empty;
+            existing.AllowFallback = allowFallback;
+            existing.UpdatedAtUtc = now;
+            await context.SaveChangesAsync(cancellationToken);
+            return existing;
+        }
+
+        existing = new SourcePriorityPolicyEntity
+        {
+            Scope = scope,
+            CanonicalChannelId = canonicalChannelId,
+            CriteriaJson = criteriaJson,
+            PreferredQuality = preferredQuality ?? string.Empty,
+            AllowFallback = allowFallback,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+        };
+        context.SourcePriorityPolicies.Add(existing);
+        await context.SaveChangesAsync(cancellationToken);
+        return existing;
+    }
+
+    // ============================================================================
+    // PHASE 8 — TV/Radio/VOD/Groups + Import Policies
+    // ============================================================================
+
+    public async Task<IReadOnlyList<ImportPolicyEntity>> ListImportPoliciesAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.ImportPolicies
+            .AsNoTracking()
+            .OrderBy(p => p.MediaKind)
+            .ToListAsync(cancellationToken);
+    }
+
+    public async Task<ImportPolicyEntity?> GetImportPolicyAsync(MediaKind kind,
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.ImportPolicies
+            .AsNoTracking()
+            .FirstOrDefaultAsync(p => p.MediaKind == kind, cancellationToken);
+    }
+
+    public async Task<ImportPolicyEntity> UpsertImportPolicyAsync(
+        MediaKind kind, VodPolicy vodPolicy,
+        string targetGroupsCsv, string excludedGroupsCsv, bool isEnabled,
+        CancellationToken cancellationToken = default)
+    {
+        if (targetGroupsCsv.Length > 2000) throw new ArgumentException("TargetGroupsCsv excede 2000 caracteres.", nameof(targetGroupsCsv));
+        if (excludedGroupsCsv.Length > 2000) throw new ArgumentException("ExcludedGroupsCsv excede 2000 caracteres.", nameof(excludedGroupsCsv));
+
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var now = DateTime.UtcNow;
+        var existing = await context.ImportPolicies
+            .FirstOrDefaultAsync(p => p.MediaKind == kind, cancellationToken);
+        if (existing != null)
+        {
+            existing.VodPolicy = vodPolicy;
+            existing.TargetGroupsCsv = targetGroupsCsv ?? string.Empty;
+            existing.ExcludedGroupsCsv = excludedGroupsCsv ?? string.Empty;
+            existing.IsEnabled = isEnabled;
+            existing.UpdatedAtUtc = now;
+            await context.SaveChangesAsync(cancellationToken);
+            return existing;
+        }
+        existing = new ImportPolicyEntity
+        {
+            MediaKind = kind,
+            VodPolicy = vodPolicy,
+            TargetGroupsCsv = targetGroupsCsv ?? string.Empty,
+            ExcludedGroupsCsv = excludedGroupsCsv ?? string.Empty,
+            IsEnabled = isEnabled,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+        };
+        context.ImportPolicies.Add(existing);
+        await context.SaveChangesAsync(cancellationToken);
+        return existing;
+    }
+
+    public async Task<IReadOnlyList<CanonicalGroupEntity>> ListCanonicalGroupsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.CanonicalGroups
+            .AsNoTracking()
+            .OrderBy(g => g.Order).ThenBy(g => g.DisplayName)
+            .ToListAsync(cancellationToken);
+    }
+
+    public async Task<CanonicalGroupEntity> UpsertCanonicalGroupAsync(
+        string key, string displayName, string? country, int order,
+        bool isEnabled, bool isDefault,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(key)) throw new ArgumentException("Key é obrigatória.", nameof(key));
+        if (string.IsNullOrWhiteSpace(displayName)) throw new ArgumentException("DisplayName é obrigatório.", nameof(displayName));
+        if (key.Length > 120) throw new ArgumentException("Key excede 120 caracteres.", nameof(key));
+        if (displayName.Length > 200) throw new ArgumentException("DisplayName excede 200 caracteres.", nameof(displayName));
+
+        var normalizedKey = key.Trim();
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var now = DateTime.UtcNow;
+        var existing = await context.CanonicalGroups
+            .FirstOrDefaultAsync(g => g.Key == normalizedKey, cancellationToken);
+        if (existing != null)
+        {
+            existing.DisplayName = displayName.Trim();
+            existing.Country = string.IsNullOrWhiteSpace(country) ? null : country.Trim();
+            existing.Order = order;
+            existing.IsEnabled = isEnabled;
+            existing.IsDefault = isDefault;
+            existing.UpdatedAtUtc = now;
+            await context.SaveChangesAsync(cancellationToken);
+            return existing;
+        }
+        existing = new CanonicalGroupEntity
+        {
+            Key = normalizedKey,
+            DisplayName = displayName.Trim(),
+            Country = string.IsNullOrWhiteSpace(country) ? null : country.Trim(),
+            Order = order,
+            IsEnabled = isEnabled,
+            IsDefault = isDefault,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+        };
+        context.CanonicalGroups.Add(existing);
+        await context.SaveChangesAsync(cancellationToken);
+        return existing;
+    }
+
+    public async Task<bool> DeleteCanonicalGroupAsync(long id, CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var entity = await context.CanonicalGroups.FirstOrDefaultAsync(g => g.Id == id, cancellationToken);
+        if (entity == null) return false;
+        context.CanonicalGroups.Remove(entity);
+        await context.SaveChangesAsync(cancellationToken);
+        return true;
+    }
+
+    public async Task<IReadOnlyList<GroupMappingEntity>> ListGroupMappingsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.GroupMappings
+            .AsNoTracking()
+            .Include(m => m.CanonicalGroup)
+            .OrderBy(m => m.SourceKind).ThenBy(m => m.SourceGroupTitle)
+            .ToListAsync(cancellationToken);
+    }
+
+    public async Task<GroupMappingEntity> UpsertGroupMappingAsync(
+        SourceKind sourceKind, string sourceGroupTitle, long canonicalGroupId,
+        bool isEnabled = true,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(sourceGroupTitle)) throw new ArgumentException("SourceGroupTitle é obrigatório.", nameof(sourceGroupTitle));
+        if (sourceGroupTitle.Length > 400) throw new ArgumentException("SourceGroupTitle excede 400 caracteres.", nameof(sourceGroupTitle));
+
+        var normalizedTitle = sourceGroupTitle.Trim();
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        if (!await context.CanonicalGroups.AnyAsync(g => g.Id == canonicalGroupId, cancellationToken))
+        {
+            throw new InvalidOperationException($"CanonicalGroup #{canonicalGroupId} não encontrada.");
+        }
+        var now = DateTime.UtcNow;
+        var existing = await context.GroupMappings
+            .FirstOrDefaultAsync(m => m.SourceKind == sourceKind && m.SourceGroupTitle == normalizedTitle,
+                cancellationToken);
+        if (existing != null)
+        {
+            existing.CanonicalGroupId = canonicalGroupId;
+            existing.IsEnabled = isEnabled;
+            existing.UpdatedAtUtc = now;
+            await context.SaveChangesAsync(cancellationToken);
+            return existing;
+        }
+        existing = new GroupMappingEntity
+        {
+            SourceKind = sourceKind,
+            SourceGroupTitle = normalizedTitle,
+            CanonicalGroupId = canonicalGroupId,
+            IsEnabled = isEnabled,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+        };
+        context.GroupMappings.Add(existing);
+        await context.SaveChangesAsync(cancellationToken);
+        return existing;
+    }
+
+    public async Task<bool> DeleteGroupMappingAsync(long id, CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var entity = await context.GroupMappings.FirstOrDefaultAsync(m => m.Id == id, cancellationToken);
+        if (entity == null) return false;
+        context.GroupMappings.Remove(entity);
+        await context.SaveChangesAsync(cancellationToken);
+        return true;
+    }
+
+    // ============================================================================
+    // PHASE 3 — Matching observability
+    // ============================================================================
+
+    /// <summary>
+    /// Regista uma decisão de <see cref="ResolveAsync"/> para
+    /// observabilidade. Pode ser chamado pelo próprio pipeline
+    /// após cada resolução.
+    /// </summary>
+    public async Task RecordMatchingAuditAsync(
+        string normalizedIdentity,
+        string originalTitle,
+        string? sourceGroup,
+        CatalogResolutionKind kind,
+        long? canonicalChannelId,
+        double confidence,
+        string reasonSignature,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(normalizedIdentity)) return;
+        if (originalTitle.Length > 500) originalTitle = originalTitle[..500];
+        if (reasonSignature.Length > 120) reasonSignature = reasonSignature[..120];
+
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        context.MatchingAudits.Add(new MatchingAuditEntity
+        {
+            NormalizedIdentity = normalizedIdentity,
+            OriginalTitle = originalTitle,
+            SourceGroup = sourceGroup,
+            ResolutionKind = kind.ToString(),
+            CanonicalChannelId = canonicalChannelId,
+            Confidence = confidence,
+            ReasonSignature = reasonSignature,
+            AtUtc = DateTime.UtcNow,
+        });
+        await context.SaveChangesAsync(cancellationToken);
+    }
+
+    public async Task<IReadOnlyList<MatchingAuditEntity>> GetRecentMatchingAuditsAsync(
+        int limit = 100,
+        long? canonicalChannelId = null,
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var query = context.MatchingAudits.AsNoTracking().AsQueryable();
+        if (canonicalChannelId.HasValue)
+        {
+            query = query.Where(a => a.CanonicalChannelId == canonicalChannelId.Value);
+        }
+        return await query
+            .OrderByDescending(a => a.AtUtc)
+            .Take(Math.Clamp(limit, 1, 1000))
+            .ToListAsync(cancellationToken);
+    }
+
+    public async Task<MatchingAuditStats> GetMatchingAuditStatsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var now = DateTime.UtcNow;
+        var total = await context.MatchingAudits.AsNoTracking().CountAsync(cancellationToken);
+        var canonicalCount = await context.MatchingAudits.AsNoTracking()
+            .CountAsync(a => a.ResolutionKind == "Canonical", cancellationToken);
+        var aliasCount = await context.MatchingAudits.AsNoTracking()
+            .CountAsync(a => a.ResolutionKind == "Alias", cancellationToken);
+        var ruleCount = await context.MatchingAudits.AsNoTracking()
+            .CountAsync(a => a.ResolutionKind == "Rule", cancellationToken);
+        var unknownCount = await context.MatchingAudits.AsNoTracking()
+            .CountAsync(a => a.ResolutionKind == "Unknown", cancellationToken);
+        var last24h = await context.MatchingAudits.AsNoTracking()
+            .CountAsync(a => a.AtUtc >= now.AddHours(-24), cancellationToken);
+
+        return new MatchingAuditStats
+        {
+            Total = total,
+            Canonical = canonicalCount,
+            Alias = aliasCount,
+            Rule = ruleCount,
+            Unknown = unknownCount,
+            Last24h = last24h,
+        };
+    }
+
+    // ============================================================================
+    // PHASE 9 b — ChannelSource observation history
+    // ============================================================================
+
+    public async Task RecordChannelSourceObservationAsync(
+        long channelSourceId,
+        StreamQuality quality,
+        EpgState epg,
+        AvailabilityState availability,
+        long responseTimeMs,
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        context.ChannelSourceObservations.Add(new ChannelSourceObservationEntity
+        {
+            ChannelSourceId = channelSourceId,
+            Quality = quality,
+            Epg = epg,
+            Availability = availability,
+            ResponseTimeMs = responseTimeMs,
+            ObservedAtUtc = DateTime.UtcNow,
+        });
+        await context.SaveChangesAsync(cancellationToken);
+    }
+
+    public async Task<IReadOnlyList<ChannelSourceObservationEntity>> GetChannelSourceObservationsAsync(
+        long channelSourceId,
+        int limit = 200,
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.ChannelSourceObservations
+            .AsNoTracking()
+            .Where(o => o.ChannelSourceId == channelSourceId)
+            .OrderByDescending(o => o.ObservedAtUtc)
+            .Take(Math.Clamp(limit, 1, 5000))
+            .ToListAsync(cancellationToken);
+    }
+
+    // ============================================================================
+    // PHASE 11 — Runs (per-step breakdown)
+    // ============================================================================
+
+    public async Task<SyncRunStepEntity> RecordSyncRunStepAsync(
+        long syncRunId, string step,
+        DateTime startedAtUtc, DateTime finishedAtUtc,
+        int itemsProcessed, int itemsSucceeded, int itemsFailed,
+        string result = "ok",
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(step)) throw new ArgumentException("Step é obrigatório.", nameof(step));
+        if (step.Length > 80) throw new ArgumentException("Step excede 80 caracteres.", nameof(step));
+        if (result.Length > 40) throw new ArgumentException("Result excede 40 caracteres.", nameof(result));
+
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var stepEntity = new SyncRunStepEntity
+        {
+            SyncRunId = syncRunId,
+            Step = step,
+            StartedAtUtc = startedAtUtc,
+            FinishedAtUtc = finishedAtUtc,
+            DurationMs = Math.Max(0, (long)(finishedAtUtc - startedAtUtc).TotalMilliseconds),
+            ItemsProcessed = itemsProcessed,
+            ItemsSucceeded = itemsSucceeded,
+            ItemsFailed = itemsFailed,
+            Result = result,
+        };
+        context.SyncRunSteps.Add(stepEntity);
+        await context.SaveChangesAsync(cancellationToken);
+        return stepEntity;
+    }
+
+    public async Task<IReadOnlyList<SyncRunStepEntity>> GetSyncRunStepsAsync(
+        long syncRunId, CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.SyncRunSteps
+            .AsNoTracking()
+            .Where(s => s.SyncRunId == syncRunId)
+            .OrderBy(s => s.StartedAtUtc)
+            .ToListAsync(cancellationToken);
+    }
+
+    // ============================================================================
+    // PHASE 12 — Scheduled jobs
+    // ============================================================================
+
+    public async Task<IReadOnlyList<ScheduledJobEntity>> ListScheduledJobsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.ScheduledJobs
+            .AsNoTracking()
+            .OrderBy(j => j.Name)
+            .ToListAsync(cancellationToken);
+    }
+
+    public async Task<ScheduledJobEntity> UpsertScheduledJobAsync(
+        string name, string cronExpression, string actionName, bool isEnabled,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Name é obrigatório.", nameof(name));
+        if (name.Length > 120) throw new ArgumentException("Name excede 120 caracteres.", nameof(name));
+        if (string.IsNullOrWhiteSpace(cronExpression)) throw new ArgumentException("CronExpression é obrigatória.", nameof(cronExpression));
+        if (cronExpression.Length > 80) throw new ArgumentException("CronExpression excede 80 caracteres.", nameof(cronExpression));
+        if (string.IsNullOrWhiteSpace(actionName)) throw new ArgumentException("ActionName é obrigatória.", nameof(actionName));
+        if (actionName.Length > 80) throw new ArgumentException("ActionName excede 80 caracteres.", nameof(actionName));
+        // Validate cron syntax eagerly so the operator gets feedback at upsert time.
+        _ = m3uCrawler.Services.Automation.CronExpression.Parse(cronExpression);
+
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var now = DateTime.UtcNow;
+        var existing = await context.ScheduledJobs
+            .FirstOrDefaultAsync(j => j.Name == name, cancellationToken);
+        if (existing != null)
+        {
+            existing.CronExpression = cronExpression;
+            existing.ActionName = actionName;
+            existing.IsEnabled = isEnabled;
+            existing.UpdatedAtUtc = now;
+            existing.NextRunAtUtc = m3uCrawler.Services.Automation.CronExpression.Parse(cronExpression)
+                .NextOccurrence(now);
+            await context.SaveChangesAsync(cancellationToken);
+            return existing;
+        }
+        var entity = new ScheduledJobEntity
+        {
+            Name = name,
+            CronExpression = cronExpression,
+            ActionName = actionName,
+            IsEnabled = isEnabled,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+            NextRunAtUtc = m3uCrawler.Services.Automation.CronExpression.Parse(cronExpression)
+                .NextOccurrence(now),
+        };
+        context.ScheduledJobs.Add(entity);
+        await context.SaveChangesAsync(cancellationToken);
+        return entity;
+    }
+
+    public async Task<bool> SetScheduledJobEnabledAsync(long id, bool isEnabled,
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var entity = await context.ScheduledJobs.FirstOrDefaultAsync(j => j.Id == id, cancellationToken);
+        if (entity == null) return false;
+        entity.IsEnabled = isEnabled;
+        entity.UpdatedAtUtc = DateTime.UtcNow;
+        await context.SaveChangesAsync(cancellationToken);
+        return true;
+    }
+
+    public async Task<bool> DeleteScheduledJobAsync(long id, CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var entity = await context.ScheduledJobs.FirstOrDefaultAsync(j => j.Id == id, cancellationToken);
+        if (entity == null) return false;
+        context.ScheduledJobs.Remove(entity);
+        await context.SaveChangesAsync(cancellationToken);
+        return true;
+    }
+
+    public async Task<bool> MarkScheduledJobRanAsync(long id, DateTime ranAtUtc, string result,
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var entity = await context.ScheduledJobs.FirstOrDefaultAsync(j => j.Id == id, cancellationToken);
+        if (entity == null) return false;
+        entity.LastRunAtUtc = ranAtUtc;
+        entity.LastResult = result;
+        entity.UpdatedAtUtc = ranAtUtc;
+        entity.NextRunAtUtc = m3uCrawler.Services.Automation.CronExpression.Parse(entity.CronExpression)
+            .NextOccurrence(ranAtUtc);
+        await context.SaveChangesAsync(cancellationToken);
+        return true;
+    }
+
+    // ============================================================================
+    // PHASE 9 — Stream degradation dashboard (visão agregada)
+    // ============================================================================
+
+    /// <summary>
+    /// Identifica <see cref="ChannelSourceEntity"/> cujo estado mais recente
+    /// é terminal (Dead / Unreachable / Timeout) E que anteriormente
+    /// estavam em estado positivo (Validated / Reachable). São os
+    /// candidatos a "stream degradado" no Dashboard.
+    /// </summary>
+    public async Task<IReadOnlyList<DegradedStreamSummary>> GetDegradedStreamsAsync(
+        int lookbackMinutes = 60 * 24 * 7,
+        int limit = 200,
+        CancellationToken cancellationToken = default)
+    {
+        lookbackMinutes = Math.Clamp(lookbackMinutes, 1, 60 * 24 * 30);
+        limit = Math.Clamp(limit, 1, 2000);
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var now = DateTime.UtcNow;
+        var from = now.AddMinutes(-lookbackMinutes);
+
+        // Carrega todas as observações activas no lookback.
+        var observations = await context.ChannelSourceObservations
+            .AsNoTracking()
+            .Where(o => o.ObservedAtUtc >= from)
+            .OrderByDescending(o => o.ObservedAtUtc)
+            .ToListAsync(cancellationToken);
+
+        // Agrupa por ChannelSourceId e classifica.
+        var byChannelSource = observations
+            .GroupBy(o => o.ChannelSourceId)
+            .Where(g => g.Any(o => IsTerminalState(o.Availability))
+                     && g.Any(o => IsHealthyState(o.Availability)))
+            .Select(g => new
+            {
+                ChannelSourceId = g.Key,
+                Latest = g.First(),
+                LastHealthy = g.FirstOrDefault(o => IsHealthyState(o.Availability)),
+                LatestTerminal = g.FirstOrDefault(o => IsTerminalState(o.Availability)),
+                TotalSamples = g.Count(),
+                FailedSamples = g.Count(o => IsTerminalState(o.Availability)),
+            })
+            .Where(x => x.LatestTerminal != null)
+            .Take(limit)
+            .ToList();
+
+        // Carrega os ChannelSources correspondentes para enriquecer o output.
+        var ids = byChannelSource.Select(x => x.ChannelSourceId).ToList();
+        var sources = await context.ChannelSources
+            .AsNoTracking()
+            .Include(cs => cs.Source)
+            .Where(cs => ids.Contains(cs.Id))
+            .ToListAsync(cancellationToken);
+
+        var byId = sources.ToDictionary(s => s.Id);
+        var result = new List<DegradedStreamSummary>();
+        foreach (var entry in byChannelSource)
+        {
+            if (!byId.TryGetValue(entry.ChannelSourceId, out var cs)) continue;
+            var failureRate = entry.TotalSamples == 0
+                ? 0d
+                : (double)entry.FailedSamples / entry.TotalSamples;
+            result.Add(new DegradedStreamSummary
+            {
+                ChannelSourceId = cs.Id,
+                CanonicalChannelId = cs.CanonicalChannelId,
+                SourceId = cs.SourceId,
+                SourceName = cs.Source?.Name ?? "—",
+                LatestAvailability = entry.Latest.Availability,
+                LatestObservedAtUtc = entry.Latest.ObservedAtUtc,
+                LatestResponseMs = entry.Latest.ResponseTimeMs,
+                LastHealthyAtUtc = entry.LastHealthy?.ObservedAtUtc,
+                TotalSamples = entry.TotalSamples,
+                FailedSamples = entry.FailedSamples,
+                FailureRate = failureRate,
+                Quality = cs.Quality,
+                Epg = cs.Epg,
+            });
+        }
+
+        return result
+            .OrderByDescending(r => r.LatestObservedAtUtc)
+            .ToList();
+    }
+
+    public async Task<DegradationStats> GetDegradationStatsAsync(
+        int lookbackMinutes = 60 * 24,
+        CancellationToken cancellationToken = default)
+    {
+        lookbackMinutes = Math.Clamp(lookbackMinutes, 1, 60 * 24 * 30);
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var from = DateTime.UtcNow.AddMinutes(-lookbackMinutes);
+        var observations = await context.ChannelSourceObservations
+            .AsNoTracking()
+            .Where(o => o.ObservedAtUtc >= from)
+            .ToListAsync(cancellationToken);
+
+        var dead = observations.Count(o => o.Availability == AvailabilityState.Dead);
+        var timeout = observations.Count(o => o.Availability == AvailabilityState.Timeout);
+        var unreachable = observations.Count(o => o.Availability == AvailabilityState.Unreachable);
+        var reachable = observations.Count(o => o.Availability == AvailabilityState.Reachable);
+        var validated = observations.Count(o => o.Availability == AvailabilityState.Validated);
+
+        return new DegradationStats
+        {
+            LookbackMinutes = lookbackMinutes,
+            DeadSamples = dead,
+            TimeoutSamples = timeout,
+            UnreachableSamples = unreachable,
+            ReachableSamples = reachable,
+            ValidatedSamples = validated,
+            TerminalRate = observations.Count == 0 ? 0 :
+                (double)(dead + timeout + unreachable) / observations.Count,
+        };
+    }
+
+    private static bool IsTerminalState(AvailabilityState s) =>
+        s is AvailabilityState.Dead
+            or AvailabilityState.Unreachable
+            or AvailabilityState.Timeout;
+
+    private static bool IsHealthyState(AvailabilityState s) =>
+        s is AvailabilityState.Validated
+            or AvailabilityState.Reachable;
+}
+
+public sealed class DegradedStreamSummary
+{
+    public long ChannelSourceId { get; set; }
+    public long CanonicalChannelId { get; set; }
+    public long SourceId { get; set; }
+    public string SourceName { get; set; } = string.Empty;
+    public AvailabilityState LatestAvailability { get; set; }
+    public DateTime LatestObservedAtUtc { get; set; }
+    public long LatestResponseMs { get; set; }
+    public DateTime? LastHealthyAtUtc { get; set; }
+    public int TotalSamples { get; set; }
+    public int FailedSamples { get; set; }
+    public double FailureRate { get; set; }
+    public StreamQuality Quality { get; set; }
+    public EpgState Epg { get; set; }
+}
+
+public sealed class DegradationStats
+{
+    public int LookbackMinutes { get; set; }
+    public int DeadSamples { get; set; }
+    public int TimeoutSamples { get; set; }
+    public int UnreachableSamples { get; set; }
+    public int ReachableSamples { get; set; }
+    public int ValidatedSamples { get; set; }
+    public double TerminalRate { get; set; }
+}
+
+public sealed class MatchingAuditStats
+{
+    public int Total { get; set; }
+    public int Canonical { get; set; }
+    public int Alias { get; set; }
+    public int Rule { get; set; }
+    public int Unknown { get; set; }
+    public int Last24h { get; set; }
 }
 
 public sealed class CatalogStats
@@ -751,6 +2264,18 @@ public sealed class CatalogStats
     public int SyncRuns { get; set; }
     public int PendingCountryApprovals { get; set; }
     public int PendingCountryApprovalsOpen { get; set; }
+    public int Sources { get; set; }
+    public int ChannelSources { get; set; }
+    public int OrderingLists { get; set; }
+    public int OrderingItems { get; set; }
+    public int SourcePriorityPolicies { get; set; }
+    public int ImportPolicies { get; set; }
+    public int CanonicalGroups { get; set; }
+    public int GroupMappings { get; set; }
+    public int MatchingAudits { get; set; }
+    public int ChannelSourceObservations { get; set; }
+    public int SyncRunSteps { get; set; }
+    public int ScheduledJobs { get; set; }
     public string DbPath { get; set; } = string.Empty;
     public DateTime GeneratedAtUtc { get; set; }
 }

@@ -2,20 +2,37 @@ using System.Globalization;
 using System.Text;
 using System.Text.RegularExpressions;
 using m3uCrawler.Models;
+using m3uCrawler.Services.Catalog;
 using TL;
 
 namespace m3uCrawler.Services
 {
     public class TelegramScraperService
     {
-        private readonly WTelegram.Client _client;
+        private readonly WTelegram.Client? _client;
         private readonly M3uCandidateDetector _detector = new();
 
         public RunReport? LastRunReport { get; private set; }
 
+        /// <summary>
+        /// Construtor padrão: lê <c>wtelegram.config</c> e instancia o
+        /// <see cref="WTelegram.Client"/> a partir dele. Requer credenciais reais
+        /// para descoberta em produção.
+        /// </summary>
         public TelegramScraperService()
         {
             _client = new WTelegram.Client(Config);
+        }
+
+        /// <summary>
+        /// Construtor para testes — permite passar um <c>WTelegram.Client</c>
+        /// injectado (ou <c>null</c> em testes unitários que não precisam de
+        /// autenticação Telegram). Os métodos públicos não dependem do cliente
+        /// para <c>IngestIntoCatalogAsync</c>.
+        /// </summary>
+        public TelegramScraperService(WTelegram.Client? client)
+        {
+            _client = client;
         }
 
         private static readonly Dictionary<string, string> _fileConfig = LoadConfigFile();
@@ -84,7 +101,7 @@ namespace m3uCrawler.Services
             {
                 try
                 {
-                    var me = await _client.LoginUserIfNeeded();
+                    var me = await _client!.LoginUserIfNeeded();
                     Console.WriteLine($"Autenticado como: {(me?.username ?? me?.first_name ?? "(sem nome)")}");
                     return;
                 }
@@ -126,7 +143,10 @@ namespace m3uCrawler.Services
             int historyHours = 48,
             string countryCode = "pt",
             string? countriesDir = null,
-            RunReport? report = null)
+            RunReport? report = null,
+            PipelineIngestionService? pipelineIngestor = null,
+            string? pipelineSourceKey = null,
+            CancellationToken cancellationToken = default)
         {
             var rep = report ?? new RunReport();
             rep.StartedAt = DateTime.UtcNow;
@@ -276,6 +296,32 @@ namespace m3uCrawler.Services
                 $"streams extraídos={rep.StreamsExtracted} após filtro país={rep.StreamsAfterCountryFilter} " +
                 $"rejeitados país={rep.StreamsRejectedByCountry} testados={rep.StreamsTested} funcionais={rep.StreamsWorking}");
 
+            // PHASE-Bridge — Ingerir no catálogo persistente. Só é chamado
+            // se o caller fornecer um ingestor (parâmetro opcional para
+            // preservar compatibilidade com callers de teste que não
+            // precisam de catálogo).
+            if (pipelineIngestor != null)
+            {
+                var sourceKey = pipelineSourceKey
+                    ?? $"telegram-{Slugify(keyword)}";
+                try
+                {
+                    var ingestionResult = await pipelineIngestor.IngestAsync(
+                        working, sourceKey, "Telegram", countryCode, cancellationToken);
+                    Console.WriteLine(
+                        $"📥 Ingestão no catálogo: {ingestionResult.IngestedCount}/{ingestionResult.ReceivedCount} " +
+                        $"streams → source='{sourceKey}', matched={ingestionResult.MatchedCount}, " +
+                        $"auto-created={ingestionResult.AutoCreatedCount}");
+                }
+                catch (Exception ex)
+                {
+                    // Falha na ingestão não aborta o pipeline — o catálogo
+                    // é uma camada adicional, não substitui o ficheiro
+                    // playlist.m3u existente.
+                    Console.WriteLine($"⚠️ Ingestão no catálogo falhou (não fatal): {ex.Message}");
+                }
+            }
+
             return (working, rep);
         }
 
@@ -300,7 +346,7 @@ namespace m3uCrawler.Services
             int messagesAnalyzed = 0;
 
             // Idempotente: se já autenticado, não faz nada
-            var me = await _client.LoginUserIfNeeded();
+            var me = await _client!.LoginUserIfNeeded();
             Console.WriteLine($"Autenticado como: {(me?.username ?? me?.first_name ?? "(sem nome)")}");
 
             var dialogsBase = await _client.Messages_GetAllDialogs();
@@ -579,7 +625,7 @@ namespace m3uCrawler.Services
                     try
                     {
                         using var ms = new MemoryStream();
-                        await _client.DownloadFileAsync(doc, ms);
+                        await _client!.DownloadFileAsync(doc, ms);
                         mediaContent = ms.ToArray();
                     }
                     catch
@@ -676,7 +722,7 @@ namespace m3uCrawler.Services
         private async Task<string?> DownloadTelegramDocumentTextAsync(Document document)
         {
             using var ms = new MemoryStream();
-            await _client.DownloadFileAsync(document, ms);
+            await _client!.DownloadFileAsync(document, ms);
 
             ms.Position = 0;
             using var reader = new StreamReader(ms, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
@@ -861,6 +907,45 @@ namespace m3uCrawler.Services
                 DetectedFrom = "xtream publication",
                 RequiresContentVerification = true
             };
+        }
+
+        /// <summary>
+        /// Slugifica uma string para uso como parte de uma chave de Source.
+        /// </summary>
+        private static string Slugify(string s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return "unknown";
+            var sb = new System.Text.StringBuilder(s.Length);
+            foreach (var c in s.Trim().ToLowerInvariant())
+            {
+                if (char.IsLetterOrDigit(c)) sb.Append(c);
+                else if (c == ' ' || c == '-' || c == '_') sb.Append('-');
+            }
+            var slug = sb.ToString().Trim('-');
+            return string.IsNullOrEmpty(slug) ? "unknown" : slug;
+        }
+
+        /// <summary>
+        /// PHASE-Bridge — Ingere os streams testados no catálogo
+        /// persistente (Source/ChannelSource). Reutiliza o
+        /// <see cref="m3uCrawler.Services.Catalog.PipelineIngestionService"/>
+        /// já existente; este wrapper existe para que o caller do
+        /// pipeline Telegram não precise de construir o ingestor.
+        ///
+        /// Idempotente e seguro em pipelines concorrentes (o
+        /// <c>EnsureSourceAsync</c> e o <c>RecordChannelSourceAsync</c>
+        /// são ambos upserts por chave natural).
+        /// </summary>
+        public Task<PipelineIngestionService.IngestionResult> IngestIntoCatalogAsync(
+            IReadOnlyList<M3uStream> streams,
+            string sourceKey,
+            string sourceKindName,
+            string countryCode,
+            PipelineIngestionService ingestor,
+            CancellationToken cancellationToken = default)
+        {
+            if (ingestor == null) throw new ArgumentNullException(nameof(ingestor));
+            return ingestor.IngestAsync(streams, sourceKey, sourceKindName, countryCode, cancellationToken);
         }
     }
 }

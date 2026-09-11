@@ -2879,6 +2879,87 @@ Fecho entregue nesta entrega:
 
 Resultado: PHASE 12 passa a `[concluído]`.
 
+## 32.12 — PHASE-Bridge — ligar pipeline real ao catálogo (2026-09-11)
+
+A validação end-to-end (commit `54fcac4`) tinha detectado que o
+pipeline real (`TelegramScraperService.SearchAndTestM3UInTelegramAsync`
+e o modo M3U8-search em `Program.cs`) **não** escrevia no catálogo
+persistente. PHASES 1–10 produziam entidades (Source, ChannelSource,
+Canonical Channel, Ordering, Source Priority, Playlist Composition,
+Dispatcharr), mas a pipeline nunca as alimentava — só o operador
+via Dashboard.
+
+Esta entrega fecha o gap sem criar arquitectura paralela:
+
+- **`PipelineIngestionService`** (`m3uCrawler/Services/Catalog/`):
+  bridge que recebe `IReadOnlyList<M3uStream>` já testados e:
+  1. Garante uma `SourceEntity` (idempotente por `Key` via
+     `EnsureSourceAsync`).
+  2. Para cada stream: normaliza o título via
+     `ChannelNormalizer.Normalize`, resolve a identidade via
+     `CatalogResolver.ResolveAsync` (mecanismo existente — sem
+     segundo algoritmo de matching).
+  3. Se Canonical → usa o canal existente (alias ou affinity group).
+  4. Se Unknown (e não bloqueado por `IdentityRule.Excluded`) →
+     cria um `CanonicalChannelEntity` com `CreateEligible` via o novo
+     `CatalogResolver.EnsureCanonicalChannelAsync` (upsert por `Key`).
+     O canal permanece disponível para revisão futura via Dashboard
+     — **não é eliminado**.
+  5. Cria/atualiza um `ChannelSourceEntity` via
+     `RecordChannelSourceAsync` (idempotente por
+     `(channelId, sourceId, streamUrl)`).
+  6. Regista `MatchingAuditEntity` via `RecordMatchingAuditAsync`
+     para observabilidade.
+  7. Proveniência preservada: `SourceEntity.Origin` =
+     `"<kind>://<key>?country=<cc>"`, `ChannelSourceEntity.MatchMethod`
+     = `"canonical-alias"`, `"auto-create"` ou
+     `"auto-create-existing-alias"`, e `MatchConfidence` entre 0.5
+     e 1.0.
+
+- **`TelegramScraperService.SearchAndTestM3UInTelegramAsync`**: dois
+  parâmetros opcionais novos — `pipelineIngestor` e
+  `pipelineSourceKey`. Se fornecidos, os `working` streams são
+  ingeridos no catálogo antes do return. Falha na ingestão é
+  apanhada e logada — **não é fatal** (a playlist M3U continua a
+  ser produzida).
+
+- **`Program.cs`**: ao entrar no bloco `--telegram` (ou
+  `--telegram-maintain`), inicializa `PipelineIngestionService` (se
+  o catálogo estiver acessível) e passa-o nas duas chamadas
+  `SearchAndTestM3UInTelegramAsync` e em `RunTelegramMaintenanceCycle`.
+  A source key por defeito é `telegram-<slug do termo>`.
+
+- **Compatibilidade preservada**: callers que não passam
+  `pipelineIngestor` (testes legacy, modos não-Telegram) continuam
+  a funcionar — o parâmetro é opcional e o wrapper
+  `IngestIntoCatalogAsync` é um novo método público separado.
+
+- **Novo teste TDD** (`m3uCrawler.Tests/PipelineIngestionBridgeTests.cs`,
+  9 testes, todos passam em Release):
+  - **A** — primeira descoberta cria Source + ChannelSource e usa
+    canonical existente;
+  - **B** — segunda passagem idêntica não cria duplicados;
+  - **C** — passagem actualiza Availability quando o stream muda;
+  - **D** — canal desconhecido fica com `CreateEligible` e é
+    visível no catálogo;
+  - **E** — matching usa `CatalogResolver.ResolveAsync` (RTP 1 e
+    `[PT] RTP 1` batem no mesmo canal);
+  - **F** — proveniência preservada (`SourceEntity.Origin`,
+    `ChannelSourceEntity.MatchMethod`/`MatchConfidence`);
+  - **G** — o caminho real de Telegram chama a bridge (via
+    `TelegramScraperService.IngestIntoCatalogAsync`);
+  - **H** — dados ingeridos chegam ao `PlaylistComposerService`;
+  - **I** — `RecordChannelSourceObservationAsync` (PHASE 9b)
+    continua a funcionar depois da bridge.
+
+- **Não duplicação**: nenhum novo tipo de persistência, nenhuma
+  nova tabela, nenhuma nova fonte de verdade. A bridge apenas
+  invoca as APIs já existentes do `CatalogResolver` com a
+  sequência apropriada.
+
+Total: 1335 → **1344 testes** em Release, 0 falhas, 3x runs
+consecutivas estáveis. Build: 0 errors, 0 warnings novos.
+
 ---
 
 # 33. Definition of Done
@@ -2937,3 +3018,4 @@ Este documento define **como completar a evolução até ao sistema funcional pr
 | PHASE 10 — Dispatcharr | `[concluído]` | BuildPlanFromCompositionAsync + 2 testes. Ver 32.8. |
 | PHASE 11 — Operations | `[concluído]` | SyncRunStepEntity + API + Dashboard Passos + 4 testes. Ver 32.9. |
 | PHASE 12 — Automation / Scheduler | `[concluído]` | ScheduledJobEntity + CronExpression + Runner + 4 actions concretas (`discoverM3u`, `validatePlaylist`, `generatePlaylist`, `syncDispatcharr`) + arranque em produção via `Program.cs --web` + 19 testes. Ver 32.10 e 32.11. |
+| PHASE-Bridge — Pipeline → Catálogo | `[concluído]` | `PipelineIngestionService` liga o pipeline real (Telegram/M3U8-search) ao catálogo persistente via `EnsureSourceAsync` + `ResolveAsync` + `RecordChannelSourceAsync` + novo `EnsureCanonicalChannelAsync` (upsert). 9 testes TDD. Ver 32.12. |

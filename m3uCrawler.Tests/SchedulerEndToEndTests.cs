@@ -353,16 +353,17 @@ public class SchedulerEndToEndTests : IAsyncLifetime
     [Fact]
     public async Task Real_pipeline_does_not_upsert_sources_or_channel_sources()
     {
-        // Este teste documenta o gap identificado na validação
-        // end-to-end: o pipeline real (M3uCrawlerService ou
-        // TelegramScraperService) NÃO chama EnsureSourceAsync /
-        // RecordChannelSourceAsync. Como consequência, após um run
-        // de produção, o catálogo canónico recebe apenas canais
-        // seedados pelo JSON baseline — nenhum novo Source ou
-        // ChannelSource é acrescentado pelo pipeline.
+        // Este teste documenta o estado de uma camada da arquitectura:
+        // a gravação directa via PlaylistManagerService.SaveToM3uPlaylist
+        // (sem passar pelo PipelineIngestionService) **não** escreve
+        // no catálogo persistente. Esta é uma propriedade por design —
+        // o pipeline Telegram já usa a bridge; este teste garante que
+        // o caminho "legacy" continua a não duplicar estado no catálogo.
         //
-        // Aqui simulamos o pipeline real sem tocar em rede:
-        // criamos M3uStream resultantes de discovery+test, gravamos
+        // Aqui simulamos esse caminho: criamos M3uStream resultantes
+        // de discovery+test, gravamos como ficheiro M3U directamente
+        // (sem pipelineIngestor), e confirmamos que o catálogo
+        // persistente não recebe novos Source/ChannelSource.
         // como o pipeline real faria, e contamos quantos
         // SourceEntity/ChannelSourceEntity existem antes/depois.
         var host = BuildHost();

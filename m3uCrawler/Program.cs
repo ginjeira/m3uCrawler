@@ -186,6 +186,23 @@ namespace m3uCrawler
                 var countryChannelValidator = new CountryChannelValidator(Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries"));
                 Console.WriteLine($"📂 Pasta de saída das playlists: {Path.GetFullPath(outputDir)}");
 
+                // PHASE-Bridge — Inicializar o ingestor de catálogo para o pipeline
+                // Telegram. Se o catálogo falhar a inicializar (e.g. SQLite
+                // bloqueada), o pipeline continua sem catalogação — a playlist
+                // M3U continua a ser produzida.
+                PipelineIngestionService? pipelineIngestor = null;
+                CatalogResolver? catalogForIngestion = null;
+                try
+                {
+                    catalogForIngestion = await InitializeCatalogAsync(catalogDbPath, CancellationToken.None);
+                    pipelineIngestor = new PipelineIngestionService(catalogForIngestion);
+                    Console.WriteLine("📦 Ingestor de catálogo inicializado.");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"⚠️ Ingestor de catálogo não disponível: {ex.Message}");
+                }
+
                 do
                 {
                     if (maintenanceMode)
@@ -200,6 +217,7 @@ namespace m3uCrawler
                             domainFilter,
                             telegramHistoryHours,
                             args,
+                            pipelineIngestor,
                             countryCode,
                             Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries"));
                     }
@@ -212,7 +230,9 @@ namespace m3uCrawler
                             maxUrlsToTest: telegramMaxStreams,
                             historyHours: telegramHistoryHours,
                             countryCode: countryCode,
-                            countriesDir: Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries"));
+                            countriesDir: Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries"),
+                            pipelineIngestor: pipelineIngestor,
+                            pipelineSourceKey: $"telegram-{Slugify(term)}");
 
                         if (!string.IsNullOrWhiteSpace(domainFilter))
                         {
@@ -638,6 +658,19 @@ namespace m3uCrawler
                 || host.EndsWith($".{domainFilter}", StringComparison.OrdinalIgnoreCase);
         }
 
+        static string Slugify(string s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return "unknown";
+            var sb = new StringBuilder(s.Length);
+            foreach (var c in s.Trim().ToLowerInvariant())
+            {
+                if (char.IsLetterOrDigit(c)) sb.Append(c);
+                else if (c == ' ' || c == '-' || c == '_') sb.Append('-');
+            }
+            var slug = sb.ToString().Trim('-');
+            return string.IsNullOrEmpty(slug) ? "unknown" : slug;
+        }
+
         static async Task RunTelegramMaintenanceCycle(
             TelegramScraperService scraper,
             PlaylistManagerService playlistManager,
@@ -648,6 +681,7 @@ namespace m3uCrawler
             string? domainFilter,
             int telegramHistoryHours,
             string[] args,
+            PipelineIngestionService? pipelineIngestor,
             string countryCode = "pt",
             string? countriesDir = null)
         {
@@ -668,7 +702,9 @@ namespace m3uCrawler
                 maxUrlsToTest: telegramMaxStreams,
                 historyHours: telegramHistoryHours,
                 countryCode: countryCode,
-                countriesDir: countriesDir);
+                countriesDir: countriesDir,
+                pipelineIngestor: pipelineIngestor,
+                pipelineSourceKey: $"telegram-{Slugify(term)}");
 
             if (!string.IsNullOrWhiteSpace(domainFilter))
             {
