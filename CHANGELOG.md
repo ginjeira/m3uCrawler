@@ -40,6 +40,19 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 - **Gap documentado (suportado por código)**: o pipeline real (`M3uCrawlerService.SearchM3u8Files` ou `TelegramScraperService.SearchAndTestM3UInTelegramAsync`) **NÃO** chama `EnsureSourceAsync`/`RecordChannelSourceAsync` — confirmado por grep. Após runs de produção, o catálogo canónico fica apenas com canais seedados pelo JSON baseline; nenhum `SourceEntity`/`ChannelSourceEntity` novo é acrescentado pelo pipeline. O teste `Real_pipeline_does_not_upsert_sources_or_channel_sources` regista este comportamento explicitamente. **(Fechado em `PHASE-Bridge` abaixo.)**
 - **Total agora**: 1335 testes em Release (anterior: 1327), 0 falhas, 0 warnings novos.
 
+### 🛠 PHASE-Bridge / R1 — country gate dentro do ingestion (2026-09-11)
+- **Bug crítico fechado**: o `PipelineIngestionService.IngestAsync` aceitava `countryCode` mas não aplicava a política de país. Streams estrangeiros (`ES La 1`, `BR Globo News`, `Sky News`) e streams sem token PT (`CANAL FANTASTICO`) eram persistidos no catálogo canónico, contaminando a playlist final.
+- **Nova API**: o construtor de `PipelineIngestionService` agora **exige** um `CountryChannelValidator` (fail-fast no construtor via `ArgumentNullException`).
+- **`IngestAsync` chama `CountryChannelValidator.ValidateStreams` internamente** antes de qualquer persistência. Streams REJECTED são silenciosamente descartados.
+- **REJECT ≠ UNKNOWN**: streams rejeitados pelo country policy **nunca** são convertidos em `CanonicalChannel.CreateEligible` (boundary arquitectural explícito).
+- **`IngestionResult.RejectedByCountryCount`**: novo campo para diagnóstico.
+- **`SourceEntity`** é criada antes do gate (audit trail); `ChannelSourceEntity` só é criado se o stream passar o gate.
+- **`Program.cs`**: partilha o `CountryChannelValidator` já construído (linha 186) com o `PipelineIngestionService` (linha 198).
+- **Testes** (`PipelineIngestionCountryGateTests.cs`, 12 testes): A–J + REJECT≠UNKNOWN. Cobrem estrangeiros, desconhecidos, batch misto, idempotência, fail-fast, e boundary.
+- **Regression guard**: `RealPipelineDiagnosticTests` foi actualizado com `Assert.Equal(0, foreignIngested)` — se algum stream REJECTED voltar a aparecer no catálogo, a teste falha.
+- **Resultado**: 1345 → **1357 testes** em Release, 0 falhas, 3x runs estáveis. Pré-R1: 27/27 ingested, 8 auto-created. Pós-R1: 21/27 ingested, 3 auto-created, 6 REJECTED.
+- **Não cria nova PHASE**: é uma correcção do PHASE-Bridge (R1). Documentado em `docs/IMPLEMENTATION_ROADMAP.md` secção 32.13.
+
 ### 🛠 PHASE-Bridge — Pipeline real → Catálogo (2026-09-11)
 - **Gap fechado (suportado por código)**: a validação end-to-end anterior tinha identificado que `TelegramScraperService.SearchAndTestM3UInTelegramAsync` e o modo M3U8-search em `Program.cs` **não** escreviam no catálogo persistente. Esta entrega fecha o gap.
 - **`PipelineIngestionService`** (`m3uCrawler/Services/Catalog/PipelineIngestionService.cs`): bridge entre `IReadOnlyList<M3uStream>` já testados e o catálogo persistente. Para cada stream: `EnsureSourceAsync` (idempotente por Key) → `ResolveAsync` (mecanismo existente, sem segundo algoritmo de matching) → se Unknown: `EnsureCanonicalChannelAsync` com `CreateEligible` (canal permanece disponível para revisão via Dashboard, nunca eliminado) → `RecordChannelSourceAsync` (idempotente por `(channelId, sourceId, streamUrl)`) → `RecordMatchingAuditAsync`. Proveniência preservada em `SourceEntity.Origin` e `ChannelSourceEntity.MatchMethod`/`MatchConfidence`.

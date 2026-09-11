@@ -2960,6 +2960,91 @@ Esta entrega fecha o gap sem criar arquitectura paralela:
 Total: 1335 → **1344 testes** em Release, 0 falhas, 3x runs
 consecutivas estáveis. Build: 0 errors, 0 warnings novos.
 
+## 32.13 — PHASE-Bridge / R1 — country gate dentro do ingestion (2026-09-11)
+
+A validação end-to-end anterior tinha identificado que o
+`PipelineIngestionService.IngestAsync` aceitava `countryCode`
+mas não aplicava a política de país. Streams estrangeiros
+(`ES La 1`, `BR Globo News`, `Sky News`) e streams sem token
+PT (`CANAL FANTASTICO`) eram persistidos no catálogo
+canónico quando o `PipelineIngestionService` era chamado
+directamente (fora do caminho Telegram já validado).
+
+Esta entrega fecha o gap R1.
+
+**Alteração arquitectural**:
+
+- O construtor de `PipelineIngestionService` agora **exige**
+  um `CountryChannelValidator`. Não há construtor sem validator
+  — `ArgumentNullException` imediato, fail-fast no construtor.
+- `IngestAsync` chama internamente
+  `CountryChannelValidator.ValidateStreams(streams, countryCode)`
+  antes de qualquer persistência. Streams REJECTED (estrangeiros,
+  negative evidence por ISO code, sem token PT no título, sem
+  fallback por group-title) são silenciosamente descartados.
+- **REJECT ≠ UNKNOWN**: um stream que viola a política de país
+  nunca é convertido em `CanonicalChannel.CreateEligible`. Apenas
+  streams que passam o gate podem cair em Unknown → auto-create.
+- `IngestionResult` ganha `RejectedByCountryCount` para diagnóstico.
+- A `SourceEntity` é criada antes do gate (registar a tentativa
+  de discovery); `ChannelSourceEntity` só é criado se o stream
+  passar o gate. Isto preserva audit trail das tentativas de
+  discovery sem persistir dados de streams rejeitados.
+
+**Como `countryCode` chega à ingestion**:
+
+- `Program.cs` constrói `CountryChannelValidator` (linha 186) e
+  partilha-o com `PipelineIngestionService` (linha 198).
+- O scraper (`TelegramScraperService`) também usa o mesmo
+  validator internamente em `SearchAndTestM3UInTelegramAsync`
+  (a chamada dupla é intencional e segura — é a mesma
+  decisão sobre os mesmos streams).
+- O `ScheduledAutomationHost` constrói o validator e injeta-o
+  na ingestion via `Program.cs` quando o dashboard é
+  arrancado com `--web`.
+
+**Testes adicionados** (`PipelineIngestionCountryGateTests.cs`,
+12 testes, todos passam em Release):
+
+- **A** — Stream estrangeiro (`ES La 1`) não é ingerido.
+- **B** — `ES La 1` não cria CanonicalChannel.
+- **C** — `BR Globo News` não cria CanonicalChannel nem
+  ChannelSource.
+- **D** — `Sky News` não cria CanonicalChannel nem ChannelSource.
+- **E** — `CANAL FANTASTICO` rejeitado pelo country policy
+  não é auto-criado (era o principal bug pré-R1).
+- **F** — Stream PT conhecido continua a ser ingerido
+  normalmente.
+- **G** — Stream PT desconhecido (com token PT) continua
+  a resultar em CreateEligible.
+- **H** — Segunda ingestão continua idempotente.
+- **I** — Batch misto (PT + estrangeiros): só PT é ingerido.
+- **J** — Caller sem country validator não pode construir
+  o `PipelineIngestionService` (fail-fast no construtor).
+- **REJECT ≠ UNKNOWN** — boundary explícito verificado.
+
+**Regression guard**: `RealPipelineDiagnosticTests` foi
+actualizado com `Assert.Equal(0, foreignIngested)` e
+`Assert.Equal(0, fantasticoChannels)`. Se algum stream REJECTED
+voltar a aparecer no catálogo ou na playlist final, a
+diagnóstico falha o teste.
+
+**Resultado da validação antes/depois**:
+
+| | Pré-R1 (commit 6053666) | Pós-R1 |
+|---|---|---|
+| Streams ingested | 27/27 | 21/27 |
+| Streams REJECTED | 0 | **6** |
+| Auto-created | 8 | 3 |
+| Catalogo estrangeiro | ES/BR/UK presentes | Nenhum |
+| Playlist com estrangeiros | Sim | Não |
+
+Total: 1345 → **1357 testes** em Release (1358 com RealPipeline
++ CountryGate + Bridge), 0 falhas, 3x runs consecutivas estáveis.
+Build: 0 errors, 0 warnings novos.
+
+Não cria nova PHASE; é uma correcção do PHASE-Bridge (R1).
+
 ---
 
 # 33. Definition of Done

@@ -195,7 +195,12 @@ namespace m3uCrawler
                 try
                 {
                     catalogForIngestion = await InitializeCatalogAsync(catalogDbPath, CancellationToken.None);
-                    pipelineIngestor = new PipelineIngestionService(catalogForIngestion);
+                    // R1 — O ingestor requer um CountryChannelValidator para
+                    // garantir que streams REJECTED pelo country policy não
+                    // são persistidos. O validator já está construído acima
+                    // (linha 186), partilhando configuração com o scraper.
+                    pipelineIngestor = new PipelineIngestionService(
+                        catalogForIngestion, countryChannelValidator);
                     Console.WriteLine("📦 Ingestor de catálogo inicializado.");
                 }
                 catch (Exception ex)

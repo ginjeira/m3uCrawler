@@ -37,6 +37,31 @@ namespace m3uCrawler.Services.Catalog;
 /// </list>
 ///
 /// <para>
+/// <b>Country gate (R1).</b> Quando o constructor recebe um
+/// <see cref="CountryChannelValidator"/> (recomendado), o
+/// <see cref="IngestAsync"/> chama <see cref="CountryChannelValidator.ValidateStreams"/>
+/// internamente. Streams REJECTED pelo country policy
+/// (estrangeiros, sem token PT, etc.) são silenciosamente
+/// descartados antes de qualquer persistência.
+/// </para>
+///
+/// <para>
+/// <b>REJECT ≠ UNKNOWN.</b> O country gate é executado antes do
+/// matching de canal. Um stream que viola a política de país
+/// nunca é convertido em CanonicalChannel CreateEligible —
+/// apenas streams que passam o gate podem ser Unknown/auto-created.
+/// </para>
+///
+/// <para>
+/// <b>Constructor sem validator.</b> Não é permitido. Lança
+/// <see cref="InvalidOperationException"/> na primeira chamada a
+/// <see cref="IngestAsync"/>. O caller tem de fornecer um
+/// <see cref="CountryChannelValidator"/> explícito. Não existe
+/// fallback silencioso para "pt" por defeito — ausência de
+/// contexto deve ser tratada como erro, não como "ingerir tudo".
+/// </para>
+///
+/// <para>
 /// Proveniência preservada via:
 /// </para>
 /// <list type="bullet">
@@ -59,10 +84,25 @@ namespace m3uCrawler.Services.Catalog;
 public sealed class PipelineIngestionService
 {
     private readonly CatalogResolver _catalog;
+    private readonly CountryChannelValidator? _countryValidator;
 
-    public PipelineIngestionService(CatalogResolver catalog)
+    /// <summary>
+    /// Constructor preferido. O <paramref name="countryValidator"/>
+    /// aplica <see cref="CountryChannelValidator.ValidateStreams"/>
+    /// antes de qualquer persistência. Sem ele, a ingestion não
+    /// é segura (nenhum filtro de país) e lança
+    /// <see cref="InvalidOperationException"/> quando chamada.
+    /// </summary>
+    public PipelineIngestionService(
+        CatalogResolver catalog,
+        CountryChannelValidator countryValidator)
     {
         _catalog = catalog ?? throw new ArgumentNullException(nameof(catalog));
+        _countryValidator = countryValidator ?? throw new ArgumentNullException(
+            nameof(countryValidator),
+            "PipelineIngestionService requer um CountryChannelValidator. " +
+            "Sem country gate, streams estrangeiros/rejeitados seriam persistidos " +
+            "no catálogo. Não há fallback silencioso para 'pt' por defeito.");
     }
 
     /// <summary>
@@ -70,6 +110,7 @@ public sealed class PipelineIngestionService
     /// </summary>
     public sealed record IngestionResult(
         int ReceivedCount,
+        int RejectedByCountryCount,
         int IngestedCount,
         int MatchedCount,
         int AutoCreatedCount,
@@ -97,6 +138,33 @@ public sealed class PipelineIngestionService
             throw new ArgumentException("sourceKey obrigatório.", nameof(sourceKey));
         if (string.IsNullOrWhiteSpace(sourceKindName))
             throw new ArgumentException("sourceKindName obrigatório.", nameof(sourceKindName));
+        if (string.IsNullOrWhiteSpace(countryCode))
+            throw new ArgumentException(
+                "countryCode obrigatório. Streams devem ter contexto de país antes da ingestion.",
+                nameof(countryCode));
+
+        // R1 — country gate. O validator é obrigatório pelo construtor;
+        // esta verificação é defensiva para o caso de alguém injectar
+        // null via reflection ou subclasses acidentais.
+        if (_countryValidator == null)
+        {
+            throw new InvalidOperationException(
+                "PipelineIngestionService foi construído sem CountryChannelValidator. " +
+                "Isto indica um bug — o construtor devia ter rejeitado o null. " +
+                "Reconstruir com um validator (ver construtor).");
+        }
+
+        // Aplicar o country gate: só streams que passam ValidateStreams
+        // entram no pipeline de ingestion. Streams REJECTED (estrangeiros,
+        // sem token PT, etc.) são silenciosamente descartados antes de
+        // qualquer persistência — REJECT nunca é convertido em UNKNOWN.
+        var countryMatches = _countryValidator.ValidateStreams(
+            streams.ToList(), countryCode);
+
+        // Map por referência M3uStream → CountryStreamMatch para
+        // preservar o stream original no loop.
+        var passedStreams = new HashSet<M3uStream>(
+            countryMatches.Select(m => m.Stream));
 
         var kind = ParseKind(sourceKindName);
         var origin = BuildOrigin(sourceKey, sourceKindName, countryCode);
@@ -118,6 +186,13 @@ public sealed class PipelineIngestionService
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (stream == null || string.IsNullOrWhiteSpace(stream.Url))
+            {
+                continue;
+            }
+
+            // R1 — REJECT ≠ UNKNOWN. Se o stream foi rejeitado pelo
+            // country gate, salta sem persistir nada.
+            if (!passedStreams.Contains(stream))
             {
                 continue;
             }
@@ -214,6 +289,7 @@ public sealed class PipelineIngestionService
 
         return new IngestionResult(
             ReceivedCount: streams.Count,
+            RejectedByCountryCount: streams.Count - passedStreams.Count,
             IngestedCount: entries.Count,
             MatchedCount: matched,
             AutoCreatedCount: autoCreated,

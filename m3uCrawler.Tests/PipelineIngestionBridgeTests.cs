@@ -49,8 +49,16 @@ public class PipelineIngestionBridgeTests : IAsyncLifetime
 
     public Task DisposeAsync() => Task.CompletedTask;
 
+    private static string CountriesDir()
+    {
+        var cwd = Directory.GetCurrentDirectory();
+        // cwd = m3uCrawler.Tests/bin/Release/net9.0; subir até à raiz do repo.
+        var repoRoot = Path.GetFullPath(Path.Combine(cwd, "..", "..", "..", ".."));
+        return Path.Combine(repoRoot, "m3uCrawler", "runtime-data", "countries");
+    }
+
     private PipelineIngestionService NewIngestor() =>
-        new PipelineIngestionService(_resolver);
+        new PipelineIngestionService(_resolver, new CountryChannelValidator(CountriesDir()));
 
     private static M3uStream MakeStream(string title, string url, string group = "Portugal", bool working = true) =>
         new()
@@ -152,20 +160,23 @@ public class PipelineIngestionBridgeTests : IAsyncLifetime
     [Fact]
     public async Task Unknown_channel_gets_a_canonical_with_CreateEligible_and_is_visible_in_catalogue()
     {
-        // "CANAL FANTASTICO" não está no catálogo seed — deve receber
-        // um CanonicalChannel próprio (CreateEligible) para revisão.
-        var stream = MakeStream("CANAL FANTASTICO", "http://x.example/fantastico.ts", "Portugal");
-        var sourceKey = "test-bridge-d";
+        // Slug único por execução para evitar colisões em paralelo.
+        var slug = $"desconhecido-{Guid.NewGuid():N}".Substring(0, 24);
+        // O título contém "PT" (passa country gate) e o slug garante
+        // unicidade da canonical criada.
+        var stream = MakeStream($"PT CANAL {slug.ToUpperInvariant()}", $"http://x.example/{slug}.ts", "Portugal");
+        var sourceKey = $"test-bridge-d-{Guid.NewGuid():N}".Substring(0, 32);
 
         var result = await NewIngestor().IngestAsync(
             new[] { stream }, sourceKey, "Telegram", "pt");
 
         Assert.Equal(1, result.IngestedCount);
+        Assert.Equal(0, result.RejectedByCountryCount);
 
         var channels = await _resolver.ListCanonicalChannelsAsync();
-        var ch = channels.FirstOrDefault(c => c.Key == "pt-canal-fantastico");
+        var ch = channels.FirstOrDefault(c => c.Key.Contains(slug));
         Assert.NotNull(ch);
-        Assert.Equal("CANAL FANTASTICO", ch!.DisplayName);
+        Assert.Equal(stream.Title, ch!.DisplayName);
         Assert.Equal(PublicationPolicy.CreateEligible, ch.PublicationPolicy);
 
         var sources = await _resolver.ListSourcesAsync();
