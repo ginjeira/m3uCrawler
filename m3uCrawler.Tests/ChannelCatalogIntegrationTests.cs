@@ -125,10 +125,12 @@ public class ChannelCatalogIntegrationTests : IAsyncLifetime
         // Initial seed is applied in InitializeAsync. Verify the
         // catalog is populated.
         await using var ctx = await _factory.CreateDbContextAsync();
+        // R2: a key do BTV foi alinhada com o baseline canónico
+        // (pt.btv → "btv"). DisplayName mantém-se "Benfica TV".
         var benfica = await ctx.CanonicalChannels
-            .FirstOrDefaultAsync(c => c.Key == "benfica-tv");
+            .FirstOrDefaultAsync(c => c.Key == "btv");
         Assert.NotNull(benfica);
-        Assert.Equal("Benfica TV", benfica!.DisplayName);
+        Assert.Equal("BTV", benfica!.DisplayName);
         Assert.Equal(EditorialCategory.Desporto, benfica.EditorialCategory);
         Assert.Equal(PublicationPolicy.CreateEligible, benfica.PublicationPolicy);
 
@@ -162,7 +164,7 @@ public class ChannelCatalogIntegrationTests : IAsyncLifetime
         _ = await _bootstrapper.InitializeAsync();
         await using var ctx2 = await _factory.CreateDbContextAsync();
         var benficaCount = await ctx2.CanonicalChannels
-            .CountAsync(c => c.Key == "benfica-tv");
+            .CountAsync(c => c.Key == "btv");
         Assert.Equal(1, benficaCount);
     }
 
@@ -210,10 +212,11 @@ public class ChannelCatalogIntegrationTests : IAsyncLifetime
         var plan = await BuildPlan(
             new[] { Stream(title, "PORTUGUESE") },
             Empty());
-        // 1 NewChannel decision: "benfica-tv" canonical key.
+        // 1 NewChannel decision: "btv" canonical key (R2 — alinhado
+        // com o baseline canónico `pt.btv`).
         Assert.Single(plan.Channels);
         Assert.Equal(SyncOutcome.NewChannel, plan.Channels[0].Outcome);
-        Assert.Equal("benfica-tv", plan.Channels[0].Identity);
+        Assert.Equal("btv", plan.Channels[0].Identity);
     }
 
     // -----------------------------------------------------------------

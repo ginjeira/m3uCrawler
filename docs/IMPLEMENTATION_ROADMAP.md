@@ -3045,6 +3045,79 @@ Build: 0 errors, 0 warnings novos.
 
 Não cria nova PHASE; é uma correcção do PHASE-Bridge (R1).
 
+## 32.14 — PHASE-Bridge / R2 — saneamento do catálogo canónico PT (2026-09-11)
+
+A validação end-to-end anterior identificou que o catálogo
+canónico PT (`docs/catalog/m3ucrawler_pt_canonical_catalog.json`)
+estava parcialmente carregado, com divergências entre o JSON e o
+`CatalogSeed` programático que produziam representações
+duplicadas para o mesmo canal lógico (e.g. `rtp1`/`rtp-1`,
+`cnn`/`cnnportugal`, `benfica-tv`/`btv`).
+
+Esta entrega fecha o gap R2 — saneamento do catálogo sem criar
+arquitectura paralela.
+
+**Alteração arquitectural**:
+
+- **`CatalogSeed.Channels` saneado**: removidos todos os canais
+  duplicados com a baseline JSON (RTP 1-3, SIC, TVI, SIC Notícias,
+  RTP Notícias, CNN, CMTV, News Now, Canal 11, V+ TVI, RTP
+  Memória, Porto Canal, Sport TV 1, Eurosport 1, SIC K, Panda,
+  Cartoon Network, Hollywood, Cinemundo, AXN, Discovery, NatGeo,
+  Globo). Mantidos apenas canais não cobertos pela baseline:
+  Sport TV 2-7, Sport TV NBA, TVI 24, TVI Internacional, SIC
+  Mulher, SIC Radical, Baby TV, Canal Panda (key legada),
+  Odisseia, BTV (key alinhada com JSON `pt.btv` → `btv`), e
+  aliases ricas para todos.
+- **`CatalogBaselineImporter`**: o alias principal (idêntico ao
+  `DisplayName` normalizado) é agora **persistido automaticamente**
+  para garantir que o matcher resolve títulos canónicos. Antes o
+  alias era pulado como "redundante", o que impedia
+  `ResolveAsync("rtp 1")` ou `ResolveAsync("cnn portugal")` de
+  funcionar quando o JSON não os declarava explicitamente.
+
+**Como ficou a relação com `pt.json`**:
+
+- `runtime-data/countries/pt.json` **mantém-se inalterado**. É a
+  configuração operacional do `CountryChannelValidator`
+  (lista de aliases + group_tokens + negative_evidence), não uma
+  duplicação do catálogo. A R2 não toca neste ficheiro.
+
+**Resultado do matching**:
+
+- `ResolveAsync("rtp 1")` → `Canonical rtp1` (RTP 1) ✓
+- `ResolveAsync("rtp 1 hd")` → `Canonical rtp1` (RTP 1) ✓
+- `ResolveAsync("cnn portugal")` → `Canonical cnnportugal` ✓
+- `ResolveAsync("rtp 3")` → `Canonical rtpnoticias` (RTP Notícias,
+  alias do JSON) ✓
+- `ResolveAsync("btv")` → `Canonical btv` (BTV) ✓
+- `ResolveAsync("benfica tv")` → `Canonical btv` (BTV) ✓
+
+**Testes adicionados** (`CatalogR2ConsistencyTests.cs`, 13
+testes, todos passam em Release):
+
+- **A** — JSON canónico é carregado integralmente (25 canais
+  do `matching.examples`).
+- **B** — Nenhuma canonical key duplicada após bootstrap.
+- **C** — RTP 1, RTP 2 e RTP 3 (alias) cada um com apenas um
+  `CanonicalChannel`.
+- **D** — Aliases do JSON resolvem correctamente (RTP1, RTP 1 HD,
+  CNN Portugal).
+- **E** — Country validation continua a rejeitar estrangeiros.
+- **F** — Aliases do JSON persistidos no `ChannelAlias`.
+- **G** — Unknown verdadeiro continua a gerar CreateEligible.
+- **H** — Ingestion idempotente após R2.
+- **I** — Bootstrap idempotente.
+- **J** — Catálogo contém os canais baseline PT.
+
+Não cria nova PHASE; é saneamento do PHASE 1 (Canonical Catalogue)
++ PHASE 4 (Sources & ChannelSource) + PHASE 5 (Ordering). Documentado
+como subfase técnica de fecho das PHASES 1–10. Não introduz
+fuzzy matching novo.
+
+Total: 1357 → **1370 testes** em Release (13 novos), 0 falhas,
+3x runs estáveis. Build: 0 errors, 0 warnings novos.
+
 ---
 
 # 33. Definition of Done

@@ -158,23 +158,29 @@ public class CatalogBaselineImporterTests : IDisposable
 
         Assert.Equal(2, report.ChannelsCreated);
         Assert.Equal(0, report.ChannelsUpdated);
-        Assert.Equal(4, report.AliasesAdded); // 3 do RTP + 1 do SIC
+        // 6 aliases:
+        //   RTP 1: "rtp 1" (auto from DisplayName) + "rtp1", "rtp 1 hd", "rtp1hd" = 4
+        //   SIC:   "sic"   (auto from DisplayName) + "sic hd" = 2
+        // O alias principal é persistido automaticamente para
+        // garantir que o matcher resolve títulos canónicos.
+        Assert.Equal(6, report.AliasesAdded);
 
         var rtp1 = await ctx.CanonicalChannels.Include(c => c.Aliases).FirstAsync(c => c.Key == "rtp1");
         Assert.Equal("RTP 1", rtp1.DisplayName);
         Assert.Equal(PublicationPolicy.CreateEligible, rtp1.PublicationPolicy);
         Assert.True(rtp1.IsEnabled);
-        Assert.Equal(3, rtp1.Aliases.Count);
-        Assert.Contains(rtp1.Aliases, a => a.NormalizedAlias == "rtp1");
+        // rtp1 has 4 aliases: "rtp 1" (auto), "rtp1", "rtp 1 hd", "rtp1hd"
+        Assert.Equal(4, rtp1.Aliases.Count);
+        Assert.Contains(rtp1.Aliases, a => a.NormalizedAlias == "rtp 1");
         Assert.Contains(rtp1.Aliases, a => a.NormalizedAlias == "rtp 1 hd");
     }
 
     [Fact]
-    public async Task ImportAsync_skips_alias_identical_to_channel_name()
+    public async Task ImportAsync_persists_alias_identical_to_channel_name()
     {
-        // "SIC" como alias de um canal cujo DisplayName é "SIC"
-        // seria redundante e geraria potencial conflito com
-        // CanonicalName no matcher. Deve ser Skipped, não Added.
+        // "SIC" como alias de um canal cujo DisplayName é "SIC" NÃO
+        // é redundante — é exactamente o alias que permite ao matcher
+        // resolver "SIC" como título. Tem de ser persistido.
         await using var ctx = NewContext();
         await ctx.Database.EnsureCreatedAsync();
 
@@ -200,13 +206,14 @@ public class CatalogBaselineImporterTests : IDisposable
         var report = await CatalogBaselineImporter.ImportAsync(ctx, baseline);
 
         Assert.Equal(1, report.ChannelsCreated);
-        Assert.Equal(1, report.AliasesAdded);
-        Assert.True(report.AliasesSkipped >= 1, $"Esperado >= 1 alias skipped, obtido {report.AliasesSkipped}");
+        Assert.Equal(2, report.AliasesAdded); // SIC e SIC HD
+        Assert.Equal(0, report.AliasesSkipped);
 
         var sic = await ctx.CanonicalChannels.Include(c => c.Aliases).FirstAsync();
-        var aliases = sic.Aliases.ToList();
-        Assert.Single(aliases);
-        Assert.Equal("sic hd", aliases[0].NormalizedAlias);
+        var aliases = sic.Aliases.Select(a => a.NormalizedAlias).ToHashSet();
+        Assert.Contains("sic", aliases);
+        Assert.Contains("sic hd", aliases);
+        Assert.Equal(2, aliases.Count);
     }
 
     [Fact]

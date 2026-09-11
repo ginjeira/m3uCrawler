@@ -7,32 +7,35 @@ namespace m3uCrawler.Services.Catalog;
 /// Seed versionado, legível e testável do catálogo. Não há valores
 /// escondidos no código: a tabela abaixo é a fonte de verdade do
 /// que é inserido na primeira migration.
-///
 /// <para>
-/// Conteúdo organizado em três blocos:
+/// <b>R2 (PHASE-Bridge / Catalog Consistency — 2026-09-11):</b>
+/// Este seed foi saneado para não duplicar a baseline canónica
+/// definida em <c>docs/catalog/m3ucrawler_pt_canonical_catalog.json</c>.
+/// Regra arquitectural: UM canal lógico = UM CanonicalChannel.
+/// A baseline JSON é a fonte primária; este seed apenas adiciona
+/// canais que <b>NÃO</b> estão na baseline e que precisam de estar
+/// disponíveis antes de o JSON ser carregado (fallback) ou que
+/// precisam de aliases mais ricos do que a baseline.
 /// </para>
+/// <para>
+/// Os canais removidos deste seed são os que têm a sua identidade
+/// totalmente coberta pela baseline JSON (RTP 1-3, SIC, TVI, SIC
+/// Notícias, CNN Portugal, CMTV, News Now, Canal 11, V+ TVI, RTP
+/// Memória, Porto Canal, Sport TV 1, Eurosport 1, BTV, SIC K,
+/// Panda, Cartoon Network, Hollywood, Cinemundo, AXN, Discovery,
+/// NatGeo, Globo).
+/// </para>
+/// <para>
+/// Canais que permanecem (não cobertos pela baseline):
 /// <list type="bullet">
-///   <item><b>Benfica TV</b>: identidade canónica com aliases
-///         explícitos (incluindo BTV HEVC PT, BENFICATV, etc.) e
-///         política CreateEligible.</item>
-///   <item><b>Sport TV NBA</b>: canal autónomo
-///         (<c>sport-tv-nba</c>, <c>CreateEligible</c>), distinto
-///         de Sport TV 1..7. Os aliases cobrem as variantes
-///         <c>SPORT TV NBA</c>, <c>PT: SPORT TV NBA</c>,
-///         <c>PT SPORT TV NBA</c> e <c>SPORT TV NBA HEVC PT</c> na
-///         forma canónica (lowercase, espaços). Nunca faz fuzzy
-///         para Sport TV 1..7 (token-set ratio 67 &lt; threshold
-///         80).</item>
-///   <item><b>Aliases canónicos legados</b>: SIC, RTP, CMTV, TVI
-///         e restantes identidades que já existiam no
-///         <c>ChannelCategoryLookup</c> curado, com a mesma
-///         categoria editorial mas com a política
-///         <see cref="PublicationPolicy.CreateEligible"/> (são
-///         canais publicáveis). Não há promoção implícita de
-///         novas entradas; o matcher lê a BD, não o dicionário
-///         antigo, para decidir <c>NewChannel</c>.</item>
+///   <item>Sport TV 2-7 (apenas Sport TV 1 está na baseline)</item>
+///   <item>Sport TV NBA (autónomo, distinto de Sport TV 1-7)</item>
+///   <item>TVI 24, TVI Internacional, SIC Mulher, SIC Radical</item>
+///   <item>Baby TV, Odisseia (Canal Panda mantém-se com a key
+///         <c>canal-panda</c> porque a baseline usa <c>panda</c>
+///         para um canal diferente no agrupamento infantil)</item>
 /// </list>
-///
+/// </para>
 /// <para>
 /// Todos os alias são fornecidos já na forma canónica que o
 /// <c>ChannelNormalizer</c> produz (lowercase, espaços em vez de
@@ -43,10 +46,13 @@ public static class CatalogSeed
 {
     public static readonly IReadOnlyList<CanonicalChannelSeed> Channels = new[]
     {
-        // ========================= Benfica TV =========================
+        // ========================= Benfica TV (BTV) =========================
+        // Mantido como fallback com aliases históricos. A baseline JSON
+        // também cria "btv" via `pt.btv`, mas em BDs legadas o seed é
+        // a única fonte; mantemos para resiliência.
         new CanonicalChannelSeed(
-            Key: "benfica-tv",
-            DisplayName: "Benfica TV",
+            Key: "btv",
+            DisplayName: "BTV",
             Category: EditorialCategory.Desporto,
             Group: CanonicalEditorialGroup.PortugalDesporto,
             Policy: PublicationPolicy.CreateEligible,
@@ -61,9 +67,7 @@ public static class CatalogSeed
             }),
 
         // ========================= Sport TV NBA =========================
-        // Canal autónomo, distinto de Sport TV 1..7. Os aliases estão
-        // na forma canónica (lowercase, espaços) que o
-        // ChannelNormalizer produz a partir dos títulos raw.
+        // Canal autónomo, distinto de Sport TV 1..7.
         new CanonicalChannelSeed(
             Key: "sport-tv-nba",
             DisplayName: "Sport TV NBA",
@@ -77,18 +81,9 @@ public static class CatalogSeed
                 "sport tv nba hevc pt",
             }),
 
-        // ========================= Sport TV 1..7 =========================
-        new CanonicalChannelSeed(
-            Key: "sport-tv-1",
-            DisplayName: "Sport TV 1",
-            Category: EditorialCategory.Desporto,
-            Group: CanonicalEditorialGroup.PortugalDesporto,
-            Policy: PublicationPolicy.CreateEligible,
-            Aliases: new[]
-            {
-                "sport tv 1",
-                "sport tv 1 fhd",
-            }),
+        // ========================= Sport TV 2-7 =========================
+        // Apenas Sport TV 1 está na baseline. Os restantes ficam aqui
+        // com aliases ricas.
         new CanonicalChannelSeed(
             Key: "sport-tv-2",
             DisplayName: "Sport TV 2",
@@ -98,6 +93,8 @@ public static class CatalogSeed
             Aliases: new[]
             {
                 "sport tv 2",
+                "sport tv 2 hd",
+                "sport tv 2 fhd",
             }),
         new CanonicalChannelSeed(
             Key: "sport-tv-3",
@@ -108,6 +105,7 @@ public static class CatalogSeed
             Aliases: new[]
             {
                 "sport tv 3",
+                "sport tv 3 hd",
             }),
         new CanonicalChannelSeed(
             Key: "sport-tv-4",
@@ -118,6 +116,7 @@ public static class CatalogSeed
             Aliases: new[]
             {
                 "sport tv 4",
+                "sport tv 4 hd",
             }),
         new CanonicalChannelSeed(
             Key: "sport-tv-5",
@@ -128,6 +127,7 @@ public static class CatalogSeed
             Aliases: new[]
             {
                 "sport tv 5",
+                "sport tv 5 hd",
             }),
         new CanonicalChannelSeed(
             Key: "sport-tv-6",
@@ -139,6 +139,18 @@ public static class CatalogSeed
             {
                 "sport tv 6",
                 "sporttv 6",
+                "sport tv 6 hd",
+            }),
+        new CanonicalChannelSeed(
+            Key: "sport-tv-7",
+            DisplayName: "Sport TV 7",
+            Category: EditorialCategory.Desporto,
+            Group: CanonicalEditorialGroup.PortugalDesporto,
+            Policy: PublicationPolicy.CreateEligible,
+            Aliases: new[]
+            {
+                "sport tv 7",
+                "sport tv 7 hd",
             }),
         new CanonicalChannelSeed(
             Key: "sport-tv-news",
@@ -151,107 +163,54 @@ public static class CatalogSeed
                 "sport tv news",
             }),
 
-        // ========================= Live (generalistas) =========================
-        new CanonicalChannelSeed(
-            Key: "rtp-1",
-            DisplayName: "RTP 1",
-            Category: EditorialCategory.Live,
-            Group: CanonicalEditorialGroup.PortugalLive,
-            Policy: PublicationPolicy.CreateEligible,
-            Aliases: new[] { "rtp 1" }),
-        new CanonicalChannelSeed(
-            Key: "rtp-2",
-            DisplayName: "RTP 2",
-            Category: EditorialCategory.Live,
-            Group: CanonicalEditorialGroup.PortugalLive,
-            Policy: PublicationPolicy.CreateEligible,
-            Aliases: new[] { "rtp 2" }),
-        new CanonicalChannelSeed(
-            Key: "rtp-3",
-            DisplayName: "RTP 3",
-            Category: EditorialCategory.Live,
-            Group: CanonicalEditorialGroup.PortugalLive,
-            Policy: PublicationPolicy.CreateEligible,
-            Aliases: new[] { "rtp 3" }),
-        new CanonicalChannelSeed(
-            Key: "rtp-noticias",
-            DisplayName: "RTP Notícias",
-            Category: EditorialCategory.Live,
-            Group: CanonicalEditorialGroup.PortugalLive,
-            Policy: PublicationPolicy.CreateEligible,
-            Aliases: new[] { "rtp noticias" }),
-        new CanonicalChannelSeed(
-            Key: "sic",
-            DisplayName: "SIC",
-            Category: EditorialCategory.Live,
-            Group: CanonicalEditorialGroup.PortugalLive,
-            Policy: PublicationPolicy.CreateEligible,
-            Aliases: new[] { "sic" }),
-        new CanonicalChannelSeed(
-            Key: "tvi",
-            DisplayName: "TVI",
-            Category: EditorialCategory.Live,
-            Group: CanonicalEditorialGroup.PortugalLive,
-            Policy: PublicationPolicy.CreateEligible,
-            Aliases: new[] { "tvi" }),
+        // ========================= Live adicional =========================
+        // TVI 24, Euronews Portugal, CNN (caso a baseline não tenha sido
+        // carregada).
         new CanonicalChannelSeed(
             Key: "tvi-24",
             DisplayName: "TVI 24",
             Category: EditorialCategory.Live,
             Group: CanonicalEditorialGroup.PortugalLive,
             Policy: PublicationPolicy.CreateEligible,
-            Aliases: new[] { "tvi 24" }),
-        new CanonicalChannelSeed(
-            Key: "cmtv",
-            DisplayName: "CMTV",
-            Category: EditorialCategory.Live,
-            Group: CanonicalEditorialGroup.PortugalLive,
-            Policy: PublicationPolicy.CreateEligible,
-            Aliases: new[] { "cmtv", "cm tv" }),
-        new CanonicalChannelSeed(
-            Key: "cnn",
-            DisplayName: "CNN",
-            Category: EditorialCategory.Live,
-            Group: CanonicalEditorialGroup.PortugalLive,
-            Policy: PublicationPolicy.CreateEligible,
-            Aliases: new[] { "cnn", "cnn portugal" }),
+            Aliases: new[]
+            {
+                "tvi 24",
+                "tvi24",
+            }),
         new CanonicalChannelSeed(
             Key: "euronews",
             DisplayName: "Euronews",
             Category: EditorialCategory.Live,
             Group: CanonicalEditorialGroup.PortugalLive,
             Policy: PublicationPolicy.CreateEligible,
-            Aliases: new[] { "euronews", "euronews portugal" }),
+            Aliases: new[]
+            {
+                "euronews",
+                "euronews portugal",
+            }),
 
         // ========================= Entretenimento =========================
-        new CanonicalChannelSeed(
-            Key: "axn",
-            DisplayName: "AXN",
-            Category: EditorialCategory.Entretenimento,
-            Group: CanonicalEditorialGroup.PortugalEntretenimento,
-            Policy: PublicationPolicy.CreateEligible,
-            Aliases: new[] { "axn" }),
         new CanonicalChannelSeed(
             Key: "axn-white",
             DisplayName: "AXN White",
             Category: EditorialCategory.Entretenimento,
             Group: CanonicalEditorialGroup.PortugalEntretenimento,
             Policy: PublicationPolicy.CreateEligible,
-            Aliases: new[] { "axn white" }),
+            Aliases: new[] { "axn white", "axn white hd" }),
         new CanonicalChannelSeed(
             Key: "amc",
             DisplayName: "AMC",
             Category: EditorialCategory.Entretenimento,
             Group: CanonicalEditorialGroup.PortugalEntretenimento,
             Policy: PublicationPolicy.CreateEligible,
-            Aliases: new[] { "amc" }),
+            Aliases: new[] { "amc", "amc hd" }),
         new CanonicalChannelSeed(
             Key: "fox",
             DisplayName: "FOX",
             Category: EditorialCategory.Entretenimento,
             Group: CanonicalEditorialGroup.PortugalEntretenimento,
             Policy: PublicationPolicy.CreateEligible,
-            Aliases: new[] { "fox" }),
+            Aliases: new[] { "fox", "fox hd", "fox life", "fox crime" }),
         new CanonicalChannelSeed(
             Key: "tv-cine",
             DisplayName: "TV Cine",
@@ -278,90 +237,65 @@ public static class CatalogSeed
             Category: EditorialCategory.Entretenimento,
             Group: CanonicalEditorialGroup.PortugalEntretenimento,
             Policy: PublicationPolicy.CreateEligible,
-            Aliases: new[] { "travel channel" }),
+            Aliases: new[] { "travel channel", "travel channel hd" }),
         new CanonicalChannelSeed(
             Key: "tvi-internacional",
             DisplayName: "TVI Internacional",
             Category: EditorialCategory.Entretenimento,
             Group: CanonicalEditorialGroup.PortugalEntretenimento,
             Policy: PublicationPolicy.CreateEligible,
-            Aliases: new[] { "tvi internacional" }),
+            Aliases: new[]
+            {
+                "tvi internacional",
+                "tvi internacional hd",
+            }),
         new CanonicalChannelSeed(
             Key: "sic-mulher",
             DisplayName: "SIC Mulher",
             Category: EditorialCategory.Entretenimento,
             Group: CanonicalEditorialGroup.PortugalEntretenimento,
             Policy: PublicationPolicy.CreateEligible,
-            Aliases: new[] { "sic mulher" }),
+            Aliases: new[] { "sic mulher", "sic mulher hd" }),
         new CanonicalChannelSeed(
             Key: "sic-radical",
             DisplayName: "SIC Radical",
             Category: EditorialCategory.Entretenimento,
             Group: CanonicalEditorialGroup.PortugalEntretenimento,
             Policy: PublicationPolicy.CreateEligible,
-            Aliases: new[] { "sic radical" }),
+            Aliases: new[] { "sic radical", "sic radical hd" }),
 
         // ========================= Infantil =========================
-        new CanonicalChannelSeed(
-            Key: "baby-tv",
-            DisplayName: "Baby TV",
-            Category: EditorialCategory.Infantil,
-            Group: CanonicalEditorialGroup.PortugalInfantil,
-            Policy: PublicationPolicy.CreateEligible,
-            Aliases: new[] { "baby tv" }),
-        new CanonicalChannelSeed(
-            Key: "cartoon-network",
-            DisplayName: "Cartoon Network",
-            Category: EditorialCategory.Infantil,
-            Group: CanonicalEditorialGroup.PortugalInfantil,
-            Policy: PublicationPolicy.CreateEligible,
-            Aliases: new[] { "cartoon network" }),
-        new CanonicalChannelSeed(
-            Key: "disney-channel",
-            DisplayName: "Disney Channel",
-            Category: EditorialCategory.Infantil,
-            Group: CanonicalEditorialGroup.PortugalInfantil,
-            Policy: PublicationPolicy.CreateEligible,
-            Aliases: new[] { "disney channel" }),
+        // Canal Panda permanece como "canal-panda" (key legada) porque a
+        // baseline usa "panda" para um canal diferente. Em BDs legadas
+        // esta key está estabelecida.
         new CanonicalChannelSeed(
             Key: "canal-panda",
             DisplayName: "Canal Panda",
             Category: EditorialCategory.Infantil,
             Group: CanonicalEditorialGroup.PortugalInfantil,
             Policy: PublicationPolicy.CreateEligible,
-            Aliases: new[] { "canal panda", "panda kids" }),
+            Aliases: new[]
+            {
+                "canal panda",
+                "panda kids",
+                "panda",
+            }),
+        new CanonicalChannelSeed(
+            Key: "baby-tv",
+            DisplayName: "Baby TV",
+            Category: EditorialCategory.Infantil,
+            Group: CanonicalEditorialGroup.PortugalInfantil,
+            Policy: PublicationPolicy.CreateEligible,
+            Aliases: new[] { "baby tv", "babytv" }),
 
         // ========================= Documentários =========================
-        new CanonicalChannelSeed(
-            Key: "discovery",
-            DisplayName: "Discovery",
-            Category: EditorialCategory.Documentarios,
-            Group: CanonicalEditorialGroup.PortugalDocumentarios,
-            Policy: PublicationPolicy.CreateEligible,
-            Aliases: new[] { "discovery", "discovery channel" }),
-        new CanonicalChannelSeed(
-            Key: "nat-geo",
-            DisplayName: "National Geographic",
-            Category: EditorialCategory.Documentarios,
-            Group: CanonicalEditorialGroup.PortugalDocumentarios,
-            Policy: PublicationPolicy.CreateEligible,
-            Aliases: new[] { "nat geo", "nat geo wild" }),
         new CanonicalChannelSeed(
             Key: "odisseia",
             DisplayName: "Odisseia",
             Category: EditorialCategory.Documentarios,
             Group: CanonicalEditorialGroup.PortugalDocumentarios,
             Policy: PublicationPolicy.CreateEligible,
-            Aliases: new[] { "odisseia" }),
-
-        // ========================= PPV / Eventos =========================
-        new CanonicalChannelSeed(
-            Key: "canal-11",
-            DisplayName: "Canal 11",
-            Category: EditorialCategory.Desporto,
-            Group: CanonicalEditorialGroup.PortugalDesporto,
-            Policy: PublicationPolicy.CreateEligible,
-            Aliases: new[] { "canal 11" }),
+            Aliases: new[] { "odisseia", "canal odisseia" }),
     };
 
     public static readonly IReadOnlyList<IdentityRuleSeed> IdentityRules = Array.Empty<IdentityRuleSeed>();

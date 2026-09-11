@@ -263,23 +263,36 @@ public static class CatalogBaselineImporter
                 }
             }
 
-            // Aliases: ignorar a entrada "principal" (que tem o
-            // mesmo nome que DisplayName); é redundante e gera
-            // colisões entre CanonicalName e um alias.
+            // Aliases: persistir SEMPRE o alias principal (idêntico
+            // ao DisplayName normalizado), mesmo que o JSON não o
+            // liste explicitamente, porque é o que permite ao
+            // matcher resolver o título principal. Aliases
+            // adicionais cobrem variantes listadas no JSON.
+            //
+            // Construímos a lista: primeiro o alias principal
+            // (idêntico ao nome), depois os aliases explícitos do
+            // JSON. Isto garante que o matching funcione mesmo para
+            // títulos canónicos (e.g. "RTP 1", "CNN Portugal").
             var channelNameNormalized = channel.DisplayName.Trim().ToLowerInvariant();
+            var aliasesToProcess = new List<string>();
+            if (!string.IsNullOrEmpty(channelNameNormalized))
+            {
+                aliasesToProcess.Add(channelNameNormalized);
+            }
             foreach (var alias in channelBaseline.Aliases)
             {
                 if (string.IsNullOrWhiteSpace(alias)) continue;
                 var normalized = alias.Trim().ToLowerInvariant();
                 if (normalized.Length == 0) continue;
-                if (normalized == channelNameNormalized)
+                // Deduplicar dentro da própria lista do canal.
+                if (!aliasesToProcess.Contains(normalized))
                 {
-                    // Alias idêntico ao nome do canal: redundante,
-                    // ignorado. Contado em Skipped (informativo).
-                    report.AliasesSkipped++;
-                    continue;
+                    aliasesToProcess.Add(normalized);
                 }
+            }
 
+            foreach (var normalized in aliasesToProcess)
+            {
                 if (existingAliases.Contains(normalized))
                 {
                     report.AliasesSkipped++;

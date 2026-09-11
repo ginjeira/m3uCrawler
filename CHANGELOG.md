@@ -40,6 +40,17 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 - **Gap documentado (suportado por código)**: o pipeline real (`M3uCrawlerService.SearchM3u8Files` ou `TelegramScraperService.SearchAndTestM3UInTelegramAsync`) **NÃO** chama `EnsureSourceAsync`/`RecordChannelSourceAsync` — confirmado por grep. Após runs de produção, o catálogo canónico fica apenas com canais seedados pelo JSON baseline; nenhum `SourceEntity`/`ChannelSourceEntity` novo é acrescentado pelo pipeline. O teste `Real_pipeline_does_not_upsert_sources_or_channel_sources` regista este comportamento explicitamente. **(Fechado em `PHASE-Bridge` abaixo.)**
 - **Total agora**: 1335 testes em Release (anterior: 1327), 0 falhas, 0 warnings novos.
 
+### 🛠 PHASE-Bridge / R2 — saneamento do catálogo canónico PT (2026-09-11)
+- **Gap fechado (suportado por código)**: a validação end-to-end identificou divergências entre o `CatalogSeed` programático e o JSON baseline canónico (`docs/catalog/m3ucrawler_pt_canonical_catalog.json`). O `CatalogSeed` criava duplicações para o mesmo canal lógico (`rtp1`/`rtp-1`, `cnn`/`cnnportugal`, `benfica-tv`/`btv`, etc.).
+- **`CatalogSeed.Channels` saneado**: removidos canais duplicados pela baseline JSON (RTP 1-3, SIC, TVI, SIC Notícias, RTP Notícias, CNN, CMTV, News Now, Canal 11, V+ TVI, RTP Memória, Porto Canal, Sport TV 1, Eurosport 1, SIC K, Panda, Cartoon Network, Hollywood, Cinemundo, AXN, Discovery, NatGeo, Globo). Mantidos apenas canais não cobertos pela baseline: Sport TV 2-7, Sport TV NBA, TVI 24, TVI Internacional, SIC Mulher, SIC Radical, Baby TV, Canal Panda (key legada), Odisseia, BTV (key alinhada).
+- **`CatalogBaselineImporter`**: o alias principal (idêntico ao `DisplayName` normalizado) é agora **persistido automaticamente**. Antes era pulado como "redundante", o que impedia `ResolveAsync("rtp 1")` e `ResolveAsync("cnn portugal")` de funcionarem quando o JSON não os declarava explicitamente.
+- **BTV**: key renomeada de `benfica-tv` para `btv` (alinhado com `pt.btv` da baseline). DisplayName actualizado para `BTV` (do JSON). Todos os aliases legados (`benficatv`, `benfica tv`, `btv hevc pt`) preservados.
+- **`runtime-data/countries/pt.json` mantido inalterado**: é a configuração operacional do `CountryChannelValidator`, não uma duplicação do catálogo. A R2 não toca neste ficheiro.
+- **Testes actualizados**: `ChannelCatalogIntegrationTests` ajustado para usar `Key = "btv"` e `DisplayName = "BTV"`. `CatalogBaselineImporterTests` ajustado para incluir o alias principal automático.
+- **Testes adicionados** (`CatalogR2ConsistencyTests.cs`, 13 testes): A–J + bootstrap idempotente + cobertura da baseline + aliases resolvidos.
+- **Resultado**: 1357 → **1370 testes** em Release, 0 falhas, 3x runs estáveis. Pré-R2: 56 canais com duplicações. Pós-R2: 46 canais únicos.
+- **Não cria nova PHASE**: é saneamento das PHASES 1–10. Documentado como `PHASE-Bridge / R2` em `docs/IMPLEMENTATION_ROADMAP.md` secção 32.14.
+
 ### 🛠 PHASE-Bridge / R1 — country gate dentro do ingestion (2026-09-11)
 - **Bug crítico fechado**: o `PipelineIngestionService.IngestAsync` aceitava `countryCode` mas não aplicava a política de país. Streams estrangeiros (`ES La 1`, `BR Globo News`, `Sky News`) e streams sem token PT (`CANAL FANTASTICO`) eram persistidos no catálogo canónico, contaminando a playlist final.
 - **Nova API**: o construtor de `PipelineIngestionService` agora **exige** um `CountryChannelValidator` (fail-fast no construtor via `ArgumentNullException`).
