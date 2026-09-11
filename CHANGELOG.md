@@ -34,6 +34,12 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
   - **Sem mudança de comportamento do pipeline a jusante**: contas descobertas continuam a ser promovidas via `TelegramScraperService.PromoteXtreamAccount` (já existente) a `CandidatePlaylist { DetectedFrom = "xtream publication" }`. O `AnalyzePlaylist` → `M3uParserService.Parse` → `ValidateStreams` → `TestStreamsAsync` continua a ser o único caminho de teste e merge. **Zero duplicação de pipeline.**
   - **Fixture nova em testes**: `m3uCrawler.Tests/Fixtures/iptvgold_07-09-2026.html` (532 KB, 70 contas Xtream, gitignored — contém credenciais reais obtidas em runtime de publicação autorizada). Auto-copiada para `bin/Fixtures/` via `<None Update="Fixtures\*"/>` no `m3uCrawler.Tests.csproj`. MD5 verificado em download: `b8af67a21c7810fcd96868d7ae142a5d`.
 
+### 🛠 Validação end-to-end do scheduler (2026-09-11)
+- **Novo ficheiro de testes** `m3uCrawler.Tests/SchedulerEndToEndTests.cs` (8 testes) que demonstram o encadeamento real das 4 actions do scheduler + composição com catálogo populado + idempotência de dispose.
+- **Validação confirmou**: `discoverM3u`, `validatePlaylist`, `generatePlaylist`, `syncDispatcharr` são resolvidas via DI, executam serviços reais, persistem `LastRunAtUtc`/`LastResult`/`NextRunAtUtc`, respeitam cancellation, capturam erros sem matar o runner, e são encadeáveis num único tick sequencial.
+- **Gap documentado (suportado por código)**: o pipeline real (`M3uCrawlerService.SearchM3u8Files` ou `TelegramScraperService.SearchAndTestM3UInTelegramAsync`) **NÃO** chama `EnsureSourceAsync`/`RecordChannelSourceAsync` — confirmado por grep. Após runs de produção, o catálogo canónico fica apenas com canais seedados pelo JSON baseline; nenhum `SourceEntity`/`ChannelSourceEntity` novo é acrescentado pelo pipeline. A bridge entre pipeline (Telegram/M3U) e catálogo é uma evolução futura fora do scope desta entrega. O teste `Real_pipeline_does_not_upsert_sources_or_channel_sources` regista este comportamento explicitamente.
+- **Total agora**: 1335 testes em Release (anterior: 1327), 0 falhas, 0 warnings novos.
+
 ### 🛠 PHASE 12 — fecho da Automation / Scheduler (2026-09-11)
 - **Acções concretas `IScheduledAction`** (4 novas, todas reutilizam serviços existentes sem duplicar pipeline):
   - `ScheduledM3uDiscoveryAction` (`discoverM3u`) — `M3uCrawlerService.SearchM3u8Files` + `M3uTesterService.TestMultipleStreams` → `output/playlist.m3u`.
