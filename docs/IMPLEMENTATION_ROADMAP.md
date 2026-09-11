@@ -3180,6 +3180,120 @@ Total: 1370 → **1378 testes** em Release (8 novos do
 `Normalize_strips_country_tokens_case_insensitively`), 0 falhas,
 3x runs estáveis. Build: 0 errors, 0 warnings novos.
 
+## 32.16 — PHASE 9A — Autópsia do bloqueio HTTP (2026-09-11)
+
+A primeira execução real no servidor (commit `7cd42ea` + WIP) **validou
+a PHASE 9A** mas expôs um **gap de integração**: a operação de
+**download de playlist** (`DownloadPlaylistContentAsync` em
+`TelegramScraperService.cs`) não usava a infra-estrutura da 9A —
+criava o seu próprio `HttpClient` com timeout fixo de 30s, sem
+`CancellationToken` propagado.
+
+### 1. Causa exacta do bloqueio
+
+```
+TelegramScraperService.DownloadPlaylistContentAsync(url):
+
+    using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+    client.DefaultRequestHeaders.Add("User-Agent", "...");
+    return await client.GetStringAsync(url);
+```
+
+Cenários em que isto **bloqueia muito para além dos 30s** ou
+**não termina**:
+
+- **Blackhole (accept, sem bytes)**: `HttpClient.Timeout = 30s`
+  deveria disparar mas em sockets TCP em estado `ESTABLISHED` sem
+  dados, o timeout pode depender da implementação do `SocketsHttpHandler`
+  e nem sempre dispara no momento esperado. Em produção
+  (`strscr1912.xyz:2095`) isto bloqueou > 5 min.
+- **Partial response (200 OK + headers + stall)**: o servidor envia
+  alguns bytes e depois para. `GetStringAsync` espera pelo
+  `Content-Length` completo — sem `CancellationToken` ligado a um
+  `CancellationTokenSource.CreateLinkedTokenSource`, o timeout pode
+  não disparar enquanto o socket não for fechado pelo peer.
+- **N candidatos bloqueantes em série**: `TelegramScraperService`
+  itera sequencialmente (`for` loop, linha 170), pelo que 30s × N
+  candidatos adiciona-se sem qualquer sinal de progresso.
+
+### 2. Onde a 9A era (e não era) aplicada
+
+A PHASE 9A foi desenhada especificamente para o `M3uTesterService`:
+
+- ✅ `M3uTesterService.SharedHttpClient` com `ConnectTimeout=5s`,
+  `OverallTimeout=12s` (via `CancelAfter`), retries selectivos,
+  cache, host-failure tracker.
+- ✅ `M3uTesterService.RunAsync` / `TestSingleAsync` aplicam tudo isto
+  no probe de streams individuais.
+- ❌ `TelegramScraperService.DownloadPlaylistContentAsync` usava
+  `new HttpClient { Timeout = 30s }` — **bypass** completo da 9A.
+- ❌ `M3uCrawlerService._httpClient` (modo legacy `--m3u8-search`)
+  também tem o mesmo problema, mas é fora do escopo desta entrada.
+- ❌ `DispatcharrClientFactory` cria `new HttpClient` por chamada
+  de login, mas o Dispatcharr está em rede interna, não bloqueia.
+
+### 3. Correcção mínima
+
+Em vez de criar um segundo framework de retry/timeout, **integrámos
+o `DownloadPlaylistContentAsync` na infra-estrutura 9A existente**:
+
+**`M3uTesterService.DownloadPlaylistContentAsync(string url,
+CancellationToken ct)`** (novo método público) reusa o
+`SharedHttpClient` e o `OverallTimeout` da 9A. Devolve
+`(string? Content, bool IsSuccess)` e nunca bloqueia para além do
+timeout configurado (default 12s, configurável via Dashboard).
+
+**`TelegramScraperService.DownloadPlaylistContentAsync`** passa a
+receber o `M3uTesterService` como parâmetro e chama o novo método.
+A assinatura local foi minimamente alterada.
+
+### 4. Testes adicionados
+
+`m3uCrawler.Tests/HttpTimeoutAutopsyTests.cs` (5 testes novos,
+todos passam em Release):
+
+- `PHASE9A_PATTERN_blackhole_terminates_within_OverallTimeout` —
+  confirma que um blackhole é terminado em ≤ 15s.
+- `PHASE9A_PATTERN_blackhole_never_exceeds_overall_timeout_plus_small_margin` —
+  confirma que o download nunca excede o OverallTimeout + 3s de
+  tolerância.
+- `PHASE9A_PATTERN_blackhole_propagates_to_caller_via_cancellation` —
+  confirma que o `CancellationToken` do caller é respeitado.
+- `PHASE9A_PATTERN_partial_response_eventually_returns_via_overall_timeout` —
+  reproduz o caso mais perigoso (partial response com stall).
+- `PHASE9A_PATTERN_batch_with_one_blackhole_completes_within_2x_overall_timeout` —
+  confirma que um blackhole no meio de um batch não trava a iteração
+  toda.
+- `PHASE9A_PATTERN_404_returns_quickly` (control) — confirma que
+  404 retorna rápido, sem overhead.
+- `LEGACY_PATTERN_blackhole_blocks_until_30s_HttpClient_timeout`
+  (skipped, documentacional) — mostra que o padrão antigo pode
+  bloquear para além dos 30s em condições de socket parciais.
+
+Os testes usam TCP servers locais com fault injection (accept sem
+bytes; 200 OK com Content-Length grande e stall), sem dependência da
+Internet.
+
+### 5. Resultado
+
+- Build Release: **0 errors, 32 warnings** (todos pré-existentes).
+- Suite: **1384 passed, 0 failed, 1 skipped** (1385 total, 2x runs
+  estáveis).
+- Antes da correcção: 1378 testes.
+- Depois: 1384 testes (+ 6 do autósia, − 1 skipped, + 1 novo skipped
+  legadO documentacional).
+
+### 6. Não foi feito
+
+- ❌ Novo mecanismo de retry-limit / circuit-breaker.
+- ❌ `--telegram-once` flag.
+- ❌ Alterações a R1/R2/R3.
+- ❌ Substituição da imagem em produção.
+- ❌ Push ao remoto.
+
+A correcção é **mínima e localizada**: reusa a infra-estrutura 9A
+existente em vez de criar uma segunda implementação.
+
 ---
 
 # 33. Definition of Done

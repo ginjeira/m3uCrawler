@@ -173,7 +173,7 @@ namespace m3uCrawler.Services
                     string? content = candidate.Content;
                     if (content == null)
                     {
-                        content = await DownloadPlaylistContentAsync(candidate.Url);
+                        content = await DownloadPlaylistContentAsync(candidate.Url, tester);
                     }
 
                     // URLs sem extensão (.m3u/.m3u8) detetados por heurística só são tratados como
@@ -701,22 +701,24 @@ namespace m3uCrawler.Services
             }
         }
 
-        private async Task<string?> DownloadPlaylistContentAsync(string? url)
+        private async Task<string?> DownloadPlaylistContentAsync(string? url, M3uTesterService tester)
         {
-            if (string.IsNullOrWhiteSpace(url)) return null;
-
-            try
+            // PHASE 9A: reusa o HttpClient partilhado e o OverallTimeout
+            // do M3uTesterService em vez de criar um HttpClient com
+            // timeout fixo de 30s sem CancellationToken (que era o
+            // comportamento original e podia bloquear a iteração
+            // quando o servidor remoto aceitava a conexão mas não
+            // respondia).
+            var (content, ok) = await tester.DownloadPlaylistContentAsync(url);
+            if (!ok)
             {
-                using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
-                client.DefaultRequestHeaders.Add("User-Agent",
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
-                return await client.GetStringAsync(url);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Falha ao descarregar playlist '{CredentialSanitizer.SanitizeUrl(url)}': {ex.Message}");
+                if (!string.IsNullOrWhiteSpace(url))
+                {
+                    Console.WriteLine($"Falha ao descarregar playlist '{CredentialSanitizer.SanitizeUrl(url)}': timeout ou erro de rede");
+                }
                 return null;
             }
+            return content;
         }
 
         private async Task<string?> DownloadTelegramDocumentTextAsync(Document document)

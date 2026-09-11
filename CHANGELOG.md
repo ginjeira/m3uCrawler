@@ -49,6 +49,15 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 - **Diagnóstico 27 streams pós-R3**: 19 matched (vs 18 pré-R3), 2 auto-created (vs 3), 6 REJECTED (estável). Confidence média 0.95 (vs 0.85 pré-R3).
 - **Não cria nova PHASE**: é hardening final do PHASE-Bridge. Documentado como `PHASE-Bridge / R3-hardening` em `docs/IMPLEMENTATION_ROADMAP.md` secção 32.15.
 
+### 🛠 PHASE 9A — Autópsia do bloqueio HTTP (2026-09-11)
+- **Gap de integração identificado**: a primeira execução real no servidor expôs que `TelegramScraperService.DownloadPlaylistContentAsync` usava `new HttpClient { Timeout = 30s }` em vez do `M3uTesterService.SharedHttpClient` da PHASE 9A. Em produção, candidatos como `strscr1912.xyz:2095` conseguiam bloquear a iteração durante minutos.
+- **Correcção mínima**: adicionado `M3uTesterService.DownloadPlaylistContentAsync(url, ct)` que reusa o `SharedHttpClient` e o `OverallTimeout` (default 12s) da 9A. `TelegramScraperService` foi refactorizado para chamar este método, passando o `M3uTesterService` como parâmetro.
+- **Sem segundo framework**: a correcção **integra-se** na infra-estrutura 9A existente, sem duplicar lógica de timeout/retry.
+- **Testes adicionados** (`HttpTimeoutAutopsyTests.cs`, 6 testes, 5 pass + 1 skipped documentacional): reproduzem blackholes TCP, partial response com stall, 404 rápido, e batch com blackhole no meio. Confirmam que o download termina dentro de `OverallTimeout=12s` + tolerância e que `CancellationToken` do caller é respeitado.
+- **Resultado**: 1378 → **1384 testes** em Release (5 novos + 1 skipped + 1 documentacional), 0 falhas, 2x runs estáveis. Build: 0 errors, 0 warnings novos.
+- **Não foi feito**: novo retry-limit/circuit-breaker, `--telegram-once`, alterações a R1/R2/R3, push ao remoto, substituição da imagem em produção.
+- Documentado como `PHASE 9A — Autópsia do bloqueio HTTP` em `docs/IMPLEMENTATION_ROADMAP.md` secção 32.16.
+
 ### 🛠 PHASE-Bridge / R2 — saneamento do catálogo canónico PT (2026-09-11)
 - **Gap fechado (suportado por código)**: a validação end-to-end identificou divergências entre o `CatalogSeed` programático e o JSON baseline canónico (`docs/catalog/m3ucrawler_pt_canonical_catalog.json`). O `CatalogSeed` criava duplicações para o mesmo canal lógico (`rtp1`/`rtp-1`, `cnn`/`cnnportugal`, `benfica-tv`/`btv`, etc.).
 - **`CatalogSeed.Channels` saneado**: removidos canais duplicados pela baseline JSON (RTP 1-3, SIC, TVI, SIC Notícias, RTP Notícias, CNN, CMTV, News Now, Canal 11, V+ TVI, RTP Memória, Porto Canal, Sport TV 1, Eurosport 1, SIC K, Panda, Cartoon Network, Hollywood, Cinemundo, AXN, Discovery, NatGeo, Globo). Mantidos apenas canais não cobertos pela baseline: Sport TV 2-7, Sport TV NBA, TVI 24, TVI Internacional, SIC Mulher, SIC Radical, Baby TV, Canal Panda (key legada), Odisseia, BTV (key alinhada).
