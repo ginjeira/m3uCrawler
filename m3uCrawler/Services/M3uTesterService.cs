@@ -77,6 +77,34 @@ public sealed class M3uTesterService : IDisposable
         return BuildStreamFromOutcome(url, title, group, outcome);
     }
 
+    /// <summary>
+    /// Variante de <see cref="TestM3u8Stream"/> que devolve também o
+    /// <see cref="StreamTestOutcome"/> completo, para que o caller
+    /// possa distinguir <c>working</c> de <c>retryable</c> (Timeout,
+    /// Network, HTTP 5xx, etc.) usando <see cref="StreamFailureClassifier"/>.
+    ///
+    /// Foi adicionada para suportar a semântica de retenção da
+    /// playlist Telegram (PHASE 9A): um stream existente cujo teste
+    /// falhe com uma falha retryable NAO deve ser removido da
+    /// playlist. Apenas falhas terminais (404, 401/403) justificam
+    /// remoção.
+    /// </summary>
+    public async Task<(M3uStream Stream, StreamTestOutcome Outcome)> TestM3u8StreamWithOutcomeAsync(
+        string url,
+        string title = "",
+        string group = "Unknown",
+        CancellationToken cancellationToken = default)
+    {
+        var outcome = await TestSingleInternalAsync(
+            url,
+            _options,
+            new ConcurrentDictionary<string, bool>(StringComparer.OrdinalIgnoreCase),
+            new StreamValidationMetrics { TotalUrls = 1 },
+            cancellationToken);
+        _lastMetrics = new StreamValidationMetrics { TotalUrls = 1 };
+        return (BuildStreamFromOutcome(url, title, group, outcome), outcome);
+    }
+
     public async Task<List<M3uStream>> TestMultipleStreams(
         List<string> urls,
         int maxConcurrency = -1,

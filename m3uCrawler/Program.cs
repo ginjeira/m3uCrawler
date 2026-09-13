@@ -4,6 +4,7 @@ using m3uCrawler.Services.Automation;
 using m3uCrawler.Services.Catalog;
 using m3uCrawler.Services.Matching;
 using m3uCrawler.Services.SourceOrdering;
+using m3uCrawler.Services.Validation;
 using m3uCrawler.Models;
 using System.Text;
 using System.Net;
@@ -713,6 +714,7 @@ namespace m3uCrawler
                 historyHours: telegramHistoryHours,
                 countryCode: countryCode,
                 countriesDir: countriesDir,
+                report: new RunReport(),
                 pipelineIngestor: pipelineIngestor,
                 pipelineSourceKey: $"telegram-{Slugify(term)}");
 
@@ -741,15 +743,44 @@ namespace m3uCrawler
                     Console.WriteLine($"🔁 Re-testando {existingMain.Count} stream(s) existentes de playlist.m3u...");
                     var retestTasks = existingMain.Select(async stream =>
                     {
-                        var tested = await tester.TestM3u8Stream(stream.Url, stream.Title, stream.Group);
+                        // TestM3u8StreamWithOutcomeAsync devolve o StreamTestOutcome
+                        // completo (inclui FailureKind) para que o caller possa
+                        // distinguir working de retryable usando o
+                        // StreamFailureClassifier. Pre-requisito da semantica de
+                        // retencao da playlist Telegram (PHASE 9A): canais com
+                        // Timeout/Network/etc. NAO desaparecem.
+                        var (tested, outcome) = await tester.TestM3u8StreamWithOutcomeAsync(
+                            stream.Url, stream.Title, stream.Group);
                         tested.OriginalExtInf = stream.OriginalExtInf;
                         tested.Logo = stream.Logo;
-                        return tested;
+                        return (tested, outcome);
                     });
 
                     var retested = await Task.WhenAll(retestTasks);
-                    stillWorkingMain = retested.Where(s => s.IsWorking).ToList();
-                    Console.WriteLine($"✅ Streams existentes ainda funcionais: {stillWorkingMain.Count}/{existingMain.Count}");
+
+                    // Soft-filter: working OR retryable -> mantido.
+                    // Apenas falhas deterministicas/terminais removem o stream.
+                    var filterResult = TelegramScraperService.FilterRetainedStreams(
+                        retested.Select(x => (x.tested, x.outcome.FailureKind)));
+
+                    stillWorkingMain = filterResult.Preserved;
+
+                    Console.WriteLine($"✅ Streams existentes preservados: {stillWorkingMain.Count}/{existingMain.Count}");
+                    Console.WriteLine($"   • Working: {filterResult.PreservedWorking}");
+                    Console.WriteLine($"   • Retryable (preservados): {filterResult.PreservedRetryable}");
+                    Console.WriteLine($"   • Terminal (removidos): {filterResult.RemovedTerminal}");
+                    if (filterResult.RemovedByKind.Count > 0)
+                    {
+                        Console.WriteLine("   • Detalhe de remoções terminais: " +
+                            string.Join(", ", filterResult.RemovedByKind.Select(kv => $"{kv.Key}={kv.Value}")));
+                    }
+                    var retryableBreakdown = string.Join(", ",
+                        filterResult.PreservedByKind.Where(kv => kv.Key != "Working")
+                                                    .Select(kv => $"{kv.Key}={kv.Value}"));
+                    if (!string.IsNullOrEmpty(retryableBreakdown))
+                    {
+                        Console.WriteLine($"   • Detalhe de preservações retryable: {retryableBreakdown}");
+                    }
                 }
                 finally
                 {

@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using m3uCrawler.Models;
 using m3uCrawler.Services.Catalog;
+using m3uCrawler.Services.Validation;
 using TL;
 
 namespace m3uCrawler.Services
@@ -152,7 +153,7 @@ namespace m3uCrawler.Services
             rep.StartedAt = DateTime.UtcNow;
             rep.Status = "running";
 
-            var (messagesAnalyzed, candidates) = await SearchM3UInTelegramInternal(keyword, limit, historyHours);
+            var (messagesAnalyzed, candidates) = await SearchM3UInTelegramInternal(keyword, limit, historyHours, rep);
             rep.MessagesAnalyzed = messagesAnalyzed;
             rep.CandidatesFound = candidates.Count;
             LastRunReport = rep;
@@ -335,7 +336,7 @@ namespace m3uCrawler.Services
         }
 
         private async Task<(int MessagesAnalyzed, List<CandidatePlaylist> Candidates)> SearchM3UInTelegramInternal(
-            string keyword, int limit = 200, int historyHours = 24)
+            string keyword, int limit = 200, int historyHours = 24, RunReport? report = null)
         {
             var candidates = new List<CandidatePlaylist>();
             // Publicacoes descobertas em qualquer mensagem: referencias Telegram
@@ -373,6 +374,15 @@ namespace m3uCrawler.Services
                     return (0, candidates);
             }
 
+            // ==== R1 (2026-09-13): cutoff UNICO por ciclo ====
+            // A implementacao anterior calculava DateTime.UtcNow.AddHours(-historyHours)
+            // dentro de foreach (var dialog in dialogList), o que deslocava o cutoff
+            // por dialogo. Agora o cutoff e' calculado UMA unica vez antes de iterar.
+            // Se um dialogo demora muito a processar, mensagens no limite da janela
+            // continuam elegiveis.
+            var cycleCutoff = DateTime.UtcNow.AddHours(-historyHours);
+            if (report != null) report.DialogsTotal = dialogList.Length;
+
             foreach (var dialog in dialogList)
             {
                 var peer = dialog.Peer;
@@ -394,19 +404,38 @@ namespace m3uCrawler.Services
                     _ => "Chat"
                 };
 
-                int offsetId = 0;
-                var cutoffDate = DateTime.UtcNow.AddHours(-historyHours);
-                bool reachedCutoff = false;
-
-                while (!reachedCutoff)
+                // Identifica peer id e tipo para telemetria em caso de erro.
+                long? peerId = peer switch
                 {
-                    Messages_MessagesBase? history = null;
+                    PeerUser pu => pu.user_id,
+                    PeerChat pc => pc.chat_id,
+                    PeerChannel pch => pch.channel_id,
+                    _ => null
+                };
+                string peerType = peer switch
+                {
+                    PeerUser => "User",
+                    PeerChat => "Chat",
+                    PeerChannel => "Channel",
+                    _ => "Unknown"
+                };
 
-                    while (history == null)
-                    {
-                        try
+                int processedBeforeDialog = messagesAnalyzed;
+
+                // ==== R2 (2026-09-13): isolar erros de Messages_GetHistory ====
+                // Antes, qualquer excepcao nao-FLOOD_WAIT (e.g. RpcError 500) matava
+                // o ciclo. Agora o try/catch interno ao dialogo permite continuar
+                // para os dialogos seguintes. O dialogo e' registado como incompleto
+                // em RunReport.DialogErrors.
+                try
+                {
+                    await EnumerateDialogHistoryAsync(
+                        resolvedPeer,
+                        chatTitle,
+                        cycleCutoff,
+                        async (offsetId) =>
                         {
-                            history = resolvedPeer switch
+                            return resolvedPeer switch
                             {
                                 User user => await _client.Messages_GetHistory(
                                     user, offset_id: offsetId, offset_date: default,
@@ -416,106 +445,30 @@ namespace m3uCrawler.Services
                                     add_offset: 0, limit: 100, max_id: 0, min_id: 0),
                                 _ => null
                             };
-                        }
-                        catch (WTelegram.WTException ex) when (ex.Message.Contains("FLOOD_WAIT"))
+                        },
+                        async (msg) =>
                         {
-                            int waitSeconds = ExtractFloodWaitSeconds(ex.Message);
-                            Console.WriteLine($"Flood control: a aguardar {waitSeconds}s antes de continuar...");
-                            await Task.Delay(TimeSpan.FromSeconds(waitSeconds + 1));
-                        }
-                    }
-
-                    if (history?.Messages == null || history.Messages.Length == 0)
-                        break;
-
-                    foreach (var msgBase in history.Messages)
-                    {
-                        if (msgBase is not Message m) continue;
-
-                        if (m.date < cutoffDate)
-                        {
-                            reachedCutoff = true;
-                            break;
-                        }
-
-                        messagesAnalyzed++;
-
-                        // Em TL atual a legenda de um media é o próprio texto da mensagem.
-                        string text = m.message ?? "";
-                        string filename = "";
-
-                        if (m.media is MessageMediaDocument mediaDoc &&
-                            mediaDoc.document is Document doc)
-                        {
-                            foreach (var attr in doc.attributes)
-                            {
-                                if (attr is DocumentAttributeFilename fn)
-                                    filename = fn.file_name ?? "";
-                            }
-                        }
-
-                        // Descoberta NÃO depende da keyword: deteta por URL, nome de anexo ou conteúdo.
-                        var found = _detector.DetectFromMessage(text, filename).ToList();
-
-                        // URLs HTTP genericas (nao captadas pelo detector) sao candidatas a
-                        // publicacao HTML com cards Xtream. Marcadas para que o loop principal
-                        // encaminhe para XtreamPublicationResolver quando o conteudo nao for
-                        // #EXTM3U.
-                        foreach (var pubUrl in ExtractRemainingHttpUrls(text, found))
-                        {
-                            found.Add(new CandidatePlaylist
-                            {
-                                Kind = CandidateSourceKind.Url,
-                                Url = pubUrl,
-                                SourceText = text,
-                                DetectedFrom = "xtream publication url",
-                                RequiresContentVerification = true
-                            });
-                        }
-
-                        // Descoberta de publicacoes Telegram (t.me/c/<channel>/<message>)
-                        // e URLs HTTP publicas adicionais. As primeiras exigem resolucao
-                        // via WTelegram apos o loop principal (precisamos de access_hash do
-                        // cache de dialogos); as URLs HTTP serao processadas como
-                        // publicacoes URL pelo mesmo pipeline.
-                        var pubs = TelegramPublicationDiscovery.DiscoverFromText(text, chatTitle);
-                        foreach (var p in pubs)
-                        {
-                            // Evitar duplicados dentro do mesmo ciclo (mesma referencia
-                            // pode aparecer em varias mensagens).
-                            if (!discoveredPublications.Any(d =>
-                                    d.ReferenceUrl == p.ReferenceUrl &&
-                                    d.ChannelId == p.ChannelId &&
-                                    d.MessageId == p.MessageId))
-                            {
-                                discoveredPublications.Add(p);
-                            }
-                        }
-
-                        bool hasAttachment = m.media is MessageMediaDocument media2 && media2.document is Document;
-                        Document? attachmentDocument = hasAttachment
-                            ? (Document)((MessageMediaDocument)m.media!).document
-                            : null;
-
-                        await ProcessAttachmentCandidatesAsync(
-                            found, hasAttachment, filename, text, async () =>
-                            {
-                                if (attachmentDocument == null) return null;
-                                return await DownloadTelegramDocumentTextAsync(attachmentDocument);
-                            });
-
-                        foreach (var candidate in found)
-                        {
-                            candidate.Source = chatTitle;
-                            candidates.Add(candidate);
-                        }
-                    }
-
-                    offsetId = history.Messages.Last().ID;
-
-                    if (reachedCutoff || history.Messages.Length < 100) break;
-
-                    await Task.Delay(300);
+                            // Processa uma mensagem que passou o filtro temporal.
+                            messagesAnalyzed++;
+                            await ProcessOneTelegramMessageAsync(
+                                msg, chatTitle, report, discoveredPublications, candidates);
+                        });
+                }
+                catch (WTelegram.WTException ex) when (ex.Message.Contains("FLOOD_WAIT"))
+                {
+                    // FLOOD_WAIT e' tratado no helper interno (com retry). Se
+                    // escapar ate aqui, e' um caso muito excepcional; regista
+                    // como incompleto mas NAO mata o ciclo.
+                    RecordDialogIncomplete(report, chatTitle, peerId, peerType, ex,
+                        offsetId: -1, processedBeforeDialog, messagesAnalyzed);
+                }
+                catch (Exception ex)
+                {
+                    // RpcError 500, IOException, SocketException, RpcException,
+                    // qualquer outra falha de enumacao. Regista e continua.
+                    int lastOffset = ExtractLastOffsetFromExceptionMessage(ex.Message);
+                    RecordDialogIncomplete(report, chatTitle, peerId, peerType, ex,
+                        offsetId: lastOffset, processedBeforeDialog, messagesAnalyzed);
                 }
 
                 await Task.Delay(500);
@@ -553,6 +506,288 @@ namespace m3uCrawler.Services
             }
 
             return (messagesAnalyzed, candidates);
+        }
+
+        // ==== Helper R1+R2 (2026-09-13): iteracao testavel ====
+        // EnumerateDialogHistoryAsync itera paginacao de um dialogo ate'
+        // atingir o cutoff temporal. Isolado para ser testado sem rede.
+        //
+        // Parametros:
+        //   - resolvedPeer: ignorado (mantido por simetria da API anterior);
+        //     a identificacao real do peer ja' foi feita no caller.
+        //   - chatTitle: identificador legivel (usado apenas em logs).
+        //   - cutoffDate: cutoff temporal UNICO por ciclo (R1).
+        //   - pageFetcher: delegate que devolve a proxima pagina de
+        //     mensagens para um dado offsetId. Pode lancar excepcoes
+        //     (RpcError, IOException, FLOOD_WAIT, etc.).
+        //   - onMessage: callback async invocado por cada mensagem que
+        //     passou o filtro temporal. NAO e' invocado para mensagens
+        //     anteriores ao cutoff.
+        //
+        // Comportamento:
+        //   - Paginas sao obtidas em batches de 100.
+        //   - Mensagens sao processadas em ordem descendente de data
+        //     (ordem natural do Messages_GetHistory).
+        //   - O loop termina quando:
+        //     (a) uma mensagem com m.date < cutoffDate e' encontrada, ou
+        //     (b) o servidor devolve pagina vazia / menor que 100, ou
+        //     (c) pageFetcher devolve null, ou
+        //     (d) pageFetcher lanca uma excepcao (propagada ao caller).
+        //   - FLOOD_WAIT e' tratado dentro do helper (com retry).
+        //   - Outras excepcoes sao propagadas.
+        internal static async Task EnumerateDialogHistoryAsync(
+            object resolvedPeer,
+            string chatTitle,
+            DateTime cutoffDate,
+            Func<int, Task<Messages_MessagesBase?>> pageFetcher,
+            Func<Message, Task> onMessage)
+        {
+            int offsetId = 0;
+            bool reachedCutoff = false;
+
+            while (!reachedCutoff)
+            {
+                Messages_MessagesBase? history = null;
+
+                while (history == null)
+                {
+                    try
+                    {
+                        history = await pageFetcher(offsetId);
+                    }
+                    catch (WTelegram.WTException ex) when (ex.Message.Contains("FLOOD_WAIT"))
+                    {
+                        int waitSeconds = ExtractFloodWaitSeconds(ex.Message);
+                        Console.WriteLine($"Flood control: a aguardar {waitSeconds}s antes de continuar...");
+                        await Task.Delay(TimeSpan.FromSeconds(waitSeconds + 1));
+                    }
+                }
+
+                if (history?.Messages == null || history.Messages.Length == 0)
+                    break;
+
+                foreach (var msgBase in history.Messages)
+                {
+                    if (msgBase is not Message m) continue;
+
+                    if (m.date < cutoffDate)
+                    {
+                        reachedCutoff = true;
+                        break;
+                    }
+
+                    await onMessage(m);
+                }
+
+                offsetId = history.Messages.Last().ID;
+
+                if (reachedCutoff || history.Messages.Length < 100) break;
+
+                await Task.Delay(300);
+            }
+        }
+
+        // ==== Processamento de UMA mensagem (R1+R2 refactor) ====
+        // Extraido do foreach original para manter o helper de iteracao
+        // pequeno e testavel. Contem toda a logica que era inline:
+        // telemetria de media, detector, ProcessAttachmentCandidates,
+        // adicao de candidates e publications descobertas.
+        private async Task ProcessOneTelegramMessageAsync(
+            Message m,
+            string chatTitle,
+            RunReport? report,
+            List<TelegramPublicationRef> discoveredPublications,
+            List<CandidatePlaylist> candidates)
+        {
+            // Em TL atual a legenda de um media é o próprio texto da mensagem.
+            string text = m.message ?? "";
+            string filename = "";
+
+            // ==== Telemetria 2026-09-12: diagnosticar silent-drop de documentos HTML ====
+            string mediaType = m.media switch
+            {
+                MessageMediaDocument => "Document",
+                MessageMediaPhoto => "Photo",
+                null => "None",
+                _ => "Other"
+            };
+            Document? telemetryDoc = null;
+            long docSize = -1;
+            string? docMime = null;
+            int docAttributes = 0;
+
+            if (m.media is MessageMediaDocument mediaDocTelemetry &&
+                mediaDocTelemetry.document is Document docTelemetry)
+            {
+                telemetryDoc = docTelemetry;
+                docSize = docTelemetry.size;
+                docMime = docTelemetry.mime_type;
+                docAttributes = docTelemetry.attributes?.Length ?? 0;
+            }
+
+            if (mediaType != "None")
+            {
+                if (report != null) report.MessagesWithMedia++;
+                if (mediaType == "Document") { if (report != null) report.MessagesWithDocumentMedia++; }
+                else if (mediaType == "Photo") { if (report != null) report.MessagesWithPhotoMedia++; }
+            }
+
+            if (m.media is MessageMediaDocument mediaDoc &&
+                mediaDoc.document is Document doc)
+            {
+                foreach (var attr in doc.attributes)
+                {
+                    if (attr is DocumentAttributeFilename fn)
+                        filename = fn.file_name ?? "";
+                }
+
+                if (!string.IsNullOrWhiteSpace(filename))
+                {
+                    if (report != null) report.DocumentsWithFilename++;
+                }
+                else
+                {
+                    if (report != null) report.DocumentsWithoutFilename++;
+                }
+            }
+
+            // [TelegramDetect]
+            if (m.media != null)
+            {
+                Console.WriteLine(
+                    $"[TelegramDetect] messageId={m.ID} date={m.date:o} " +
+                    $"mediaType={mediaType} documentType={telemetryDoc?.GetType().Name ?? "<n/a>"} " +
+                    $"filename='{TruncateForLog(filename, 128)}' " +
+                    $"mimeType='{docMime ?? "<n/a>"}' size={docSize} " +
+                    $"captionLength={text.Length} docAttributes={docAttributes}");
+
+                if (IsTelemetryTarget(filename, text))
+                {
+                    Console.WriteLine(
+                        $"[TelegramDetectTarget] messageId={m.ID} date={m.date:o} " +
+                        $"mediaType={mediaType} filename='{TruncateForLog(filename, 128)}' " +
+                        $"mimeType='{docMime ?? "<n/a>"}' size={docSize}");
+                }
+            }
+
+            // Descoberta NAO depende da keyword.
+            var found = _detector.DetectFromMessage(text, filename).ToList();
+
+            if (m.media != null)
+            {
+                var htmlCount = found.Count(c => c.DetectedFrom == "html attachment");
+                if (report != null) report.HtmlCandidatesCreated += htmlCount;
+                Console.WriteLine(
+                    $"[TelegramDetectResult] messageId={m.ID} filename='{TruncateForLog(filename, 128)}' " +
+                    $"candidates={found.Count}");
+            }
+
+            foreach (var pubUrl in ExtractRemainingHttpUrls(text, found))
+            {
+                found.Add(new CandidatePlaylist
+                {
+                    Kind = CandidateSourceKind.Url,
+                    Url = pubUrl,
+                    SourceText = text,
+                    DetectedFrom = "xtream publication url",
+                    RequiresContentVerification = true
+                });
+            }
+
+            var pubs = TelegramPublicationDiscovery.DiscoverFromText(text, chatTitle);
+            foreach (var p in pubs)
+            {
+                if (!discoveredPublications.Any(d =>
+                        d.ReferenceUrl == p.ReferenceUrl &&
+                        d.ChannelId == p.ChannelId &&
+                        d.MessageId == p.MessageId))
+                {
+                    discoveredPublications.Add(p);
+                }
+            }
+
+            bool hasAttachment = m.media is MessageMediaDocument media2 && media2.document is Document;
+            Document? attachmentDocument = hasAttachment
+                ? (Document)((MessageMediaDocument)m.media!).document
+                : null;
+
+            // Note: ProcessAttachmentCandidatesAsync is async.
+            await ProcessAttachmentCandidatesAsync(
+                found, hasAttachment, filename, text, async () =>
+                {
+                    if (attachmentDocument == null) return null;
+                    return await DownloadTelegramDocumentTextAsync(attachmentDocument);
+                },
+                report: report,
+                messageId: m.ID);
+
+            foreach (var candidate in found)
+            {
+                candidate.Source = chatTitle;
+                candidates.Add(candidate);
+            }
+        }
+
+        // ==== Registo de dialogo incompleto (R2) ====
+        // Chamado quando o EnumerateDialogHistoryAsync lanca uma excepcao
+        // nao-FLOOD_WAIT. Incrementa DialogsIncomplete e adiciona um
+        // DialogError ao RunReport com o contexto da falha.
+        private static void RecordDialogIncomplete(
+            RunReport? report,
+            string chatTitle,
+            long? peerId,
+            string peerType,
+            Exception ex,
+            int offsetId,
+            int messagesBeforeDialog,
+            int currentMessagesAnalyzed)
+        {
+            int processed = currentMessagesAnalyzed - messagesBeforeDialog;
+
+            if (report != null)
+            {
+                report.DialogsIncomplete++;
+                report.DialogErrors.Add(new DialogError
+                {
+                    ChatTitle = chatTitle,
+                    PeerId = peerId,
+                    PeerType = peerType,
+                    ExceptionType = ex.GetType().Name,
+                    ExceptionMessage = TruncateForLog(ex.Message, 256),
+                    FailedAtOffsetId = offsetId,
+                    MessagesProcessedInDialog = processed,
+                    TimestampUtc = DateTime.UtcNow
+                });
+            }
+
+            Console.WriteLine(
+                $"[TelegramDialogError] chatTitle='{TruncateForLog(chatTitle, 64)}' " +
+                $"peerType={peerType} peerId={peerId?.ToString() ?? "<n/a>"} " +
+                $"failedAtOffsetId={offsetId} messagesProcessedInDialog={processed} " +
+                $"exceptionType={ex.GetType().Name} message='{TruncateForLog(ex.Message, 128)}'");
+        }
+
+        // Tenta extrair o offsetId do contexto de uma mensagem de exceccao
+        // do WTelegram. Devolve -1 se nao for possivel.
+        private static int ExtractLastOffsetFromExceptionMessage(string exceptionMessage)
+        {
+            // O WTelegram normalmente inclui o codigo da mensagem afectada
+            // (e.g. "AFFECTED_MSG_ID=12345"). E' heuristico e tolerante
+            // a falhas - devolve -1 quando nao reconhece o padrao.
+            if (string.IsNullOrEmpty(exceptionMessage)) return -1;
+
+            const string tag = "AFFECTED_MSG_ID=";
+            int idx = exceptionMessage.IndexOf(tag, StringComparison.Ordinal);
+            if (idx >= 0)
+            {
+                int start = idx + tag.Length;
+                int end = start;
+                while (end < exceptionMessage.Length && char.IsDigit(exceptionMessage[end]))
+                    end++;
+                if (end > start && int.TryParse(exceptionMessage[start..end], out var v))
+                    return v;
+            }
+            return -1;
         }
 
         /// <summary>
@@ -661,7 +896,9 @@ namespace m3uCrawler.Services
             bool hasAttachment,
             string filename,
             string text,
-            Func<Task<string?>> downloader)
+            Func<Task<string?>> downloader,
+            RunReport? report = null,
+            int? messageId = null)
         {
             // Materializa a vista filtrada ANTES de iterar para que o `Add` que ocorre dentro
             // do loop (quando o conteúdo do anexo começa por #EXTM3U) não invalide o enumerador
@@ -680,6 +917,13 @@ namespace m3uCrawler.Services
                     var attachmentText = await downloader();
                     candidate.Content = attachmentText;
 
+                    // ==== Telemetria 2026-09-12 ====
+                    if (report != null) report.DocumentDownloadSuccesses++;
+                    Console.WriteLine(
+                        $"[TelegramDocumentDownload] messageId={messageId} " +
+                        $"filename='{TruncateForLog(filename, 128)}' " +
+                        $"result=success bytes={(attachmentText?.Length ?? 0)}");
+
                     if (!string.IsNullOrWhiteSpace(attachmentText) &&
                         new M3uCandidateDetector().LooksLikePlaylistContent(attachmentText) &&
                         !found.Any(x => x.DetectedFrom == "#EXTM3U content"))
@@ -696,9 +940,47 @@ namespace m3uCrawler.Services
                 }
                 catch (Exception ex)
                 {
+                    // ==== Telemetria 2026-09-12 ====
+                    if (report != null) report.DocumentDownloadFailures++;
+                    Console.WriteLine(
+                        $"[TelegramDocumentDownload] messageId={messageId} " +
+                        $"filename='{TruncateForLog(filename, 128)}' " +
+                        $"result=failure exceptionType={ex.GetType().Name} message='{TruncateForLog(ex.Message, 128)}'");
                     Console.WriteLine($"Falha ao processar anexo '{filename}': {ex.Message}");
                 }
             }
+        }
+
+        // Trunca uma string para logging, sem expor credenciais.
+        // Conservative: tambem remove newlines que quebrariam o formato key=value.
+        internal static string TruncateForLog(string? value, int maxLen)
+        {
+            if (string.IsNullOrEmpty(value)) return string.Empty;
+            var compact = value.Replace('\n', ' ').Replace('\r', ' ').Replace('\t', ' ');
+            if (compact.Length <= maxLen) return compact;
+            return compact[..maxLen] + "...";
+        }
+
+        // Determina se uma mensagem deve ser marcada como alvo prioritario
+        // na telemetria (i.e., potencialmente relacionada com a publicacao
+        // de IPTV reportada). NAO filtra — apenas sinaliza.
+        internal static bool IsTelemetryTarget(string? filename, string? caption)
+        {
+            if (!string.IsNullOrEmpty(filename))
+            {
+                if (filename.Contains("204.52.191.254", StringComparison.Ordinal)) return true;
+                if (filename.Contains("RATTENPAPST", StringComparison.Ordinal)) return true;
+                if (filename.Contains("97111a99", StringComparison.Ordinal)) return true;
+                if (filename.Contains("6dcd9b4bd6", StringComparison.Ordinal)) return true;
+            }
+            if (!string.IsNullOrEmpty(caption))
+            {
+                if (caption.Contains("204.52.191.254", StringComparison.Ordinal)) return true;
+                if (caption.Contains("RATTENPAPST", StringComparison.Ordinal)) return true;
+                if (caption.Contains("97111a99ffbe", StringComparison.Ordinal)) return true;
+                if (caption.Contains("6dcd9b4bd6", StringComparison.Ordinal)) return true;
+            }
+            return false;
         }
 
         private async Task<string?> DownloadPlaylistContentAsync(string? url, M3uTesterService tester)
@@ -766,6 +1048,53 @@ namespace m3uCrawler.Services
     int rejected = streams.Count - accepted.Count;
     return (accepted, rejected);
 }
+
+        // Filtra streams existentes re-testados para retencao na playlist.
+        //
+        // Semantica (PHASE 9A): um stream existente e' mantido se
+        //   - o teste actual passou (IsWorking == true); OU
+        //   - o teste falhou com uma falha classificada como retryable
+        //     por StreamFailureClassifier (Timeout, Network,
+        //     ConnectionRefused, DnsFailure, HttpStatus429,
+        //     HttpStatus5xx).
+        //
+        // Apenas falhas terminais/deterministic (404, 401/403, TLS,
+        // Auth, etc.) levam a remocao. Esta regra evita que um
+        // timeout transitorio de 12s apague a playlist inteira,
+        // como observado em 2026-09-11 (48579 streams -> 25
+        // streams apos reteste).
+        //
+        // Este helper e' isolado para ser testavel sem HTTP:
+        // recebe uma sequencia de (M3uStream, StreamFailureKind)
+        // e devolve as duas particoes (preserved, removedByKind).
+        internal static FilterRetainedResult FilterRetainedStreams(
+            IEnumerable<(M3uStream Stream, StreamFailureKind FailureKind)> retestOutcomes)
+        {
+            var preserved = new List<M3uStream>();
+            var removedByKind = new Dictionary<string, int>(StringComparer.Ordinal);
+            var preservedByKind = new Dictionary<string, int>(StringComparer.Ordinal);
+
+            foreach (var (stream, kind) in retestOutcomes)
+            {
+                var kindName = kind.ToString();
+                if (stream.IsWorking || Validation.StreamFailureClassifier.IsRetryable(kind))
+                {
+                    preserved.Add(stream);
+                    // Distingue Working de Retryable dentro dos preservados
+                    // para o relatorio final.
+                    var bucketKey = stream.IsWorking ? "Working" : kindName;
+                    preservedByKind.TryGetValue(bucketKey, out var n);
+                    preservedByKind[bucketKey] = n + 1;
+                }
+                else
+                {
+                    removedByKind.TryGetValue(kindName, out var n);
+                    removedByKind[kindName] = n + 1;
+                }
+            }
+
+            return new FilterRetainedResult(preserved, preservedByKind, removedByKind);
+        }
 
         // Funde streams existentes (re-testados) com os novos funcionais, dedupundivos por URL
         // e priorizando os funcionais. Usado por --telegram-maintain e testável sem Telegram.
@@ -949,5 +1278,24 @@ namespace m3uCrawler.Services
             if (ingestor == null) throw new ArgumentNullException(nameof(ingestor));
             return ingestor.IngestAsync(streams, sourceKey, sourceKindName, countryCode, cancellationToken);
         }
+    }
+
+    /// <summary>
+    /// Resultado de <see cref="TelegramScraperService.FilterRetainedStreams"/>:
+    /// as particoes de streams preservados vs removidos apos re-teste,
+    /// com contadores por StreamFailureKind para telemetria.
+    /// </summary>
+    public sealed record FilterRetainedResult(
+        List<M3uStream> Preserved,
+        Dictionary<string, int> PreservedByKind,
+        Dictionary<string, int> RemovedByKind)
+    {
+        public int PreservedRetryable =>
+            PreservedByKind.Where(kv => kv.Key != "Working").Sum(kv => kv.Value);
+
+        public int PreservedWorking =>
+            PreservedByKind.TryGetValue("Working", out var n) ? n : 0;
+
+        public int RemovedTerminal => RemovedByKind.Sum(kv => kv.Value);
     }
 }
