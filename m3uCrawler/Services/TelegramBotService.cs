@@ -3,6 +3,7 @@ using Telegram.Bot.Types;
 using Telegram.Bot.Polling;
 using Telegram.Bot.Types.Enums;
 using m3uCrawler.Services;
+using m3uCrawler.Services.Validation;
 
 namespace m3uCrawler.Services;
 
@@ -53,8 +54,10 @@ public class TelegramBotService
             cancellationToken: ct
         );
 
-        // 2. Testar streams
-        var tester = new M3uTesterService();
+        // 2. Testar streams — 9A-PROD-WIRING: tester via factory ligado
+        // ao state partilhado do processo.
+        var tester = StreamValidationTesterFactory.CreateTester(
+            TryLoadSharedValidationState() ?? StreamValidationTesterFactory.CreateIsolatedState());
         var tested = await tester.TestMultipleStreams(urls, 10);
 
         var working = tested.Where(s => s.IsWorking).ToList();
@@ -90,5 +93,23 @@ public class TelegramBotService
     {
         Console.WriteLine($"Erro Telegram: {ex.Message}");
         return Task.CompletedTask;
+    }
+
+    // Helper partilhado com o mesmo nome em outros call sites. Carrega o
+    // StreamValidationState se o runtime-data existir; caso contrario
+    // devolve null para fallback isolado.
+    private static StreamValidationState? TryLoadSharedValidationState()
+    {
+        try
+        {
+            var runtimeDir = Path.Combine(Directory.GetCurrentDirectory(), "runtime-data");
+            if (!Directory.Exists(runtimeDir)) return null;
+            var store = new StreamValidationPolicyStore(runtimeDir);
+            return StreamValidationTesterFactory.CreateStateFromStore(store);
+        }
+        catch
+        {
+            return null;
+        }
     }
 }

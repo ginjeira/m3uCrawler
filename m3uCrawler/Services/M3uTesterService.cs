@@ -31,14 +31,37 @@ public sealed class M3uTesterService : IDisposable
 
     private readonly StreamValidationOptions _options;
     private readonly StreamValidationCache _cache;
-    private readonly HostFailureTracker _hostTracker = new();
+    private readonly HostFailureTracker _hostTracker;
     private StreamValidationMetrics? _lastMetrics;
 
+    /// <summary>
+    /// Construtor legacy. Cria options, cache e hostTracker PRIVADOS.
+    /// Mantido para retro-compatibilidade com o Dashboard e com testes
+    /// que precisam de tester isolado. Em produção, prefira o construtor
+    /// que recebe <see cref="StreamValidationState"/>.
+    /// </summary>
     public M3uTesterService(StreamValidationOptions? options = null)
     {
         _options = (options ?? new StreamValidationOptions()).Clone();
         _options.Sanitize();
         _cache = new StreamValidationCache(_options);
+        _hostTracker = new HostFailureTracker();
+    }
+
+    /// <summary>
+    /// Construtor que recebe o <see cref="StreamValidationState"/>
+    /// partilhado do processo. Tester fica "ligado" ao state: usa as
+    /// mesmas options, o mesmo cache e o mesmo host-tracker que outros
+    /// testers criados a partir do mesmo state.
+    ///
+    /// Introduzido em 2026-09-13 pela 9A-PROD-WIRING.
+    /// </summary>
+    public M3uTesterService(StreamValidationState state)
+    {
+        if (state == null) throw new ArgumentNullException(nameof(state));
+        _options = state.Options.Clone();
+        _cache = state.Cache;
+        _hostTracker = state.HostTracker;
     }
 
     public StreamValidationOptions Options => _options.Clone();
@@ -123,6 +146,109 @@ public sealed class M3uTesterService : IDisposable
             list.Add(BuildStreamFromOutcome(o.Url, ExtractTitleFromUrl(o.Url), "Unknown", o));
         }
         return list;
+    }
+
+    /// <summary>
+    /// Testa N streams com backpressure explícita. Resolve o problema
+    /// de scheduling explosivo quando o caller precisa de testar streams
+    /// individualmente (e.g. <c>--telegram-maintain</c>) — em vez de
+    /// <c>existingMain.Select(...).Task.WhenAll</c>, que cria N Tasks
+    /// simultâneas, este método cria no máximo
+    /// <see cref="StreamValidationOptions.MaxConcurrency"/> workers
+    /// activos e processa a lista de forma incremental.
+    ///
+    /// Semelhante a <see cref="RunAsync"/> em semântica, mas devolve
+    /// <see cref="M3uStream"/> em vez de <see cref="StreamTestOutcome"/>
+    /// e mantém a ORDEM dos inputs (necessário para o caller mapear
+    /// resultado → stream original sem usar dicionário).
+    ///
+    /// Introduzido em 2026-09-13 pela 9A-PROD-WIRING para resolver o
+    /// "48k Tasks" do ciclo <c>--telegram-maintain</c>.
+    /// </summary>
+    public async Task<List<(M3uStream Stream, StreamTestOutcome Outcome)>> TestManyBoundedAsync(
+        IReadOnlyList<(string Url, string Title, string Group)> requests,
+        CancellationToken cancellationToken = default)
+    {
+        var results = new List<(M3uStream, StreamTestOutcome)>(requests.Count);
+        if (requests.Count == 0) return results;
+
+        var maxConcurrency = Math.Max(1, _options.MaxConcurrency);
+        var semaphore = new SemaphoreSlim(maxConcurrency);
+        var metrics = new StreamValidationMetrics { TotalUrls = requests.Count };
+        _lastMetrics = metrics;
+
+        var hostCacheStatus = new ConcurrentDictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+
+        var tasks = new List<Task<(M3uStream Stream, StreamTestOutcome Outcome)>>(requests.Count);
+
+        // Materializa indices antes de iterar para preservar a ORDEM
+        // dos resultados mesmo que o scheduling dos workers seja
+        // nao-determinico.
+        var orderedResults = new (M3uStream, StreamTestOutcome)?[requests.Count];
+
+        for (var i = 0; i < requests.Count; i++)
+        {
+            var idx = i;
+            var (url, title, group) = requests[idx];
+
+            tasks.Add(Task.Run(async () =>
+            {
+                try
+                {
+                    await semaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    orderedResults[idx] = (
+                        BuildStreamFromOutcome(url, title, group,
+                            StreamTestOutcome.Empty(url) with { WasShortCircuited = true }),
+                        StreamTestOutcome.Empty(url) with { WasShortCircuited = true });
+                    metrics.IncrementSkipped();
+                    return orderedResults[idx]!.Value;
+                }
+
+                try
+                {
+                    var outcome = await TestSingleInternalAsync(
+                        url, _options, hostCacheStatus, metrics, cancellationToken)
+                        .ConfigureAwait(false);
+                    var stream = BuildStreamFromOutcome(url, title, group, outcome);
+                    var pair = (stream, outcome);
+                    orderedResults[idx] = pair;
+                    return pair;
+                }
+                finally
+                {
+                    semaphore.Release();
+                }
+            }, CancellationToken.None));
+        }
+
+        try
+        {
+            await Task.WhenAll(tasks).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Cancellation coop: marca como skipped os que faltam.
+            for (var i = 0; i < orderedResults.Length; i++)
+            {
+                if (orderedResults[i] == null)
+                {
+                    var (u, t, g) = requests[i];
+                    orderedResults[i] = (
+                        BuildStreamFromOutcome(u, t, g, StreamTestOutcome.Empty(u) with { WasShortCircuited = true }),
+                        StreamTestOutcome.Empty(u) with { WasShortCircuited = true });
+                    metrics.IncrementSkipped();
+                }
+            }
+        }
+
+        foreach (var item in orderedResults)
+        {
+            results.Add(item ?? throw new InvalidOperationException("TestManyBoundedAsync invariant violated."));
+        }
+        return results;
     }
 
     public async Task<IReadOnlyList<StreamTestOutcome>> RunAsync(

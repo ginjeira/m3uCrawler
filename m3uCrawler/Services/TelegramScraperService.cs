@@ -162,7 +162,12 @@ namespace m3uCrawler.Services
                 ?? Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries");
             var validator = new CountryChannelValidator(countriesRoot);
             var parser = new M3uParserService();
-            var tester = new M3uTesterService();
+            // 9A-PROD-WIRING: tester criado via factory. Quando existe
+            // um stream_validation_policy.json no runtime-data, este
+            // tester usa a policy persistida. Caso contrario, usa
+            // defaults.
+            var tester = StreamValidationTesterFactory.CreateTester(
+                TryLoadSharedValidationState() ?? StreamValidationTesterFactory.CreateIsolatedState());
 
             var working = new List<M3uStream>();
 
@@ -1128,6 +1133,24 @@ namespace m3uCrawler.Services
 
             // Algumas exceções chegam mascaradas como FLOOD_WAIT_X sem número.
             return message.Contains("FLOOD_WAIT", StringComparison.OrdinalIgnoreCase) ? 180 : 30;
+        }
+
+        // Tenta carregar o StreamValidationState partilhado a partir do
+        // runtime-data. Devolve null se o directório não existir (e.g.
+        // em testes).
+        private static StreamValidationState? TryLoadSharedValidationState()
+        {
+            try
+            {
+                var runtimeDir = Path.Combine(Directory.GetCurrentDirectory(), "runtime-data");
+                if (!Directory.Exists(runtimeDir)) return null;
+                var store = new StreamValidationPolicyStore(runtimeDir);
+                return StreamValidationTesterFactory.CreateStateFromStore(store);
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         // ====================================================================

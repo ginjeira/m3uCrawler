@@ -438,7 +438,12 @@ namespace m3uCrawler
             }
 
             var crawler = new M3uCrawlerService();
-            var tester = new M3uTesterService();
+            // 9A-PROD-WIRING: o tester é criado via factory a partir de um
+            // state partilhado. Mesmo no modo M3U legacy isto alinha com o
+            // resto do processo — se houver um tester state configurado
+            // pelo dashboard, é o mesmo.
+            var tester = StreamValidationTesterFactory.CreateTester(
+                StreamValidationTesterFactory.CreateIsolatedState());
             var playlistManager = new PlaylistManagerService();
 
             // Se o dashboard standalone está activo, manter o processo vivo
@@ -737,31 +742,42 @@ namespace m3uCrawler
             List<M3uStream> stillWorkingMain;
             if (existingMain.Count > 0)
             {
-                var tester = new M3uTesterService();
+                // 9A-PROD-WIRING: tester criado via factory, ligado a um
+                // state partilhado para que cache e HostFailureTracker
+                // sobrevivam entre ciclos. Em producao o state vem do
+                // StreamValidationPolicyStore (carregado abaixo).
+                StreamValidationState? state = null;
+                try
+                {
+                    var runtimeDir = Path.Combine(Directory.GetCurrentDirectory(), "runtime-data");
+                    var store = new StreamValidationPolicyStore(runtimeDir);
+                    state = StreamValidationTesterFactory.CreateStateFromStore(store);
+                }
+                catch
+                {
+                    // Em testes ou em modo M3U legacy, o runtime-data
+                    // pode nao existir. Fallback para state isolado.
+                    state = StreamValidationTesterFactory.CreateIsolatedState();
+                }
+
+                var tester = StreamValidationTesterFactory.CreateTester(state);
                 try
                 {
                     Console.WriteLine($"🔁 Re-testando {existingMain.Count} stream(s) existentes de playlist.m3u...");
-                    var retestTasks = existingMain.Select(async stream =>
-                    {
-                        // TestM3u8StreamWithOutcomeAsync devolve o StreamTestOutcome
-                        // completo (inclui FailureKind) para que o caller possa
-                        // distinguir working de retryable usando o
-                        // StreamFailureClassifier. Pre-requisito da semantica de
-                        // retencao da playlist Telegram (PHASE 9A): canais com
-                        // Timeout/Network/etc. NAO desaparecem.
-                        var (tested, outcome) = await tester.TestM3u8StreamWithOutcomeAsync(
-                            stream.Url, stream.Title, stream.Group);
-                        tested.OriginalExtInf = stream.OriginalExtInf;
-                        tested.Logo = stream.Logo;
-                        return (tested, outcome);
-                    });
 
-                    var retested = await Task.WhenAll(retestTasks);
+                    // 9A-PROD-WIRING: TestManyBoundedAsync substitui o
+                    // Task.WhenAll explosivo. Cria no maximo
+                    // options.MaxConcurrency workers activos em vez de
+                    // N Tasks. Mantem a ORDEM dos resultados.
+                    var requests = existingMain
+                        .Select(s => (Url: s.Url, Title: s.Title, Group: s.Group))
+                        .ToList();
+                    var retested = await tester.TestManyBoundedAsync(requests);
 
                     // Soft-filter: working OR retryable -> mantido.
                     // Apenas falhas deterministicas/terminais removem o stream.
                     var filterResult = TelegramScraperService.FilterRetainedStreams(
-                        retested.Select(x => (x.tested, x.outcome.FailureKind)));
+                        retested.Select(x => (x.Stream, x.Outcome.FailureKind)));
 
                     stillWorkingMain = filterResult.Preserved;
 

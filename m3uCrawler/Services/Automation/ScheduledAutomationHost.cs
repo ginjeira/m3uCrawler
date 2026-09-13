@@ -6,6 +6,7 @@ using m3uCrawler.Models;
 using m3uCrawler.Services;
 using m3uCrawler.Services.Catalog;
 using m3uCrawler.Services.Matching;
+using m3uCrawler.Services.Validation;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace m3uCrawler.Services.Automation;
@@ -62,7 +63,11 @@ public sealed class ScheduledAutomationHost : IDisposable
         // Serviços existentes reutilizados (sem nova pipeline):
         sc.AddSingleton(new PlaylistManagerService());
         sc.AddSingleton(new M3uCrawlerService());
-        sc.AddSingleton(new M3uTesterService());
+        // 9A-PROD-WIRING: tester criado via factory a partir de um
+        // state partilhado. Singleton no DI garante que cache e
+        // HostFailureTracker sobrevivem entre execuções agendadas.
+        sc.AddSingleton(_ => StreamValidationTesterFactory.CreateTester(
+            TryLoadSharedValidationState() ?? StreamValidationTesterFactory.CreateIsolatedState()));
         sc.AddSingleton(new PlaylistComposerService(catalog.GetFactory()));
         sc.AddSingleton<AliasResolver>(_ => AliasResolver.FromFile(dispatcharrConfig.AliasFile));
 
@@ -109,5 +114,22 @@ public sealed class ScheduledAutomationHost : IDisposable
     {
         _runner.Dispose();
         _services.Dispose();
+    }
+
+    // Helper partilhado: tenta carregar o StreamValidationState do
+    // runtime-data. Devolve null se o directório não existir.
+    private static StreamValidationState? TryLoadSharedValidationState()
+    {
+        try
+        {
+            var runtimeDir = Path.Combine(Directory.GetCurrentDirectory(), "runtime-data");
+            if (!Directory.Exists(runtimeDir)) return null;
+            var store = new StreamValidationPolicyStore(runtimeDir);
+            return StreamValidationTesterFactory.CreateStateFromStore(store);
+        }
+        catch
+        {
+            return null;
+        }
     }
 }
