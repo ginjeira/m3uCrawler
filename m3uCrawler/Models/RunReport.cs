@@ -111,6 +111,55 @@ namespace m3uCrawler.Models
         // Promovidas a CandidatePlaylist que entraram no pipeline existente.
         public int XtreamAccountsForwarded { get; set; }
 
+        // === Telegram Document telemetry (introduzido 2026-09-12) ===
+        // Diagnostica silent-drop de mensagens Telegram com anexos (HTML/M3U/M3U8).
+        // Cada campo conta uma fase do pipeline de descoberta. Sem telemetria,
+        // mensagens com media e sem filename visivel eram contabilizadas em
+        // MessagesAnalyzed mas ignoradas em silencio nas fases seguintes.
+
+        // Total de mensagens analisadas que tinham media (qualquer tipo).
+        public int MessagesWithMedia { get; set; }
+
+        // Mensagens com media = MessageMediaDocument (anexo de documento).
+        public int MessagesWithDocumentMedia { get; set; }
+
+        // Mensagens com media = MessageMediaPhoto (imagem com caption).
+        public int MessagesWithPhotoMedia { get; set; }
+
+        // Mensagens com m.media.MessageMediaDocument que tinha DocumentAttributeFilename
+        // com file_name nao vazio e nao whitespace.
+        public int DocumentsWithFilename { get; set; }
+
+        // Mensagens com m.media.MessageMediaDocument SEM DocumentAttributeFilename
+        // utilisavel (sem attribute, ou com file_name vazio).
+        public int DocumentsWithoutFilename { get; set; }
+
+        // Numero de CandidatePlaylist criados pelo M3uCandidateDetector com
+        // DetectedFrom == "html attachment" ou "attachment filename".
+        public int HtmlCandidatesCreated { get; set; }
+
+        // Downloads de anexos que terminaram sem exceccao.
+        public int DocumentDownloadSuccesses { get; set; }
+
+        // Downloads de anexos que lancaram exceccao (capturados por
+        // ProcessAttachmentCandidatesAsync / DownloadTelegramDocumentTextAsync).
+        public int DocumentDownloadFailures { get; set; }
+
+        // === Telegram enumeration resilience (introduzido 2026-09-13) ===
+        // Quando Messages_GetHistory lanca uma excepcao nao-FLOOD_WAIT
+        // (e.g. RpcError 500 RPC_CALL_FAIL), o dialogo e' marcado como
+        // incompleto e o ciclo continua para o dialogo seguinte.
+
+        // Total de dialogos encontrados em Messages_GetAllDialogs.
+        public int DialogsTotal { get; set; }
+
+        // Numero de dialogos que NAO foram completamente enumerados
+        // (atingiram excepcao ou nao leram ate ao cutoff).
+        public int DialogsIncomplete { get; set; }
+
+        // Detalhe de cada dialogo incompleto: peer, exception, offset, etc.
+        public List<DialogError> DialogErrors { get; set; } = new();
+
         public List<string> RejectionReasons { get; set; } = new();
         public List<DiscoveredPlaylist> DiscoveredPlaylists { get; set; } = new();
         public List<PublicationTriageEntry> PublicationsTriageLog { get; set; } = new();
