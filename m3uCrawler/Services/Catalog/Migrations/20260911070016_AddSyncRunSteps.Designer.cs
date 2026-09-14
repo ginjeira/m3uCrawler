@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using m3uCrawler.Services.Catalog;
 
@@ -10,9 +11,11 @@ using m3uCrawler.Services.Catalog;
 namespace m3uCrawler.Services.Catalog.Migrations
 {
     [DbContext(typeof(ChannelCatalogDbContext))]
-    partial class ChannelCatalogDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260911070016_AddSyncRunSteps")]
+    partial class AddSyncRunSteps
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder.HasAnnotation("ProductVersion", "9.0.0");
@@ -713,55 +716,6 @@ namespace m3uCrawler.Services.Catalog.Migrations
                         .IsUnique();
 
                     b.ToTable("review_items", (string)null);
-                });
-
-            modelBuilder.Entity("m3uCrawler.Services.Catalog.ScheduledJobEntity", b =>
-                {
-                    b.Property<long>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("INTEGER");
-
-                    b.Property<string>("ActionName")
-                        .IsRequired()
-                        .HasMaxLength(80)
-                        .HasColumnType("TEXT");
-
-                    b.Property<DateTime>("CreatedAtUtc")
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("CronExpression")
-                        .IsRequired()
-                        .HasMaxLength(80)
-                        .HasColumnType("TEXT");
-
-                    b.Property<bool>("IsEnabled")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<string>("LastResult")
-                        .IsRequired()
-                        .HasMaxLength(120)
-                        .HasColumnType("TEXT");
-
-                    b.Property<DateTime?>("LastRunAtUtc")
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("Name")
-                        .IsRequired()
-                        .HasMaxLength(120)
-                        .HasColumnType("TEXT");
-
-                    b.Property<DateTime?>("NextRunAtUtc")
-                        .HasColumnType("TEXT");
-
-                    b.Property<DateTime>("UpdatedAtUtc")
-                        .HasColumnType("TEXT");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("Name")
-                        .IsUnique();
-
-                    b.ToTable("scheduled_jobs", (string)null);
                 });
 
             modelBuilder.Entity("m3uCrawler.Services.Catalog.SourceEntity", b =>

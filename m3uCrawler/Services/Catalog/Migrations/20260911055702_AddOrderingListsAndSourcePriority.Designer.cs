@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using m3uCrawler.Services.Catalog;
 
@@ -10,9 +11,11 @@ using m3uCrawler.Services.Catalog;
 namespace m3uCrawler.Services.Catalog.Migrations
 {
     [DbContext(typeof(ChannelCatalogDbContext))]
-    partial class ChannelCatalogDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260911055702_AddOrderingListsAndSourcePriority")]
+    partial class AddOrderingListsAndSourcePriority
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder.HasAnnotation("ProductVersion", "9.0.0");
@@ -122,49 +125,6 @@ namespace m3uCrawler.Services.Catalog.Migrations
                     b.ToTable("canonical_channels", (string)null);
                 });
 
-            modelBuilder.Entity("m3uCrawler.Services.Catalog.CanonicalGroupEntity", b =>
-                {
-                    b.Property<long>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("INTEGER");
-
-                    b.Property<string>("Country")
-                        .HasMaxLength(10)
-                        .HasColumnType("TEXT");
-
-                    b.Property<DateTime>("CreatedAtUtc")
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("DisplayName")
-                        .IsRequired()
-                        .HasMaxLength(200)
-                        .HasColumnType("TEXT");
-
-                    b.Property<bool>("IsDefault")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<bool>("IsEnabled")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<string>("Key")
-                        .IsRequired()
-                        .HasMaxLength(120)
-                        .HasColumnType("TEXT");
-
-                    b.Property<int>("Order")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<DateTime>("UpdatedAtUtc")
-                        .HasColumnType("TEXT");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("Key")
-                        .IsUnique();
-
-                    b.ToTable("canonical_groups", (string)null);
-                });
-
             modelBuilder.Entity("m3uCrawler.Services.Catalog.ChannelAliasEntity", b =>
                 {
                     b.Property<long>("Id")
@@ -260,37 +220,6 @@ namespace m3uCrawler.Services.Catalog.Migrations
                     b.ToTable("channel_sources", (string)null);
                 });
 
-            modelBuilder.Entity("m3uCrawler.Services.Catalog.ChannelSourceObservationEntity", b =>
-                {
-                    b.Property<long>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("INTEGER");
-
-                    b.Property<int>("Availability")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<long>("ChannelSourceId")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<int>("Epg")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<DateTime>("ObservedAtUtc")
-                        .HasColumnType("TEXT");
-
-                    b.Property<int>("Quality")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<long>("ResponseTimeMs")
-                        .HasColumnType("INTEGER");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("ChannelSourceId", "ObservedAtUtc");
-
-                    b.ToTable("channel_source_observations", (string)null);
-                });
-
             modelBuilder.Entity("m3uCrawler.Services.Catalog.DispatcharrChannelOwnershipEntity", b =>
                 {
                     b.Property<long>("Id")
@@ -365,42 +294,6 @@ namespace m3uCrawler.Services.Catalog.Migrations
                     b.ToTable("dispatcharr_stream_ownerships", (string)null);
                 });
 
-            modelBuilder.Entity("m3uCrawler.Services.Catalog.GroupMappingEntity", b =>
-                {
-                    b.Property<long>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("INTEGER");
-
-                    b.Property<long>("CanonicalGroupId")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<DateTime>("CreatedAtUtc")
-                        .HasColumnType("TEXT");
-
-                    b.Property<bool>("IsEnabled")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<string>("SourceGroupTitle")
-                        .IsRequired()
-                        .HasMaxLength(400)
-                        .HasColumnType("TEXT");
-
-                    b.Property<int>("SourceKind")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<DateTime>("UpdatedAtUtc")
-                        .HasColumnType("TEXT");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("CanonicalGroupId");
-
-                    b.HasIndex("SourceKind", "SourceGroupTitle")
-                        .IsUnique();
-
-                    b.ToTable("group_mappings", (string)null);
-                });
-
             modelBuilder.Entity("m3uCrawler.Services.Catalog.IdentityRuleEntity", b =>
                 {
                     b.Property<long>("Id")
@@ -432,95 +325,6 @@ namespace m3uCrawler.Services.Catalog.Migrations
                         .IsUnique();
 
                     b.ToTable("identity_rules", (string)null);
-                });
-
-            modelBuilder.Entity("m3uCrawler.Services.Catalog.ImportPolicyEntity", b =>
-                {
-                    b.Property<long>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("INTEGER");
-
-                    b.Property<DateTime>("CreatedAtUtc")
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("ExcludedGroupsCsv")
-                        .IsRequired()
-                        .HasMaxLength(2000)
-                        .HasColumnType("TEXT");
-
-                    b.Property<bool>("IsEnabled")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<int>("MediaKind")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<string>("TargetGroupsCsv")
-                        .IsRequired()
-                        .HasMaxLength(2000)
-                        .HasColumnType("TEXT");
-
-                    b.Property<DateTime>("UpdatedAtUtc")
-                        .HasColumnType("TEXT");
-
-                    b.Property<int>("VodPolicy")
-                        .HasColumnType("INTEGER");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("MediaKind")
-                        .IsUnique();
-
-                    b.ToTable("import_policies", (string)null);
-                });
-
-            modelBuilder.Entity("m3uCrawler.Services.Catalog.MatchingAuditEntity", b =>
-                {
-                    b.Property<long>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("INTEGER");
-
-                    b.Property<DateTime>("AtUtc")
-                        .HasColumnType("TEXT");
-
-                    b.Property<long?>("CanonicalChannelId")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<double>("Confidence")
-                        .HasColumnType("REAL");
-
-                    b.Property<string>("NormalizedIdentity")
-                        .IsRequired()
-                        .HasMaxLength(200)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("OriginalTitle")
-                        .IsRequired()
-                        .HasMaxLength(500)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("ReasonSignature")
-                        .IsRequired()
-                        .HasMaxLength(120)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("ResolutionKind")
-                        .IsRequired()
-                        .HasMaxLength(40)
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("SourceGroup")
-                        .HasMaxLength(200)
-                        .HasColumnType("TEXT");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("AtUtc");
-
-                    b.HasIndex("CanonicalChannelId");
-
-                    b.HasIndex("NormalizedIdentity");
-
-                    b.ToTable("matching_audits", (string)null);
                 });
 
             modelBuilder.Entity("m3uCrawler.Services.Catalog.OrderingItemEntity", b =>
@@ -715,55 +519,6 @@ namespace m3uCrawler.Services.Catalog.Migrations
                     b.ToTable("review_items", (string)null);
                 });
 
-            modelBuilder.Entity("m3uCrawler.Services.Catalog.ScheduledJobEntity", b =>
-                {
-                    b.Property<long>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("INTEGER");
-
-                    b.Property<string>("ActionName")
-                        .IsRequired()
-                        .HasMaxLength(80)
-                        .HasColumnType("TEXT");
-
-                    b.Property<DateTime>("CreatedAtUtc")
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("CronExpression")
-                        .IsRequired()
-                        .HasMaxLength(80)
-                        .HasColumnType("TEXT");
-
-                    b.Property<bool>("IsEnabled")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<string>("LastResult")
-                        .IsRequired()
-                        .HasMaxLength(120)
-                        .HasColumnType("TEXT");
-
-                    b.Property<DateTime?>("LastRunAtUtc")
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("Name")
-                        .IsRequired()
-                        .HasMaxLength(120)
-                        .HasColumnType("TEXT");
-
-                    b.Property<DateTime?>("NextRunAtUtc")
-                        .HasColumnType("TEXT");
-
-                    b.Property<DateTime>("UpdatedAtUtc")
-                        .HasColumnType("TEXT");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("Name")
-                        .IsUnique();
-
-                    b.ToTable("scheduled_jobs", (string)null);
-                });
-
             modelBuilder.Entity("m3uCrawler.Services.Catalog.SourceEntity", b =>
                 {
                     b.Property<long>("Id")
@@ -899,51 +654,6 @@ namespace m3uCrawler.Services.Catalog.Migrations
                     b.ToTable("sync_runs", (string)null);
                 });
 
-            modelBuilder.Entity("m3uCrawler.Services.Catalog.SyncRunStepEntity", b =>
-                {
-                    b.Property<long>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("INTEGER");
-
-                    b.Property<long>("DurationMs")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<DateTime>("FinishedAtUtc")
-                        .HasColumnType("TEXT");
-
-                    b.Property<int>("ItemsFailed")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<int>("ItemsProcessed")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<int>("ItemsSucceeded")
-                        .HasColumnType("INTEGER");
-
-                    b.Property<string>("Result")
-                        .IsRequired()
-                        .HasMaxLength(40)
-                        .HasColumnType("TEXT");
-
-                    b.Property<DateTime>("StartedAtUtc")
-                        .HasColumnType("TEXT");
-
-                    b.Property<string>("Step")
-                        .IsRequired()
-                        .HasMaxLength(80)
-                        .HasColumnType("TEXT");
-
-                    b.Property<long>("SyncRunId")
-                        .HasColumnType("INTEGER");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("SyncRunId", "Step")
-                        .IsUnique();
-
-                    b.ToTable("sync_run_steps", (string)null);
-                });
-
             modelBuilder.Entity("m3uCrawler.Services.Catalog.AffinityGroupEntity", b =>
                 {
                     b.HasOne("m3uCrawler.Services.Catalog.CanonicalChannelEntity", "CanonicalChannel")
@@ -1005,17 +715,6 @@ namespace m3uCrawler.Services.Catalog.Migrations
                     b.Navigation("CanonicalChannel");
                 });
 
-            modelBuilder.Entity("m3uCrawler.Services.Catalog.GroupMappingEntity", b =>
-                {
-                    b.HasOne("m3uCrawler.Services.Catalog.CanonicalGroupEntity", "CanonicalGroup")
-                        .WithMany()
-                        .HasForeignKey("CanonicalGroupId")
-                        .OnDelete(DeleteBehavior.Restrict)
-                        .IsRequired();
-
-                    b.Navigation("CanonicalGroup");
-                });
-
             modelBuilder.Entity("m3uCrawler.Services.Catalog.OrderingItemEntity", b =>
                 {
                     b.HasOne("m3uCrawler.Services.Catalog.CanonicalChannelEntity", "CanonicalChannel")
@@ -1043,17 +742,6 @@ namespace m3uCrawler.Services.Catalog.Migrations
                         .OnDelete(DeleteBehavior.SetNull);
 
                     b.Navigation("ApprovedCanonicalChannel");
-                });
-
-            modelBuilder.Entity("m3uCrawler.Services.Catalog.SyncRunStepEntity", b =>
-                {
-                    b.HasOne("m3uCrawler.Services.Catalog.SyncRunEntity", "SyncRun")
-                        .WithMany()
-                        .HasForeignKey("SyncRunId")
-                        .OnDelete(DeleteBehavior.Cascade)
-                        .IsRequired();
-
-                    b.Navigation("SyncRun");
                 });
 
             modelBuilder.Entity("m3uCrawler.Services.Catalog.AffinityGroupEntity", b =>

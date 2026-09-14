@@ -1,4 +1,5 @@
 using m3uCrawler.Models;
+using m3uCrawler.Services.Catalog;
 using System.Text;
 using System.Text.Json;
 
@@ -24,6 +25,35 @@ namespace m3uCrawler.Services
             await File.WriteAllTextAsync(filePath, m3uContent.ToString(), Encoding.UTF8);
             Console.WriteLine($"Playlist M3U guardada em: {filePath}");
             Console.WriteLine($"Total de streams funcionais: {workingStreams.Count}");
+        }
+
+        /// <summary>
+        /// PHASE 7 b — Escreve uma playlist M3U a partir de uma
+        /// <see cref="PlaylistComposition"/>. Mantém o formato
+        /// EXTINF/EXTM3U existente; usa o group canónico do
+        /// <see cref="PlaylistEntry.Group"/>. Não volta a testar
+        /// streams (a composição já foi feita com proveniência).
+        /// </summary>
+        public async Task WriteComposedAsync(PlaylistComposition composition, string filePath)
+        {
+            if (composition == null) throw new ArgumentNullException(nameof(composition));
+            if (string.IsNullOrWhiteSpace(filePath)) throw new ArgumentException("filePath é obrigatório.", nameof(filePath));
+
+            var sb = new StringBuilder();
+            sb.AppendLine("#EXTM3U");
+            sb.AppendLine($"#PLAYLIST:m3uCrawler - Generated on {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+            sb.AppendLine($"#ORDERING-LIST:{composition.OrderingListId}={composition.OrderingListName}");
+            sb.AppendLine();
+
+            foreach (var entry in composition.Entries)
+            {
+                sb.AppendLine($"#EXTINF:-1 group-title=\"{entry.Group}\",{entry.DisplayName}");
+                sb.AppendLine(entry.StreamUrl);
+            }
+
+            await File.WriteAllTextAsync(filePath, sb.ToString(), Encoding.UTF8);
+            Console.WriteLine($"Playlist (composed) guardada em: {filePath}");
+            Console.WriteLine($"Entradas: {composition.TotalEntries}; faltam: {composition.MissingChannels.Count}");
         }
 
         public async Task SaveToJsonReport(List<M3uStream> streams, string filePath)

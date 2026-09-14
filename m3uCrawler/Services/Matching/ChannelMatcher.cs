@@ -120,6 +120,45 @@ namespace m3uCrawler.Services.Matching
                 .GetResult();
         }
 
+        /// <summary>
+        /// PHASE 10 — Constrói um <see cref="MatchPlan"/> a partir de uma
+        /// <see cref="PlaylistComposition"/> pré-resolvida (PHASE 7).
+        /// A composição já contém a proveniência da stream escolhida
+        /// através do composer + SourcePriority (PHASE 6); esta função
+        /// apenas converte cada entry para <see cref="DiscoveredStream"/>
+        /// e chama o pipeline existente.
+        /// </summary>
+        public async Task<MatchPlan> BuildPlanFromCompositionAsync(
+            Services.Catalog.PlaylistComposition composition,
+            DispatcharrState existing,
+            MatchingOptions options,
+            IStreamOrderingPolicy ordering,
+            string sourcePlaylistPath,
+            string dispatcharrBaseUrl,
+            bool dryRun,
+            DateTime? nowUtc = null)
+        {
+            if (composition == null) throw new ArgumentNullException(nameof(composition));
+            var discovered = new List<DiscoveredStream>(composition.Entries.Count);
+            foreach (var entry in composition.Entries)
+            {
+                var m3u = new M3uStream
+                {
+                    Url = entry.StreamUrl,
+                    Title = entry.DisplayName,
+                    Group = entry.Group,
+                    IsWorking = true,
+                };
+                discovered.Add(new DiscoveredStream(
+                    m3u,
+                    Provider: $"source:{entry.SourceName}",
+                    Source: sourcePlaylistPath));
+            }
+            return await BuildPlanAsync(
+                discovered, existing, options, ordering,
+                sourcePlaylistPath, dispatcharrBaseUrl, dryRun, nowUtc);
+        }
+
         private async Task<MatchPlan> BuildPlanCoreInternalAsync(
             IReadOnlyList<DiscoveredStream> discovered,
             DispatcharrState existing,

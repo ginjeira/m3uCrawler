@@ -314,6 +314,61 @@ public sealed class SyncRunEntity
 }
 
 /// <summary>
+/// PHASE 11 — Passo detalhado dentro de uma <see cref="SyncRunEntity"/>.
+/// Permite desagregar a timeline da execução em fases observáveis
+/// (matching, validation, sync, etc.) com tempos e contadores.
+/// </summary>
+public sealed class SyncRunStepEntity
+{
+    public long Id { get; set; }
+
+    public long SyncRunId { get; set; }
+    public SyncRunEntity? SyncRun { get; set; }
+
+    /// <summary>Nome lógico do passo (e.g. "discovery", "matching", "apply").</summary>
+    public string Step { get; set; } = string.Empty;
+
+    public DateTime StartedAtUtc { get; set; }
+    public DateTime FinishedAtUtc { get; set; }
+    public long DurationMs { get; set; }
+
+    public int ItemsProcessed { get; set; }
+    public int ItemsSucceeded { get; set; }
+    public int ItemsFailed { get; set; }
+
+    public string Result { get; set; } = "ok";
+}
+
+/// <summary>
+/// PHASE 12 — Job agendado. O operador define um nome, uma
+/// expressão cron (formato simplificado: <c>minuto hora dia-do-mês
+/// mês dia-da-semana</c>) e uma acção opaca por nome. O
+/// <c>ScheduledJobRunner</c> calcula o próximo tick e dispara
+/// a acção quando chegar a hora.
+/// </summary>
+public sealed class ScheduledJobEntity
+{
+    public long Id { get; set; }
+
+    public string Name { get; set; } = string.Empty;
+
+    /// <summary>Cron simplificado (5 campos separados por espaços).</summary>
+    public string CronExpression { get; set; } = string.Empty;
+
+    /// <summary>Nome lógico da acção (e.g. "discoverTelegram").</summary>
+    public string ActionName { get; set; } = string.Empty;
+
+    public bool IsEnabled { get; set; } = true;
+
+    public DateTime? LastRunAtUtc { get; set; }
+    public DateTime? NextRunAtUtc { get; set; }
+    public string LastResult { get; set; } = string.Empty;
+
+    public DateTime CreatedAtUtc { get; set; }
+    public DateTime UpdatedAtUtc { get; set; }
+}
+
+/// <summary>
 /// Canal que gerou dúvida no country-level targeting e aguarda
 /// decisão humana. Criado quando um stream tem indicadores de país
 /// (e.g. "PT" no título) mas não bate num canal canónico
@@ -373,4 +428,333 @@ public enum PendingApprovalState
     Open = 0,
     Approved = 1,
     Rejected = 2,
+}
+
+/// <summary>
+/// PHASE 4 — Source externa que alimenta o catálogo.
+/// Pode ser Telegram, M3U, Xtream, HTTP, ficheiro local, ou manual.
+/// Cada source tem 0..N <see cref="ChannelSourceEntity"/>.
+/// </summary>
+public sealed class SourceEntity
+{
+    public long Id { get; set; }
+
+    /// <summary>Nome humano (ex.: "Telegram — canal m3u8-pt").</summary>
+    public string Name { get; set; } = string.Empty;
+
+    /// <summary>Slug único (ex.: "telegram-m3u8-pt").</summary>
+    public string Key { get; set; } = string.Empty;
+
+    public SourceKind Kind { get; set; } = SourceKind.M3U;
+
+    /// <summary>Origem concreta (URL, path, chat_id, etc.). Sanitizada.</summary>
+    public string Origin { get; set; } = string.Empty;
+
+    public bool IsEnabled { get; set; } = true;
+
+    public int Priority { get; set; }
+
+    public DateTime? LastDiscoveryAtUtc { get; set; }
+    public DateTime? LastValidationAtUtc { get; set; }
+
+    public DateTime CreatedAtUtc { get; set; }
+    public DateTime UpdatedAtUtc { get; set; }
+
+    public List<ChannelSourceEntity> ChannelSources { get; set; } = new();
+}
+
+public enum SourceKind
+{
+    Telegram = 0,
+    M3U = 1,
+    Xtream = 2,
+    Http = 3,
+    File = 4,
+    Manual = 5,
+}
+
+/// <summary>
+/// PHASE 4 — Associação entre um <see cref="CanonicalChannelEntity"/> e um
+/// stream concreto descoberto a partir de uma <see cref="SourceEntity"/>.
+/// Representa a proveniência: "este canal pode ser entregue por esta stream
+/// desta source". Uma source pode contribuir vários streams para o mesmo
+/// canal; um canal pode ter streams vindos de várias sources.
+/// </summary>
+public sealed class ChannelSourceEntity
+{
+    public long Id { get; set; }
+
+    public long CanonicalChannelId { get; set; }
+    public CanonicalChannelEntity? CanonicalChannel { get; set; }
+
+    public long SourceId { get; set; }
+    public SourceEntity? Source { get; set; }
+
+    /// <summary>URL sanitizada do stream (sem credenciais em claro).</summary>
+    public string StreamUrl { get; set; } = string.Empty;
+
+    /// <summary>Identificador opaco do stream dentro da source.</summary>
+    public string? ExternalStreamId { get; set; }
+
+    public StreamQuality Quality { get; set; } = StreamQuality.Unknown;
+    public EpgState Epg { get; set; } = EpgState.Unknown;
+    public AvailabilityState Availability { get; set; } = AvailabilityState.Discovered;
+
+    public double MatchConfidence { get; set; }
+    public string MatchMethod { get; set; } = string.Empty;
+
+    public DateTime FirstSeenAtUtc { get; set; }
+    public DateTime LastSeenAtUtc { get; set; }
+    public DateTime LastTestedAtUtc { get; set; }
+    public long LastResponseTimeMs { get; set; }
+
+    public bool IsEnabled { get; set; } = true;
+
+    public DateTime CreatedAtUtc { get; set; }
+    public DateTime UpdatedAtUtc { get; set; }
+}
+
+public enum StreamQuality
+{
+    Unknown = 0,
+    SD = 1,
+    HD = 2,
+    FHD = 3,
+    UHD = 4,
+    FourK = 5,
+}
+
+public enum EpgState
+{
+    Unknown = 0,
+    Available = 1,
+    Unavailable = 2,
+}
+
+public enum AvailabilityState
+{
+    Discovered = 0,
+    Validated = 1,
+    Reachable = 2,
+    Unreachable = 3,
+    Timeout = 4,
+    Dead = 5,
+}
+
+/// <summary>
+/// PHASE 5 — Lista de ordenação. Determina a ordem dos canais
+/// numa playlist gerada. Existe separadamente do catálogo canónico
+/// porque (a) o operador pode ter várias listas ("Portugal Principal",
+/// "Minha Lista"), (b) a posição é propriedade da lista, não do
+/// canal, (c) duas listas podem incluir o mesmo canal em posições
+/// diferentes.
+/// </summary>
+public sealed class OrderingListEntity
+{
+    public long Id { get; set; }
+
+    public string Name { get; set; } = string.Empty;
+
+    /// <summary>Slug único, imutável (e.g. "pt-principal").</summary>
+    public string Key { get; set; } = string.Empty;
+
+    public string? Country { get; set; }
+    public string? Description { get; set; }
+
+    public bool IsEnabled { get; set; } = true;
+
+    public DateTime CreatedAtUtc { get; set; }
+    public DateTime UpdatedAtUtc { get; set; }
+
+    public List<OrderingItemEntity> Items { get; set; } = new();
+}
+
+/// <summary>
+/// Item de uma <see cref="OrderingListEntity"/>: referencia um
+/// <see cref="CanonicalChannelEntity"/> numa posição específica.
+/// A posição 0..N é contínua dentro de cada lista; gaps não são
+/// permitidos (ver <c>OrderingListService</c>).
+/// </summary>
+public sealed class OrderingItemEntity
+{
+    public long Id { get; set; }
+
+    public long OrderingListId { get; set; }
+    public OrderingListEntity? OrderingList { get; set; }
+
+    public long CanonicalChannelId { get; set; }
+    public CanonicalChannelEntity? CanonicalChannel { get; set; }
+
+    public int Position { get; set; }
+    public bool IsEnabled { get; set; } = true;
+
+    public DateTime CreatedAtUtc { get; set; }
+    public DateTime UpdatedAtUtc { get; set; }
+}
+
+/// <summary>
+/// PHASE 6 — Política de prioridade entre <see cref="ChannelSourceEntity"/>
+/// quando várias streams estão disponíveis para o mesmo
+/// <see cref="CanonicalChannelEntity"/>. Persistida como JSON simples
+/// (os critérios são extensíveis) e aplicada em playlist generation.
+/// </summary>
+/// <summary>
+/// PHASE 8 — Política de import por tipo de media.
+/// Configurável pelo operador: TV ON/OFF, Radio ON/OFF, VOD ON/OFF,
+/// mais as políticas específicas de VOD (Import / Keep / Exclude)
+/// e grupos-alvo.
+/// </summary>
+public sealed class ImportPolicyEntity
+{
+    public long Id { get; set; }
+
+    public MediaKind MediaKind { get; set; } = MediaKind.Live;
+
+    /// <summary>Política específica para VOD (Live/Radio ignoram).</summary>
+    public VodPolicy VodPolicy { get; set; } = VodPolicy.ExcludeVod;
+
+    /// <summary>Lista de slugs de grupos alvo separados por vírgula.</summary>
+    public string TargetGroupsCsv { get; set; } = string.Empty;
+
+    /// <summary>Lista de slugs de grupos a excluir.</summary>
+    public string ExcludedGroupsCsv { get; set; } = string.Empty;
+
+    public bool IsEnabled { get; set; } = true;
+
+    public DateTime CreatedAtUtc { get; set; }
+    public DateTime UpdatedAtUtc { get; set; }
+}
+
+public enum MediaKind
+{
+    Live = 0,
+    Radio = 1,
+    Vod = 2,
+}
+
+public enum VodPolicy
+{
+    ImportVod = 0,
+    KeepVod = 1,
+    ExcludeVod = 2,
+}
+
+/// <summary>
+/// PHASE 8 — Grupo canónico persistente. Substitui o enum
+/// rígido <c>CanonicalEditorialGroup</c> por uma entidade
+/// configurável pelo operador.
+/// </summary>
+public sealed class CanonicalGroupEntity
+{
+    public long Id { get; set; }
+
+    /// <summary>Slug único (e.g. "portugal-live", "portugal-desporto").</summary>
+    public string Key { get; set; } = string.Empty;
+
+    public string DisplayName { get; set; } = string.Empty;
+    public string? Country { get; set; }
+    public int Order { get; set; }
+    public bool IsEnabled { get; set; } = true;
+    public bool IsDefault { get; set; }
+
+    public DateTime CreatedAtUtc { get; set; }
+    public DateTime UpdatedAtUtc { get; set; }
+}
+
+/// <summary>
+/// PHASE 8 — Mapping entre um <c>group-title</c> da source e um
+/// <see cref="CanonicalGroupEntity"/>. Nunca transforma
+/// automaticamente qualquer group-title num grupo canónico — só
+/// através de mapping explícito.
+/// </summary>
+public sealed class GroupMappingEntity
+{
+    public long Id { get; set; }
+
+    /// <summary>Tipo de source à qual o mapping se aplica.</summary>
+    public SourceKind SourceKind { get; set; }
+
+    /// <summary>group-title original (case-sensitive, verbatim da source).</summary>
+    public string SourceGroupTitle { get; set; } = string.Empty;
+
+    public long CanonicalGroupId { get; set; }
+    public CanonicalGroupEntity? CanonicalGroup { get; set; }
+
+    public bool IsEnabled { get; set; } = true;
+
+    public DateTime CreatedAtUtc { get; set; }
+    public DateTime UpdatedAtUtc { get; set; }
+}
+
+/// <summary>
+/// PHASE 3 — Auditoria de cada chamada a
+/// <c>CatalogResolver.ResolveAsync</c>. Permite observabilidade
+/// fina de matching por canal (que identidades foram resolvidas,
+/// qual o caminho, com que confiança).
+/// </summary>
+public sealed class MatchingAuditEntity
+{
+    public long Id { get; set; }
+
+    /// <summary>Identidade normalizada (mesma string passada a ResolveAsync).</summary>
+    public string NormalizedIdentity { get; set; } = string.Empty;
+
+    /// <summary>Título original (não normalizado) — referência.</summary>
+    public string OriginalTitle { get; set; } = string.Empty;
+
+    /// <summary>Source group do stream (e.g. "Portugal", "Desporto").</summary>
+    public string? SourceGroup { get; set; }
+
+    /// <summary>Caminho da decisão: <c>Rule</c>, <c>Alias</c>, <c>Unknown</c>, <c>CachedChannel</c>.</summary>
+    public string ResolutionKind { get; set; } = "Unknown";
+
+    public long? CanonicalChannelId { get; set; }
+
+    /// <summary>Confiança atribuída (1.0 para canonical/alias; 0 para unknown; ≤1 para rule).</summary>
+    public double Confidence { get; set; }
+
+    public string ReasonSignature { get; set; } = string.Empty;
+
+    public DateTime AtUtc { get; set; }
+}
+
+/// <summary>
+/// PHASE 9 b — Histórico de observações (Quality/EPG/Availability/ResponseTimeMs)
+/// por <see cref="ChannelSourceEntity"/>. Permite ver a evolução
+/// de um stream ao longo do tempo.
+/// </summary>
+public sealed class ChannelSourceObservationEntity
+{
+    public long Id { get; set; }
+
+    public long ChannelSourceId { get; set; }
+
+    public StreamQuality Quality { get; set; }
+    public EpgState Epg { get; set; }
+    public AvailabilityState Availability { get; set; }
+    public long ResponseTimeMs { get; set; }
+
+    public DateTime ObservedAtUtc { get; set; }
+}
+
+public sealed class SourcePriorityPolicyEntity
+{
+    public long Id { get; set; }
+
+    /// <summary>"global" para a política por defeito do sistema; "channel:{id}" para override por canal.</summary>
+    public string Scope { get; set; } = "global";
+
+    public long? CanonicalChannelId { get; set; }
+
+    /// <summary>Critérios em ordem de prioridade (Manual, Quality, Reliability, EPG, Latency, ResponseTime, Availability).</summary>
+    public string CriteriaJson { get; set; } = "[\"Manual\",\"Quality\",\"Reliability\",\"Availability\"]";
+
+    /// <summary>Quality preferida (UHD&gt;FHD&gt;HD&gt;SD). Empty = sem preferência.</summary>
+    public string PreferredQuality { get; set; } = string.Empty;
+
+    /// <summary>Se true, usa fallback para streams menos preferidas se a escolhida falhar.</summary>
+    public bool AllowFallback { get; set; } = true;
+
+    public DateTime CreatedAtUtc { get; set; }
+    public DateTime UpdatedAtUtc { get; set; }
 }
