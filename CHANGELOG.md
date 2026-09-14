@@ -8,6 +8,18 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 ## [Unreleased]
 
 ### ✨ Adicionado
+- **Fallback URL-only no `XtreamPublicationResolver.ResolveFromHtml`** (introduzido 2026-09-14): quando os caminhos DOM-based e flat-text não produzem nenhuma conta mas o HTML contém URLs `get.php?username=…&password=…`, o resolver extrai credenciais directamente das URLs como último fallback. Cobre o caso do publisher `m3u-sᴄᴀɴ` cuja edição de 14-09-2026 (mensagem Telegram `110751`) deixou de emitir labels visíveis e passou a disponibilizar **apenas as URLs** em `get.php`. A nova lógica:
+  - Detecta URLs `<scheme>://<host>[:<port>]/get.php?username=X&password=Y` independentemente dos atributos ou do texto à volta (`href`, texto puro, etc.).
+  - Suporta HTML entities (`&amp;`, `&#38;`, `&lt;`, `&gt;`) no query string.
+  - Valida que **ambos** `username=` e `password=` estão presentes (URLs sem uma das chaves são silenciosamente ignoradas).
+  - Deduplica por `(scheme, host, port, username)` exactamente como exige a regra de identidade lógica do projecto (password nunca participa).
+  - Restritivo: hostname passa `LooksLikeValidHost`, scheme é `http`/`https`, username/password ≤ 64 chars.
+  - Restaurado o caminho DOM-based como preferido: **só** activamos o fallback quando os dois caminhos anteriores devolvem 0 contas, evitando qualquer regressão na resolução do formato antigo (110705 produz 9 contas pelo DOM, fica inalterado).
+  - Validado em reprodução isolada: 110751 (`neorcqds.top:8080`) passa de `XtreamAccountsDiscovered=0` para `=751`; 110705 (mesmo host) continua em 9 contas. Zero duplicação de pipeline, zero mutação do Dispatcharr, zero regressão em testes existentes.
+- **Testes** (11 novos, todos passam em `<1s`): `XtreamPublicationResolverUrlOnlyFallbackTests` — formato legacy não-regressão, formato URL-only puro, dedup múltiplas URLs, portas explícitas/implícitas (https → 443), query parameters em ordem diferente, URL inválida/incompleta silenciosamente ignorada, URL sem username ignorada, URL sem password ignorada, HTML sem contas devolve 0, texto tipo `username=foo` mas não em URL real não é capturado, **fixture sanitizada baseada na estrutura real de 110751** com credenciais fictícias que resolve 3 contas distintas.
+- **Total agora**: **1466 testes** (anterior: 1455) — 11 novos, 0 removidos, 0 skipped incrementado.
+
+### ✨ Adicionado
 - **Resolução de publicações Telegram via t.me/c/ (introduzido 2026-09-09)**: uma mensagem Telegram que contém apenas um deep link para outra publicação do Telegram (e.g. `https://t.me/c/1635952193/110637`) deixa de ser invisível para o crawler. O pipeline agora descobre, resolve e tria estas referências em três camadas distintas:
   - **`TelegramPublicationDiscovery`** (parsing puro, sem I/O): identifica `https://t.me/c/<channel>/<message>` e URLs HTTP públicas adicionais no texto da mensagem.
   - **`TelegramPublicationResolver`** (recebe um `TelegramMessageFetcher` delegate, testável sem WTelegram): resolve a mensagem via `WTelegram.Channels_GetMessages(inputChannel, [InputMessageID])`, classifica o resultado em **`Resolved` / `ResolutionFailed` / `RequiresReview` / `Unsupported`**, aplica recursão com depth-limit (`MaxResolutionDepth = 3`) e seen-set para evitar ciclos, e re-aplica `XtreamPublicationResolver.ResolveFromHtml` quando o attachment é HTML com cards Xtream.

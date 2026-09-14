@@ -146,7 +146,138 @@ namespace m3uCrawler.Services
                 }
             }
 
+            // Fallback URL-only: se DOM e flat-text nao produziram nenhuma conta,
+            // tentar extrair credenciais directamente de URLs Xtream
+            //   <scheme>://<host>[:<port>]/get.php?username=X&password=Y
+            // presentes no HTML. Cobre publicacoes que apenas disponibilizam as
+            // URLs sem labels (ex. publisher m3u-sᴄᴀɴ, edicao 14-09-2026). Ver
+            // ResolveFromGetPhpUrls para detalhes.
+            if (accounts.Count == 0)
+            {
+                var urlAccounts = ResolveFromGetPhpUrls(html);
+                if (urlAccounts.Count > 0)
+                {
+                    return Deduplicate(urlAccounts.ToList());
+                }
+            }
+
             return Deduplicate(accounts);
+        }
+
+        /// <summary>
+        /// Fallback URL-only do resolver. Procura no HTML todas as URLs do tipo
+        ///   &lt;scheme&gt;://&lt;host&gt;[:&lt;port&gt;]/get.php?username=X&amp;password=Y
+        /// e gera uma <see cref="XtreamAccountInfo"/> por combinacao unica
+        /// (host:port, username). Activado apenas quando os caminhos DOM-based
+        /// e flat-text nao produziram nenhuma conta, de modo a nao regredir
+        /// formatos que o resolver ja sab tratar (ex. 110705 do publisher m3u-sᴄᴀɴ).
+        ///
+        /// Restriccoes (em ordem):
+        ///   1. scheme explicito http ou https; nada de outras schemes;
+        ///   2. hostname deve passar <see cref="LooksLikeValidHost"/>;
+        ///   3. username nao vazio, maximo 64 chars (limite do Xtream);
+        ///   4. password nao vazia, maximo 64 chars (limite do Xtream);
+        ///   5. deduplicacao por (host:port, username) como exige o invariante
+        ///      do projecto (password NAO participa da identidade logica);
+        ///   6. URL com username ausente, password ausente, ou path != /get.php
+        ///      e' simplesmente ignorada; nao gera ruido no output.
+        ///
+        /// Nao expoe credenciais em logs ou diagnosticos; mensagens de erro
+        /// sao apenas descritivas.
+        /// </summary>
+        internal static IReadOnlyList<XtreamAccountInfo> ResolveFromGetPhpUrls(string html)
+        {
+            if (string.IsNullOrWhiteSpace(html)) return Array.Empty<XtreamAccountInfo>();
+
+            const int MaxCredentialLength = 64;
+
+            var matches = GetPhpUrlRegex.Matches(html);
+            if (matches.Count == 0) return Array.Empty<XtreamAccountInfo>();
+
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            var accounts = new List<XtreamAccountInfo>();
+            foreach (Match m in matches)
+            {
+                string urlRaw = m.Value;
+                string query = m.Groups["query"].Value;
+                if (string.IsNullOrEmpty(query)) continue;
+
+                // Normalizar o query string para suportar HTML entities (&amp;).
+                // O Uri NAO descodifica essas entidades sozinho, portanto sem esta
+                // normalizacao o parametro 'username' fundia-se com o '&password'.
+                string normalizedQuery = query
+                    .Replace("&amp;", "&")
+                    .Replace("&#38;", "&")
+                    .Replace("&lt;", "<")
+                    .Replace("&gt;", ">");
+
+                if (!QueryHasXtreamCredentials(normalizedQuery, out string user, out string pass))
+                    continue;
+
+                // Reconstruir o URL com o query string normalizado para o Uri parse.
+                string urlNormalized = urlRaw[..(urlRaw.Length - query.Length)] + normalizedQuery;
+                if (!Uri.TryCreate(urlNormalized, UriKind.Absolute, out var uri)) continue;
+                if (!LooksLikeValidHost(uri.Host)) continue;
+
+                // Defensive: o regex+QueryHas ja garante presenca, mas validamos
+                // comprimento como limite superior.
+                if (user.Length == 0 || user.Length > MaxCredentialLength) continue;
+                if (pass.Length == 0 || pass.Length > MaxCredentialLength) continue;
+
+                int port = uri.IsDefaultPort ? DefaultPortFor(uri.Scheme) : uri.Port;
+                string scheme = uri.Scheme.ToLowerInvariant();
+
+                // Identidade logica do projecto = (scheme, host, port, user).
+                string key = $"{scheme}://{uri.Host}:{port}/{user}".ToLowerInvariant();
+                if (!seen.Add(key)) continue;
+
+                accounts.Add(new XtreamAccountInfo
+                {
+                    Host = uri.Host,
+                    Port = port,
+                    Scheme = scheme,
+                    Username = user,
+                    Password = pass,
+                    M3uUrl = urlRaw,
+                    SourcePublicationUrl = string.Empty,
+                    SourceTelegramMessageId = string.Empty,
+                    SourceTelegramChannel = string.Empty
+                });
+            }
+            return accounts;
+        }
+
+        // Captura uma URL absoluta cujo path termine em /get.php?username=...&password=...
+        // O URL NAO e' delimitado por <, >, ", ', espaco. O query string pode
+        // conter &type=...&output=... etc., que serao ignorados por
+        // QueryHasXtreamCredentials. Username e password sao capturados apenas
+        // quando o link FICA a acabar exactamente em get.php (evita apanhar
+        // URLs que simplesmente mencionem "username=" no seu path).
+        private static readonly Regex GetPhpUrlRegex = new(
+            @"https?://[^\s<>""'<]+/get\.php\?(?<query>[^\s<>""'<>]*)",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+        // Heuristica extra (alinhada com ResolveFromGetPhpUrls): o query string
+        // capturado tem de conter AMBOS os parametros username e password; senao
+        // a URL e' ignorada.
+        private static bool QueryHasXtreamCredentials(string query, out string user, out string pass)
+        {
+            user = string.Empty;
+            pass = string.Empty;
+            if (string.IsNullOrEmpty(query)) return false;
+            foreach (var part in query.Split('&', StringSplitOptions.RemoveEmptyEntries))
+            {
+                var eq = part.IndexOf('=');
+                if (eq <= 0) continue;
+                string key = part[..eq].Trim().ToLowerInvariant();
+                string val = part[(eq + 1)..];
+                // Suportar prefixo &amp; apos HTML entity decode; quem chama
+                // ResolveFromGetPhpUrls deserializou o HTML, mas mantemos o strip.
+                val = val.Replace("&amp;", "&");
+                if (key == "username") user = Uri.UnescapeDataString(val);
+                else if (key == "password") pass = Uri.UnescapeDataString(val);
+            }
+            return user.Length > 0 && pass.Length > 0;
         }
 
         // Tamanho minimo do texto plano para activar o fallback adaptativo.
