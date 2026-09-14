@@ -32,6 +32,46 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 - **Total agora**: **1476 testes** (anterior: 1466) — 10 novos, 0 removidos, 0 regressões.
 
 ### 🛡️ Correcções / Hardening
+- **PHASE 9A-FIX (2026-09-14): `ConnectTimeout` configurável e classificação inequívoca de `TaskCanceledException` interna**. A PHASE 9A introduziu (em `ed3d6ef`) um `SharedHttpClient` estático com `SocketsHttpHandler.ConnectTimeout = TimeSpan.FromSeconds(DefaultConnectionTimeoutSeconds=5)` e `HttpClient.Timeout = TimeSpan.FromSeconds(DefaultOverallTimeoutSeconds=12)`. Em produção observámos (em `92a5d0d`) um padrão repetitivo `[DownloadPlaylist] kind=Unknown durationMs=~5000 error=TaskCanceledException` que correspondia a timeouts internos do `HttpClient` classificados incorrectamente como `Unknown` e que não respeitavam o valor configurado pela `StreamValidationPolicy`. Correcção aplicada (read-only sobre `M3uTesterService` + extracção de factory testável, sem tocar em `CountryChannelValidator`, `M3uParserService`, `TelegramPublicationResolver`, `XtreamPublicationResolver`, `PipelineIngestionService`, `StreamValidationCache`, `HostFailureTracker`, nem `StreamValidationTesterFactory`):
+  - **Factory testável `HttpClientFactory`** (novo ficheiro `m3uCrawler/Services/Validation/HttpClientFactory.cs`): encapsula a criação do `HttpClient` partilhado com cache `ConcurrentDictionary<(int ConnectSeconds, int OverallSeconds), (HttpClient Client, SocketsHttpHandler Handler)>`. Cada combinação distinta de timeouts obtém o seu próprio `HttpClient` uma única vez via `GetOrAdd`; testers com as mesmas options partilham-no; **nunca** há um `HttpClient` por stream. O método público `CreateConfiguredClient(int, int)` devolve o `SocketsHttpHandler` em conjunto com o `HttpClient` para que testes possam inspeccionar `ConnectTimeout` directamente, sem reflection.
+  - **Resolução lazy via `_client` por tester**: o construtor do `M3uTesterService` resolve o `HttpClient` correcto a partir das options já sanitizadas via `HttpClientFactory.ResolveClient(...)`. `ProbeOnceAsync` (estático) também resolve internamente para suportar override options em chamadas individuais.
+  - **`IsHttpClientInternalTimeout(Exception)`** em `M3uTesterService`: nova heurística que detecta se uma excepção foi causada por um timeout **interno** do `HttpClient`/`SocketsHttpHandler` (i.e., a cadeia de `InnerException`s contém um `TimeoutException`), distinguindo-a de uma cancellation externa do caller. Heurística **conservadora**: baseia-se apenas na presença de `TimeoutException` em qq nível de `InnerException`, conforme documentado pelo .NET 9 (dotnet/runtime #47484, #63706, #78070). Cancelamentos externos não trazem `TimeoutException` na cadeia, logo são inequivocamente distinguíveis.
+  - **Classificador de `DownloadPlaylistContentAsync` melhorado**:
+    - `kind=HttpConnectTimeout` — `TaskCanceledException` interna + `durationMs < ConnectionTimeout*1000+500` (i.e., `SocketsHttpHandler.ConnectTimeout` disparou).
+    - `kind=HttpRequestTimeout` — `TaskCanceledException` interna + duração ≥ `ConnectTimeout+500` (i.e., `HttpClient.Timeout`).
+    - `kind=Timeout` — `attemptCts.CancelAfter(OverallTimeout)` cooperativo disparou e não há `TimeoutException` interna.
+    - `kind=Cancellation` — `cancellationToken` do caller foi cancelado.
+    - `kind=Unknown` — mantido como catch-all genuíno (não mais mascarando timeouts internos do HttpClient).
+  - **`Sanitize` já existente** continua a clampar `ConnectionTimeoutSeconds` ao intervalo `[1, 300]` e `OverallTimeoutSeconds` ao intervalo `[1, 600]`. Não foram alterados defaults (`5` connect, `12` overall) para não mascarar o problema externo de providers. O cache `HttpClientFactory` está limitado por estes clamps (máximo teórico de 180 000 chaves; em prática ≤10).
+- **Testes** (24 novos, todos determinísticos com `TcpListener` local ou instâncias directas do factory — sem Internet pública): `Phase9AFixTests` —
+  - `StreamValidationOptions_ConnectionTimeout_accessor_matches_seconds`: accessor `ConnectionTimeout` devolve `TimeSpan` correcto.
+  - `StreamValidationOptions_Sanitize_clamps_ConnectionTimeoutSeconds`: confirma clamp `[1, 300]`.
+  - `IsHttpClientInternalTimeout_returns_true_for_TaskCanceledException_with_inner_TimeoutException`: caso básico.
+  - `IsHttpClientInternalTimeout_returns_true_for_nested_chain`: cadeia aninhada.
+  - `IsHttpClientInternalTimeout_returns_false_for_external_cancellation`: cancellation externa.
+  - `IsHttpClientInternalTimeout_returns_false_for_plain_HttpRequestException`: network exception.
+  - `IsHttpClientInternalTimeout_returns_false_for_plain_OperationCanceledException`: defensivo.
+  - `IsHttpClientInternalTimeout_returns_false_for_null`: defensivo.
+  - `IsHttpClientInternalTimeout_traverses_deep_nesting_with_intermediate_non_Timeout_types`: cadeia profunda.
+  - `IsHttpClientInternalTimeout_handles_ConnectTimeout_chain_realistic_in_net9`: reproduz a cadeia documentada para `ConnectTimeout` (dotnet/runtime #47484).
+  - `IsHttpClientInternalTimeout_handles_HttpClientTimeout_chain_realistic_in_net9`: reproduz a cadeia documentada para `HttpClient.Timeout` (dotnet/runtime #78070).
+  - `HttpClientFactory_applies_ConnectionTimeoutSeconds_to_SocketsHttpHandler_ConnectTimeout`: prova formal de que o valor chega ao handler.
+  - `HttpClientFactory_applies_OverallTimeoutSeconds_to_HttpClient_Timeout`: prova formal de que o valor chega ao client.
+  - `HttpClientFactory_propagates_custom_values_not_just_defaults`: valores custom `(15, 45)` chegam ao handler/client.
+  - `HttpClientFactory_resolves_distinct_clients_for_distinct_keys`: chaves distintas → instâncias distintas.
+  - `HttpClientFactory_returns_same_client_for_same_key`: mesma chave → mesma instância.
+  - `HttpClientFactory_handlers_are_disposable_independently_via_client_disposing`: `disposeHandler: true` funciona.
+  - `HttpClient_with_configured_timeouts_resolves_to_distinct_cache_entries`: invariante lógico do cache.
+  - `Multiple_testers_with_same_timeouts_share_the_same_HttpClient`: cache estável.
+  - `Tester_with_different_timeouts_gets_distinct_HttpClient_cached_separately`: invariante.
+  - `OverallTimeout_2s_terminates_within_3s_when_blackhole`: `OverallTimeout=2s` dispara em <3.5s com blackhole local.
+  - `ConnectTimeout_is_decoupled_from_OverallTimeout_classification`: blackhole com `OverallTimeout=2s` termina cedo e devolve `(null, false)`.
+  - `TestManyBoundedAsync_still_respects_max_concurrency_with_configured_options`: regression guard da 9A — bounded concurrency preservada com partial response + `MaxConcurrency=2`.
+- **Total agora**: **1506 testes** (anterior: 1483) — 23 novos, 0 removidos, 0 regressões.
+- **Sem alterações funcionais em produção detectáveis**: o `HttpClient` por defeito continua com `ConnectTimeout=5s` e `OverallTimeout=12s` (idêntico ao actual em `92a5d0d`). A diferença visível em logs é a classificação: `Unknown / TaskCanceledException` deixa de aparecer para timeouts HTTP internos (substituído por `HttpConnectTimeout` ou `HttpRequestTimeout`).
+- **Limitações documentadas**: (a) o evento físico de TCP `ConnectTimeout` (SYN sem resposta) não é reproduzível de forma totalmente determinística num teste unitário sem manipular routing de pacotes ou usar IP não-roteável (dependente de rede); a invariante é validada por inspecção directa do `SocketsHttpHandler.ConnectTimeout` e por reprodução das cadeias de excepção documentadas. (b) `HttpClientFactory.Cache` não tem mecanismo de eviction; o número de chaves distintas é naturalmente pequeno (1-3 em produção) e os `Sanitize` garantem limites finitos. (c) `IsHttpClientInternalTimeout` é conservadora (só detecta via `TimeoutException` na cadeia); cancelamentos cuja cadeia não traga `TimeoutException` serão classificados como `Cancellation` ou `Timeout` (coop.), nunca falsamente como internal timeout.
+
+### 🛡️ Correcções / Hardening
 - **PIPELINE-INC-HARDENING (2026-09-14): thread-safety do `RunReport` sob producer-consumer concorrente**. Risco detectado: o `RunReport` é mutado por até `maxConcurrency` tasks do worker simultaneamente, com escritas em contadores `int` (que não são atómicos em C#) e em `List<>` (que não é thread-safe). Correcção aplicada:
   - **Counters `int` que são escritos por múltiplas tasks**: convertidos para `internal int _Field` com property-wrapper. `Interlocked.Increment(ref rep._X)` e `Interlocked.Add(ref rep._X, n)` substituem `++` e `+=`.
   - **`List<>` (`RejectionReasons`, `DiscoveredPlaylists`)**: protegidos por `lock(rep.SyncRoot)`. `RunReport` expõe novo `internal readonly object SyncRoot`.

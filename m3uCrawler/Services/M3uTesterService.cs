@@ -18,20 +18,32 @@ namespace m3uCrawler.Services;
 /// </summary>
 public sealed class M3uTesterService : IDisposable
 {
-    private static readonly HttpClient SharedHttpClient = CreateSharedClient();
+    // PHASE 9A-FIX (2026-09-14): cache keyed em vez de HttpClient
+    // estatico. Cada combinacao distinta de (ConnectionTimeoutSeconds,
+    // OverallTimeoutSeconds) obtem o seu proprio HttpClient partilhado
+    // atraves de <see cref="HttpClientFactory"/>. O factory e' internal
+    // mas tem uma API publica para testes deterministicos que inspeccionam
+    // o SocketsHttpHandler.ConnectTimeout e o HttpClient.Timeout sem
+    // reflection. Isto permite que a policy persistida controle os
+    // timeouts sem deixar de garantir que existe no MAXIMO um HttpClient
+    // por chave (i.e. um HttpClient por valor distinto de
+    // ConnectionTimeout/OverallTimeout efectivamente usado em todo o
+    // processo). Nao ha um HttpClient por stream/tester.
 
     /// <summary>
-    /// Acesso read-only ao HttpClient partilhado para instrumentação
-    /// de testes (autópsia de timeouts, contagem de requests, etc.).
-    /// Não deve ser usado em código de produção — usar as APIs
-    /// <see cref="TestM3u8Stream"/>, <see cref="TestMultipleStreams"/>
+    /// Acesso read-only ao HttpClient partilhado default para
+    /// instrumentação de testes (autópsia de timeouts, contagem de
+    /// requests, etc.). Não deve ser usado em código de produção —
+    /// usar as APIs <see cref="TestM3u8Stream"/>, <see cref="TestMultipleStreams"/>
     /// ou <see cref="RunAsync"/>.
     /// </summary>
-    internal static HttpClient SharedHttpClientForTest => SharedHttpClient;
+    internal static HttpClient SharedHttpClientForTest =>
+        HttpClientFactory.DefaultSharedClient;
 
     private readonly StreamValidationOptions _options;
     private readonly StreamValidationCache _cache;
     private readonly HostFailureTracker _hostTracker;
+    private readonly HttpClient _client;
     private StreamValidationMetrics? _lastMetrics;
 
     /// <summary>
@@ -46,6 +58,7 @@ public sealed class M3uTesterService : IDisposable
         _options.Sanitize();
         _cache = new StreamValidationCache(_options);
         _hostTracker = new HostFailureTracker();
+        _client = HttpClientFactory.ResolveClient(_options.ConnectionTimeoutSeconds, _options.OverallTimeoutSeconds).Client;
     }
 
     /// <summary>
@@ -62,26 +75,49 @@ public sealed class M3uTesterService : IDisposable
         _options = state.Options.Clone();
         _cache = state.Cache;
         _hostTracker = state.HostTracker;
+        _client = HttpClientFactory.ResolveClient(_options.ConnectionTimeoutSeconds, _options.OverallTimeoutSeconds).Client;
     }
 
     public StreamValidationOptions Options => _options.Clone();
     public StreamValidationMetrics? LastMetrics => _lastMetrics;
 
-    private static HttpClient CreateSharedClient()
+    /// <summary>
+    /// Indica se uma excepcao foi causada por um timeout INTERNO do
+    /// <see cref="HttpClient"/> ou do <see cref="SocketsHttpHandler"/>
+    /// (ConnectTimeout ou HttpClient.Timeout), distinguindo-a de uma
+    /// cancellation externa do caller.
+    ///
+    /// Heuristica observada em .NET 9 (validada por documentacao
+    /// Microsoft Learn + dotnet/runtime issues #47484, #63706, #78070,
+    /// #103134):
+    /// - Quando SocketsHttpHandler.ConnectTimeout dispara, lanca
+    ///   <see cref="TaskCanceledException"/> com inner
+    ///   <see cref="TimeoutException"/> cuja mensagem comeca por
+    ///   "A connection could not be established within the configured
+    ///   ConnectTimeout." (eventualmente wrappeado em mais camadas).
+    /// - Quando HttpClient.Timeout dispara, lanca
+    ///   <see cref="TaskCanceledException"/> com mensagem
+    ///   "The request was canceled due to the configured HttpClient.Timeout
+    ///   of N seconds elapsing." A cadeia interna tambem traz
+    ///   <see cref="TimeoutException"/>.
+    /// - Cancellation externa (via token do caller) lanca
+    ///   <see cref="OperationCanceledException"/> / <see cref="TaskCanceledException"/>
+    ///   SEM <see cref="TimeoutException"/> na cadeia de InnerExceptions.
+    ///
+    /// Em resumo: a presenca de <see cref="TimeoutException"/> em qq
+    /// nivel de InnerException indica timeout interno do HttpClient. A
+    /// ausencia indica cancellation externa. Esta heuristica e' mais
+    /// robusta do que comparar o CancellationToken da excepcao com
+    /// default(CancellationToken) (que pode gerar falsos positivos quando
+    /// o caller passa CancellationToken.None).
+    /// </summary>
+    internal static bool IsHttpClientInternalTimeout(Exception ex)
     {
-        var handler = new SocketsHttpHandler
+        for (var e = ex; e != null; e = e.InnerException)
         {
-            PooledConnectionLifetime = TimeSpan.FromMinutes(2),
-            PooledConnectionIdleTimeout = TimeSpan.FromMinutes(1),
-            AutomaticDecompression = DecompressionMethods.None,
-            ConnectTimeout = TimeSpan.FromSeconds(StreamValidationOptions.DefaultConnectionTimeoutSeconds),
-        };
-        var client = new HttpClient(handler, disposeHandler: true)
-        {
-            Timeout = TimeSpan.FromSeconds(StreamValidationOptions.DefaultOverallTimeoutSeconds),
-        };
-        client.DefaultRequestHeaders.Add("User-Agent", StreamValidationOptions.DefaultUserAgent);
-        return client;
+            if (e is TimeoutException) return true;
+        }
+        return false;
     }
 
     public async Task<M3uStream> TestM3u8Stream(
@@ -451,10 +487,15 @@ public sealed class M3uTesterService : IDisposable
         var sw = Stopwatch.StartNew();
         try
         {
+            // Resolve (ou reusa) o HttpClient partilhado que corresponde
+            // as options deste tester. Em producao isto devolve sempre
+            // o mesmo client para a mesma combinacao de timeouts.
+            var client = HttpClientFactory.ResolveClient(options.ConnectionTimeoutSeconds, options.OverallTimeoutSeconds).Client;
+
             using var request = new HttpRequestMessage(HttpMethod.Get, url);
             request.Headers.UserAgent.ParseAdd(options.UserAgent);
 
-            using var response = await SharedHttpClient
+            using var response = await client
                 .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
                 .ConfigureAwait(false);
 
@@ -492,11 +533,14 @@ public sealed class M3uTesterService : IDisposable
     }
 
     /// <summary>
-    /// Faz download de uma URL de playlist usando o
-    /// <see cref="SharedHttpClient"/> da PHASE 9A e respeita o
-    /// <see cref="StreamValidationOptions.OverallTimeout"/>. Usado
-    /// pelo pipeline Telegram para obter o conteúdo de uma playlist
-    /// remota sem criar um <c>HttpClient</c> próprio por chamada.
+    /// Faz download de uma URL de playlist usando o HttpClient partilhado
+    /// da PHASE 9A (configurado por
+    /// <see cref="StreamValidationOptions.ConnectionTimeoutSeconds"/> e
+    /// <see cref="StreamValidationOptions.OverallTimeoutSeconds"/>) e
+    /// respeita o <see cref="StreamValidationOptions.OverallTimeout"/>
+    /// como timer adicional cooperativo. Usado pelo pipeline Telegram para
+    /// obter o conteúdo de uma playlist remota sem criar um
+    /// <c>HttpClient</c> próprio por chamada.
     /// </summary>
     /// <returns>
     /// Tuplo (conteúdo, sucesso). Se o download falhar ou exceder o
@@ -510,11 +554,15 @@ public sealed class M3uTesterService : IDisposable
         CancellationToken cancellationToken = default)
     {
         // PIPELINE-INC-DIAG (2026-09-14): Classificador de causa de falha.
+        // PHASE 9A-FIX (2026-09-14): distingue timeout interno do
+        // HttpClient (ConnectTimeout ou HttpClient.Timeout) de uma
+        // cancellation externa, atraves de IsHttpClientInternalTimeout.
         // Diagnostico read-only - nao altera comportamento HTTP nem o contrato
         // publico. Apenas emite um log estruturado por falha, identificando
-        // o tipo de problema (Timeout / Cancellation / HttpStatus4xx / 5xx /
-        // 429 / Network / TlsOrConnection / Dns / InvalidUrl) para distingui-los
-        // do actual rotulo "timeout ou erro de rede" do caller.
+        // o tipo de problema (Timeout / Cancellation / HttpTimeout /
+        // HttpConnectTimeout / HttpStatus4xx / 5xx / 429 / Network /
+        // TlsOrConnection / Dns / InvalidUrl) para distingui-los do
+        // rotulo generico "timeout ou erro de rede" do caller.
         // A classificacao segue a natureza da exception + status HTTP.
         // AVISO: nunca emite credenciais, query string completa, ou URL com
         // password. Apenas host + path + status + duracao.
@@ -532,7 +580,7 @@ public sealed class M3uTesterService : IDisposable
         {
             using var request = new HttpRequestMessage(HttpMethod.Get, url);
             request.Headers.UserAgent.ParseAdd(_options.UserAgent);
-            using var response = await SharedHttpClient
+            using var response = await _client
                 .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, attemptCts.Token)
                 .ConfigureAwait(false);
 
@@ -552,9 +600,34 @@ public sealed class M3uTesterService : IDisposable
                 .ConfigureAwait(false);
             return (content, true);
         }
-        catch (OperationCanceledException) when (attemptCts.IsCancellationRequested)
+        catch (Exception ex) when (ex is OperationCanceledException && IsHttpClientInternalTimeout(ex))
         {
-            // attemptCts disparou antes do caller cancellation; Likely timeout.
+            // PHASE 9A-FIX (2026-09-14): timeout INTERNO do HttpClient.
+            // A excepcao traz TimeoutException na cadeia (comportamento
+            // documentado do .NET 9 para SocketsHttpHandler.ConnectTimeout
+            // e HttpClient.Timeout). Disambiguamos pela duracao observada:
+            //   - elapsed < ConnectionTimeout*1000+500  -> HttpConnectTimeout
+            //   - caso contrario                          -> HttpRequestTimeout
+            // Limites: se o utilizador configurar ConnectTimeout=5 e
+            // OverallTimeout=12 (default), HttpConnectTimeout dispara
+            // primeiro. Se ConnectTimeout>OverallTimeout, o attemptCts
+            // cancela primeiro e IsHttpClientInternalTimeout==false,
+            // caindo no catch seguinte (kind=Timeout). Em ambos os casos
+            // a classificacao e' inequivoca.
+            var elapsed = (int)sw.ElapsedMilliseconds;
+            var connectMs = _options.ConnectionTimeoutSeconds * 1000;
+            var kind = elapsed < connectMs + 500
+                ? "HttpConnectTimeout"
+                : "HttpRequestTimeout";
+            LogPlaylistDownloadOutcome(url, kind: kind, durationMs: elapsed, status: 0, errorName: ex.GetType().Name);
+            return (null, false);
+        }
+        catch (OperationCanceledException) when (attemptCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+            // attemptCts cooperativo (CancelAfter OverallTimeout) disparou
+            // antes do HttpClient interno. A excepcao NAO traz
+            // TimeoutException na cadeia (cancelamento vem do nosso
+            // CancellationTokenSource, nao do SocketsHttpHandler).
             var elapsed = (int)sw.ElapsedMilliseconds;
             LogPlaylistDownloadOutcome(url, kind: "Timeout", durationMs: elapsed, status: 0);
             return (null, false);
