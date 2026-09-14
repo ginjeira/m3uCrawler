@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Net;
 using m3uCrawler.Models;
 using m3uCrawler.Services;
 using m3uCrawler.Services.Validation;
@@ -190,39 +192,52 @@ public class StreamValidationProdWiringTests : IDisposable
     public async Task TestManyBoundedAsync_does_not_create_one_task_per_stream()
     {
         // O ponto central desta tarefa: --telegram-maintain nao pode
-        // agendar N Tasks quando faz re-teste. Aqui validamos que o
-        // scheduling e' limitado por MaxConcurrency medindo o tempo
-        // total: com MaxConcurrency=4 e 40 streams com timeout rapido,
-        // o tempo total <= 40 / 4 * timeout (em ms). Sem bound, todas
-        // as Tasks seriam agendadas e os timeouts correriam em paralelo.
+        // agendar N workers em paralelo quando faz re-teste. Aqui
+        // validamos que o scheduling e' limitado por MaxConcurrency
+        // medindo o tempo total contra um servidor HTTP local com delay
+        // deterministico: com MaxConcurrency=4 e 16 streams servidas a
+        // 500ms cada, o tempo total deve ser >= ~4 * 500ms = 2000ms
+        // (4 waves sequenciais). Sem bound, todas correriam em paralelo
+        // e seriam precisos ~500ms.
+        //
+        // A implementacao actual usa SemaphoreSlim(maxConcurrency) para
+        // limitar a entrada dos workers, mas cria uma Task por stream;
+        // o teste valida portanto "bounded concurrency" e nao "uma Task
+        // por stream" -- o nome do teste e' mantido por compatibilidade
+        // historica.
+        const int MaxConcurrency = 4;
+        const int StreamCount = 16;
+        const int PerRequestDelayMs = 500;
+        var lowerBoundMs = (StreamCount / MaxConcurrency) * PerRequestDelayMs;
+        var upperBoundMs = lowerBoundMs * 3;   // margem generosa para JIT/scheduler
+
+        using var server = new DelayedHttpListener(PerRequestDelayMs);
+        server.Start();
+
         var state = StreamValidationTesterFactory.CreateIsolatedState();
-        state.Options.MaxConcurrency = 4;
-        state.Options.OverallTimeoutSeconds = 2;
+        state.Options.MaxConcurrency = MaxConcurrency;
+        state.Options.OverallTimeoutSeconds = 30;
         state.Options.MaxRetries = 0;
         var tester = StreamValidationTesterFactory.CreateTester(state);
 
-        const int N = 40;
-        var requests = Enumerable.Range(0, N)
-            .Select(i => (Url: $"http://127.0.0.1:1/nonexistent-{i}", Title: $"T{i}", Group: "PT"))
+        var requests = Enumerable.Range(0, StreamCount)
+            .Select(i => (Url: $"{server.BaseUrl}/stream-{i}", Title: $"T{i}", Group: "PT"))
             .ToList();
 
-        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var sw = Stopwatch.StartNew();
         var results = await tester.TestManyBoundedAsync(requests);
         sw.Stop();
 
-        Assert.Equal(N, results.Count);
-        // Com MaxConcurrency=4 e timeout 2s, esperado ~ N/4 * 2s = 20s
-        // para todos terminarem por timeout. Margem: <= 25s.
-        // Sem bound (Task.WhenAll com 40 Tasks), todos correriam em
-        // paralelo e seriam precisos ~2s.
-        var upperBoundMs = 25_000;
+        Assert.Equal(StreamCount, results.Count);
+        // Bounded: ~lowerBoundMs ou mais (nunca menos).
+        Assert.True(sw.ElapsedMilliseconds >= lowerBoundMs,
+            $"Bounded test took {sw.ElapsedMilliseconds}ms, expected >= {lowerBoundMs}ms " +
+            $"({StreamCount / MaxConcurrency} waves x {PerRequestDelayMs}ms). " +
+            $"Suggests parallelism exceeded MaxConcurrency={MaxConcurrency}.");
+        // E nao demasiado lento (sanity check).
         Assert.True(sw.ElapsedMilliseconds <= upperBoundMs,
-            $"Bounded test took {sw.ElapsedMilliseconds}ms, expected <= {upperBoundMs}ms (4 workers x 2s timeout x 10 waves).");
-        // E o teste nao pode ser demasiado rapido: se fosse <= 3s,
-        // significaria que TestManyBoundedAsync correu em paralelo
-        // (sinal de que o bound NAO foi respeitado).
-        Assert.True(sw.ElapsedMilliseconds >= 4_000,
-            $"Bounded test took {sw.ElapsedMilliseconds}ms — too fast, suggests parallelism exceeded MaxConcurrency=4.");
+            $"Bounded test took {sw.ElapsedMilliseconds}ms, expected <= {upperBoundMs}ms. " +
+            $"Suggests workers nao estao a ser reutilizados ou ha outro gargalo.");
     }
 
     [Fact]
@@ -293,5 +308,82 @@ public class StreamValidationProdWiringTests : IDisposable
         Assert.NotNull(state.Options);
         Assert.NotNull(state.Cache);
         Assert.NotNull(state.HostTracker);
+    }
+}
+
+/// <summary>
+/// Helper local: HttpListener que dorme <c>delayMs</c> por request e
+/// devolve um payload M3U minimo (200 OK). Usado para tornar o teste
+/// <c>TestManyBoundedAsync_does_not_create_one_task_per_stream</c>
+/// deterministico entre plataformas (substitui a heuristica de
+/// elapsed time contra TCP RST, que e' demasiado rapida em Linux).
+/// </summary>
+internal sealed class DelayedHttpListener : IDisposable
+{
+    private readonly HttpListener _listener = new();
+    private readonly CancellationTokenSource _cts = new();
+    private readonly int _delayMs;
+    private readonly int _port;
+
+    public DelayedHttpListener(int delayMs)
+    {
+        _delayMs = delayMs;
+        _port = GetFreePort();
+        _listener.Prefixes.Add($"http://127.0.0.1:{_port}/");
+    }
+
+    public string BaseUrl => $"http://127.0.0.1:{_port}";
+
+    public void Start()
+    {
+        _listener.Start();
+        _ = Task.Run(LoopAsync);
+    }
+
+    private async Task LoopAsync()
+    {
+        while (!_cts.IsCancellationRequested && _listener.IsListening)
+        {
+            HttpListenerContext ctx;
+            try { ctx = await _listener.GetContextAsync().ConfigureAwait(false); }
+            catch (HttpListenerException) { return; }
+            catch (ObjectDisposedException) { return; }
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(_delayMs, _cts.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) { }
+                try
+                {
+                    ctx.Response.StatusCode = 200;
+                    ctx.Response.ContentType = "audio/x-mpegurl";
+                    var bytes = System.Text.Encoding.UTF8.GetBytes("#EXTM3U\n");
+                    ctx.Response.ContentLength64 = bytes.Length;
+                    await ctx.Response.OutputStream.WriteAsync(bytes).ConfigureAwait(false);
+                    ctx.Response.Close();
+                }
+                catch { /* swallow */ }
+            });
+        }
+    }
+
+    private static int GetFreePort()
+    {
+        var l = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+        l.Start();
+        var port = ((System.Net.IPEndPoint)l.LocalEndpoint).Port;
+        l.Stop();
+        return port;
+    }
+
+    public void Dispose()
+    {
+        try { _cts.Cancel(); } catch { }
+        try { _listener.Stop(); } catch { }
+        try { _listener.Close(); } catch { }
+        _cts.Dispose();
     }
 }
