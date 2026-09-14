@@ -721,7 +721,10 @@ namespace m3uCrawler.Services
                 found, hasAttachment, filename, text, async () =>
                 {
                     if (attachmentDocument == null) return null;
-                    return await DownloadTelegramDocumentTextAsync(attachmentDocument);
+                    return await DownloadTelegramDocumentTextAsync(
+                        attachmentDocument,
+                        filenameForLog: filename,
+                        messageIdForLog: m.ID);
                 },
                 report: report,
                 messageId: m.ID);
@@ -864,9 +867,23 @@ namespace m3uCrawler.Services
                     kind = ClassifyAttachmentForFetcher(filename);
                     try
                     {
-                        using var ms = new MemoryStream();
-                        await _client!.DownloadFileAsync(doc, ms);
-                        mediaContent = ms.ToArray();
+                        // Usa o mesmo helper com telemetria completa que o
+                        // caminho principal de download, garantindo que
+                        // downloads truncados NAO chegam ao parser.
+                        var content = await DownloadTelegramDocumentTextAsync(
+                            doc,
+                            filenameForLog: filename,
+                            messageIdForLog: m.ID);
+                        if (content != null)
+                        {
+                            // Re-encoda em bytes para o resolver (compat).
+                            mediaContent = System.Text.Encoding.UTF8.GetBytes(content);
+                        }
+                        else
+                        {
+                            // truncated/failed -> sem media content.
+                            mediaContent = null;
+                        }
                     }
                     catch
                     {
@@ -1008,14 +1025,146 @@ namespace m3uCrawler.Services
             return content;
         }
 
-        private async Task<string?> DownloadTelegramDocumentTextAsync(Document document)
+        // Faz download de um Document via WTelegram.Client.DownloadFileAsync
+        // e devolve o texto (UTF-8) se o download for COMPLETO.
+        //
+        // Telemetria 2026-09-14 (investigacao de truncamento):
+        //   expectedBytes  = document.size (declarado pelo Telegram)
+        //   actualBytes    = ms.Length (recebido)
+        //   status         = complete | truncated | unexpected | failed
+        //   - complete:    actualBytes == expectedBytes (> 0)
+        //   - truncated:   actualBytes <  expectedBytes (download incompleto)
+        //   - unexpected:  actualBytes >  expectedBytes (improvavel)
+        //   - failed:      exception ou actualBytes == 0
+        //
+        // Devolve null em todos os casos que nao sejam complete para
+        // que o caller nao faca parse de HTML truncado.
+        //
+        // NOTA: passamos fileSize=document.size para activar a
+        // validacao interna do WTelegram.Client.
+        private async Task<string?> DownloadTelegramDocumentTextAsync(
+            Document document,
+            string filenameForLog,
+            int? messageIdForLog = null)
         {
-            using var ms = new MemoryStream();
-            await _client!.DownloadFileAsync(document, ms);
+            var expected = document.size;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
 
-            ms.Position = 0;
-            using var reader = new StreamReader(ms, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
-            return await reader.ReadToEndAsync();
+            long chunks = 0;
+            long lastTransmitted = 0;
+
+            try
+            {
+                using var ms = new MemoryStream();
+                using var cts = new CancellationTokenSource();
+                // Hard timeout 5 minutos para o download completo.
+                // Documento de 22 MB a 1 MB/s -> ~22s; deixamos margem
+                // generosa para evitar falsos positivos.
+                cts.CancelAfter(TimeSpan.FromMinutes(5));
+
+                // Progress callback: cada chamada = 1 chunk completo.
+                // transmitted e' cumulativo (desde 0).
+                // Cancelamento via cts.ThrowIfCancellationRequested() — a
+                // WTelegram propaga a excepcao como WTException.
+                WTelegram.Client.ProgressCallback progress = (transmitted, total) =>
+                {
+                    chunks++;
+                    lastTransmitted = transmitted;
+                    if (transmitted >= expected && expected > 0) return;
+                    cts.Token.ThrowIfCancellationRequested();
+                };
+
+                // Usamos a overload base InputFileLocationBase para passar
+                // fileSize explicitamente (activa a validacao interna da
+                // lib: cada chunk deve ter FilePartSize bytes excepto o
+                // ultimo) e o progress callback.
+                //
+                // document.ToFileLocation() devolve um
+                // InputDocumentFileLocation que implementa
+                // InputFileLocationBase. Tambem ha overloads Document-typed
+                // mas nao suportam fileSize.
+                await _client!.DownloadFileAsync(
+                    fileLocation: document.ToFileLocation(),
+                    outputStream: ms,
+                    dc_id: 0,
+                    fileSize: expected,
+                    progress: progress).ConfigureAwait(false);
+
+                sw.Stop();
+                var actual = ms.Length;
+
+                if (actual == 0)
+                {
+                    LogDownloadOutcome(filenameForLog, messageIdForLog, expected, 0,
+                        status: "failed", durationMs: sw.ElapsedMilliseconds,
+                        chunks: (int)chunks, error: "empty stream");
+                    return null;
+                }
+
+                if (expected > 0 && actual < expected)
+                {
+                    LogDownloadOutcome(filenameForLog, messageIdForLog, expected, actual,
+                        status: "truncated", durationMs: sw.ElapsedMilliseconds,
+                        chunks: (int)chunks, error: null);
+                    return null;
+                }
+
+                if (expected > 0 && actual > expected)
+                {
+                    LogDownloadOutcome(filenameForLog, messageIdForLog, expected, actual,
+                        status: "unexpected", durationMs: sw.ElapsedMilliseconds,
+                        chunks: (int)chunks, error: null);
+                    // Em unexpected ainda tentamos usar o conteudo.
+                }
+
+                LogDownloadOutcome(filenameForLog, messageIdForLog, expected, actual,
+                    status: "complete", durationMs: sw.ElapsedMilliseconds,
+                    chunks: (int)chunks, error: null);
+
+                ms.Position = 0;
+                using var reader = new StreamReader(ms, Encoding.UTF8,
+                    detectEncodingFromByteOrderMarks: true);
+                return await reader.ReadToEndAsync().ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                sw.Stop();
+                LogDownloadOutcome(filenameForLog, messageIdForLog, expected, lastTransmitted,
+                    status: "failed", durationMs: sw.ElapsedMilliseconds,
+                    chunks: (int)chunks, error: "OperationCanceledException");
+                return null;
+            }
+            catch (Exception ex)
+            {
+                sw.Stop();
+                LogDownloadOutcome(filenameForLog, messageIdForLog, expected, lastTransmitted,
+                    status: "failed", durationMs: sw.ElapsedMilliseconds,
+                    chunks: (int)chunks, error: ex.GetType().Name);
+                return null;
+            }
+        }
+
+        // Imprime UMA linha estruturada por download com status,
+        // bytes esperados/recebidos, duracao e motivo. Usada por
+        // DownloadTelegramDocumentTextAsync e pela outra chamada
+        // directa em BuildResolvedFromMessage (caso da publicacao
+        // t.me/c/).
+        internal static void LogDownloadOutcome(
+            string filename,
+            int? messageId,
+            long expected,
+            long actual,
+            string status,
+            long durationMs,
+            int chunks,
+            string? error)
+        {
+            Console.WriteLine(
+                $"[TelegramDocumentDownload] messageId={messageId} " +
+                $"filename='{TruncateForLog(filename, 128)}' " +
+                $"expected={expected} actual={actual} " +
+                $"status={status} durationMs={durationMs} chunks={chunks}" +
+                (error is null ? "" : $" error={error}"));
         }
 
         private async Task<List<M3uStream>> TestStreamsAsync(
