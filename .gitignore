@@ -26,4 +26,7 @@ TestResults/
 # Real-world Telegram publication fixtures (may contain real credentials).
 m3uCrawler.Tests/Fixtures/
 
+# Local Docker Compose override with absolute Windows paths.
+docker-compose.local.yml
+
 

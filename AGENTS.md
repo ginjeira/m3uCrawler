@@ -167,3 +167,100 @@ Esta regra evita simultaneamente:
 - **Não duplicar pipelines**. Candidatos Xtream entram na mesma pipeline unificada dos restantes M3U (sem segunda pipeline paralela).
 - **Não introduzir volumes Docker anónimos/nomeados** que substituam os bind mounts actuais. Os dados continuam a viver em `/opt/m3ucrawler/runtime-data`.
 - **Não alterar nada fora do escopo do pedido**. Mudanças cosméticas não solicitadas devem ser propostas separadamente.
+
+---
+
+## 9. Setup local para testes (Windows + Docker Desktop)
+
+> Esta secção documenta como **qualquer agente AI** (Kilo, Roo, etc.) deve configurar e usar um ambiente local equivalente à produção, **sem nunca tocar no servidor**. O setup foi estabelecido em 2026-09-14 e é estável; detalhes interactivos (autenticação Telegram) vivem em `.kilo/LOCAL_DEV.md`.
+
+### 9.1 Quando usar este setup
+
+- Desenvolver/testar alterações sem aceder ao servidor de produção.
+- Validar comportamento de novos commits antes de PR.
+- Autenticar uma nova sessão Telegram (`session.dat`) sem afectar a sessão de produção.
+- Experimentar mudanças de pipeline (matching, validação, catalog) com isolamento total.
+
+### 9.2 Restrições absolutas
+
+Estas restrições aplicam-se a qualquer sessão AI que vá interagir com o setup local:
+
+1. **NUNCA** correr `git add wtelegram.config`, `git add session.dat` ou equivalente. Já estão em `.gitignore`, mas reforço.
+2. **NUNCA** mostrar conteúdo de `wtelegram.config`, `session.dat`, ou passwords 2FA em logs, screenshots, mensagens ou commits.
+3. **NUNCA** correr `docker compose up -d` sem `-f docker-compose.local.yml`. O `docker-compose.yml` da raiz aponta para paths Linux e nome de container `m3ucrawler` (produção).
+4. **NUNCA** correr `docker pull ghcr.io/ginjeira/m3ucrawler:latest` — o package é **privado** (owner `ginjeira` reporta 0 packages públicos; todos os endpoints `/v2/` GHCR devolvem 401). Esta é uma propriedade da conta, não falta de credenciais locais.
+5. **NUNCA** apagar `C:\Users\ULSSJOSE\m3ucrawler\runtime-data\wtelegram.config` — é uma cópia byte-exact (320 B) do servidor. Para regenerar é preciso aceder ao servidor.
+
+### 9.3 Componentes do setup
+
+| Componente | Localização | Propósito |
+|---|---|---|
+| Runtime data (bind mount) | `C:\Users\ULSSJOSE\m3ucrawler\runtime-data\` | Substitui `/opt/m3ucrawler/runtime-data` do servidor |
+| Imagem local | `m3ucrawler:local` | Construída a partir do Dockerfile do repo, **não** puxada de GHCR |
+| Compose local | `docker-compose.local.yml` (raiz do repo, **.gitignored**) | Duas configurações via profiles: `default` (só dashboard) e `full` (com Telegram) |
+| `.gitignore` adicional | entrada `docker-compose.local.yml` linha 30 | Impede versionamento acidental |
+
+### 9.4 Comandos essenciais
+
+**Validar que o setup está operacional** (sem afectar nada):
+
+```powershell
+docker ps --filter name=m3ucrawler --format '{{.Names}} {{.Status}} {{.Ports}}'
+Test-Path C:\Users\ULSSJOSE\m3ucrawler\runtime-data\session.dat   # esperado: True
+Test-Path C:\Users\ULSSJOSE\m3ucrawler\runtime-data\wtelegram.config   # esperado: True
+docker images m3ucrawler:local --format '{{.Repository}}:{{.Tag}} {{.Size}}'
+```
+
+**Reconstruir a imagem local** após mudanças no código (sem aceder ao GHCR):
+
+```powershell
+cd C:\Users\ULSSJOSE\Repos\m3uCrawler
+$sha = git rev-parse HEAD
+docker build -t m3ucrawler:local -f m3uCrawler/Dockerfile `
+    --build-arg M3uCrawlerVersion=refs/heads/main `
+    --build-arg M3uCrawlerCommitSha=$sha `
+    --build-arg M3uCrawlerBuildNumber=0 `
+    --build-arg M3uCrawlerBuildDate=$(Get-Date -Format 'o') `
+    .
+```
+
+**Arrancar dashboard-only** (sem Telegram, para validação rápida):
+
+```powershell
+docker compose -f C:\Users\ULSSJOSE\Repos\m3uCrawler\docker-compose.local.yml up -d
+# Dashboard em http://localhost:5000/
+```
+
+**Arrancar com Telegram** (autenticação interactiva):
+
+```powershell
+# Sempre em FOREGROUND com TTY, nunca em background, para ter controlo do stdin.
+docker compose -f C:\Users\ULSSJOSE\Repos\m3uCrawler\docker-compose.local.yml --profile full run --rm m3ucrawler-telegram
+# Dashboard em http://localhost:5001/ (porta 5001 para coexistir com o profile default)
+# Após autenticação: Ctrl+P Ctrl+Q para detach sem matar.
+```
+
+### 9.5 Procedimento para primeira autenticação Telegram (após setup inicial)
+
+Ver runbook completo em **`.kilo/LOCAL_DEV.md`** § "Primeira autenticação Telegram". Em resumo:
+
+1. Apagar `session.dat` local se existir (estado corrompido de tentativas anteriores).
+2. Cooling period 60s.
+3. `docker compose ... --profile full run --rm m3ucrawler-telegram`.
+4. Quando a app pedir `verification_code:`, digitar manualmente o código que o Telegram enviar (via app ou SMS).
+5. Se pedir `password:`, digitar a password 2FA.
+6. `Ctrl+P Ctrl+Q` para detach após ver `Autenticado como: <user>`.
+
+### 9.6 Diagnóstico rápido
+
+| Sintoma | Causa provável | Resolução |
+|---|---|---|
+| `docker pull ghcr.io/ginjeira/m3ucrawler:latest` → `denied` | Package privado, **não** falta de credenciais locais | Não tentar pull; usar `docker build -t m3ucrawler:local` |
+| Dashboard em `http://localhost:5000/` falha | Profile errado, ou container não está no profile `default` | Ver `docker ps --filter name=m3ucrawler` |
+| `PHONE_CODE_INVALID` em loop sem attach | `session.dat` local corrompido, **ou** stdin a receber input externo | Apagar `session.dat`, esperar 60s, foreground com `-it` |
+| `docker compose ... up -d` falha com "no service selected" | Profiles mal seleccionados | Usar `docker compose --profile full` explicitamente |
+| `/api/version` mostra versão diferente do `git rev-parse HEAD` | Imagem `m3ucrawler:local` desactualizada | Re-`docker build` com o SHA actual |
+
+### 9.7 Não duplicar este setup noutro local do repo
+
+Esta secção em `AGENTS.md` é a **referência canónica** para qualquer agente AI. O runbook detalhado está em `.kilo/LOCAL_DEV.md` (já `.gitignored` por convenção). **Não** duplicar em `m3uCrawler/README.md` nem em `DEPLOYMENT.md` — esses descrevem produção.

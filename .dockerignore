@@ -29,3 +29,6 @@ WTelegram.session
 *.zip
 *.tar.gz
 m3uCrawler-main.zip
+
+# Local Docker Compose override (absolute Windows paths).
+docker-compose.local.yml
