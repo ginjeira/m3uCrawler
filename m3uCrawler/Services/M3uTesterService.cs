@@ -509,8 +509,21 @@ public sealed class M3uTesterService : IDisposable
         string url,
         CancellationToken cancellationToken = default)
     {
+        // PIPELINE-INC-DIAG (2026-09-14): Classificador de causa de falha.
+        // Diagnostico read-only - nao altera comportamento HTTP nem o contrato
+        // publico. Apenas emite um log estruturado por falha, identificando
+        // o tipo de problema (Timeout / Cancellation / HttpStatus4xx / 5xx /
+        // 429 / Network / TlsOrConnection / Dns / InvalidUrl) para distingui-los
+        // do actual rotulo "timeout ou erro de rede" do caller.
+        // A classificacao segue a natureza da exception + status HTTP.
+        // AVISO: nunca emite credenciais, query string completa, ou URL com
+        // password. Apenas host + path + status + duracao.
+        var sw = System.Diagnostics.Stopwatch.StartNew();
         if (string.IsNullOrWhiteSpace(url))
+        {
+            LogPlaylistDownloadOutcome(url, kind: "InvalidUrl", durationMs: 0, status: 0);
             return (null, false);
+        }
 
         using var attemptCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         attemptCts.CancelAfter(_options.OverallTimeout);
@@ -523,8 +536,14 @@ public sealed class M3uTesterService : IDisposable
                 .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, attemptCts.Token)
                 .ConfigureAwait(false);
 
+            var elapsed = (int)sw.ElapsedMilliseconds;
             if (!response.IsSuccessStatusCode)
             {
+                int status = (int)response.StatusCode;
+                var kind = status == 429
+                    ? "Http429"
+                    : (status >= 500 ? "Http5xx" : "Http4xx");
+                LogPlaylistDownloadOutcome(url, kind: kind, durationMs: elapsed, status: status);
                 return (null, false);
             }
 
@@ -535,12 +554,80 @@ public sealed class M3uTesterService : IDisposable
         }
         catch (OperationCanceledException) when (attemptCts.IsCancellationRequested)
         {
+            // attemptCts disparou antes do caller cancellation; Likely timeout.
+            var elapsed = (int)sw.ElapsedMilliseconds;
+            LogPlaylistDownloadOutcome(url, kind: "Timeout", durationMs: elapsed, status: 0);
             return (null, false);
         }
-        catch (Exception)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
+            // Cancellation explicita do caller (nao timeout do OverallTimeout).
+            var elapsed = (int)sw.ElapsedMilliseconds;
+            LogPlaylistDownloadOutcome(url, kind: "Cancellation", durationMs: elapsed, status: 0);
             return (null, false);
         }
+        catch (System.Security.Authentication.AuthenticationException ex)
+        {
+            var elapsed = (int)sw.ElapsedMilliseconds;
+            LogPlaylistDownloadOutcome(url, kind: "TlsOrConnection", durationMs: elapsed, status: 0, errorName: ex.GetType().Name);
+            return (null, false);
+        }
+        catch (System.Net.Sockets.SocketException ex) when (ex.SocketErrorCode == System.Net.Sockets.SocketError.HostNotFound)
+        {
+            var elapsed = (int)sw.ElapsedMilliseconds;
+            LogPlaylistDownloadOutcome(url, kind: "Dns", durationMs: elapsed, status: 0, errorName: ex.GetType().Name);
+            return (null, false);
+        }
+        catch (System.Net.Sockets.SocketException ex)
+        {
+            // Demais falhas de socket: connection refused, reset, etc.
+            var elapsed = (int)sw.ElapsedMilliseconds;
+            LogPlaylistDownloadOutcome(url, kind: "TlsOrConnection", durationMs: elapsed, status: 0, errorName: ex.GetType().Name);
+            return (null, false);
+        }
+        catch (HttpRequestException ex)
+        {
+            var elapsed = (int)sw.ElapsedMilliseconds;
+            LogPlaylistDownloadOutcome(url, kind: "Network", durationMs: elapsed, status: 0, errorName: ex.GetType().Name);
+            return (null, false);
+        }
+        catch (Exception ex)
+        {
+            var elapsed = (int)sw.ElapsedMilliseconds;
+            LogPlaylistDownloadOutcome(url, kind: "Unknown", durationMs: elapsed, status: 0, errorName: ex.GetType().Name);
+            return (null, false);
+        }
+    }
+
+    /// <summary>
+    /// Diagnostico estruturado de DownloadPlaylistContentAsync. Nao emite
+    /// username, password, query string com credenciais, ou URL integral;
+    /// apenas host + path. Use para distinguir timeout, cancellation,
+    /// rate-limit (429), 5xx, 4xx, erros de rede/TLS/DNS sem perder a
+    /// privacidade dos parametros de autenticacao.
+    /// </summary>
+    private static void LogPlaylistDownloadOutcome(string? url, string kind, int durationMs, int status, string? errorName = null)
+    {
+        if (string.IsNullOrEmpty(url)) { Console.WriteLine($"[DownloadPlaylist] kind={kind} durationMs={durationMs} status={status}"); return; }
+        // Mask the URL: keep scheme + host + path; remove query string fully.
+        // (Esta funcao jah preserva as credenciais no caller; ainda assim
+        // sanitizamos por defesa em profundidade.)
+        string safeUrl;
+        try
+        {
+            var u = new Uri(url);
+            safeUrl = $"{u.Scheme}://{u.Host}:{u.Port}{u.AbsolutePath}";
+        }
+        catch
+        {
+            // Fallback: tirar tudo apos '?'.
+            int q = url.IndexOf('?');
+            safeUrl = q > 0 ? url[..q] : url;
+        }
+        // Cortar path muito longo: 128 chars max.
+        if (safeUrl.Length > 200) safeUrl = safeUrl[..200] + "...";
+        Console.WriteLine(
+            $"[DownloadPlaylist] kind={kind} durationMs={durationMs} status={status}{(errorName == null ? "" : " error=" + errorName)} url={safeUrl}");
     }
 
     private static M3uStream BuildStreamFromOutcome(string url, string title, string group, StreamTestOutcome outcome)

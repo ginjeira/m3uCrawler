@@ -120,8 +120,11 @@ namespace m3uCrawler.Services
         // Resultado legível de uma pesquisa (mantido para compatibilidade de API).
         public async Task<List<string>> SearchM3UInTelegram(string keyword, int limit = 200, int historyHours = 24)
         {
-            var (_, candidates) = await SearchM3UInTelegramInternal(keyword, limit, historyHours);
-            return candidates
+            // Compatibilidade de API antiga: delega via canal sem producer
+            // (apenas para display da lista de candidatos).
+            var captured = new List<CandidatePlaylist>();
+            await SearchM3UInTelegramInternal(keyword, limit, historyHours, onCandidateProduced: c => captured.Add(c));
+            return captured
                 .Select(c => $"{c.Source} :: {Display(c)}")
                 .ToList();
         }
@@ -153,10 +156,33 @@ namespace m3uCrawler.Services
             rep.StartedAt = DateTime.UtcNow;
             rep.Status = "running";
 
-            var (messagesAnalyzed, candidates) = await SearchM3UInTelegramInternal(keyword, limit, historyHours, rep);
-            rep.MessagesAnalyzed = messagesAnalyzed;
-            rep.CandidatesFound = candidates.Count;
-            LastRunReport = rep;
+            // ==== PIPELINE-INC (2026-09-14): processamento incremental ====
+            // Cada candidate descoberto entra imediatamente no processamento,
+            // sem esperar que todos os dialogos sejam enumerados. A 110751 era
+            // detectada as 10:50:16 mas o primeiro teste de playlist so'
+            // corria as 11:03:30 (latencia artificial de ~13 min). Com esta
+            // mudanca o latency reduz-se a (download+teste) / parallelism.
+            //
+            // Topologia:
+            //   producer:  SearchM3UInTelegramInternal(...) emite
+            //              cada candidate via callback 'onCandidateProduced'
+            //              para o writer do channel.
+            //   consumer:  worker Task.Run le do channel.Reader e processa
+            //              cada candidate com concurrency = maxConcurrency.
+            //
+            // Invariantes preservados (R1/R2/9A):
+            // - Mesmo validator/parser/tester/integration usados.
+            // - Order de processador dos candidates NEM sempre preservada
+            //   (esta e' a aceitavel trade-off; definida como 'no máximo
+            //   o limite da janela').
+            // - Counter rep.CandidatesFound e' actualizado incrementalmente
+            //   em ProcessOneTelegramMessageAsync (mantem-se a semantica).
+            var candidateChannel = System.Threading.Channels.Channel.CreateUnbounded<CandidatePlaylist>(
+                new System.Threading.Channels.UnboundedChannelOptions
+                {
+                    SingleReader = true,
+                    SingleWriter = false
+                });
 
             var countriesRoot = countriesDir
                 ?? Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries");
@@ -170,122 +196,93 @@ namespace m3uCrawler.Services
                 TryLoadSharedValidationState() ?? StreamValidationTesterFactory.CreateIsolatedState());
 
             var working = new List<M3uStream>();
+            var workingLock = new object();
+            var processingDone = new TaskCompletionSource();
+
+            // Consumer/worker: le do canal e processa com maxConcurrency.
+            var worker = Task.Run(async () =>
+            {
+                var semaphore = new SemaphoreSlim(Math.Max(1, maxConcurrency));
+                var activeProcessing = new List<Task>();
+                try
+                {
+                    await foreach (var c in candidateChannel.Reader.ReadAllAsync(cancellationToken))
+                    {
+                        await semaphore.WaitAsync(cancellationToken);
+                        var t = Task.Run(async () =>
+                        {
+                            try
+                            {
+                                await ProcessCandidateAsync(
+                                    c, tester, parser, validator, countryCode, rep,
+                                    maxUrlsToTest, maxConcurrency,
+                                    candidateChannel.Writer, working, workingLock,
+                                    cancellationToken);
+                            }
+                            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                            {
+                                // Cancelamento explicito; nada a registar.
+                            }
+                            catch (Exception ex)
+                            {
+                                // Falha no processamento de UM candidate NAO mata o pipeline.
+                                // Continua para os proximos.
+                                rep.RejectionReasons.Add($"{Display(c)}: processing exception {ex.GetType().Name}");
+                            }
+                            finally
+                            {
+                                semaphore.Release();
+                            }
+                        }, cancellationToken);
+                        activeProcessing.Add(t);
+                    }
+                    await Task.WhenAll(activeProcessing);
+                }
+                finally
+                {
+                    semaphore.Dispose();
+                    processingDone.TrySetResult();
+                }
+            }, cancellationToken);
+
+            // Producer: arranca a enumearacao Telegram com callback de emissao.
+            int messagesAnalyzed = 0;
+            Exception? enumEx = null;
+            try
+            {
+                messagesAnalyzed = await SearchM3UInTelegramInternal(
+                    keyword, limit, historyHours, rep,
+                    onCandidateProduced: c =>
+                    {
+                        // channel.Writer.TryWrite e' non-blocking (unboundedChannel).
+                        if (!candidateChannel.Writer.TryWrite(c))
+                        {
+                            rep.RejectionReasons.Add($"{Display(c)}: candidate channel write failed");
+                        }
+                    });
+            }
+            catch (Exception ex)
+            {
+                enumEx = ex;
+            }
+            finally
+            {
+                candidateChannel.Writer.Complete();
+            }
+
+            // Esperar pelo worker terminar.
+            await processingDone.Task;
+            if (enumEx != null) Console.WriteLine($"⚠️ {nameof(SearchM3UInTelegramInternal)} exit: {enumEx.GetType().Name}: {enumEx.Message}");
+
+            rep.MessagesAnalyzed = messagesAnalyzed;
+            // rep.CandidatesFound e' incrementado dentro de ProcessOneTelegramMessageAsync.
+            LastRunReport = rep;
 
             try
             {
-                for (int ci = 0; ci < candidates.Count; ci++)
-                {
-                    var candidate = candidates[ci];
-                    string? content = candidate.Content;
-                    if (content == null)
-                    {
-                        content = await DownloadPlaylistContentAsync(candidate.Url, tester);
-                    }
-
-                    // URLs sem extensão (.m3u/.m3u8) detetados por heurística só são tratados como
-                    // playlist se o conteúdo HTTP for efectivamente #EXTM3U.
-                    // Caso contrario, pode ser uma publicacao HTML com cards Xtream
-                    // (resolver dedicado identifica contas e faz fan-out).
-                    if (candidate.RequiresContentVerification && !_detector.LooksLikePlaylistContent(content))
-                    {
-                        if (LooksLikeHtmlPublication(content))
-                        {
-                            var accounts = XtreamPublicationResolver.ResolveFromHtml(
-                                content!, candidate.Url ?? string.Empty);
-                            if (accounts.Count == 0)
-                            {
-                                // Pagina HTML sem cards Xtream validas: nao incrementa
-                                // PlaylistsInvalid (a pagina existe; simplesmente nao e
-                                // uma publicacao Xtream). Apenas diagnostico sanitizado.
-                                rep.RejectionReasons.Add(
-                                    $"{CredentialSanitizer.SanitizeUrl(candidate.Url) ?? candidate.Source}: no xtream cards found");
-                                continue;
-                            }
-
-                            // Fan-out: cada conta -> CandidatePlaylist com playlist Xtream.
-                            foreach (var acc in accounts)
-                            {
-                                var playlistUrl = acc.M3uUrl ?? BuildXtreamPlaylistUrl(acc);
-                                var promoted = PromoteXtreamAccount(playlistUrl, candidate.Url ?? string.Empty);
-                                if (promoted != null)
-                                {
-                                    candidates.Add(promoted);
-                                }
-                            }
-                            continue;
-                        }
-
-                        rep.PlaylistsInvalid++;
-                        rep.RejectionReasons.Add($"{CredentialSanitizer.SanitizeUrl(candidate.Url) ?? candidate.Source}: conteúdo não é uma playlist M3U");
-                        continue;
-                    }
-
-                    if (string.IsNullOrWhiteSpace(content))
-                    {
-                        rep.PlaylistsInvalid++;
-                        rep.RejectionReasons.Add($"{Display(candidate)}: playlist indisponível ou vazia");
-                        continue;
-                    }
-
-                    rep.PlaylistsDownloaded++;
-
-                    var analysis = validator.AnalyzePlaylist(content, countryCode, 3);
-                    var discovered = new DiscoveredPlaylist
-                    {
-                        Source = candidate.Source,
-                        Name = Display(candidate),
-                        CountryDetected = analysis.IsTargetCountry ? countryCode : string.Empty,
-                        ChannelsRecognized = analysis.RecognizedChannelCount,
-                        State = analysis.IsTargetCountry ? "accepted" : "rejected"
-                    };
-
-                    if (!analysis.IsTargetCountry)
-                    {
-                        rep.PlaylistsRejected++;
-                        rep.RejectionReasons.Add(
-                            $"{discovered.Name}: país {countryCode.ToUpperInvariant()} não corresponde " +
-                            $"(canais reconhecidos {analysis.RecognizedChannelCount}/3)");
-                        rep.DiscoveredPlaylists.Add(discovered);
-                        continue;
-                    }
-
-                    rep.CountryMatches++;
-                    rep.ChannelsRecognized += analysis.RecognizedChannelCount;
-
-                    var streams = parser.Parse(content);
-                    discovered.StreamCount = streams.Count;
-                    rep.StreamsExtracted += streams.Count;
-
-                    // Gate per-stream (pipeline per-canal/per-stream, desde 2026-08-30).
-                    // AnalyzePlaylist actua apenas como fast-reject acima; a aprovação final
-                    // dos streams exige que cada um seja individualmente validado contra os
-                    // aliases do país. Streams rejeitados aqui nunca chegam a TestStreamsAsync.
-                    var (countryStreams, countryRejected) = FilterStreamsByCountry(
-                        validator, streams, countryCode);
-                    discovered.StreamsAfterCountryFilter = countryStreams.Count;
-                    rep.StreamsAfterCountryFilter += countryStreams.Count;
-                    rep.StreamsRejectedByCountry += countryRejected;
-
-                    if (countryStreams.Count == 0)
-                    {
-                        rep.PlaylistsRejected++;
-                        rep.RejectionReasons.Add(
-                            $"{discovered.Name}: país {countryCode.ToUpperInvariant()} validado na playlist " +
-                            $"(aliases={analysis.RecognizedChannelCount}) mas nenhum stream individual do país " +
-                            $"(matched={streams.Count - countryRejected}/{streams.Count})");
-                        rep.DiscoveredPlaylists.Add(discovered);
-                        continue;
-                    }
-
-                    var tested = await TestStreamsAsync(tester, countryStreams, maxConcurrency, maxUrlsToTest);
-                    rep.StreamsTested += tested.Count;
-                    rep.StreamsWorking += tested.Count(s => s.IsWorking);
-                    rep.StreamsFailed += tested.Count(s => !s.IsWorking);
-                    discovered.WorkingStreams = tested.Count(s => s.IsWorking);
-
-                    working.AddRange(tested.Where(s => s.IsWorking));
-                    rep.DiscoveredPlaylists.Add(discovered);
-                }
+                // PIPELINE-INC: o worker acima ja' consumiu e processou cada
+                // candidate dentro de ProcessCandidateAsync. Nada mais a iterar aqui.
+                _ = worker;
             }
             finally
             {
@@ -340,8 +337,182 @@ namespace m3uCrawler.Services
             return working;
         }
 
-        private async Task<(int MessagesAnalyzed, List<CandidatePlaylist> Candidates)> SearchM3UInTelegramInternal(
-            string keyword, int limit = 200, int historyHours = 24, RunReport? report = null)
+        // ==== PIPELINE-INC (2026-09-14): processador de UM candidate ====
+        // Extrado do loop legado de SearchAndTestM3UInTelegramAsync. Agora corre
+        // dentro do worker (consumo do Channel<CandidatePlaylist>). Promove
+        // novos candidates Xtream (fan-out de HTML) voltando a submete-los
+        // ao writer do canal, preservando a semantica online.
+        private async Task ProcessCandidateAsync(
+            CandidatePlaylist candidate,
+            M3uTesterService tester,
+            M3uParserService parser,
+            CountryChannelValidator validator,
+            string countryCode,
+            RunReport rep,
+            int maxUrlsToTest,
+            int maxConcurrency,
+            System.Threading.Channels.ChannelWriter<CandidatePlaylist> writer,
+            List<M3uStream> working,
+            object workingLock,
+            CancellationToken cancellationToken)
+        {
+            // PIPELINE-INC-HARDENING (2026-09-14): cada instancia de ProcessCandidateAsync
+            // corre na sua propria task; ate `maxConcurrency` tasks em paralelo
+            // escrevem em counters/listas deste mesmo RunReport.
+            //
+            // Contadores inteiros:
+            //   ++ NAO e' atomico em C# (sem volatile, sem memory barrier). Em
+            //   loops onde duas tasks fazem ++x simultaneamente, uma das
+            //   actualizacoes pode perder-se. Usamos Interlocked.Increment
+            //   para garantir atomicidade.
+            //
+            // List<>.Add:
+            //   NAO e' thread-safe (internamente chama Array.Resize). Se
+            //   duas tasks adicionarem em paralelo, pode corromper o array
+            //   (InvalidOperationException) ou perder items. Lock no
+            //   RunReport.SyncRoot antes de Add.
+            //
+            // Nao tocamos:
+            //   - CountryChannelValidator (per-candidate, nao partilhado
+            //     em mutacao). O validador pode ser reentrant; e' imutavel.
+            //   - M3uParserService.Parse (estatico, sem estado mutavel).
+            //   - StreamValidationTesterFactory e StreamValidationCache
+            //     (os testes de streams sao single-threaded dentro de
+            //     TestStreamsAsync que tem `maxConcurrency` interno).
+            //   - ChannelWriter.TryWrite (NAO pede lock; e' lock-free).
+            string? content = candidate.Content;
+            if (content == null)
+            {
+                content = await DownloadPlaylistContentAsync(candidate.Url, tester);
+            }
+
+            // URL sem extensao (.m3u/.m3u8): detetada por heuristica. So' tratada
+            // como playlist se o conteudo HTTP for de facto #EXTM3U. Caso
+            // contrario pode ser uma publicacao HTML com cards Xtream.
+            if (candidate.RequiresContentVerification && content != null && !_detector.LooksLikePlaylistContent(content))
+            {
+                if (LooksLikeHtmlPublication(content))
+                {
+                    var accounts = XtreamPublicationResolver.ResolveFromHtml(
+                        content!, candidate.Url ?? string.Empty);
+                    if (accounts.Count == 0)
+                    {
+                        AddRejection(rep, $"{CredentialSanitizer.SanitizeUrl(candidate.Url) ?? candidate.Source}: no xtream cards found");
+                        return;
+                    }
+                    foreach (var acc in accounts)
+                    {
+                        var playlistUrl = acc.M3uUrl ?? BuildXtreamPlaylistUrl(acc);
+                        var promoted = PromoteXtreamAccount(playlistUrl, candidate.Url ?? string.Empty);
+                        if (promoted != null)
+                        {
+                            // Re-injecta no canal. ChannelWriter.TryWrite e' non-blocking.
+                            if (!writer.TryWrite(promoted))
+                            {
+                                AddRejection(rep, $"{Display(promoted)}: channel write failed");
+                            }
+                        }
+                    }
+                    return;
+                }
+                Interlocked.Increment(ref rep._PlaylistsInvalid);
+                AddRejection(rep, $"{CredentialSanitizer.SanitizeUrl(candidate.Url) ?? candidate.Source}: conteúdo não é uma playlist M3U");
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(content))
+            {
+                Interlocked.Increment(ref rep._PlaylistsInvalid);
+                AddRejection(rep, $"{Display(candidate)}: playlist indisponível ou vazia");
+                return;
+            }
+
+            Interlocked.Increment(ref rep._PlaylistsDownloaded);
+
+            var analysis = validator.AnalyzePlaylist(content, countryCode, 3);
+            var discovered = new DiscoveredPlaylist
+            {
+                Source = candidate.Source,
+                Name = Display(candidate),
+                CountryDetected = analysis.IsTargetCountry ? countryCode : string.Empty,
+                ChannelsRecognized = analysis.RecognizedChannelCount,
+                State = analysis.IsTargetCountry ? "accepted" : "rejected"
+            };
+
+            if (!analysis.IsTargetCountry)
+            {
+                Interlocked.Increment(ref rep._PlaylistsRejected);
+                AddRejection(rep,
+                    $"{discovered.Name}: país {countryCode.ToUpperInvariant()} não corresponde " +
+                    $"(canais reconhecidos {analysis.RecognizedChannelCount}/3)");
+                AddDiscovered(rep, discovered);
+                return;
+            }
+
+            Interlocked.Increment(ref rep._CountryMatches);
+            Interlocked.Add(ref rep._ChannelsRecognized, analysis.RecognizedChannelCount);
+
+            var streams = parser.Parse(content);
+            discovered.StreamCount = streams.Count;
+            Interlocked.Add(ref rep._StreamsExtracted, streams.Count);
+
+            // Gate per-stream (pipeline per-canal/per-stream, desde 2026-08-30).
+            // AnalyzePlaylist actua apenas como fast-reject acima; a aprovacao final
+            // dos streams exige que cada um seja individualmente validado contra os
+            // aliases do pais. Streams rejeitados aqui nunca chegam a TestStreamsAsync.
+            var (countryStreams, countryRejected) = FilterStreamsByCountry(
+                validator, streams, countryCode);
+            discovered.StreamsAfterCountryFilter = countryStreams.Count;
+            Interlocked.Add(ref rep._StreamsAfterCountryFilter, countryStreams.Count);
+            Interlocked.Add(ref rep._StreamsRejectedByCountry, countryRejected);
+
+            if (countryStreams.Count == 0)
+            {
+                Interlocked.Increment(ref rep._PlaylistsRejected);
+                AddRejection(rep,
+                    $"{discovered.Name}: país {countryCode.ToUpperInvariant()} validado na playlist " +
+                    $"(aliases={analysis.RecognizedChannelCount}) mas nenhum stream individual do país " +
+                    $"(matched={streams.Count - countryRejected}/{streams.Count})");
+                AddDiscovered(rep, discovered);
+                return;
+            }
+
+            var tested = await TestStreamsAsync(tester, countryStreams, maxConcurrency, maxUrlsToTest);
+            Interlocked.Add(ref rep._StreamsTested, tested.Count);
+            Interlocked.Add(ref rep._StreamsWorking, tested.Count(s => s.IsWorking));
+            Interlocked.Add(ref rep._StreamsFailed, tested.Count(s => !s.IsWorking));
+            discovered.WorkingStreams = tested.Count(s => s.IsWorking);
+
+            lock (workingLock)
+            {
+                working.AddRange(tested.Where(s => s.IsWorking));
+            }
+            // discovered precisa de ser adicionado ao RunReport sob lock
+            // (lista partilhada).
+            AddDiscovered(rep, discovered);
+        }
+
+        // PIPELINE-INC-HARDENING: helpers thread-safe para escrita em
+        // List<>.Add de RunReport. Usam RunReport.SyncRoot.
+        private static void AddRejection(RunReport rep, string reason)
+        {
+            lock (rep.SyncRoot)
+            {
+                rep.RejectionReasons.Add(reason);
+            }
+        }
+
+        private static void AddDiscovered(RunReport rep, DiscoveredPlaylist playlist)
+        {
+            lock (rep.SyncRoot)
+            {
+                rep.DiscoveredPlaylists.Add(playlist);
+            }
+        }
+
+        private async Task<int> SearchM3UInTelegramInternal(
+            string keyword, int limit = 200, int historyHours = 24, RunReport? report = null,
+            Action<CandidatePlaylist>? onCandidateProduced = null)
         {
             var candidates = new List<CandidatePlaylist>();
             // Publicacoes descobertas em qualquer mensagem: referencias Telegram
@@ -376,7 +547,7 @@ namespace m3uCrawler.Services
                     break;
                 default:
                     Console.WriteLine($"Nenhum diálogo encontrado (tipo de resposta: {dialogsBase?.GetType().Name}).");
-                    return (0, candidates);
+                    return 0;
             }
 
             // ==== R1 (2026-09-13): cutoff UNICO por ciclo ====
@@ -456,7 +627,8 @@ namespace m3uCrawler.Services
                             // Processa uma mensagem que passou o filtro temporal.
                             messagesAnalyzed++;
                             await ProcessOneTelegramMessageAsync(
-                                msg, chatTitle, report, discoveredPublications, candidates);
+                                msg, chatTitle, report, discoveredPublications, candidates,
+                                onCandidateProduced);
                         });
                 }
                 catch (WTelegram.WTException ex) when (ex.Message.Contains("FLOOD_WAIT"))
@@ -510,7 +682,7 @@ namespace m3uCrawler.Services
                 }
             }
 
-            return (messagesAnalyzed, candidates);
+            return messagesAnalyzed;
         }
 
         // ==== Helper R1+R2 (2026-09-13): iteracao testavel ====
@@ -602,7 +774,8 @@ namespace m3uCrawler.Services
             string chatTitle,
             RunReport? report,
             List<TelegramPublicationRef> discoveredPublications,
-            List<CandidatePlaylist> candidates)
+            List<CandidatePlaylist> candidates,
+            Action<CandidatePlaylist>? onCandidateProduced)
         {
             // Em TL atual a legenda de um media é o próprio texto da mensagem.
             string text = m.message ?? "";
@@ -733,6 +906,11 @@ namespace m3uCrawler.Services
             {
                 candidate.Source = chatTitle;
                 candidates.Add(candidate);
+                // Candidados devem ser contados incrementalmente (consistente com
+                // a semantica anterior: rep.CandidatesFound = candidates.Count
+                // no fim do pipeline; agora definido no momento da producao).
+                if (report != null) report.CandidatesFound++;
+                onCandidateProduced?.Invoke(candidate);
             }
         }
 

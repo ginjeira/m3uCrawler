@@ -20,6 +20,29 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 - **Total agora**: **1466 testes** (anterior: 1455) — 11 novos, 0 removidos, 0 skipped incrementado.
 
 ### ✨ Adicionado
+- **Processamento incremental dos candidates** (PIPELINE-INC, 2026-09-14): o pipeline Telegram deixou de ser **batch-then-test** (acumulava todos os candidatos num `List` e só depois os testava) para passar a **producer-consumer online**: cada `CandidatePlaylist` descoberto durante a enumeração é emitido imediatamente para um `System.Threading.Channels.Channel<CandidatePlaylist>` e processado por um worker dedicado com `SemaphoreSlim(maxConcurrency)`. Resolve a latência artificial observada na run da mensagem `110751` (detectada ~10:50:16, primeiro teste de playlist só ~11:03:30 — 13 min de espera artificial). Agora a latência entre deteção e teste é (download+teste) / parallelism. Invariantes preservados (R1/R2/9A sem alteração):
+  - `CountryChannelValidator.AnalyzePlaylist`/`FilterStreamsByCountry` (R1) — exact same usage.
+  - `M3uParserService.Parse` — exact same usage.
+  - `StreamValidationTesterFactory.CreateTester` / `StreamValidationOptions` — exact same usage; `OverallTimeoutSeconds = 12` inalterado.
+  - `StreamValidationCache` / `HostFailureTracker` — não alterados.
+  - `PipelineIngestionService` (catalogo persistente) — exact same usage.
+  - `wtelegram.config` — não tocado.
+- **Classificador de falhas em `M3uTesterService.DownloadPlaylistContentAsync`** (PIPELINE-INC-DIAG, 2026-09-14): rótulo "timeout ou erro de rede" insuficiente — substituído por log estruturado com `kind` ∈ {`InvalidUrl`, `Http4xx`, `Http429`, `Http5xx`, `Timeout`, `Cancellation`, `Dns`, `TlsOrConnection`, `Network`, `Unknown`}, cada um com `durationMs`, `status` HTTP e URL sanitizada (sem credenciais, sem query string). API pública intacta (`Task<(string?, bool)>`). Apenas logging, não afecta comportamento HTTP nem timeouts.
+- **Testes** (10 novos, todos passam em `<1s`): `TelegramPipelineIncrementalTests` — callback `onCandidateProduced` invocado por candidate; `Channel<CandidatePlaylist>` delivery sob concorrência (50 candidates, maxConcurrency=5); consumer termina em `Complete()`; erro no processamento de UM candidate não derruba o pipeline (5/6 processados); producer+consumer correm em paralelo; múltiplos producers não corrompem o canal; callback `null` é no-op; `RunReport.CandidatesFound` incrementa-se por candidato; Cancellation propaga-se ao worker; classificador `InvalidUrl` para URL vazia.
+- **Total agora**: **1476 testes** (anterior: 1466) — 10 novos, 0 removidos, 0 regressões.
+
+### 🛡️ Correcções / Hardening
+- **PIPELINE-INC-HARDENING (2026-09-14): thread-safety do `RunReport` sob producer-consumer concorrente**. Risco detectado: o `RunReport` é mutado por até `maxConcurrency` tasks do worker simultaneamente, com escritas em contadores `int` (que não são atómicos em C#) e em `List<>` (que não é thread-safe). Correcção aplicada:
+  - **Counters `int` que são escritos por múltiplas tasks**: convertidos para `internal int _Field` com property-wrapper. `Interlocked.Increment(ref rep._X)` e `Interlocked.Add(ref rep._X, n)` substituem `++` e `+=`.
+  - **`List<>` (`RejectionReasons`, `DiscoveredPlaylists`)**: protegidos por `lock(rep.SyncRoot)`. `RunReport` expõe novo `internal readonly object SyncRoot`.
+  - **Helpers estáticos `AddRejection` / `AddDiscovered`**: encapsulam o `lock(rep.SyncRoot)` para invocação limpa em `ProcessCandidateAsync`.
+  - **`M3uTesterService`**: zero alterações (não é concorrente).
+  - **`CountryChannelValidator` / `M3uParserService` / `StreamValidationTesterFactory` / `StreamValidationCache` / `HostFailureTracker`**: zero alterações.
+- **PIPELINE-INC-CHANNEL-ANALYSIS (2026-09-14): análise do `Channel<CandidatePlaylist>` unbounded**. Pior caso conhecido: 1 mensagem HTML (110751) produz 751 accounts Xtream; o channel cresce linearmente. Cada `CandidatePlaylist` é ~500 bytes → pior caso plausível seria ~50 MB para 100 000 accounts/mensagem. Fan-out é determinístico e bounded (sem recursão, sem loop). Channel unbounded é seguro no desenho actual — não convertido para bounded. Activar bounded seria contraproducente (perda potencial de candidates) sem benefício mensurável.
+- **Testes** (7 novos, todos passam em `<16ms`): `TelegramPipelineRunReportThreadSafetyTests` — 1000 increments concorrentes em 4 counters distintos, valor exacto por counter; 200 writes concorrentes em `RejectionReasons` e `DiscoveredPlaylists` sem perda/erro; 5 runs repetidos sem perda; mix counter+list sem race; stress com `SemaphoreSlim(8)`; fan-out múltiplo simultâneo; integridade de `Status` string sob escritas concorrentes.
+- **Total agora**: **1483 testes** (anterior: 1476) — 7 novos, 0 removidos, 0 skipped incrementado.
+
+### ✨ Adicionado
 - **Resolução de publicações Telegram via t.me/c/ (introduzido 2026-09-09)**: uma mensagem Telegram que contém apenas um deep link para outra publicação do Telegram (e.g. `https://t.me/c/1635952193/110637`) deixa de ser invisível para o crawler. O pipeline agora descobre, resolve e tria estas referências em três camadas distintas:
   - **`TelegramPublicationDiscovery`** (parsing puro, sem I/O): identifica `https://t.me/c/<channel>/<message>` e URLs HTTP públicas adicionais no texto da mensagem.
   - **`TelegramPublicationResolver`** (recebe um `TelegramMessageFetcher` delegate, testável sem WTelegram): resolve a mensagem via `WTelegram.Channels_GetMessages(inputChannel, [InputMessageID])`, classifica o resultado em **`Resolved` / `ResolutionFailed` / `RequiresReview` / `Unsupported`**, aplica recursão com depth-limit (`MaxResolutionDepth = 3`) e seen-set para evitar ciclos, e re-aplica `XtreamPublicationResolver.ResolveFromHtml` quando o attachment é HTML com cards Xtream.

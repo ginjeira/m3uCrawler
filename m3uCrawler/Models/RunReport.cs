@@ -56,6 +56,19 @@ namespace m3uCrawler.Models
     /// </summary>
     public class RunReport
     {
+        // PIPELINE-INC-HARDENING (2026-09-14): o producer-consumer online
+        // pode escrever em counters/listas desta classe a partir de ate
+        // `maxConcurrency` tasks. Os contadores inteiros nao sao atomicos
+        // em C# (++ pode perder actualizacoes), e List<>.Add nao e' thread-safe.
+        // A canalizacao actual e':
+        //   - counters -> Interlocked.Increment nas escritas concorrentes
+        //     (ProcessCandidateAsync). Escritas single-thread (producer / fan-
+        //     out Xtream) mantem `++`.
+        //   - List<>.Add -> lock(this.SyncRoot) sincronizado.
+        // Membros apenas single-thread (MutationsBySingleThread) nao requerem
+        // sincronizacao.
+        internal readonly object SyncRoot = new();
+
         public DateTime StartedAt { get; set; } = DateTime.UtcNow;
         public DateTime FinishedAt { get; set; }
         public long DurationMs { get; set; }
@@ -63,24 +76,42 @@ namespace m3uCrawler.Models
 
         public int MessagesAnalyzed { get; set; }
         public int CandidatesFound { get; set; }
-        public int PlaylistsDownloaded { get; set; }
-        public int PlaylistsInvalid { get; set; }
-        public int CountryMatches { get; set; }
-        public int PlaylistsRejected { get; set; }
-        public int ChannelsRecognized { get; set; }
-        public int StreamsExtracted { get; set; }
+
+        // PIPELINE-INC-HARDENING (2026-09-14): os counters abaixo sao escritos
+        // em ProcessCandidateAsync por ate `maxConcurrency` tasks simultaneas.
+        // Auto-properties nao permitem `ref`, entao sao campos com properties
+        // wrappers. Escritas concorrentes usam Interlocked.* (aceita field).
+        // Escritas single-thread (apenas por ProcessCandidateAsync single
+        // executor) continuam a ter o mesmo aspecto semantico.
+        internal int _PlaylistsDownloaded;
+        public int PlaylistsDownloaded { get => _PlaylistsDownloaded; set => _PlaylistsDownloaded = value; }
+        internal int _PlaylistsInvalid;
+        public int PlaylistsInvalid { get => _PlaylistsInvalid; set => _PlaylistsInvalid = value; }
+        internal int _CountryMatches;
+        public int CountryMatches { get => _CountryMatches; set => _CountryMatches = value; }
+        internal int _PlaylistsRejected;
+        public int PlaylistsRejected { get => _PlaylistsRejected; set => _PlaylistsRejected = value; }
+        internal int _ChannelsRecognized;
+        public int ChannelsRecognized { get => _ChannelsRecognized; set => _ChannelsRecognized = value; }
+        internal int _StreamsExtracted;
+        public int StreamsExtracted { get => _StreamsExtracted; set => _StreamsExtracted = value; }
 
         // Streams que efectivamente chegaram a TestStreamsAsync após o filtro per-canal.
         // <= StreamsExtracted. Adicionado em 2026-08-30.
-        public int StreamsAfterCountryFilter { get; set; }
+        internal int _StreamsAfterCountryFilter;
+        public int StreamsAfterCountryFilter { get => _StreamsAfterCountryFilter; set => _StreamsAfterCountryFilter = value; }
 
         // Streams rejeitados pelo filtro per-canal/per-stream. (= StreamsExtracted - StreamsAfterCountryFilter).
         // Adicionado em 2026-08-30.
-        public int StreamsRejectedByCountry { get; set; }
+        internal int _StreamsRejectedByCountry;
+        public int StreamsRejectedByCountry { get => _StreamsRejectedByCountry; set => _StreamsRejectedByCountry = value; }
 
-        public int StreamsTested { get; set; }
-        public int StreamsWorking { get; set; }
-        public int StreamsFailed { get; set; }
+        internal int _StreamsTested;
+        public int StreamsTested { get => _StreamsTested; set => _StreamsTested = value; }
+        internal int _StreamsWorking;
+        public int StreamsWorking { get => _StreamsWorking; set => _StreamsWorking = value; }
+        internal int _StreamsFailed;
+        public int StreamsFailed { get => _StreamsFailed; set => _StreamsFailed = value; }
 
         // === Publicacao Discovery / Resolution (introduzido 2026-09-09) ===
 
