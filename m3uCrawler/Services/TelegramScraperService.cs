@@ -940,11 +940,11 @@ namespace m3uCrawler.Services
                     candidate.Content = attachmentText;
 
                     // ==== Telemetria 2026-09-12 ====
+                    // A linha detalhada com expected/actual/status e' emitida
+                    // por DownloadTelegramDocumentTextAsync. Aqui apenas
+                    // incrementamos o counter e marcamos como success
+                    // (a linha de truncamento ja' foi emitida pelo helper).
                     if (report != null) report.DocumentDownloadSuccesses++;
-                    Console.WriteLine(
-                        $"[TelegramDocumentDownload] messageId={messageId} " +
-                        $"filename='{TruncateForLog(filename, 128)}' " +
-                        $"result=success bytes={(attachmentText?.Length ?? 0)}");
 
                     if (!string.IsNullOrWhiteSpace(attachmentText) &&
                         new M3uCandidateDetector().LooksLikePlaylistContent(attachmentText) &&
@@ -963,11 +963,13 @@ namespace m3uCrawler.Services
                 catch (Exception ex)
                 {
                     // ==== Telemetria 2026-09-12 ====
+                    // O counter e o log detalhado ja' foram emitidos pelo
+                    // helper DownloadTelegramDocumentTextAsync quando
+                    // o erro vem do caminho principal. Aqui apenas
+                    // incrementamos o counter e damos uma mensagem
+                    // humana. Para o caminho de publicacao (t.me/c/),
+                    // o helper ja' foi chamado dentro do delegate.
                     if (report != null) report.DocumentDownloadFailures++;
-                    Console.WriteLine(
-                        $"[TelegramDocumentDownload] messageId={messageId} " +
-                        $"filename='{TruncateForLog(filename, 128)}' " +
-                        $"result=failure exceptionType={ex.GetType().Name} message='{TruncateForLog(ex.Message, 128)}'");
                     Console.WriteLine($"Falha ao processar anexo '{filename}': {ex.Message}");
                 }
             }
