@@ -194,5 +194,32 @@ namespace m3uCrawler.Models
         public List<string> RejectionReasons { get; set; } = new();
         public List<DiscoveredPlaylist> DiscoveredPlaylists { get; set; } = new();
         public List<PublicationTriageEntry> PublicationsTriageLog { get; set; } = new();
+
+        // PHASE-OBSERVABILITY (2026-09-15): contadores adicionais que
+        // reconciliam o RunReport com os eventos de tracing emitidos
+        // pela camada PipelineTrace. Cada contador corresponde a uma
+        // categoria de evento (e.g. HttpRequestStart, HttpRequestEnd,
+        // ResolverStart, ResolverEnd). Os valores aqui sao o numero
+        // de eventos observados durante o run.
+        //
+        // Nao sao incrementados automaticamente pelo RunReport (sao
+        // contados externamente pela camada de tracing); este
+        // expositor permite gravar um snapshot no RunReport.
+        public int TraceEventsHttpRequestStart { get; set; }
+        public int TraceEventsHttpRequestEnd { get; set; }
+        public int TraceEventsHttpRequestFailed { get; set; }
+        public int TraceEventsResolverStart { get; set; }
+        public int TraceEventsResolverEnd { get; set; }
+        public int TraceEventsCandidateCreated { get; set; }
+        public int TraceEventsCandidateRejected { get; set; }
+        public int TraceEventsChannelEnqueue { get; set; }
+        public int TraceEventsChannelDequeue { get; set; }
+        public int TraceEventsWorkerStart { get; set; }
+        public int TraceEventsWorkerEnd { get; set; }
+        public int TraceEventsAttachmentDownloadStart { get; set; }
+        public int TraceEventsAttachmentDownloadComplete { get; set; }
+        public int TraceEventsAttachmentDownloadFailed { get; set; }
+        public int TraceEventsXtreamAccount { get; set; }
+        public int TraceEventsCandidatePromoted { get; set; }
     }
 }

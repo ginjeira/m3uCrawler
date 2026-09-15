@@ -46,6 +46,12 @@ public sealed class M3uTesterService : IDisposable
     private readonly HttpClient _client;
     private StreamValidationMetrics? _lastMetrics;
 
+    // PHASE-OBSERVABILITY (2026-09-15): sink de tracing por instancia. Por
+    // defeito e' NullTraceSink.Instance (no-op) para nao alterar comportamento
+    // dos testes que instanciam M3uTesterService directamente. Pode ser
+    // substituido via constructor adicional ou SetTrace(ITraceSink).
+    private Validation.ITraceSink _trace = Validation.NullTraceSink.Instance;
+
     /// <summary>
     /// Construtor legacy. Cria options, cache e hostTracker PRIVADOS.
     /// Mantido para retro-compatibilidade com o Dashboard e com testes
@@ -76,6 +82,15 @@ public sealed class M3uTesterService : IDisposable
         _cache = state.Cache;
         _hostTracker = state.HostTracker;
         _client = HttpClientFactory.ResolveClient(_options.ConnectionTimeoutSeconds, _options.OverallTimeoutSeconds).Client;
+    }
+
+    // PHASE-OBSERVABILITY (2026-09-15): permite associar um sink de tracing
+    // ao tester. Por defeito o sink e' NullTraceSink (no-op). O tester
+    // permanece em conformidade com a sua API publica (nao ha mudanca
+    // de comportamento, apenas de observabilidade).
+    internal void SetTrace(Validation.ITraceSink trace)
+    {
+        _trace = trace ?? Validation.NullTraceSink.Instance;
     }
 
     public StreamValidationOptions Options => _options.Clone();
@@ -557,15 +572,9 @@ public sealed class M3uTesterService : IDisposable
         // PHASE 9A-FIX (2026-09-14): distingue timeout interno do
         // HttpClient (ConnectTimeout ou HttpClient.Timeout) de uma
         // cancellation externa, atraves de IsHttpClientInternalTimeout.
-        // Diagnostico read-only - nao altera comportamento HTTP nem o contrato
-        // publico. Apenas emite um log estruturado por falha, identificando
-        // o tipo de problema (Timeout / Cancellation / HttpTimeout /
-        // HttpConnectTimeout / HttpStatus4xx / 5xx / 429 / Network /
-        // TlsOrConnection / Dns / InvalidUrl) para distingui-los do
-        // rotulo generico "timeout ou erro de rede" do caller.
-        // A classificacao segue a natureza da exception + status HTTP.
-        // AVISO: nunca emite credenciais, query string completa, ou URL com
-        // password. Apenas host + path + status + duracao.
+        // PHASE-OBSERVABILITY (2026-09-15): adicionado tracing detalhado
+        // (requestId, request headers, response headers, body timing, dispose).
+        // Sem alteracao de comportamento HTTP nem do contrato publico.
         var sw = System.Diagnostics.Stopwatch.StartNew();
         if (string.IsNullOrWhiteSpace(url))
         {
@@ -573,16 +582,36 @@ public sealed class M3uTesterService : IDisposable
             return (null, false);
         }
 
+        // PHASE-OBSERVABILITY: tracing por request. PipelineTrace.Null se nao
+        // disponivel (back-compat com testes legacy).
+        var trace = _trace ?? Validation.NullTraceSink.Instance;
+        var requestId = "req_" + Guid.NewGuid().ToString("N").Substring(0, 8);
+        var ctx = new Validation.TraceContext
+        {
+            RequestId = requestId,
+        };
+        var safeUrl = CredentialSanitizer.SanitizeUrl(url);
+        trace.Information(Validation.TraceCategory.HttpRequestStart, ctx,
+            $"host={SafeHost(url)} path={SafePath(url)} safeUrl={safeUrl}");
+
         using var attemptCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         attemptCts.CancelAfter(_options.OverallTimeout);
+        var headersSw = Stopwatch.StartNew();
 
         try
         {
             using var request = new HttpRequestMessage(HttpMethod.Get, url);
             request.Headers.UserAgent.ParseAdd(_options.UserAgent);
+            request.Headers.Add("X-Request-Id", requestId);
+            var sendSw = Stopwatch.StartNew();
             using var response = await _client
                 .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, attemptCts.Token)
                 .ConfigureAwait(false);
+            var elapsedHeaders = (int)headersSw.ElapsedMilliseconds;
+            var contentType = response.Content.Headers.ContentType?.ToString() ?? string.Empty;
+            var contentLength = response.Content.Headers.ContentLength?.ToString() ?? "unknown";
+            trace.Information(Validation.TraceCategory.HttpRequestHeaders, ctx,
+                $"status={(int)response.StatusCode} timeToHeadersMs={elapsedHeaders} contentType={contentType} contentLength={contentLength}");
 
             var elapsed = (int)sw.ElapsedMilliseconds;
             if (!response.IsSuccessStatusCode)
@@ -591,84 +620,120 @@ public sealed class M3uTesterService : IDisposable
                 var kind = status == 429
                     ? "Http429"
                     : (status >= 500 ? "Http5xx" : "Http4xx");
+                trace.Warning(Validation.TraceCategory.HttpRequestEnd, ctx,
+                    $"kind={kind} status={status} durationMs={elapsed}");
                 LogPlaylistDownloadOutcome(url, kind: kind, durationMs: elapsed, status: status);
                 return (null, false);
             }
 
+            // Body read com timer separado.
+            var bodySw = Stopwatch.StartNew();
             var content = await response.Content
                 .ReadAsStringAsync(attemptCts.Token)
                 .ConfigureAwait(false);
+            var bodyMs = (int)bodySw.ElapsedMilliseconds;
+            var bytesRead = content?.Length ?? 0;
+            trace.Information(Validation.TraceCategory.HttpRequestBody, ctx,
+                $"bodyBytes={bytesRead} bodyReadMs={bodyMs}");
+            trace.Information(Validation.TraceCategory.HttpRequestEnd, ctx,
+                $"kind=HttpSuccess status=200 durationMs={elapsed}");
             return (content, true);
         }
         catch (Exception ex) when (ex is OperationCanceledException && IsHttpClientInternalTimeout(ex))
         {
-            // PHASE 9A-FIX (2026-09-14): timeout INTERNO do HttpClient.
-            // A excepcao traz TimeoutException na cadeia (comportamento
-            // documentado do .NET 9 para SocketsHttpHandler.ConnectTimeout
-            // e HttpClient.Timeout). Disambiguamos pela duracao observada:
-            //   - elapsed < ConnectionTimeout*1000+500  -> HttpConnectTimeout
-            //   - caso contrario                          -> HttpRequestTimeout
-            // Limites: se o utilizador configurar ConnectTimeout=5 e
-            // OverallTimeout=12 (default), HttpConnectTimeout dispara
-            // primeiro. Se ConnectTimeout>OverallTimeout, o attemptCts
-            // cancela primeiro e IsHttpClientInternalTimeout==false,
-            // caindo no catch seguinte (kind=Timeout). Em ambos os casos
-            // a classificacao e' inequivoca.
             var elapsed = (int)sw.ElapsedMilliseconds;
             var connectMs = _options.ConnectionTimeoutSeconds * 1000;
             var kind = elapsed < connectMs + 500
                 ? "HttpConnectTimeout"
                 : "HttpRequestTimeout";
+            trace.Warning(Validation.TraceCategory.HttpRequestFailed, ctx,
+                $"kind={kind} durationMs={elapsed} innerException={ex.InnerException?.GetType().Name} innerMessage='{(ex.InnerException?.Message ?? "").Substring(0, Math.Min(120, (ex.InnerException?.Message ?? "").Length))}'",
+                ex);
             LogPlaylistDownloadOutcome(url, kind: kind, durationMs: elapsed, status: 0, errorName: ex.GetType().Name);
             return (null, false);
         }
         catch (OperationCanceledException) when (attemptCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
         {
-            // attemptCts cooperativo (CancelAfter OverallTimeout) disparou
-            // antes do HttpClient interno. A excepcao NAO traz
-            // TimeoutException na cadeia (cancelamento vem do nosso
-            // CancellationTokenSource, nao do SocketsHttpHandler).
             var elapsed = (int)sw.ElapsedMilliseconds;
+            trace.Warning(Validation.TraceCategory.HttpRequestFailed, ctx,
+                $"kind=Timeout durationMs={elapsed} attemptCts fired");
             LogPlaylistDownloadOutcome(url, kind: "Timeout", durationMs: elapsed, status: 0);
             return (null, false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            // Cancellation explicita do caller (nao timeout do OverallTimeout).
             var elapsed = (int)sw.ElapsedMilliseconds;
+            trace.Warning(Validation.TraceCategory.HttpRequestFailed, ctx,
+                $"kind=Cancellation durationMs={elapsed} caller cancellation");
             LogPlaylistDownloadOutcome(url, kind: "Cancellation", durationMs: elapsed, status: 0);
             return (null, false);
         }
         catch (System.Security.Authentication.AuthenticationException ex)
         {
             var elapsed = (int)sw.ElapsedMilliseconds;
+            trace.Error(Validation.TraceCategory.HttpRequestFailed, ctx,
+                $"kind=TlsOrConnection durationMs={elapsed} ex={ex.GetType().Name} message='{ex.Message.Substring(0, Math.Min(120, ex.Message.Length))}'", ex);
             LogPlaylistDownloadOutcome(url, kind: "TlsOrConnection", durationMs: elapsed, status: 0, errorName: ex.GetType().Name);
             return (null, false);
         }
         catch (System.Net.Sockets.SocketException ex) when (ex.SocketErrorCode == System.Net.Sockets.SocketError.HostNotFound)
         {
             var elapsed = (int)sw.ElapsedMilliseconds;
+            trace.Error(Validation.TraceCategory.HttpRequestFailed, ctx,
+                $"kind=Dns durationMs={elapsed} socketError={ex.SocketErrorCode}", ex);
             LogPlaylistDownloadOutcome(url, kind: "Dns", durationMs: elapsed, status: 0, errorName: ex.GetType().Name);
             return (null, false);
         }
         catch (System.Net.Sockets.SocketException ex)
         {
-            // Demais falhas de socket: connection refused, reset, etc.
             var elapsed = (int)sw.ElapsedMilliseconds;
+            trace.Error(Validation.TraceCategory.HttpRequestFailed, ctx,
+                $"kind=Socket durationMs={elapsed} socketError={ex.SocketErrorCode}", ex);
             LogPlaylistDownloadOutcome(url, kind: "TlsOrConnection", durationMs: elapsed, status: 0, errorName: ex.GetType().Name);
             return (null, false);
         }
         catch (HttpRequestException ex)
         {
             var elapsed = (int)sw.ElapsedMilliseconds;
+            var inner = ex.InnerException;
+            trace.Error(Validation.TraceCategory.HttpRequestFailed, ctx,
+                $"kind=Network durationMs={elapsed} innerType={inner?.GetType().Name} innerMessage='{(inner?.Message ?? "").Substring(0, Math.Min(120, (inner?.Message ?? "").Length))}'", ex);
             LogPlaylistDownloadOutcome(url, kind: "Network", durationMs: elapsed, status: 0, errorName: ex.GetType().Name);
             return (null, false);
         }
         catch (Exception ex)
         {
             var elapsed = (int)sw.ElapsedMilliseconds;
+            trace.Error(Validation.TraceCategory.HttpRequestFailed, ctx,
+                $"kind=Unknown durationMs={elapsed} ex={ex.GetType().Name} message='{ex.Message.Substring(0, Math.Min(120, ex.Message.Length))}'", ex);
             LogPlaylistDownloadOutcome(url, kind: "Unknown", durationMs: elapsed, status: 0, errorName: ex.GetType().Name);
             return (null, false);
+        }
+    }
+
+    private static string SafeHost(string url)
+    {
+        try
+        {
+            return new Uri(url).Host;
+        }
+        catch
+        {
+            return "?";
+        }
+    }
+
+    private static string SafePath(string url)
+    {
+        try
+        {
+            var u = new Uri(url);
+            var path = u.AbsolutePath ?? "/";
+            return path.Length > 128 ? path[..128] + "..." : path;
+        }
+        catch
+        {
+            return "?";
         }
     }
 

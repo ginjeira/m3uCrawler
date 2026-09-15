@@ -13,7 +13,21 @@ namespace m3uCrawler.Services
         private readonly WTelegram.Client? _client;
         private readonly M3uCandidateDetector _detector = new();
 
+        // PHASE-OBSERVABILITY (2026-09-15): sink de tracing opcional. Por
+        // defeito e' NullTraceSink.Instance (no-op) para nao alterar
+        // comportamento dos testes que instanciam directamente.
+        private m3uCrawler.Services.Validation.ITraceSink _trace = m3uCrawler.Services.Validation.NullTraceSink.Instance;
+
         public RunReport? LastRunReport { get; private set; }
+
+        // PHASE-OBSERVABILITY (2026-09-15): associa um sink de tracing
+        // para observabilidade. Por defeito o sink e' NullTraceSink
+        // (no-op). O servico permanece em conformidade com a sua API
+        // publica (nao ha mudanca de comportamento).
+        public void SetTrace(m3uCrawler.Services.Validation.ITraceSink trace)
+        {
+            _trace = trace ?? m3uCrawler.Services.Validation.NullTraceSink.Instance;
+        }
 
         /// <summary>
         /// Construtor padrão: lê <c>wtelegram.config</c> e instancia o
@@ -156,6 +170,17 @@ namespace m3uCrawler.Services
             rep.StartedAt = DateTime.UtcNow;
             rep.Status = "running";
 
+            // PHASE-OBSERVABILITY (2026-09-15): tracing por run. O trace e'
+            // opcional (null -> NullTraceSink) para manter back-compat. Em
+            // producao, o Program.cs cria um PipelineTrace e associa-o a este
+            // servico via setter; testes podem passar um CapturingTraceSink.
+            var trace = _trace ?? m3uCrawler.Services.Validation.NullTraceSink.Instance;
+            var runCtx = new m3uCrawler.Services.Validation.TraceContext { };
+            trace.Information(m3uCrawler.Services.Validation.TraceCategory.RunStart, runCtx,
+                $"keyword='{keyword}' limit={limit} maxConcurrency={maxConcurrency} maxUrlsToTest={maxUrlsToTest} historyHours={historyHours} countryCode={countryCode}");
+            trace.Information(m3uCrawler.Services.Validation.TraceCategory.RunParameters, runCtx,
+                $"source=Telegram countriesDir={countriesDir ?? "<default>"} pipelineIngestor={(pipelineIngestor != null ? "set" : "null")} pipelineSourceKey={pipelineSourceKey ?? "<null>"}");
+
             // ==== PIPELINE-INC (2026-09-14): processamento incremental ====
             // Cada candidate descoberto entra imediatamente no processamento,
             // sem esperar que todos os dialogos sejam enumerados. A 110751 era
@@ -194,6 +219,13 @@ namespace m3uCrawler.Services
             // defaults.
             var tester = StreamValidationTesterFactory.CreateTester(
                 TryLoadSharedValidationState() ?? StreamValidationTesterFactory.CreateIsolatedState());
+            // PHASE-OBSERVABILITY (2026-09-15): associa o trace sink ao tester
+            // para que todos os HTTP requests do worker tambem sejam observados.
+            if (_trace is m3uCrawler.Services.Validation.PipelineTrace traceSink)
+            {
+                try { tester.GetType().GetMethod("SetTrace", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)?.Invoke(tester, new object[] { traceSink }); }
+                catch { /* SetTrace e' opcional nao-publico; tolerar se nao existir */ }
+            }
 
             var working = new List<M3uStream>();
             var workingLock = new object();
@@ -208,9 +240,29 @@ namespace m3uCrawler.Services
                 {
                     await foreach (var c in candidateChannel.Reader.ReadAllAsync(cancellationToken))
                     {
+                        // PHASE-OBSERVABILITY: ChannelDequeue event.
+                        var dequeueTrace = _trace ?? m3uCrawler.Services.Validation.NullTraceSink.Instance;
+                        dequeueTrace.Information(m3uCrawler.Services.Validation.TraceCategory.ChannelDequeue, new m3uCrawler.Services.Validation.TraceContext
+                        {
+                            CandidateId = c.Id,
+                            TelegramMessageId = null, // ChannelDequeue pode servir varias mensagens; e' especifico ao candidate
+                            ChatTitle = c.Source,
+                        }, $"worker-task={Task.CurrentId} kind={c.Kind} source={TruncateForLog(c.Source, 64)} filename='{TruncateForLog(c.FileName, 128)}'");
+
                         await semaphore.WaitAsync(cancellationToken);
                         var t = Task.Run(async () =>
                         {
+                            // PHASE-OBSERVABILITY: WorkerStart + CandidateProcessStart.
+                            dequeueTrace.Information(m3uCrawler.Services.Validation.TraceCategory.WorkerStart, new m3uCrawler.Services.Validation.TraceContext
+                            {
+                                CandidateId = c.Id,
+                                ChatTitle = c.Source,
+                            }, $"task={Task.CurrentId}");
+                            dequeueTrace.Information(m3uCrawler.Services.Validation.TraceCategory.CandidateProcessStart, new m3uCrawler.Services.Validation.TraceContext
+                            {
+                                CandidateId = c.Id,
+                                ChatTitle = c.Source,
+                            }, $"kind={c.Kind} url={CredentialSanitizer.SanitizeUrl(c.Url ?? string.Empty)} detectedFrom={c.DetectedFrom}");
                             try
                             {
                                 await ProcessCandidateAsync(
@@ -228,9 +280,22 @@ namespace m3uCrawler.Services
                                 // Falha no processamento de UM candidate NAO mata o pipeline.
                                 // Continua para os proximos.
                                 rep.RejectionReasons.Add($"{Display(c)}: processing exception {ex.GetType().Name}");
+                                dequeueTrace.Error(m3uCrawler.Services.Validation.TraceCategory.WorkerEnd, new m3uCrawler.Services.Validation.TraceContext
+                                {
+                                    CandidateId = c.Id,
+                                }, $"kind=Exception ex={ex.GetType().Name} message='{ex.Message.Substring(0, Math.Min(120, ex.Message.Length))}'", ex);
                             }
                             finally
                             {
+                                // PHASE-OBSERVABILITY: CandidateProcessEnd + WorkerEnd.
+                                dequeueTrace.Information(m3uCrawler.Services.Validation.TraceCategory.CandidateProcessEnd, new m3uCrawler.Services.Validation.TraceContext
+                                {
+                                    CandidateId = c.Id,
+                                }, "");
+                                dequeueTrace.Information(m3uCrawler.Services.Validation.TraceCategory.WorkerEnd, new m3uCrawler.Services.Validation.TraceContext
+                                {
+                                    CandidateId = c.Id,
+                                }, $"task={Task.CurrentId}");
                                 semaphore.Release();
                             }
                         }, cancellationToken);
@@ -254,10 +319,22 @@ namespace m3uCrawler.Services
                     keyword, limit, historyHours, rep,
                     onCandidateProduced: c =>
                     {
+                        // PHASE-OBSERVABILITY: ChannelEnqueue event.
+                        var enqueueTrace = _trace ?? m3uCrawler.Services.Validation.NullTraceSink.Instance;
+                        enqueueTrace.Information(m3uCrawler.Services.Validation.TraceCategory.ChannelEnqueue, new m3uCrawler.Services.Validation.TraceContext
+                        {
+                            CandidateId = c.Id,
+                            ChatTitle = c.Source,
+                        }, $"kind={c.Kind} filename='{TruncateForLog(c.FileName, 128)}'");
+
                         // channel.Writer.TryWrite e' non-blocking (unboundedChannel).
                         if (!candidateChannel.Writer.TryWrite(c))
                         {
                             rep.RejectionReasons.Add($"{Display(c)}: candidate channel write failed");
+                            enqueueTrace.Warning(m3uCrawler.Services.Validation.TraceCategory.CandidateRejected, new m3uCrawler.Services.Validation.TraceContext
+                            {
+                                CandidateId = c.Id,
+                            }, "reason=channel-write-failed");
                         }
                     });
             }
@@ -325,6 +402,17 @@ namespace m3uCrawler.Services
                 }
             }
 
+            // PHASE-OBSERVABILITY (2026-09-15): RunEnd event.
+            var traceEnd = _trace ?? m3uCrawler.Services.Validation.NullTraceSink.Instance;
+            var endCtx = new m3uCrawler.Services.Validation.TraceContext { };
+            traceEnd.Information(m3uCrawler.Services.Validation.TraceCategory.RunEnd, endCtx,
+                $"messagesAnalyzed={rep.MessagesAnalyzed} candidatesFound={rep.CandidatesFound} playlistsDownloaded={rep.PlaylistsDownloaded} streamsWorking={rep.StreamsWorking} streamsFailed={rep.StreamsFailed} durationMs={rep.DurationMs}");
+            // PHASE-OBSERVABILITY: se o trace e' uma PipelineTrace com runId, copia
+            // os contadores de eventos para o RunReport (reconciliacao pos-run).
+            if (_trace is m3uCrawler.Services.Validation.PipelineTrace realTrace)
+            {
+                m3uCrawler.Services.Validation.RunReportTraceReconciler.RecordSnapshot(rep, realTrace);
+            }
             return (working, rep);
         }
 
@@ -391,25 +479,61 @@ namespace m3uCrawler.Services
             // contrario pode ser uma publicacao HTML com cards Xtream.
             if (candidate.RequiresContentVerification && content != null && !_detector.LooksLikePlaylistContent(content))
             {
+                // PHASE-OBSERVABILITY: ResolverStart.
+                var resTrace = _trace ?? m3uCrawler.Services.Validation.NullTraceSink.Instance;
+                resTrace.Information(m3uCrawler.Services.Validation.TraceCategory.ResolverStart, new m3uCrawler.Services.Validation.TraceContext
+                {
+                    CandidateId = candidate.Id,
+                    ChatTitle = candidate.Source,
+                }, $"resolver=XtreamPublicationResolver contentLength={content?.Length ?? 0}");
                 if (LooksLikeHtmlPublication(content))
                 {
                     var accounts = XtreamPublicationResolver.ResolveFromHtml(
                         content!, candidate.Url ?? string.Empty);
+                    resTrace.Information(m3uCrawler.Services.Validation.TraceCategory.ResolverEnd, new m3uCrawler.Services.Validation.TraceContext
+                    {
+                        CandidateId = candidate.Id,
+                    }, $"resolver=XtreamPublicationResolver accountsDiscovered={accounts.Count}");
                     if (accounts.Count == 0)
                     {
                         AddRejection(rep, $"{CredentialSanitizer.SanitizeUrl(candidate.Url) ?? candidate.Source}: no xtream cards found");
+                        resTrace.Warning(m3uCrawler.Services.Validation.TraceCategory.CandidateRejected, new m3uCrawler.Services.Validation.TraceContext
+                        {
+                            CandidateId = candidate.Id,
+                        }, "reason=no-xtream-cards");
                         return;
                     }
+                    // PHASE-OBSERVABILITY: emitir um evento por XtreamAccount para reconciliacao.
+                    // Nao inclui password, apenas host/port/username hash + parent.
+                    int xIdx = 0;
                     foreach (var acc in accounts)
                     {
+                        var accId = $"{candidate.Id}#x{xIdx}";
+                        resTrace.Information(m3uCrawler.Services.Validation.TraceCategory.XtreamAccount, new m3uCrawler.Services.Validation.TraceContext
+                        {
+                            CandidateId = candidate.Id,
+                            ParentCandidateId = candidate.Id,
+                        }, $"accountId={accId} host={acc.Host} port={acc.Port} username={SafeUsername(acc.Username)}");
+                        xIdx++;
+
                         var playlistUrl = acc.M3uUrl ?? BuildXtreamPlaylistUrl(acc);
                         var promoted = PromoteXtreamAccount(playlistUrl, candidate.Url ?? string.Empty);
                         if (promoted != null)
                         {
+                            resTrace.Information(m3uCrawler.Services.Validation.TraceCategory.CandidatePromoted, new m3uCrawler.Services.Validation.TraceContext
+                            {
+                                CandidateId = candidate.Id,
+                                ParentCandidateId = promoted.Id,
+                            }, $"promotedCandidateId={promoted.Id} m3uUrl={CredentialSanitizer.SanitizeUrl(playlistUrl ?? string.Empty)}");
+
                             // Re-injecta no canal. ChannelWriter.TryWrite e' non-blocking.
                             if (!writer.TryWrite(promoted))
                             {
                                 AddRejection(rep, $"{Display(promoted)}: channel write failed");
+                                resTrace.Warning(m3uCrawler.Services.Validation.TraceCategory.CandidateRejected, new m3uCrawler.Services.Validation.TraceContext
+                                {
+                                    CandidateId = promoted.Id,
+                                }, "reason=channel-write-failed");
                             }
                         }
                     }
@@ -781,6 +905,16 @@ namespace m3uCrawler.Services
             string text = m.message ?? "";
             string filename = "";
 
+            // PHASE-OBSERVABILITY (2026-09-15): tracing por mensagem.
+            var msgTrace = _trace ?? m3uCrawler.Services.Validation.NullTraceSink.Instance;
+            var msgCtx = new m3uCrawler.Services.Validation.TraceContext
+            {
+                TelegramMessageId = m.ID,
+                ChatTitle = chatTitle,
+            };
+            msgTrace.Information(m3uCrawler.Services.Validation.TraceCategory.MessageAnalyzed, msgCtx,
+                $"date={m.date:o} textLength={text.Length}");
+
             // ==== Telemetria 2026-09-12: diagnosticar silent-drop de documentos HTML ====
             string mediaType = m.media switch
             {
@@ -805,6 +939,8 @@ namespace m3uCrawler.Services
 
             if (mediaType != "None")
             {
+                msgTrace.Information(m3uCrawler.Services.Validation.TraceCategory.MessageMediaInfo, msgCtx,
+                    $"mediaType={mediaType} size={docSize} mimeType='{docMime ?? "<n/a>"}' docAttributes={docAttributes}");
                 if (report != null) report.MessagesWithMedia++;
                 if (mediaType == "Document") { if (report != null) report.MessagesWithDocumentMedia++; }
                 else if (mediaType == "Photo") { if (report != null) report.MessagesWithPhotoMedia++; }
@@ -849,7 +985,11 @@ namespace m3uCrawler.Services
             }
 
             // Descoberta NAO depende da keyword.
+            msgTrace.Information(m3uCrawler.Services.Validation.TraceCategory.DetectStart, msgCtx,
+                $"filename='{TruncateForLog(filename, 128)}'");
             var found = _detector.DetectFromMessage(text, filename).ToList();
+            msgTrace.Information(m3uCrawler.Services.Validation.TraceCategory.DetectEnd, msgCtx,
+                $"candidates={found.Count}");
 
             if (m.media != null)
             {
@@ -858,6 +998,13 @@ namespace m3uCrawler.Services
                 Console.WriteLine(
                     $"[TelegramDetectResult] messageId={m.ID} filename='{TruncateForLog(filename, 128)}' " +
                     $"candidates={found.Count}");
+
+                // PHASE-OBSERVABILITY: emite um evento por candidate criado.
+                foreach (var c in found)
+                {
+                    msgTrace.Information(m3uCrawler.Services.Validation.TraceCategory.CandidateCreated, msgCtx,
+                        $"candidateId={c.Id} kind={c.Kind} source={TruncateForLog(c.Source, 64)} filename='{TruncateForLog(c.FileName, 128)}' url={CredentialSanitizer.SanitizeUrl(c.Url ?? string.Empty)} detectedFrom={c.DetectedFrom} requiresContentVerification={c.RequiresContentVerification}");
+                }
             }
 
             foreach (var pubUrl in ExtractRemainingHttpUrls(text, found))
@@ -1230,6 +1377,16 @@ namespace m3uCrawler.Services
             var expected = document.size;
             var sw = System.Diagnostics.Stopwatch.StartNew();
 
+            // PHASE-OBSERVABILITY (2026-09-15): tracing de download.
+            var dlTrace = _trace ?? m3uCrawler.Services.Validation.NullTraceSink.Instance;
+            var dlCtx = new m3uCrawler.Services.Validation.TraceContext
+            {
+                TelegramMessageId = messageIdForLog,
+                AttachmentFilename = filenameForLog,
+            };
+            dlTrace.Information(m3uCrawler.Services.Validation.TraceCategory.AttachmentDownloadStart, dlCtx,
+                $"expected={expected}");
+
             long chunks = 0;
             long lastTransmitted = 0;
 
@@ -1250,6 +1407,9 @@ namespace m3uCrawler.Services
                 {
                     chunks++;
                     lastTransmitted = transmitted;
+                    // PHASE-OBSERVABILITY: emitir progress por chunk (Debug).
+                    dlTrace.Debug(m3uCrawler.Services.Validation.TraceCategory.AttachmentDownloadProgress, dlCtx,
+                        $"transmitted={transmitted} total={total} chunks={chunks}");
                     if (transmitted >= expected && expected > 0) return;
                     cts.Token.ThrowIfCancellationRequested();
                 };
@@ -1275,6 +1435,8 @@ namespace m3uCrawler.Services
 
                 if (actual == 0)
                 {
+                    dlTrace.Warning(m3uCrawler.Services.Validation.TraceCategory.AttachmentDownloadFailed, dlCtx,
+                        $"status=failed expected={expected} actual=0 chunks={chunks} durationMs={sw.ElapsedMilliseconds} error=empty-stream");
                     LogDownloadOutcome(filenameForLog, messageIdForLog, expected, 0,
                         status: "failed", durationMs: sw.ElapsedMilliseconds,
                         chunks: (int)chunks, error: "empty stream");
@@ -1283,6 +1445,8 @@ namespace m3uCrawler.Services
 
                 if (expected > 0 && actual < expected)
                 {
+                    dlTrace.Warning(m3uCrawler.Services.Validation.TraceCategory.AttachmentDownloadFailed, dlCtx,
+                        $"status=truncated expected={expected} actual={actual} chunks={chunks} durationMs={sw.ElapsedMilliseconds}");
                     LogDownloadOutcome(filenameForLog, messageIdForLog, expected, actual,
                         status: "truncated", durationMs: sw.ElapsedMilliseconds,
                         chunks: (int)chunks, error: null);
@@ -1291,12 +1455,16 @@ namespace m3uCrawler.Services
 
                 if (expected > 0 && actual > expected)
                 {
+                    dlTrace.Warning(m3uCrawler.Services.Validation.TraceCategory.AttachmentDownloadFailed, dlCtx,
+                        $"status=unexpected expected={expected} actual={actual} chunks={chunks} durationMs={sw.ElapsedMilliseconds}");
                     LogDownloadOutcome(filenameForLog, messageIdForLog, expected, actual,
                         status: "unexpected", durationMs: sw.ElapsedMilliseconds,
                         chunks: (int)chunks, error: null);
                     // Em unexpected ainda tentamos usar o conteudo.
                 }
 
+                dlTrace.Information(m3uCrawler.Services.Validation.TraceCategory.AttachmentDownloadComplete, dlCtx,
+                    $"expected={expected} actual={actual} chunks={chunks} durationMs={sw.ElapsedMilliseconds}");
                 LogDownloadOutcome(filenameForLog, messageIdForLog, expected, actual,
                     status: "complete", durationMs: sw.ElapsedMilliseconds,
                     chunks: (int)chunks, error: null);
@@ -1606,6 +1774,19 @@ namespace m3uCrawler.Services
             }
             var slug = sb.ToString().Trim('-');
             return string.IsNullOrEmpty(slug) ? "unknown" : slug;
+        }
+
+        /// <summary>
+        /// PHASE-OBSERVABILITY (2026-09-15): helper que produz um username
+        /// seguro para logs: primeiros 4 chars + tamanho total. Nunca
+        /// expõe a string completa para evitar correlação com passwords
+        /// reais ou usernames reutilizados.
+        /// </summary>
+        private static string SafeUsername(string? username)
+        {
+            if (string.IsNullOrEmpty(username)) return "<empty>";
+            if (username.Length <= 4) return new string('*', username.Length);
+            return username.Substring(0, 4) + "*(" + username.Length + ")";
         }
 
         /// <summary>
