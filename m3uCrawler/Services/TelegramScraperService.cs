@@ -223,8 +223,7 @@ namespace m3uCrawler.Services
             // para que todos os HTTP requests do worker tambem sejam observados.
             if (_trace is m3uCrawler.Services.Validation.PipelineTrace traceSink)
             {
-                try { tester.GetType().GetMethod("SetTrace", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)?.Invoke(tester, new object[] { traceSink }); }
-                catch { /* SetTrace e' opcional nao-publico; tolerar se nao existir */ }
+                tester.SetTrace(traceSink);
             }
 
             var working = new List<M3uStream>();

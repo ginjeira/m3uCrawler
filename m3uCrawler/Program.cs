@@ -108,6 +108,21 @@ namespace m3uCrawler
             if (args.Contains("--telegram"))
             {
                 var scraper = new TelegramScraperService();
+                // PHASE-OBSERVABILITY (2026-09-15): activar tracing automaticamente
+                // quando a env var M3UCRAWLER_TRACE esta' definida. Em modo
+                // observabilidade (--telegram + M3UCRAWLER_TRACE=1), o pipeline
+                // emite eventos estruturados com TraceContext, permitindo
+                // reconstruir o percurso completo de qualquer mensagem/candidate.
+                // Por defeito (sem a env var) o tracing e' NullTraceSink.Instance
+                // (no-op), preservando o comportamento de producao.
+                string? traceEnv = Environment.GetEnvironmentVariable("M3UCRAWLER_TRACE");
+                if (!string.IsNullOrEmpty(traceEnv) && traceEnv != "0" && traceEnv.ToLowerInvariant() != "false")
+                {
+                    var pipelineTrace = new m3uCrawler.Services.Validation.PipelineTrace();
+                    pipelineTrace.MinimumLevel = m3uCrawler.Services.Validation.TraceLevel.Debug;
+                    scraper.SetTrace(pipelineTrace);
+                    Console.WriteLine($"[OBSERVABILITY] PipelineTrace active runId={pipelineTrace.RunId} minimumLevel=Debug");
+                }
                 await scraper.LoginAsync();
 
                 var catalogDbPath = ResolveCatalogDbPath(args);

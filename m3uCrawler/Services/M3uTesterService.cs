@@ -88,7 +88,7 @@ public sealed class M3uTesterService : IDisposable
     // ao tester. Por defeito o sink e' NullTraceSink (no-op). O tester
     // permanece em conformidade com a sua API publica (nao ha mudanca
     // de comportamento, apenas de observabilidade).
-    internal void SetTrace(Validation.ITraceSink trace)
+    public void SetTrace(Validation.ITraceSink trace)
     {
         _trace = trace ?? Validation.NullTraceSink.Instance;
     }
