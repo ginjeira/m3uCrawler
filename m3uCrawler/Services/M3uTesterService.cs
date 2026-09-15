@@ -579,6 +579,7 @@ public sealed class M3uTesterService : IDisposable
         if (string.IsNullOrWhiteSpace(url))
         {
             LogPlaylistDownloadOutcome(url, kind: "InvalidUrl", durationMs: 0, status: 0);
+            Validation.Diag110751.Report("DOWNLOAD_HTTP", "INVALID_URL", "", candidateId: null);
             return (null, false);
         }
 
@@ -594,6 +595,10 @@ public sealed class M3uTesterService : IDisposable
         trace.Information(Validation.TraceCategory.HttpRequestStart, ctx,
             $"host={SafeHost(url)} path={SafePath(url)} safeUrl={safeUrl}");
 
+        // DIAGNOSTIC-110751: download START + REQUEST_CREATED.
+        Validation.Diag110751Http.ReportDownloadStart(url, null, null);
+        Validation.Diag110751Http.ReportRequestCreated(url, null, null, requestId);
+
         using var attemptCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         attemptCts.CancelAfter(_options.OverallTimeout);
         var headersSw = Stopwatch.StartNew();
@@ -604,6 +609,11 @@ public sealed class M3uTesterService : IDisposable
             request.Headers.UserAgent.ParseAdd(_options.UserAgent);
             request.Headers.Add("X-Request-Id", requestId);
             var sendSw = Stopwatch.StartNew();
+            // DIAGNOSTIC-110751: SEND_START (sem resolucao DNS artificial:
+            // mantemos apenas a observacao do percurso HTTP real; qualquer
+            // informacao sobre DNS/connection sera' obtida legitimamente
+            // pelo HttpClient).
+            Validation.Diag110751Http.ReportRequestSendStart(url, null, null, requestId);
             using var response = await _client
                 .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, attemptCts.Token)
                 .ConfigureAwait(false);
@@ -612,6 +622,10 @@ public sealed class M3uTesterService : IDisposable
             var contentLength = response.Content.Headers.ContentLength?.ToString() ?? "unknown";
             trace.Information(Validation.TraceCategory.HttpRequestHeaders, ctx,
                 $"status={(int)response.StatusCode} timeToHeadersMs={elapsedHeaders} contentType={contentType} contentLength={contentLength}");
+            // DIAGNOSTIC-110751: HEADERS_RECEIVED.
+            string httpVer = response.Version?.ToString() ?? "?";
+            Validation.Diag110751Http.ReportHeadersReceived(null, null, requestId,
+                (int)response.StatusCode, httpVer, contentType, contentLength, elapsedHeaders);
 
             var elapsed = (int)sw.ElapsedMilliseconds;
             if (!response.IsSuccessStatusCode)
@@ -623,11 +637,14 @@ public sealed class M3uTesterService : IDisposable
                 trace.Warning(Validation.TraceCategory.HttpRequestEnd, ctx,
                     $"kind={kind} status={status} durationMs={elapsed}");
                 LogPlaylistDownloadOutcome(url, kind: kind, durationMs: elapsed, status: status);
+                Validation.Diag110751Http.ReportDownloadEnd(null, null, requestId, elapsed, ok: false);
                 return (null, false);
             }
 
             // Body read com timer separado.
             var bodySw = Stopwatch.StartNew();
+            // DIAGNOSTIC-110751: BODY_READ_START.
+            Validation.Diag110751Http.ReportBodyStart(null, null, requestId, (int)bodySw.ElapsedMilliseconds);
             var content = await response.Content
                 .ReadAsStringAsync(attemptCts.Token)
                 .ConfigureAwait(false);
@@ -637,6 +654,8 @@ public sealed class M3uTesterService : IDisposable
                 $"bodyBytes={bytesRead} bodyReadMs={bodyMs}");
             trace.Information(Validation.TraceCategory.HttpRequestEnd, ctx,
                 $"kind=HttpSuccess status=200 durationMs={elapsed}");
+            Validation.Diag110751Http.ReportBodyEnd(null, null, requestId, bytesRead, bodyMs);
+            Validation.Diag110751Http.ReportDownloadEnd(null, null, requestId, elapsed, ok: true);
             return (content, true);
         }
         catch (Exception ex) when (ex is OperationCanceledException && IsHttpClientInternalTimeout(ex))
@@ -650,6 +669,8 @@ public sealed class M3uTesterService : IDisposable
                 $"kind={kind} durationMs={elapsed} innerException={ex.InnerException?.GetType().Name} innerMessage='{(ex.InnerException?.Message ?? "").Substring(0, Math.Min(120, (ex.InnerException?.Message ?? "").Length))}'",
                 ex);
             LogPlaylistDownloadOutcome(url, kind: kind, durationMs: elapsed, status: 0, errorName: ex.GetType().Name);
+            Validation.Diag110751Http.ReportDownloadError(null, null, requestId, ex, elapsed);
+            Validation.Diag110751.RecordFirstFailure("DOWNLOAD_HTTP", ex);
             return (null, false);
         }
         catch (OperationCanceledException) when (attemptCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
@@ -658,6 +679,8 @@ public sealed class M3uTesterService : IDisposable
             trace.Warning(Validation.TraceCategory.HttpRequestFailed, ctx,
                 $"kind=Timeout durationMs={elapsed} attemptCts fired");
             LogPlaylistDownloadOutcome(url, kind: "Timeout", durationMs: elapsed, status: 0);
+            Validation.Diag110751Http.ReportDownloadError(null, null, requestId, new TimeoutException("attemptCts fired"), elapsed);
+            Validation.Diag110751.RecordFirstFailure("DOWNLOAD_HTTP", new TimeoutException("attemptCts fired"));
             return (null, false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -666,6 +689,8 @@ public sealed class M3uTesterService : IDisposable
             trace.Warning(Validation.TraceCategory.HttpRequestFailed, ctx,
                 $"kind=Cancellation durationMs={elapsed} caller cancellation");
             LogPlaylistDownloadOutcome(url, kind: "Cancellation", durationMs: elapsed, status: 0);
+            Validation.Diag110751Http.ReportDownloadError(null, null, requestId, ex: new OperationCanceledException("caller cancellation"), elapsed);
+            Validation.Diag110751.RecordFirstCancellation("DOWNLOAD_HTTP", cancellationToken);
             return (null, false);
         }
         catch (System.Security.Authentication.AuthenticationException ex)
@@ -674,6 +699,8 @@ public sealed class M3uTesterService : IDisposable
             trace.Error(Validation.TraceCategory.HttpRequestFailed, ctx,
                 $"kind=TlsOrConnection durationMs={elapsed} ex={ex.GetType().Name} message='{ex.Message.Substring(0, Math.Min(120, ex.Message.Length))}'", ex);
             LogPlaylistDownloadOutcome(url, kind: "TlsOrConnection", durationMs: elapsed, status: 0, errorName: ex.GetType().Name);
+            Validation.Diag110751Http.ReportDownloadError(null, null, requestId, ex, elapsed);
+            Validation.Diag110751.RecordFirstFailure("DOWNLOAD_HTTP", ex);
             return (null, false);
         }
         catch (System.Net.Sockets.SocketException ex) when (ex.SocketErrorCode == System.Net.Sockets.SocketError.HostNotFound)
@@ -682,6 +709,8 @@ public sealed class M3uTesterService : IDisposable
             trace.Error(Validation.TraceCategory.HttpRequestFailed, ctx,
                 $"kind=Dns durationMs={elapsed} socketError={ex.SocketErrorCode}", ex);
             LogPlaylistDownloadOutcome(url, kind: "Dns", durationMs: elapsed, status: 0, errorName: ex.GetType().Name);
+            Validation.Diag110751Http.ReportDownloadError(null, null, requestId, ex, elapsed);
+            Validation.Diag110751.RecordFirstFailure("DOWNLOAD_HTTP", ex);
             return (null, false);
         }
         catch (System.Net.Sockets.SocketException ex)
@@ -690,6 +719,8 @@ public sealed class M3uTesterService : IDisposable
             trace.Error(Validation.TraceCategory.HttpRequestFailed, ctx,
                 $"kind=Socket durationMs={elapsed} socketError={ex.SocketErrorCode}", ex);
             LogPlaylistDownloadOutcome(url, kind: "TlsOrConnection", durationMs: elapsed, status: 0, errorName: ex.GetType().Name);
+            Validation.Diag110751Http.ReportDownloadError(null, null, requestId, ex, elapsed);
+            Validation.Diag110751.RecordFirstFailure("DOWNLOAD_HTTP", ex);
             return (null, false);
         }
         catch (HttpRequestException ex)
@@ -699,6 +730,8 @@ public sealed class M3uTesterService : IDisposable
             trace.Error(Validation.TraceCategory.HttpRequestFailed, ctx,
                 $"kind=Network durationMs={elapsed} innerType={inner?.GetType().Name} innerMessage='{(inner?.Message ?? "").Substring(0, Math.Min(120, (inner?.Message ?? "").Length))}'", ex);
             LogPlaylistDownloadOutcome(url, kind: "Network", durationMs: elapsed, status: 0, errorName: ex.GetType().Name);
+            Validation.Diag110751Http.ReportDownloadError(null, null, requestId, ex, elapsed);
+            Validation.Diag110751.RecordFirstFailure("DOWNLOAD_HTTP", ex);
             return (null, false);
         }
         catch (Exception ex)
@@ -707,6 +740,8 @@ public sealed class M3uTesterService : IDisposable
             trace.Error(Validation.TraceCategory.HttpRequestFailed, ctx,
                 $"kind=Unknown durationMs={elapsed} ex={ex.GetType().Name} message='{ex.Message.Substring(0, Math.Min(120, ex.Message.Length))}'", ex);
             LogPlaylistDownloadOutcome(url, kind: "Unknown", durationMs: elapsed, status: 0, errorName: ex.GetType().Name);
+            Validation.Diag110751Http.ReportDownloadError(null, null, requestId, ex, elapsed);
+            Validation.Diag110751.RecordFirstFailure("DOWNLOAD_HTTP", ex);
             return (null, false);
         }
     }

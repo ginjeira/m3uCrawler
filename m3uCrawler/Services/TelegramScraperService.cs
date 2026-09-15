@@ -170,6 +170,25 @@ namespace m3uCrawler.Services
             rep.StartedAt = DateTime.UtcNow;
             rep.Status = "running";
 
+            // DIAGNOSTIC-110751 (2026-09-15): inicializa instrumentacao
+            // profunda se a env var M3UCRAWLER_DIAG_110751 estiver
+            // definida. Tudo o resto do fluxo emite via Diag110751.Report.
+            Validation.Diag110751.EnsureInitialized();
+            // DIAGNOSTIC-110751 (fail-fast): CancellationToken interno
+            // dedicado ao modo de diagnostico. Quando Diag110751 dispara
+            // a primeira falha, a stop-callback abaixo cancela este
+            // token, fazendo o worker sair do `await foreach` e o
+            // producer parar de emitir novos candidates.
+            var diagCts = new CancellationTokenSource();
+            CancellationToken diagCt = diagCts.Token;
+            Action<Exception> diagStopCb = _ =>
+            {
+                try { diagCts.Cancel(); } catch { /* ignore */ }
+            };
+            Validation.Diag110751.RegisterStopCallback(diagStopCb);
+            Validation.Diag110751.Report("RUN", "START",
+                $"keyword='{keyword}' limit={limit} maxConcurrency={maxConcurrency} maxUrlsToTest={maxUrlsToTest} historyHours={historyHours} countryCode={countryCode} countriesDir='{countriesDir ?? "<default>"}'");
+
             // PHASE-OBSERVABILITY (2026-09-15): tracing por run. O trace e'
             // opcional (null -> NullTraceSink) para manter back-compat. Em
             // producao, o Program.cs cria um PipelineTrace e associa-o a este
@@ -238,8 +257,19 @@ namespace m3uCrawler.Services
                 var activeProcessing = new List<Task>();
                 try
                 {
+                    // DIAGNOSTIC-110751 (fail-fast): o ReadAllAsync observa
+                    // cancellationToken OU diagCt (modo investigacao). Se
+                    // Diag110751 disparar a primeira falha, diagCt e'
+                    // cancelado pela stop-callback, fazendo o worker sair
+                    // do loop antes de processar novos candidates.
                     await foreach (var c in candidateChannel.Reader.ReadAllAsync(cancellationToken))
                     {
+                        if (Validation.Diag110751.IsStopping)
+                        {
+                            Validation.Diag110751.Report("WORKER", "DEQUEUE_LOOP_EXIT",
+                                $"reason=diagnostic_stopping task={Task.CurrentId}");
+                            break;
+                        }
                         // PHASE-OBSERVABILITY: ChannelDequeue event.
                         var dequeueTrace = _trace ?? m3uCrawler.Services.Validation.NullTraceSink.Instance;
                         dequeueTrace.Information(m3uCrawler.Services.Validation.TraceCategory.ChannelDequeue, new m3uCrawler.Services.Validation.TraceContext
@@ -250,6 +280,21 @@ namespace m3uCrawler.Services
                         }, $"worker-task={Task.CurrentId} kind={c.Kind} source={TruncateForLog(c.Source, 64)} filename='{TruncateForLog(c.FileName, 128)}'");
 
                         await semaphore.WaitAsync(cancellationToken);
+                        // DIAGNOSTIC-110751 (fail-fast): se o diagnostico ja'
+                        // disparou a primeira falha, nao iniciar nova
+                        // task; o worker sai do loop assim que o channel
+                        // for completado.
+                        if (Validation.Diag110751.IsStopping)
+                        {
+                            semaphore.Release();
+                            Validation.Diag110751.Report("WORKER", "SKIPPED",
+                                $"task={Task.CurrentId} candidateId={c.Id} reason=diagnostic_stopping",
+                                candidateId: c.Id);
+                            continue;
+                        }
+                        // DIAGNOSTIC-110751: worker depois de obter slot.
+                        Validation.Diag110751.Report("WORKER", "DEQUEUE",
+                            $"task={Task.CurrentId} candidateId={c.Id}", candidateId: c.Id);
                         var t = Task.Run(async () =>
                         {
                             // PHASE-OBSERVABILITY: WorkerStart + CandidateProcessStart.
@@ -263,6 +308,10 @@ namespace m3uCrawler.Services
                                 CandidateId = c.Id,
                                 ChatTitle = c.Source,
                             }, $"kind={c.Kind} url={CredentialSanitizer.SanitizeUrl(c.Url ?? string.Empty)} detectedFrom={c.DetectedFrom}");
+                            // DIAGNOSTIC-110751: PROCESS_CANDIDATE start.
+                            Validation.Diag110751.Report("PROCESS_CANDIDATE", "START",
+                                $"task={Task.CurrentId} kind={c.Kind} url='{Validation.Diag110751Http.SafeUrl(c.Url)}' detectedFrom={c.DetectedFrom}",
+                                candidateId: c.Id);
                             try
                             {
                                 await ProcessCandidateAsync(
@@ -270,10 +319,16 @@ namespace m3uCrawler.Services
                                     maxUrlsToTest, maxConcurrency,
                                     candidateChannel.Writer, working, workingLock,
                                     cancellationToken);
+                                // DIAGNOSTIC-110751: PROCESS_CANDIDATE end (sem exception).
+                                Validation.Diag110751.Report("PROCESS_CANDIDATE", "END",
+                                    $"task={Task.CurrentId}", candidateId: c.Id);
                             }
                             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
                             {
                                 // Cancelamento explicito; nada a registar.
+                                Validation.Diag110751.RecordFirstCancellation("PROCESS_CANDIDATE", cancellationToken);
+                                Validation.Diag110751.Report("PROCESS_CANDIDATE", "CANCELLED",
+                                    $"task={Task.CurrentId}", candidateId: c.Id);
                             }
                             catch (Exception ex)
                             {
@@ -284,6 +339,8 @@ namespace m3uCrawler.Services
                                 {
                                     CandidateId = c.Id,
                                 }, $"kind=Exception ex={ex.GetType().Name} message='{ex.Message.Substring(0, Math.Min(120, ex.Message.Length))}'", ex);
+                                Validation.Diag110751.Report("PROCESS_CANDIDATE", "ERROR",
+                                    $"task={Task.CurrentId}", candidateId: c.Id, exception: ex);
                             }
                             finally
                             {
@@ -296,6 +353,9 @@ namespace m3uCrawler.Services
                                 {
                                     CandidateId = c.Id,
                                 }, $"task={Task.CurrentId}");
+                                // DIAGNOSTIC-110751: WORKER end.
+                                Validation.Diag110751.Report("WORKER", "END",
+                                    $"task={Task.CurrentId}", candidateId: c.Id);
                                 semaphore.Release();
                             }
                         }, cancellationToken);
@@ -315,28 +375,59 @@ namespace m3uCrawler.Services
             Exception? enumEx = null;
             try
             {
-                messagesAnalyzed = await SearchM3UInTelegramInternal(
-                    keyword, limit, historyHours, rep,
-                    onCandidateProduced: c =>
-                    {
-                        // PHASE-OBSERVABILITY: ChannelEnqueue event.
-                        var enqueueTrace = _trace ?? m3uCrawler.Services.Validation.NullTraceSink.Instance;
-                        enqueueTrace.Information(m3uCrawler.Services.Validation.TraceCategory.ChannelEnqueue, new m3uCrawler.Services.Validation.TraceContext
+                    messagesAnalyzed = await SearchM3UInTelegramInternal(
+                        keyword, limit, historyHours, rep,
+                        onCandidateProduced: c =>
                         {
-                            CandidateId = c.Id,
-                            ChatTitle = c.Source,
-                        }, $"kind={c.Kind} filename='{TruncateForLog(c.FileName, 128)}'");
-
-                        // channel.Writer.TryWrite e' non-blocking (unboundedChannel).
-                        if (!candidateChannel.Writer.TryWrite(c))
-                        {
-                            rep.RejectionReasons.Add($"{Display(c)}: candidate channel write failed");
-                            enqueueTrace.Warning(m3uCrawler.Services.Validation.TraceCategory.CandidateRejected, new m3uCrawler.Services.Validation.TraceContext
+                            // PHASE-OBSERVABILITY: ChannelEnqueue event.
+                            var enqueueTrace = _trace ?? m3uCrawler.Services.Validation.NullTraceSink.Instance;
+                            enqueueTrace.Information(m3uCrawler.Services.Validation.TraceCategory.ChannelEnqueue, new m3uCrawler.Services.Validation.TraceContext
                             {
                                 CandidateId = c.Id,
-                            }, "reason=channel-write-failed");
-                        }
-                    });
+                                ChatTitle = c.Source,
+                            }, $"kind={c.Kind} filename='{TruncateForLog(c.FileName, 128)}'");
+
+                            // DIAGNOSTIC-110751 (fail-fast): se a primeira
+                            // falha ja' foi registada, nao produzir mais
+                            // candidates para o worker.
+                            if (Validation.Diag110751.IsStopping)
+                            {
+                                Validation.Diag110751.Report("CANDIDATE_PRODUCED", "SKIPPED",
+                                    $"reason=diagnostic_stopping kind={c.Kind}",
+                                    candidateId: c.Id);
+                                return;
+                            }
+
+                            // DIAGNOSTIC-110751: CANDIDATE_PRODUCED + CHANNEL_WRITE start.
+                            Validation.Diag110751.Report("CANDIDATE_PRODUCED", "START",
+                                $"kind={c.Kind} filename='{TruncateForLog(c.FileName, 128)}' url='{Validation.Diag110751Http.SafeUrl(c.Url)}' detectedFrom={c.DetectedFrom} requiresContentVerification={c.RequiresContentVerification}",
+                                candidateId: c.Id);
+
+                            // channel.Writer.TryWrite e' non-blocking (unboundedChannel).
+                            var writeSw = System.Diagnostics.Stopwatch.StartNew();
+                            bool wroteOk;
+                            try
+                            {
+                                wroteOk = candidateChannel.Writer.TryWrite(c);
+                            }
+                            catch (Exception ex)
+                            {
+                                Validation.Diag110751.Report("CHANNEL_WRITE", "ERROR", $"writeElapsedMs={writeSw.ElapsedMilliseconds}",
+                                    candidateId: c.Id, exception: ex);
+                                throw;
+                            }
+                            Validation.Diag110751.Report("CHANNEL_WRITE", wroteOk ? "END" : "FAILED",
+                                $"writeElapsedMs={writeSw.ElapsedMilliseconds}",
+                                candidateId: c.Id);
+                            if (!wroteOk)
+                            {
+                                rep.RejectionReasons.Add($"{Display(c)}: candidate channel write failed");
+                                enqueueTrace.Warning(m3uCrawler.Services.Validation.TraceCategory.CandidateRejected, new m3uCrawler.Services.Validation.TraceContext
+                                {
+                                    CandidateId = c.Id,
+                                }, "reason=channel-write-failed");
+                            }
+                        });
             }
             catch (Exception ex)
             {
@@ -413,6 +504,12 @@ namespace m3uCrawler.Services
             {
                 m3uCrawler.Services.Validation.RunReportTraceReconciler.RecordSnapshot(rep, realTrace);
             }
+            // DIAGNOSTIC-110751 (2026-09-15): emite o fecho do run.
+            Validation.Diag110751.Report("RUN", "END",
+                $"messagesAnalyzed={rep.MessagesAnalyzed} candidatesFound={rep.CandidatesFound} playlistsDownloaded={rep.PlaylistsDownloaded} streamsWorking={rep.StreamsWorking} streamsFailed={rep.StreamsFailed} durationMs={rep.DurationMs}");
+            Validation.Diag110751.UnregisterStopCallback(diagStopCb);
+            try { diagCts.Dispose(); } catch { /* ignore */ }
+            Validation.Diag110751.Shutdown("normal");
             return (working, rep);
         }
 
@@ -469,16 +566,40 @@ namespace m3uCrawler.Services
             //     TestStreamsAsync que tem `maxConcurrency` interno).
             //   - ChannelWriter.TryWrite (NAO pede lock; e' lock-free).
             string? content = candidate.Content;
+            // DIAGNOSTIC-110751: marca o tipo de entrada.
+            Validation.Diag110751.Report("PROCESS_CANDIDATE_BODY", "ENTER",
+                $"contentProvided={(content != null ? "yes" : "no")} contentLength={content?.Length ?? 0} requiresContentVerification={candidate.RequiresContentVerification} url='{Validation.Diag110751Http.SafeUrl(candidate.Url)}'",
+                candidateId: candidate.Id);
             if (content == null)
             {
-                content = await DownloadPlaylistContentAsync(candidate.Url, tester);
+                Validation.Diag110751.Report("DOWNLOAD_DECISION", "START",
+                    $"candidate has no content; will download url='{Validation.Diag110751Http.SafeUrl(candidate.Url)}'",
+                    candidateId: candidate.Id);
+                try
+                {
+                    content = await DownloadPlaylistContentAsync(candidate.Url, tester);
+                }
+                catch (Exception ex)
+                {
+                    Validation.Diag110751.Report("DOWNLOAD_DECISION", "ERROR",
+                        "", candidateId: candidate.Id, exception: ex);
+                    throw;
+                }
+                Validation.Diag110751.Report("DOWNLOAD_DECISION", "END",
+                    $"contentLength={content?.Length ?? 0} contentNull={(content == null)}",
+                    candidateId: candidate.Id);
             }
 
             // URL sem extensao (.m3u/.m3u8): detetada por heuristica. So' tratada
             // como playlist se o conteudo HTTP for de facto #EXTM3U. Caso
             // contrario pode ser uma publicacao HTML com cards Xtream.
+            Validation.Diag110751.Report("HTML_DETECTION", "CHECK",
+                $"requiresContentVerification={candidate.RequiresContentVerification} contentNull={(content == null)}",
+                candidateId: candidate.Id);
             if (candidate.RequiresContentVerification && content != null && !_detector.LooksLikePlaylistContent(content))
             {
+                Validation.Diag110751.Report("HTML_DETECTION", "BRANCH", "looks_like_html_publication",
+                    candidateId: candidate.Id);
                 // PHASE-OBSERVABILITY: ResolverStart.
                 var resTrace = _trace ?? m3uCrawler.Services.Validation.NullTraceSink.Instance;
                 resTrace.Information(m3uCrawler.Services.Validation.TraceCategory.ResolverStart, new m3uCrawler.Services.Validation.TraceContext
@@ -488,15 +609,23 @@ namespace m3uCrawler.Services
                 }, $"resolver=XtreamPublicationResolver contentLength={content?.Length ?? 0}");
                 if (LooksLikeHtmlPublication(content))
                 {
+                    Validation.Diag110751.Report("RESOLVE_FROM_HTML", "START",
+                        $"contentLength={content!.Length}",
+                        candidateId: candidate.Id);
                     var accounts = XtreamPublicationResolver.ResolveFromHtml(
                         content!, candidate.Url ?? string.Empty);
+                    Validation.Diag110751.Report("RESOLVE_FROM_HTML", "END",
+                        $"accountsDiscovered={accounts.Count}",
+                        candidateId: candidate.Id);
                     resTrace.Information(m3uCrawler.Services.Validation.TraceCategory.ResolverEnd, new m3uCrawler.Services.Validation.TraceContext
                     {
                         CandidateId = candidate.Id,
                     }, $"resolver=XtreamPublicationResolver accountsDiscovered={accounts.Count}");
                     if (accounts.Count == 0)
                     {
-                        AddRejection(rep, $"{CredentialSanitizer.SanitizeUrl(candidate.Url) ?? candidate.Source}: no xtream cards found");
+                        Validation.Diag110751.Report("RESOLVE_FROM_HTML", "BRANCH", "accounts=0",
+                        candidateId: candidate.Id);
+                    AddRejection(rep, $"{CredentialSanitizer.SanitizeUrl(candidate.Url) ?? candidate.Source}: no xtream cards found");
                         resTrace.Warning(m3uCrawler.Services.Validation.TraceCategory.CandidateRejected, new m3uCrawler.Services.Validation.TraceContext
                         {
                             CandidateId = candidate.Id,
@@ -506,9 +635,30 @@ namespace m3uCrawler.Services
                     // PHASE-OBSERVABILITY: emitir um evento por XtreamAccount para reconciliacao.
                     // Nao inclui password, apenas host/port/username hash + parent.
                     int xIdx = 0;
+                    var foreachSw = System.Diagnostics.Stopwatch.StartNew();
+                    // DIAGNOSTIC-110751: foreach entry.
+                    Validation.Diag110751.Report("FOREACH_ACCOUNTS", "ENTER",
+                        $"total={accounts.Count}",
+                        candidateId: candidate.Id, totalAccounts: accounts.Count);
                     foreach (var acc in accounts)
                     {
+                        // DIAGNOSTIC-110751 (fail-fast): se a primeira falha
+                        // ja' foi registada antes deste loop, parar o
+                        // processamento de accounts.
+                        if (Validation.Diag110751.IsStopping)
+                        {
+                            Validation.Diag110751.Report("FOREACH_ACCOUNTS", "STOP",
+                                $"processed={xIdx} total={accounts.Count} reason=diagnostic_stopping",
+                                candidateId: candidate.Id, totalAccounts: accounts.Count);
+                            break;
+                        }
+                        var accSw = System.Diagnostics.Stopwatch.StartNew();
                         var accId = $"{candidate.Id}#x{xIdx}";
+                        var total = accounts.Count;
+                        // DIAGNOSTIC-110751: ACCOUNT_START.
+                        Validation.Diag110751.Report("ACCOUNT", "START",
+                            $"host={acc.Host} port={acc.Port} username={SafeUsername(acc.Username)}",
+                            candidateId: candidate.Id, accountIndex: xIdx, totalAccounts: total);
                         resTrace.Information(m3uCrawler.Services.Validation.TraceCategory.XtreamAccount, new m3uCrawler.Services.Validation.TraceContext
                         {
                             CandidateId = candidate.Id,
@@ -516,8 +666,28 @@ namespace m3uCrawler.Services
                         }, $"accountId={accId} host={acc.Host} port={acc.Port} username={SafeUsername(acc.Username)}");
                         xIdx++;
 
-                        var playlistUrl = acc.M3uUrl ?? BuildXtreamPlaylistUrl(acc);
-                        var promoted = PromoteXtreamAccount(playlistUrl, candidate.Url ?? string.Empty);
+                        string? playlistUrl;
+                        // DIAGNOSTIC-110751: BUILD stage.
+                        var buildDiagSw = System.Diagnostics.Stopwatch.StartNew();
+                        Validation.Diag110751.Report("BUILD_URL", "STAGE_START",
+                            $"host={acc.Host} port={acc.Port}",
+                            candidateId: candidate.Id, accountIndex: xIdx - 1, totalAccounts: total);
+                        playlistUrl = acc.M3uUrl ?? BuildXtreamPlaylistUrl(acc);
+                        Validation.Diag110751.Report("BUILD_URL", "STAGE_END",
+                            $"ok={(playlistUrl != null)} urlHost={(playlistUrl == null ? "<null>" : DiagnosticHelpers.SafeHostFromUrl(playlistUrl))} stageElapsedMs={buildDiagSw.ElapsedMilliseconds}",
+                            candidateId: candidate.Id, accountIndex: xIdx - 1, totalAccounts: total,
+                            elapsedMs: buildDiagSw.ElapsedMilliseconds);
+
+                        CandidatePlaylist? promoted;
+                        // DIAGNOSTIC-110751: PROMOTE stage.
+                        var promoteDiagSw = System.Diagnostics.Stopwatch.StartNew();
+                        Validation.Diag110751.Report("PROMOTE", "STAGE_START", "",
+                            candidateId: candidate.Id, accountIndex: xIdx - 1, totalAccounts: total);
+                        promoted = PromoteXtreamAccount(playlistUrl, candidate.Url ?? string.Empty);
+                        Validation.Diag110751.Report("PROMOTE", "STAGE_END",
+                            $"promotedNull={(promoted == null)} promotedId={(promoted == null ? "<null>" : promoted.Id.ToString())} stageElapsedMs={promoteDiagSw.ElapsedMilliseconds}",
+                            candidateId: candidate.Id, accountIndex: xIdx - 1, totalAccounts: total,
+                            elapsedMs: promoteDiagSw.ElapsedMilliseconds);
                         if (promoted != null)
                         {
                             resTrace.Information(m3uCrawler.Services.Validation.TraceCategory.CandidatePromoted, new m3uCrawler.Services.Validation.TraceContext
@@ -527,7 +697,17 @@ namespace m3uCrawler.Services
                             }, $"promotedCandidateId={promoted.Id} m3uUrl={CredentialSanitizer.SanitizeUrl(playlistUrl ?? string.Empty)}");
 
                             // Re-injecta no canal. ChannelWriter.TryWrite e' non-blocking.
-                            if (!writer.TryWrite(promoted))
+                            // DIAGNOSTIC-110751: WRITE stage.
+                            var writeDiagSw = System.Diagnostics.Stopwatch.StartNew();
+                            Validation.Diag110751.Report("WRITE", "STAGE_START",
+                                $"promotedId={promoted.Id}",
+                                candidateId: candidate.Id, accountIndex: xIdx - 1, totalAccounts: total);
+                            bool writeOk = writer.TryWrite(promoted);
+                            Validation.Diag110751.Report("WRITE", "STAGE_END",
+                                $"result={writeOk} stageElapsedMs={writeDiagSw.ElapsedMilliseconds}",
+                                candidateId: candidate.Id, accountIndex: xIdx - 1, totalAccounts: total,
+                                elapsedMs: writeDiagSw.ElapsedMilliseconds);
+                            if (!writeOk)
                             {
                                 AddRejection(rep, $"{Display(promoted)}: channel write failed");
                                 resTrace.Warning(m3uCrawler.Services.Validation.TraceCategory.CandidateRejected, new m3uCrawler.Services.Validation.TraceContext
@@ -536,10 +716,22 @@ namespace m3uCrawler.Services
                                 }, "reason=channel-write-failed");
                             }
                         }
+                        // DIAGNOSTIC-110751: ACCOUNT_END.
+                        Validation.Diag110751.Report("ACCOUNT", "END",
+                            $"accountElapsedMs={accSw.ElapsedMilliseconds} foreachElapsedMs={foreachSw.ElapsedMilliseconds}",
+                            candidateId: candidate.Id, accountIndex: xIdx - 1, totalAccounts: total,
+                            elapsedMs: accSw.ElapsedMilliseconds);
                     }
+                    // DIAGNOSTIC-110751: foreach end.
+                    Validation.Diag110751.Report("FOREACH_ACCOUNTS", "END",
+                        $"processed={xIdx} total={accounts.Count} foreachElapsedMs={foreachSw.ElapsedMilliseconds}",
+                        candidateId: candidate.Id, totalAccounts: accounts.Count,
+                        elapsedMs: foreachSw.ElapsedMilliseconds);
                     return;
                 }
                 Interlocked.Increment(ref rep._PlaylistsInvalid);
+                Validation.Diag110751.Report("HTML_DETECTION", "BRANCH", "not_html_publication_playlist_invalid",
+                    candidateId: candidate.Id);
                 AddRejection(rep, $"{CredentialSanitizer.SanitizeUrl(candidate.Url) ?? candidate.Source}: conteúdo não é uma playlist M3U");
                 return;
             }
@@ -547,13 +739,21 @@ namespace m3uCrawler.Services
             if (string.IsNullOrWhiteSpace(content))
             {
                 Interlocked.Increment(ref rep._PlaylistsInvalid);
+                Validation.Diag110751.Report("PROCESS_CANDIDATE_BODY", "BRANCH", "content_empty",
+                    candidateId: candidate.Id);
                 AddRejection(rep, $"{Display(candidate)}: playlist indisponível ou vazia");
                 return;
             }
 
             Interlocked.Increment(ref rep._PlaylistsDownloaded);
 
+            Validation.Diag110751.Report("ANALYZE_PLAYLIST", "START",
+                $"country={countryCode}",
+                candidateId: candidate.Id);
             var analysis = validator.AnalyzePlaylist(content, countryCode, 3);
+            Validation.Diag110751.Report("ANALYZE_PLAYLIST", "END",
+                $"isTarget={analysis.IsTargetCountry} recognized={analysis.RecognizedChannelCount}",
+                candidateId: candidate.Id);
             var discovered = new DiscoveredPlaylist
             {
                 Source = candidate.Source,
@@ -566,6 +766,8 @@ namespace m3uCrawler.Services
             if (!analysis.IsTargetCountry)
             {
                 Interlocked.Increment(ref rep._PlaylistsRejected);
+                Validation.Diag110751.Report("PROCESS_CANDIDATE_BODY", "BRANCH", "country_rejected",
+                    candidateId: candidate.Id);
                 AddRejection(rep,
                     $"{discovered.Name}: país {countryCode.ToUpperInvariant()} não corresponde " +
                     $"(canais reconhecidos {analysis.RecognizedChannelCount}/3)");
@@ -602,6 +804,9 @@ namespace m3uCrawler.Services
             }
 
             var tested = await TestStreamsAsync(tester, countryStreams, maxConcurrency, maxUrlsToTest);
+            Validation.Diag110751.Report("TEST_STREAMS", "END",
+                $"tested={tested.Count} working={tested.Count(s => s.IsWorking)} failed={tested.Count(s => !s.IsWorking)}",
+                candidateId: candidate.Id);
             Interlocked.Add(ref rep._StreamsTested, tested.Count);
             Interlocked.Add(ref rep._StreamsWorking, tested.Count(s => s.IsWorking));
             Interlocked.Add(ref rep._StreamsFailed, tested.Count(s => !s.IsWorking));
@@ -1377,6 +1582,12 @@ namespace m3uCrawler.Services
             var expected = document.size;
             var sw = System.Diagnostics.Stopwatch.StartNew();
 
+            // DIAGNOSTIC-110751: deep trace do download.
+            Validation.Diag110751Http.ReportDownloadStart($"telegram://document/{document.ID}", messageIdForLog, null);
+            Validation.Diag110751.Report("ATTACHMENT_DOWNLOAD", "START",
+                $"expected={expected} filename='{filenameForLog}'",
+                messageId: messageIdForLog);
+
             // PHASE-OBSERVABILITY (2026-09-15): tracing de download.
             var dlTrace = _trace ?? m3uCrawler.Services.Validation.NullTraceSink.Instance;
             var dlCtx = new m3uCrawler.Services.Validation.TraceContext
@@ -1410,6 +1621,9 @@ namespace m3uCrawler.Services
                     // PHASE-OBSERVABILITY: emitir progress por chunk (Debug).
                     dlTrace.Debug(m3uCrawler.Services.Validation.TraceCategory.AttachmentDownloadProgress, dlCtx,
                         $"transmitted={transmitted} total={total} chunks={chunks}");
+                    Validation.Diag110751.Report("ATTACHMENT_DOWNLOAD", "PROGRESS",
+                        $"transmitted={transmitted} total={total} chunks={chunks} elapsedMs={sw.ElapsedMilliseconds}",
+                        messageId: messageIdForLog);
                     if (transmitted >= expected && expected > 0) return;
                     cts.Token.ThrowIfCancellationRequested();
                 };
@@ -1472,11 +1686,18 @@ namespace m3uCrawler.Services
                 ms.Position = 0;
                 using var reader = new StreamReader(ms, Encoding.UTF8,
                     detectEncodingFromByteOrderMarks: true);
-                return await reader.ReadToEndAsync().ConfigureAwait(false);
+                var text = await reader.ReadToEndAsync().ConfigureAwait(false);
+                Validation.Diag110751.Report("ATTACHMENT_DOWNLOAD", "END",
+                    $"expected={expected} actual={ms.Length} chunks={chunks} durationMs={sw.ElapsedMilliseconds} textLength={text?.Length ?? 0}",
+                    messageId: messageIdForLog);
+                return text;
             }
             catch (OperationCanceledException)
             {
                 sw.Stop();
+                Validation.Diag110751.Report("ATTACHMENT_DOWNLOAD", "CANCELLED",
+                    $"expected={expected} chunks={chunks} durationMs={sw.ElapsedMilliseconds}",
+                    messageId: messageIdForLog);
                 LogDownloadOutcome(filenameForLog, messageIdForLog, expected, lastTransmitted,
                     status: "failed", durationMs: sw.ElapsedMilliseconds,
                     chunks: (int)chunks, error: "OperationCanceledException");
@@ -1485,6 +1706,9 @@ namespace m3uCrawler.Services
             catch (Exception ex)
             {
                 sw.Stop();
+                Validation.Diag110751.Report("ATTACHMENT_DOWNLOAD", "ERROR",
+                    $"expected={expected} chunks={chunks} durationMs={sw.ElapsedMilliseconds}",
+                    messageId: messageIdForLog, exception: ex);
                 LogDownloadOutcome(filenameForLog, messageIdForLog, expected, lastTransmitted,
                     status: "failed", durationMs: sw.ElapsedMilliseconds,
                     chunks: (int)chunks, error: ex.GetType().Name);
@@ -1520,6 +1744,8 @@ namespace m3uCrawler.Services
         {
             var toTest = (maxUrlsToTest > 0 ? streams.Take(maxUrlsToTest) : streams).ToList();
             if (toTest.Count == 0) return new List<M3uStream>();
+            Validation.Diag110751.Report("TEST_STREAMS", "START",
+                $"toTest={toTest.Count} maxConcurrency={maxConcurrency} maxUrlsToTest={maxUrlsToTest}");
 
             var semaphore = new SemaphoreSlim(maxConcurrency);
             var tasks = toTest.Select(async s =>
@@ -1830,5 +2056,21 @@ namespace m3uCrawler.Services
             PreservedByKind.TryGetValue("Working", out var n) ? n : 0;
 
         public int RemovedTerminal => RemovedByKind.Sum(kv => kv.Value);
+    }
+}
+namespace m3uCrawler.Services
+{
+    internal static class DiagnosticHelpers
+    {
+        public static string SafeHostFromUrl(string? url)
+        {
+            if (string.IsNullOrEmpty(url)) return "?";
+            try { return new Uri(url).Host ?? "?"; } catch { return "?"; }
+        }
+        public static string TruncateForLog(string s, int maxLen)
+        {
+            if (s == null) return string.Empty;
+            return s.Length <= maxLen ? s : s.Substring(0, maxLen) + "...";
+        }
     }
 }
