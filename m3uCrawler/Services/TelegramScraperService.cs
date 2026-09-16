@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using m3uCrawler.Models;
 using m3uCrawler.Services.Catalog;
+using m3uCrawler.Services.LiveRun;
 using m3uCrawler.Services.Validation;
 using TL;
 
@@ -171,11 +172,23 @@ namespace m3uCrawler.Services
             RunReport? report = null,
             PipelineIngestionService? pipelineIngestor = null,
             string? pipelineSourceKey = null,
+            ILiveRunProgress? liveRunProgress = null,
             CancellationToken cancellationToken = default)
         {
             var rep = report ?? new RunReport();
             rep.StartedAt = DateTime.UtcNow;
             rep.Status = "running";
+
+            // PHASE 9C.4 — instrumentação da Live Run. Opcional por
+            // design: sem monitor (null) o comportamento é exactamente
+            // o actual. Os reportes são feitos nos mesmos pontos onde o
+            // RunReport autoritativo já é actualizado.
+            if (liveRunProgress is not null)
+            {
+                await liveRunProgress.EnterPhaseAsync(
+                    LiveRunPhase.ReadingTelegram, "reading telegram messages", cancellationToken)
+                    .ConfigureAwait(false);
+            }
 
             // PHASE-OBSERVABILITY (2026-09-15): tracing por run. O trace e'
             // opcional (null -> NullTraceSink) para manter back-compat. Em
@@ -286,6 +299,7 @@ namespace m3uCrawler.Services
                                     c, tester, parser, validator, countryCode, rep,
                                     maxUrlsToTest, accountValidator, accountGateCoordinator,
                                     candidateChannel.Writer, working, workingLock,
+                                    liveRunProgress,
                                     cancellationToken);
                             }
                             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -334,6 +348,7 @@ namespace m3uCrawler.Services
             {
                 messagesAnalyzed = await SearchM3UInTelegramInternal(
                     keyword, limit, historyHours, rep,
+                    liveRunProgress: liveRunProgress,
                     onCandidateProduced: c =>
                     {
                         // PHASE-OBSERVABILITY: ChannelEnqueue event.
@@ -371,6 +386,10 @@ namespace m3uCrawler.Services
             rep.MessagesAnalyzed = messagesAnalyzed;
             // rep.CandidatesFound e' incrementado dentro de ProcessOneTelegramMessageAsync.
             LastRunReport = rep;
+
+            // PHASE 9C.4 — contadores de Telegram (mensagens/dialogos)
+            // disponiveis apenas agora, apos a enumeracao do producer.
+            liveRunProgress?.ReportCounts(rep);
 
             try
             {
@@ -433,6 +452,14 @@ namespace m3uCrawler.Services
             {
                 m3uCrawler.Services.Validation.RunReportTraceReconciler.RecordSnapshot(rep, realTrace);
             }
+
+            // PHASE 9C.4 — snapshot final dos contadores reais.
+            if (liveRunProgress is not null)
+            {
+                liveRunProgress.ReportCounts(rep);
+                liveRunProgress.ReportMessage(
+                    $"pipeline completed: {rep.StreamsWorking} working / {rep.StreamsTested} tested streams");
+            }
             return (working, rep);
         }
 
@@ -463,6 +490,7 @@ namespace m3uCrawler.Services
             System.Threading.Channels.ChannelWriter<CandidatePlaylist> writer,
             List<M3uStream> working,
             object workingLock,
+            ILiveRunProgress? liveRunProgress,
             CancellationToken cancellationToken)
         {
             // PIPELINE-INC-HARDENING (2026-09-14): cada instancia de ProcessCandidateAsync
@@ -490,6 +518,15 @@ namespace m3uCrawler.Services
             //     AccountGateCoordinator dentro de TestStreamsAsync).
             //   - ChannelWriter.TryWrite (NAO pede lock; e' lock-free).
             string? content = candidate.Content;
+            // PHASE 9C.4 — Downloading: só quando há download HTTP real
+            // (candidatos a partir de anexo já trazem conteúdo).
+            if (liveRunProgress is not null && content is null)
+            {
+                await liveRunProgress.EnterPhaseAsync(
+                    LiveRunPhase.Downloading,
+                    "downloading playlist content",
+                    cancellationToken).ConfigureAwait(false);
+            }
             // EXPERIMENT-SERIAL-PER-XTREAM (2026-09-16): se o candidate foi
             // promovido a partir de uma publicacao Xtream (DetectedFrom
             // == "xtream publication"), serializamos o download por
@@ -512,6 +549,17 @@ namespace m3uCrawler.Services
                 {
                     content = await DownloadPlaylistContentAsync(candidate.Url, tester);
                 }
+            }
+
+            if (liveRunProgress is not null)
+            {
+                liveRunProgress.ReportCounts(rep);
+                liveRunProgress.ReportActivity(
+                    LiveRunActivityCategory.Playlist,
+                    content is null ? LiveRunActivityLevel.Warning : LiveRunActivityLevel.Info,
+                    content is null
+                        ? $"playlist download failed ({Display(candidate)})"
+                        : "playlist content downloaded");
             }
 
             // URL sem extensao (.m3u/.m3u8): detetada por heuristica. So' tratada
@@ -593,6 +641,16 @@ namespace m3uCrawler.Services
 
             Interlocked.Increment(ref rep._PlaylistsDownloaded);
 
+            // PHASE 9C.4 — Analyzing: análise de conteúdo da playlist
+            // (deteccao de país + parsing M3U). VALIDATING cobre o gate
+            // per-stream abaixo.
+            if (liveRunProgress is not null)
+            {
+                await liveRunProgress.EnterPhaseAsync(
+                    LiveRunPhase.Analyzing, "analyzing playlist content", cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
             var analysis = validator.AnalyzePlaylist(content, countryCode, 3);
             var discovered = new DiscoveredPlaylist
             {
@@ -619,6 +677,15 @@ namespace m3uCrawler.Services
             var streams = parser.Parse(content);
             discovered.StreamCount = streams.Count;
             Interlocked.Add(ref rep._StreamsExtracted, streams.Count);
+
+            // PHASE 9C.4 — Validating: gate per-canal/per-stream e teste
+            // dos streams alvo.
+            if (liveRunProgress is not null)
+            {
+                await liveRunProgress.EnterPhaseAsync(
+                    LiveRunPhase.Validating, "validating streams for country", cancellationToken)
+                    .ConfigureAwait(false);
+            }
 
             // Gate per-stream (pipeline per-canal/per-stream, desde 2026-08-30).
             // AnalyzePlaylist actua apenas como fast-reject acima; a aprovacao final
@@ -657,6 +724,17 @@ namespace m3uCrawler.Services
             // discovered precisa de ser adicionado ao RunReport sob lock
             // (lista partilhada).
             AddDiscovered(rep, discovered);
+
+            if (liveRunProgress is not null)
+            {
+                liveRunProgress.ReportCounts(rep);
+                liveRunProgress.ReportMessage(
+                    $"tested {rep.StreamsTested}/{rep.StreamsAfterCountryFilter} streams");
+                liveRunProgress.ReportActivity(
+                    LiveRunActivityCategory.Stream,
+                    LiveRunActivityLevel.Info,
+                    $"validated {tested.Count(s => s.IsWorking)}/{tested.Count} streams for one playlist");
+            }
         }
 
         // PIPELINE-INC-HARDENING: helpers thread-safe para escrita em
@@ -679,7 +757,8 @@ namespace m3uCrawler.Services
 
         private async Task<int> SearchM3UInTelegramInternal(
             string keyword, int limit = 200, int historyHours = 24, RunReport? report = null,
-            Action<CandidatePlaylist>? onCandidateProduced = null)
+            Action<CandidatePlaylist>? onCandidateProduced = null,
+            ILiveRunProgress? liveRunProgress = null)
         {
             var candidates = new List<CandidatePlaylist>();
             // Publicacoes descobertas em qualquer mensagem: referencias Telegram
@@ -795,7 +874,7 @@ namespace m3uCrawler.Services
                             messagesAnalyzed++;
                             await ProcessOneTelegramMessageAsync(
                                 msg, chatTitle, report, discoveredPublications, candidates,
-                                onCandidateProduced);
+                                onCandidateProduced, liveRunProgress);
                         });
                 }
                 catch (WTelegram.WTException ex) when (ex.Message.Contains("FLOOD_WAIT"))
@@ -942,7 +1021,8 @@ namespace m3uCrawler.Services
             RunReport? report,
             List<TelegramPublicationRef> discoveredPublications,
             List<CandidatePlaylist> candidates,
-            Action<CandidatePlaylist>? onCandidateProduced)
+            Action<CandidatePlaylist>? onCandidateProduced,
+            ILiveRunProgress? liveRunProgress = null)
         {
             // Em TL atual a legenda de um media é o próprio texto da mensagem.
             string text = m.message ?? "";
@@ -1091,6 +1171,19 @@ namespace m3uCrawler.Services
                 },
                 report: report,
                 messageId: m.ID);
+
+            // PHASE 9C.4 — Discovering: reportado ANTES de enfileirar os
+            // candidatos, garantindo que a ordem monotónica do timeline
+            // (ReadingTelegram -> Discovering -> Downloading) se mantém
+            // mesmo com o producer/consumer concorrente.
+            if (liveRunProgress is not null && found.Count > 0)
+            {
+                await liveRunProgress.EnterPhaseAsync(
+                    LiveRunPhase.Discovering,
+                    $"detected {found.Count} candidate(s)",
+                    CancellationToken.None).ConfigureAwait(false);
+                liveRunProgress.ReportCounts(report!);
+            }
 
             foreach (var candidate in found)
             {

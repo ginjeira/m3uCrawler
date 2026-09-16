@@ -113,6 +113,7 @@ public sealed class RunCoordinator
         }
 
         LiveRunEntity? entity = null;
+        LiveRunMonitor? monitor = null;
         var startedAtUtc = DateTime.UtcNow;
         var runId = Guid.NewGuid().ToString();
         try
@@ -120,7 +121,22 @@ public sealed class RunCoordinator
             entity = await PersistRunStartAsync(runId, request, startedAtUtc, cancellationToken)
                 .ConfigureAwait(false);
 
-            var initialSnapshot = BuildLiveSnapshot(entity, isRunning: true, currentPhase: Catalog.LiveRunPhase.Idle);
+            // Instrumentação: monitor da execução. Falhas de
+            // persistência são toleradas internamente pelo monitor —
+            // nunca quebram a pipeline.
+            monitor = new LiveRunMonitor(
+                _dbFactory,
+                entity.Id,
+                entity.RunId,
+                request.Mode,
+                request.Source,
+                entity.StartedAtUtc,
+                SetCurrentSnapshot,
+                null,
+                LiveRunActivityFeed.DefaultCapacity);
+            await monitor.InitializeAsync(cancellationToken).ConfigureAwait(false);
+
+            var initialSnapshot = monitor.BuildSnapshot();
             SetCurrentSnapshot(initialSnapshot);
 
             _logger.LogInformation(
@@ -128,11 +144,18 @@ public sealed class RunCoordinator
                 runId, request.Mode, request.Source);
 
             var pipeline = _pipelineFactory(request);
+            if (pipeline is ILiveRunProgressAware progressAware)
+            {
+                progressAware.Progress = monitor;
+            }
+
             await pipeline.ExecuteAsync(request, cancellationToken).ConfigureAwait(false);
 
+            await monitor.EnterPhaseAsync(Catalog.LiveRunPhase.Completed, "completed", cancellationToken)
+                .ConfigureAwait(false);
             await MarkCompletedAsync(entity, cancellationToken).ConfigureAwait(false);
 
-            var finalSnapshot = BuildLiveSnapshot(entity, isRunning: false, currentPhase: null);
+            var finalSnapshot = BuildLiveSnapshot(entity, isRunning: false, currentPhase: null, monitor);
             SetCurrentSnapshot(finalSnapshot);
 
             return new LiveRunOutcome
@@ -143,9 +166,12 @@ public sealed class RunCoordinator
         }
         catch (OperationCanceledException)
         {
+            await SafeEnterPhaseAsync(monitor, Catalog.LiveRunPhase.Error, "cancelled").ConfigureAwait(false);
+            // CancellationToken.None: o token do run já está cancelado,
+            // mas o estado terminal tem de ficar persistido (FinishedAtUtc).
             await MarkTerminalAsync(entity, LiveRunTerminalStatus.Failed,
-                "cancelled", cancellationToken).ConfigureAwait(false);
-            var snapshot = BuildLiveSnapshot(entity!, isRunning: false, currentPhase: null);
+                "cancelled", CancellationToken.None).ConfigureAwait(false);
+            var snapshot = BuildLiveSnapshot(entity!, isRunning: false, currentPhase: null, monitor);
             SetCurrentSnapshot(snapshot);
             throw;
         }
@@ -155,9 +181,11 @@ public sealed class RunCoordinator
             // tokens ou paths absolutos. O log inclui ex.ToString()
             // (servidor-side, não exposto pela API futura).
             _logger.LogError(ex, "Live run failed: runId={RunId}", runId);
+            await SafeEnterPhaseAsync(monitor, Catalog.LiveRunPhase.Error,
+                "failed: pipeline exception").ConfigureAwait(false);
             await MarkTerminalAsync(entity, LiveRunTerminalStatus.Failed,
-                "failed: pipeline exception", cancellationToken).ConfigureAwait(false);
-            var snapshot = BuildLiveSnapshot(entity!, isRunning: false, currentPhase: null);
+                "failed: pipeline exception", CancellationToken.None).ConfigureAwait(false);
+            var snapshot = BuildLiveSnapshot(entity!, isRunning: false, currentPhase: null, monitor);
             SetCurrentSnapshot(snapshot);
             return new LiveRunOutcome
             {
@@ -169,6 +197,28 @@ public sealed class RunCoordinator
         finally
         {
             Volatile.Write(ref _isRunningFlag, 0);
+        }
+    }
+
+    /// <summary>
+    /// Transição terminal best-effort: usa <see cref="CancellationToken.None"/>
+    /// (o token do run pode já estar cancelado) e nunca propaga
+    /// excepções da instrumentação.
+    /// </summary>
+    private static async Task SafeEnterPhaseAsync(
+        LiveRunMonitor? monitor,
+        Catalog.LiveRunPhase phase,
+        string message)
+    {
+        if (monitor is null) return;
+        try
+        {
+            await monitor.EnterPhaseAsync(phase, message, CancellationToken.None)
+                .ConfigureAwait(false);
+        }
+        catch
+        {
+            // Instrumentação nunca quebra o coordinator.
         }
     }
 
@@ -298,7 +348,8 @@ public sealed class RunCoordinator
     private static LiveRunSnapshot BuildLiveSnapshot(
         LiveRunEntity entity,
         bool isRunning,
-        Catalog.LiveRunPhase? currentPhase)
+        Catalog.LiveRunPhase? currentPhase,
+        LiveRunMonitor? monitor = null)
     {
         return new LiveRunSnapshot
         {
@@ -312,6 +363,12 @@ public sealed class RunCoordinator
             CountsJson = entity.CountsJson,
             CurrentPhase = currentPhase,
             IsRunning = isRunning,
+            PhaseIndex = monitor?.PhaseIndex ?? 0,
+            PhaseStartedAtUtc = monitor?.PhaseStartedAtUtc,
+            UpdatedAtUtc = monitor?.UpdatedAtUtc ?? entity.UpdatedAtUtc,
+            Counts = monitor?.CountsSnapshot,
+            RecentActivities = monitor?.ActivitiesSnapshot ?? Array.Empty<LiveRunActivity>(),
+            Sanitized = true,
         };
     }
 

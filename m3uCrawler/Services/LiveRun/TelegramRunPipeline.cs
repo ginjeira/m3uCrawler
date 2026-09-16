@@ -20,22 +20,30 @@ namespace m3uCrawler.Services.LiveRun;
 /// </para>
 ///
 /// <para>
-/// O objectivo desta subwave é existir um único caminho de
-/// invocação. O wiring concreto com o pipeline Telegram é
-/// completado na subwave 3 (instrumentação). Aqui o coordinator
-/// já consegue iniciar/parar/recovery sem alterar
-/// <c>TelegramScraperService</c>.
+/// O pipeline é <see cref="ILiveRunProgressAware"/>: o
+/// <see cref="RunCoordinator"/> injecta o monitor da execução antes
+/// de invocar <see cref="ExecuteAsync"/>, e a função delegada
+/// recebe-o para reportar fases, contadores e actividades nos pontos
+/// reais da pipeline. Sem monitor, a função recebe <c>null</c> e o
+/// comportamento é exactamente o actual.
 /// </para>
 /// </summary>
-public sealed class TelegramRunPipeline : IRunPipeline
+public sealed class TelegramRunPipeline : IRunPipeline, ILiveRunProgressAware
 {
-    private readonly Func<LiveRunRequest, CancellationToken, Task> _invoker;
+    private readonly Func<LiveRunRequest, ILiveRunProgress?, CancellationToken, Task> _invoker;
 
-    public TelegramRunPipeline(Func<LiveRunRequest, CancellationToken, Task> invoker)
+    public TelegramRunPipeline(
+        Func<LiveRunRequest, ILiveRunProgress?, CancellationToken, Task> invoker)
     {
         _invoker = invoker ?? throw new ArgumentNullException(nameof(invoker));
     }
 
+    /// <summary>
+    /// Monitor injectado pelo <see cref="RunCoordinator"/>. <c>null</c>
+    /// significa "sem instrumentação".
+    /// </summary>
+    public ILiveRunProgress? Progress { get; set; }
+
     public Task ExecuteAsync(LiveRunRequest request, CancellationToken cancellationToken) =>
-        _invoker(request, cancellationToken);
+        _invoker(request, Progress, cancellationToken);
 }

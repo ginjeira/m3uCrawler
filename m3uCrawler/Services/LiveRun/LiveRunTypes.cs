@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 
 namespace m3uCrawler.Services.LiveRun;
 
@@ -62,6 +63,38 @@ public sealed class LiveRunSnapshot
     /// <see cref="CurrentPhase"/> é não-nulo.
     /// </summary>
     public bool IsRunning { get; init; }
+
+    /// <summary>
+    /// Índice monotónico da fase corrente dentro do run (ver
+    /// <see cref="Catalog.LiveRunPhase"/>). <c>0</c> corresponde a
+    /// <c>Idle</c>.
+    /// </summary>
+    public int PhaseIndex { get; init; }
+
+    /// <summary>Instante em que a fase corrente começou.</summary>
+    public DateTime? PhaseStartedAtUtc { get; init; }
+
+    /// <summary>Última actualização de progresso observada.</summary>
+    public DateTime UpdatedAtUtc { get; init; }
+
+    /// <summary>
+    /// Totalizadores tipados (cópia do estado vivo). Nunca contém
+    /// credenciais — são apenas números.
+    /// </summary>
+    public LiveRunCounts? Counts { get; init; }
+
+    /// <summary>
+    /// Janela das actividades mais recentes do feed em memória
+    /// (mais recente primeiro). Destina-se à futura API de polling.
+    /// </summary>
+    public IReadOnlyList<LiveRunActivity> RecentActivities { get; init; } =
+        Array.Empty<LiveRunActivity>();
+
+    /// <summary>
+    /// Recordatório/garantia de que o snapshot só contém mensagens e
+    /// metadados sanitizados. É sempre <c>true</c>.
+    /// </summary>
+    public bool Sanitized { get; init; } = true;
 
     public TimeSpan Duration =>
         (FinishedAtUtc ?? DateTime.UtcNow) - StartedAtUtc;
