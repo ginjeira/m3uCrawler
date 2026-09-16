@@ -523,6 +523,81 @@ Para deployments em rede não confiável, **recomenda-se vivamente** proteger o 
 
 A playlist M3U funcional (`/api/playlist`) continua a devolver as URLs Xtream reais — a protecção do token controla **quem** pode aceder, não **o quê**.
 
+## Ciclo de vida de configuração (PHASE 9C.1)
+
+Uma instalação nova deve ser **fail-safe**: arranca, expõe o Dashboard e **não**
+inicia discovery nem jobs automáticos enquanto não estiver configurada. O estado
+do lifecycle é persistido e sobrevive a restart.
+
+### Estados
+
+| Estado | Significado |
+|---|---|
+| `NOT_CONFIGURED` | Instalação nova, sem estado persistido e sem evidência de operação anterior. Discovery automático e scheduler bloqueados. |
+| `CONFIGURING` | Configuração em curso. Continua a bloquear discovery automático e scheduler. |
+| `READY` | Instalação configurada. O comportamento operacional existente é preservado. |
+
+Os nomes `NOT_CONFIGURED` / `CONFIGURING` / `READY` são contrato externo
+(reportados em `/api/configuration/lifecycle` e nos logs) e não devem ser
+renomeados.
+
+### Autoridade e bootstrap
+
+- **O estado persistido é a autoridade.** Se existir estado persistido válido,
+  é usado sem inferência.
+- Sem estado persistido, corre-se o bootstrap:
+  1. procurar **evidência objectiva** de instalação já operacional;
+  2. se existir, adoptar `READY` (**legacy adoption**) e registar em log;
+  3. caso contrário, iniciar em `NOT_CONFIGURED`.
+
+### Evidência de legacy adoption
+
+Considera-se evidência (entidades que não são criadas por migration/seed numa
+instalação nova) a existência de qualquer uma de:
+
+- catálogo persistente: `sources`, `channel-sources`, observações, `ordering
+  lists/items`, `import policies`, grupos canónicos e mappings, jobs agendados,
+  `sync-runs/steps`, `review items`, `matching audits`, `pending country
+  approvals`, `affinity groups`, ownership Dispatcharr e `identity rules`;
+- artefactos de output: `import_history.json`, `playlist.m3u`,
+  `telegram_run_report.json` ou `telegram_playlist_*.m3u`.
+
+`CanonicalChannels`, `ChannelAliases` (seed/baseline) e
+`SourcePriorityPolicies` (default global lazily) **não** contam como evidência.
+
+### Persistência
+
+O estado é gravado em `configuration_lifecycle.json`, ao lado do
+`channel-catalog.db` (mesmo volume persistente; em produção `/data`). Reutiliza
+o padrão de estado persistente já existente (JSON em runtime-data) — não
+introduz tabela nem base de dados nova. A escrita é atómica.
+
+### Gates
+
+- **Scheduler:** `ScheduledJobRunner` recusa executar qualquer job automático em
+  `NOT_CONFIGURED`/`CONFIGURING` e regista `blocked:not-configured`, sem o tratar
+  como sucesso nem avançar o próximo tick (o job continua vencido e corre assim
+  que a instalação fique `READY`).
+- **Discovery automático (Telegram):** o modo manutenção
+  (`--telegram-maintain`) e o loop (`--loop-hours`) são bloqueados em
+  `NOT_CONFIGURED`/`CONFIGURING`. Invocações manuais de um único ciclo
+  permanecem operador-iniciadas.
+- A decisão é centralizada em `IConfigurationGate` (um único mecanismo).
+
+### API e observabilidade
+
+`GET /api/configuration/lifecycle` devolve o estado, a marca de adopção legacy,
+a razão (não sensível) e a avaliação **advisory** dos requisitos da PHASE 9C
+§5. O endpoint é de leitura apenas, respeita o token do dashboard
+(`--web-token`) e não expõe operações destrutivas.
+
+Os requisitos da PHASE 9C §32.18 §5 (ordering list, import policies, grupos,
+sources activas, source priority, etc.) são **advisory** nesta wave: informam,
+não bloqueiam `READY`. A sua validação como gate pertence ao wizard (wave
+seguinte).
+
+Documentação de arquitectura: `docs/architecture/configuration-lifecycle.md`.
+
 ## Comportamento funcional
 
 Os cenários abaixo descrevem o comportamento esperado e estão cobertos por testes unitários sempre que possível.

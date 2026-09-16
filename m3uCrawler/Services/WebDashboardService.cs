@@ -2,6 +2,7 @@ using m3uCrawler.Build;
 using m3uCrawler.Models;
 using m3uCrawler.Services.Automation;
 using m3uCrawler.Services.Catalog;
+using m3uCrawler.Services.Configuration;
 using m3uCrawler.Services.Sync;
 using m3uCrawler.Services.Validation;
 using System.Net;
@@ -16,10 +17,21 @@ namespace m3uCrawler.Services
     {
         private static CatalogResolver? _catalogResolver;
         private static IReadOnlyList<IScheduledAction>? _scheduledActions;
+        private static ConfigurationLifecycleService? _configurationLifecycle;
 
         public static void SetCatalogResolver(CatalogResolver resolver)
         {
             _catalogResolver = resolver;
+        }
+
+        /// <summary>
+        /// PHASE 9C.1 — Regista o serviço de lifecycle para que o dashboard
+        /// possa reportar o estado de configuração. Passar <c>null</c> em
+        /// testes repõe o comportamento "não ligado".
+        /// </summary>
+        public static void SetConfigurationLifecycle(ConfigurationLifecycleService? lifecycle)
+        {
+            _configurationLifecycle = lifecycle;
         }
 
         /// <summary>
@@ -145,6 +157,18 @@ namespace m3uCrawler.Services
             if (requestPath.Equals("/api/version", StringComparison.OrdinalIgnoreCase))
             {
                 await WriteJsonAsync(context.Response, BuildVersionPayload());
+                return;
+            }
+
+            // PHASE 9C.1 — Estado do ciclo de vida de configuração.
+            // Endpoint de leitura apenas: em NOT_CONFIGURED o dashboard
+            // continua acessível e mostra inequivocamente que a aplicação
+            // ainda não está configurada. Não expõe operações destrutivas
+            // nem contorna a autenticação (o gate de token é avaliado
+            // antes, no topo do handler).
+            if (requestPath.Equals("/api/configuration/lifecycle", StringComparison.OrdinalIgnoreCase))
+            {
+                await WriteJsonAsync(context.Response, await BuildLifecyclePayloadAsync(_configurationLifecycle));
                 return;
             }
 
@@ -2182,6 +2206,51 @@ namespace m3uCrawler.Services
                 commit = info.Commit,
                 build = info.BuildNumber,
                 buildDate = info.BuildDate.UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ssZ", System.Globalization.CultureInfo.InvariantCulture),
+            };
+        }
+
+        /// <summary>
+        /// PHASE 9C.1 — Constrói o payload do endpoint
+        /// <c>GET /api/configuration/lifecycle</c>. Público para ser
+        /// testável sem levantar um HttpListener. Quando o lifecycle não
+        /// está ligado, reporta <c>available=false</c> e um estado
+        /// não-pronto (fail-safe), nunca uma falsa prontidão.
+        /// </summary>
+        public static async Task<object> BuildLifecyclePayloadAsync(ConfigurationLifecycleService? lifecycle)
+        {
+            if (lifecycle == null)
+            {
+                return new
+                {
+                    state = ConfigurationLifecycleState.NotConfigured.ToWireName(),
+                    available = false,
+                    isReady = false,
+                    adoptedFromLegacy = false,
+                    adoptedAtUtc = (string?)null,
+                    updatedAtUtc = (string?)null,
+                    reason = "lifecycle-not-wired",
+                    advisory = Array.Empty<object>(),
+                };
+            }
+
+            var snapshot = await lifecycle.GetStateAsync();
+            var advisory = await lifecycle.EvaluateAdvisoryAsync();
+
+            return new
+            {
+                state = snapshot.State.ToWireName(),
+                available = true,
+                isReady = snapshot.IsReady,
+                adoptedFromLegacy = snapshot.AdoptedFromLegacy,
+                adoptedAtUtc = snapshot.AdoptedAtUtc?.ToString("o"),
+                updatedAtUtc = snapshot.UpdatedAtUtc.ToString("o"),
+                reason = snapshot.LastReason,
+                advisory = advisory.Select(a => new
+                {
+                    key = a.Key,
+                    satisfied = a.Satisfied,
+                    detail = a.Detail,
+                }),
             };
         }
 

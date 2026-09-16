@@ -2,6 +2,7 @@ using m3uCrawler.Build;
 using m3uCrawler.Services;
 using m3uCrawler.Services.Automation;
 using m3uCrawler.Services.Catalog;
+using m3uCrawler.Services.Configuration;
 using m3uCrawler.Services.Matching;
 using m3uCrawler.Services.SourceOrdering;
 using m3uCrawler.Services.Validation;
@@ -58,6 +59,24 @@ namespace m3uCrawler
                         ResolveCatalogDbPath(args), CancellationToken.None);
                     WebDashboardService.SetCatalogResolver(webCatalogResolver);
 
+                    // PHASE 9C.1 — Lifecycle de configuração. O dashboard
+                    // fica sempre acessível; o estado é reportado em
+                    // /api/configuration/lifecycle e o gate bloqueia
+                    // discovery/scheduler automáticos em NOT_CONFIGURED.
+                    var lifecycle = BuildConfigurationLifecycle(
+                        ResolveCatalogDbPath(args),
+                        dashboardOutputDir,
+                        webCatalogResolver);
+                    WebDashboardService.SetConfigurationLifecycle(lifecycle);
+                    try
+                    {
+                        LogLifecycleState(await lifecycle.EnsureInitializedAsync(CancellationToken.None));
+                    }
+                    catch (Exception lifecycleEx)
+                    {
+                        Console.WriteLine($"⚠️ Não foi possível inicializar o estado de configuração: {lifecycleEx.Message}");
+                    }
+
                     // PHASE 12 — Construir e arrancar o scheduler. As actions
                     // concretas ficam registadas para o formulário do Dashboard
                     // e o runner entra em loop respeitando shutdown via Ctrl+C
@@ -66,7 +85,8 @@ namespace m3uCrawler
                     automationHost = ScheduledAutomationHost.Build(
                         webCatalogResolver,
                         dashboardOutputDir,
-                        dispatcharrConfig);
+                        dispatcharrConfig,
+                        gate: new ConfigurationGate(lifecycle));
                     WebDashboardService.SetScheduledActions(automationHost.RegisteredActions);
                     automationHost.Start();
                     Console.WriteLine(
@@ -229,8 +249,44 @@ namespace m3uCrawler
                     Console.WriteLine($"⚠️ Ingestor de catálogo não disponível: {ex.Message}");
                 }
 
+                // PHASE 9C.1 — Gate de configuração para discovery automático.
+                // Manutenção (--telegram-maintain) e loop (--loop-hours) são
+                // caminhos automáticos: em NOT_CONFIGURED/CONFIGURING ficam
+                // bloqueados. Uma invocação manual de um único ciclo
+                // (--telegram sem loop nem manutenção) é operador-iniciada e
+                // não é afectada nesta wave.
+                bool automaticDiscovery = maintenanceMode || loopHours > 0;
+                var configurationLifecycle = BuildConfigurationLifecycle(
+                    catalogDbPath, outputDir, catalogForIngestion);
+                if (automaticDiscovery)
+                {
+                    try
+                    {
+                        LogLifecycleState(await configurationLifecycle.EnsureInitializedAsync(CancellationToken.None));
+                    }
+                    catch (Exception lifecycleEx)
+                    {
+                        Console.WriteLine($"⚠️ Não foi possível inicializar o estado de configuração: {lifecycleEx.Message}");
+                    }
+                }
+                var configurationGate = new ConfigurationGate(configurationLifecycle);
+
                 do
                 {
+                    if (automaticDiscovery && !await configurationGate.IsReadyAsync())
+                    {
+                        Console.WriteLine(
+                            $"⛔ automatic discovery blocked: not configured (state={configurationGate.State.ToWireName()})");
+                        if (loopHours <= 0)
+                        {
+                            return;
+                        }
+                        Console.WriteLine();
+                        Console.WriteLine($"⏳ Próxima execução em {loopHours} hora(s)...");
+                        await Task.Delay(TimeSpan.FromHours(loopHours));
+                        continue;
+                    }
+
                     if (maintenanceMode)
                     {
                         await RunTelegramMaintenanceCycle(
@@ -944,6 +1000,37 @@ namespace m3uCrawler
             await context.DisposeAsync();
             var factory = new RuntimeChannelCatalogDbContextFactory(dbPath);
             return new CatalogResolver(factory, dbPath);
+        }
+
+        /// <summary>
+        /// PHASE 9C.1 — Constrói o serviço de lifecycle de configuração.
+        /// O estado é persistido ao lado do <c>channel-catalog.db</c>
+        /// (mesmo volume persistente). Não faz I/O; o bootstrap é
+        /// explícito via <c>EnsureInitializedAsync</c>.
+        /// </summary>
+        static ConfigurationLifecycleService BuildConfigurationLifecycle(
+            string catalogDbPath, string outputDir, CatalogResolver? catalog)
+        {
+            var store = ConfigurationLifecycleStore.ForCatalogDatabase(catalogDbPath);
+            return new ConfigurationLifecycleService(store, catalog?.GetFactory(), outputDir);
+        }
+
+        /// <summary>
+        /// PHASE 9C.1 — Log não sensível do estado de configuração
+        /// (nome do estado e, quando aplicável, a marca de adopção legacy).
+        /// </summary>
+        static void LogLifecycleState(ConfigurationLifecycleSnapshot snapshot)
+        {
+            if (snapshot.AdoptedFromLegacy)
+            {
+                Console.WriteLine(
+                    $"🧭 Configuration lifecycle: {snapshot.State.ToWireName()} (legacy adoption: {snapshot.LastReason})");
+            }
+            else
+            {
+                Console.WriteLine(
+                    $"🧭 Configuration lifecycle: {snapshot.State.ToWireName()}");
+            }
         }
 
         static async Task TrySyncToDispatcharrAsync(

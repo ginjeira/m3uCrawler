@@ -3407,11 +3407,23 @@ observar:
 
 # 32.18 — PHASE 9C — First-Run / Configuration Lifecycle / Dashboard Hardening
 
-> **Estado: `[pendente]` — próxima fase de execução.**
+> **Estado: `[em curso]` — 9C.1 implementada (2026-09-16); restantes waves pendentes.**
 >
 > Esta fase é uma condição de consolidação do produto antes de novas
 > funcionalidades. Não introduz uma segunda arquitectura: fecha o lifecycle
 > operacional sobre o catálogo, políticas, Dashboard e scheduler já existentes.
+>
+> **9C.1 — Configuration Lifecycle / First-Run Bootstrap: implementada.**
+> Estados `NOT_CONFIGURED`/`CONFIGURING`/`READY` persistidos
+> (`configuration_lifecycle.json` junto ao catálogo), estado persistido como
+> autoridade, adopção legacy de instalações existentes, gate único de
+> discovery/scheduler (`IConfigurationGate`), endpoint read-only
+> `GET /api/configuration/lifecycle`. Os requisitos do §5 são **advisory** nesta
+> wave (não bloqueiam `READY`), por compatibilidade com instalações existentes.
+> Detalhe em `docs/architecture/configuration-lifecycle.md`.
+> **Pendente:** wizard 9C.2, redesign do Dashboard, gate de command equivalents e
+> endpoints, migração `CanonicalChannelId` → `CanonicalChannel.Key` e restantes
+> itens da fase.
 
 ## 1. Objectivo
 
@@ -3512,6 +3524,28 @@ O bootstrap deve:
 
 A transição para `READY` deve ser determinística e testável.
 
+### Regra de compatibilidade para instalações existentes
+
+A definição de `READY` nesta fase deve preservar instalações `m3uCrawler`
+já operacionais.
+
+Para uma instalação sem estado de lifecycle persistido:
+
+1. se existir evidência objectiva e verificável de que a instalação já era
+   operacional, a instalação deve ser **adoptada como `READY`**;
+2. a adopção deve ser registada em log;
+3. se não existir evidência suficiente, a instalação deve permanecer em
+   `NOT_CONFIGURED`.
+
+A ausência de um ou mais itens da lista de configuração mínima abaixo não deve,
+por si só, bloquear uma instalação legacy que já esteja comprovadamente
+operacional. Esses requisitos são **advisory nesta wave** e serão transformados
+em configuração explícita e governada pelo wizard.
+
+Esta regra existe exclusivamente para compatibilidade durante a introdução do
+lifecycle. Não substitui a validação da configuração completa numa instalação
+nova.
+
 ## 5. Configuração mínima de uma instalação nova
 
 A validação deve definir explicitamente quais componentes são obrigatórios
@@ -3544,16 +3578,40 @@ O Dashboard deve fornecer um fluxo explícito de primeira configuração.
 O wizard deve permitir, no mínimo:
 
 1. verificar estado da instalação;
-2. carregar/importar a baseline/catálogo;
-3. confirmar país;
-4. criar ou seleccionar ordering list activa;
-5. configurar sources;
-6. rever source priority;
-7. configurar políticas de importação/grupos;
-8. configurar validação de streams;
-9. configurar scheduler, se pretendido;
-10. validar tudo;
-11. concluir bootstrap e mudar para `READY`.
+2. criar o **primeiro utilizador administrador**;
+3. autenticar o operador através desse administrador para continuar o
+   bootstrap;
+4. carregar/importar a baseline/catálogo;
+5. confirmar país;
+6. criar ou seleccionar ordering list activa;
+7. configurar sources;
+8. rever source priority;
+9. configurar políticas de importação/grupos;
+10. configurar validação de streams;
+11. configurar scheduler, se pretendido;
+12. validar tudo;
+13. concluir bootstrap e mudar para `READY`.
+
+### Primeiro utilizador administrador
+
+Numa instalação nova, o wizard é responsável pela criação do primeiro
+utilizador administrador da aplicação.
+
+Regras:
+
+- não deve existir uma password administrativa default;
+- a password deve ser definida explicitamente durante o wizard;
+- a criação do primeiro administrador deve ser segura, transaccional e
+  idempotente;
+- depois de concluído o bootstrap, esse utilizador passa a ser utilizado para
+  o acesso autenticado normal ao Dashboard;
+- em `NOT_CONFIGURED`, o Dashboard deve disponibilizar apenas o acesso
+  necessário ao bootstrap/wizard, não o funcionamento administrativo normal;
+- o wizard não deve expor nem devolver a password ou outros segredos em
+  respostas, logs, previews ou erros;
+- uma instalação legacy adoptada como `READY` não deve criar silenciosamente
+  um novo administrador; a estratégia de autenticação/migração legacy deve ser
+  tratada explicitamente.
 
 O wizard não deve duplicar CRUD já existente. Deve apenas orquestrar os
 serviços/API existentes e apresentar ao operador o que falta.
@@ -3727,8 +3785,16 @@ A primeira execução deve seguir fail-safe:
 - não expor credenciais;
 - não considerar uma configuração parcialmente preenchida como `READY`.
 
+Durante `NOT_CONFIGURED`, o Dashboard deve permitir apenas o fluxo necessário
+para o bootstrap inicial. O wizard deve criar o primeiro utilizador
+administrador antes de disponibilizar o acesso administrativo normal.
+
 O Dashboard deve exigir autenticação em instalação normal e todas as APIs
 administrativas devem respeitar o mesmo controlo de acesso.
+
+A adopção de uma instalação legacy como `READY` não deve criar implicitamente
+credenciais administrativas novas. Qualquer migração para o modelo de
+autenticação introduzido nesta fase deve ser explícita e segura.
 
 Logs e respostas do Dashboard continuam sujeitos à sanitização existente.
 
@@ -3743,10 +3809,25 @@ Adicionar testes cobrindo pelo menos:
 
 - instalação nova começa em `NOT_CONFIGURED`;
 - bootstrap é idempotente;
-- configuração incompleta não passa a `READY`;
+- instalação legacy operacional sem estado persistido é adoptada como
+  `READY`;
+- instalação sem estado e sem evidência legacy suficiente permanece
+  `NOT_CONFIGURED`;
+- os requisitos advisory da configuração mínima não bloqueiam a adopção
+  legacy;
+- configuração incompleta de uma instalação nova não passa a `READY`;
 - configuração válida passa a `READY`;
 - configuração inválida regressa a estado não-operacional;
 - mensagens/códigos de validação são determinísticos.
+
+### Primeiro administrador / autenticação
+
+- o wizard cria o primeiro utilizador administrador;
+- não existe password default;
+- a password definida no wizard não aparece em logs, respostas ou erros;
+- a criação do administrador é idempotente e não cria duplicados;
+- após o bootstrap, o acesso normal ao Dashboard exige autenticação;
+- instalações legacy não recebem silenciosamente um novo administrador.
 
 ### Discovery gate
 
@@ -3795,6 +3876,8 @@ NOT_CONFIGURED
       ↓
 wizard
       ↓
+criação do primeiro administrador
+      ↓
 configuração persistida
       ↓
 validação
@@ -3833,7 +3916,9 @@ Além da Definition of Done global:
 
 - lifecycle persistente implementado;
 - bootstrap implementado;
+- adopção legacy implementada e testada;
 - wizard funcional;
+- criação segura do primeiro utilizador administrador implementada e testada;
 - discovery gate aplicado a todas as entradas relevantes;
 - scheduler integrado com o gate;
 - auditoria completa do Dashboard concluída;
@@ -3906,7 +3991,7 @@ Este documento define **como completar a evolução até ao sistema funcional pr
 | PHASE 10 — Dispatcharr | `[concluído]` | BuildPlanFromCompositionAsync + 2 testes. Ver 32.8. |
 | PHASE 11 — Operations | `[concluído]` | SyncRunStepEntity + API + Dashboard Passos + 4 testes. Ver 32.9. |
 | PHASE 12 — Automation / Scheduler | `[concluído]` | ScheduledJobEntity + CronExpression + Runner + 4 actions concretas (`discoverM3u`, `validatePlaylist`, `generatePlaylist`, `syncDispatcharr`) + arranque em produção via `Program.cs --web` + 19 testes. Ver 32.10 e 32.11. |
-| **PHASE 9C — First-Run / Configuration Lifecycle / Dashboard Hardening** | **`[pendente]`** | Próxima fase de execução: bootstrap, `NOT_CONFIGURED/CONFIGURING/READY`, wizard, discovery gate, scheduler gate, auditoria integral do Dashboard e correcção/migração das afinidades. Ver 32.18. |
+| **PHASE 9C — First-Run / Configuration Lifecycle / Dashboard Hardening** | **`[em curso]`** | 9C.1 implementada (lifecycle persistido `NOT_CONFIGURED/CONFIGURING/READY`, adopção legacy, gate de discovery/scheduler, endpoint read-only). Pendente: wizard 9C.2, redesign do Dashboard, gate de command/endpoints e migração das afinidades. Ver 32.18. |
 | PHASE-Bridge — Pipeline → Catálogo | `[concluído]` | `PipelineIngestionService` liga o pipeline real (Telegram/M3U8-search) ao catálogo persistente via `EnsureSourceAsync` + `ResolveAsync` + `RecordChannelSourceAsync` + novo `EnsureCanonicalChannelAsync` (upsert). 9 testes TDD. Ver 32.12. |
 # 32.19 — PHASE 13 — Dispatcharr Source Selection, Diversity & Source Limits
 

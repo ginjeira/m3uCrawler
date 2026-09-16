@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using m3uCrawler.Models;
 using m3uCrawler.Services;
 using m3uCrawler.Services.Catalog;
+using m3uCrawler.Services.Configuration;
 using m3uCrawler.Services.Matching;
 using m3uCrawler.Services.Validation;
 using Microsoft.Extensions.DependencyInjection;
@@ -50,7 +51,8 @@ public sealed class ScheduledAutomationHost : IDisposable
         string outputDir,
         DispatcharrConfig dispatcharrConfig,
         TimeSpan? pollInterval = null,
-        Action<ScheduledActionOptions>? configureOptions = null)
+        Action<ScheduledActionOptions>? configureOptions = null,
+        IConfigurationGate? gate = null)
     {
         var options = new ScheduledActionOptions { OutputDir = outputDir };
         configureOptions?.Invoke(options);
@@ -90,7 +92,8 @@ public sealed class ScheduledAutomationHost : IDisposable
         var runner = new ScheduledJobRunner(
             catalog.GetFactory(),
             provider,
-            pollInterval);
+            pollInterval,
+            gate);
 
         return new ScheduledAutomationHost(provider, runner, options, actions);
     }

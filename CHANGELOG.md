@@ -7,6 +7,18 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Unreleased]
 
+### ✨ Adicionado
+- **PHASE 9C.1 (2026-09-16): ciclo de vida de configuração / first-run bootstrap.** Fundação fail-safe para instalações novas: o processo arranca, o Dashboard fica acessível e, enquanto não estiver configurado, **nenhum discovery automático nem job agendado executa**.
+  - Novos estados persistidos `NOT_CONFIGURED` / `CONFIGURING` / `READY` (`m3uCrawler/Services/Configuration/ConfigurationLifecycleState.cs`), reportados como strings estáveis.
+  - **Autoridade do estado persistido**: se existir estado válido, é usado sem inferência. Sem estado, corre o bootstrap: evidência objectiva de instalação operacional → adopta `READY` com *legacy adoption*; caso contrário → `NOT_CONFIGURED`.
+  - **Legacy adoption** determinada apenas por entidades criadas por operação (sources, channel-sources, ordering lists/items, import policies, grupos, jobs, sync-runs, reviews, matching audits, affinity groups, ownership Dispatcharr, identity rules) e por artefactos de output (`import_history.json`, `playlist.m3u`, `telegram_run_report.json`, `telegram_playlist_*.m3u`). `canonical_channels`/`channel_aliases` (seed/baseline) e `source_priority_policies` (default global) não contam.
+  - **Persistência**: `configuration_lifecycle.json` ao lado do `channel-catalog.db`, no volume persistente (produção `/data`), com escrita atómica. Sem tabela nova nem migração de BD.
+  - **Gate único** (`IConfigurationGate`): `ScheduledJobRunner` bloqueia todos os jobs automáticos (incluindo `discoverM3u`) fora de `READY`, registando `blocked:not-configured` sem tratar como sucesso nem avançar o próximo tick. O Telegram automático (`--telegram-maintain` e `--loop-hours`) é igualmente bloqueado; a invocação manual de um único ciclo não é afectada.
+  - **Dashboard**: endpoint read-only `GET /api/configuration/lifecycle` (respeita `--web-token`), acessível em `NOT_CONFIGURED`, com marca de adopção e avaliação **advisory** dos requisitos §32.18 §5 — que **não** bloqueiam `READY` (compatibilidade com instalações existentes).
+  - Observabilidade proporcional: `🧭 Configuration lifecycle: …`, `⛔ automatic discovery blocked: not configured`, `⛔ scheduler blocked: not configured`; sem dados sensíveis.
+  - Testes: `ConfigurationLifecycleTests`, `ConfigurationGateSchedulerTests`, `ConfigurationLifecycleEndpointTests` (bootstrap, persistência/reload, transições, adopção legacy com e sem evidência, advisory não-bloqueante, gate do scheduler e do discovery, dashboard acessível em `NOT_CONFIGURED`).
+  - Documentado em `docs/architecture/configuration-lifecycle.md` e `m3uCrawler/README.md` § "Ciclo de vida de configuração (PHASE 9C.1)".
+
 ### 🛡️ Correcções / Hardening
 - **PHASE 9A.3 (2026-09-16): concorrência global por Xtream account no run Telegram.** A Phase 9A.2 integrou `TestStreamsAsync` com o `AccountBoundedWorkerPool`, mas construía **um pool local por chamada**, pelo que dois `CandidatePlaylist` da MESMA account processados por workers diferentes podiam testar streams em paralelo, e `MaxConcurrentAccounts` não era um limite global efectivo (era ditado pelo semáforo de candidates). Correcção:
   - Novo `m3uCrawler/Services/Validation/AccountGateCoordinator.cs`: coordenador com lifetime de **run**, `SemaphoreSlim` global limitado a `MaxConcurrentAccounts`, `ConcurrentDictionary<string, SemaphoreSlim(1,1)>` por `AccountId`, refcount/cleanup e `Dispose` determinístico. Aquisição slot global → gate da account; libertações sempre em `finally`.

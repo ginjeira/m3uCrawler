@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using m3uCrawler.Services.Catalog;
+using m3uCrawler.Services.Configuration;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -28,20 +29,26 @@ public interface IScheduledAction
 /// </summary>
 public sealed class ScheduledJobRunner : IDisposable
 {
+    public const string BlockedResult = "blocked:not-configured";
+
     private readonly IDbContextFactory<ChannelCatalogDbContext> _dbFactory;
     private readonly IServiceProvider _services;
     private readonly TimeSpan _pollInterval;
+    private readonly IConfigurationGate? _gate;
     private readonly CancellationTokenSource _cts = new();
     private Task? _loop;
+    private bool _blockedLogged;
 
     public ScheduledJobRunner(
         IDbContextFactory<ChannelCatalogDbContext> dbFactory,
         IServiceProvider services,
-        TimeSpan? pollInterval = null)
+        TimeSpan? pollInterval = null,
+        IConfigurationGate? gate = null)
     {
         _dbFactory = dbFactory;
         _services = services;
         _pollInterval = pollInterval ?? TimeSpan.FromSeconds(30);
+        _gate = gate;
     }
 
     public void Start()
@@ -95,6 +102,22 @@ public sealed class ScheduledJobRunner : IDisposable
             .Where(j => j.IsEnabled && j.NextRunAtUtc != null && j.NextRunAtUtc <= now)
             .ToListAsync(cancellationToken);
 
+        // PHASE 9C.1 — Gate de configuração: em NOT_CONFIGURED/CONFIGURING
+        // nenhum job automático executa. A decisão é centralizada no
+        // IConfigurationGate (um único mecanismo, não espalhado).
+        if (_gate != null && !await _gate.IsReadyAsync(cancellationToken))
+        {
+            await RecordBlockedAsync(due, now, cancellationToken);
+            if (!_blockedLogged)
+            {
+                Console.WriteLine(
+                    $"⛔ scheduler blocked: not configured (state={_gate.State.ToWireName()})");
+                _blockedLogged = true;
+            }
+            return 0;
+        }
+        _blockedLogged = false;
+
         var ran = 0;
         foreach (var job in due)
         {
@@ -131,6 +154,37 @@ public sealed class ScheduledJobRunner : IDisposable
             ran++;
         }
         return ran;
+    }
+
+    /// <summary>
+    /// Regista nos jobs vencidos que a execução foi bloqueada pela
+    /// configuração, sem a tratar como sucesso. Não avança
+    /// <c>NextRunAtUtc</c> nem <c>LastRunAtUtc</c>: o job continua vencido
+    /// para correr assim que a instalação fique <c>READY</c>.
+    /// </summary>
+    private async Task RecordBlockedAsync(
+        List<ScheduledJobEntity> due,
+        DateTime now,
+        CancellationToken cancellationToken)
+    {
+        if (due.Count == 0) return;
+
+        await using var context = await _dbFactory.CreateDbContextAsync(cancellationToken);
+        var changed = false;
+        foreach (var job in due)
+        {
+            var entity = await context.ScheduledJobs
+                .FirstOrDefaultAsync(j => j.Id == job.Id, cancellationToken);
+            if (entity == null) continue;
+            if (string.Equals(entity.LastResult, BlockedResult, StringComparison.Ordinal)) continue;
+            entity.LastResult = BlockedResult;
+            entity.UpdatedAtUtc = now;
+            changed = true;
+        }
+        if (changed)
+        {
+            await context.SaveChangesAsync(cancellationToken);
+        }
     }
 
     private IScheduledAction? ResolveAction(string name)
