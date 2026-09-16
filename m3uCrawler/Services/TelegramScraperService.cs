@@ -224,8 +224,19 @@ namespace m3uCrawler.Services
             // um stream_validation_policy.json no runtime-data, este
             // tester usa a policy persistida. Caso contrario, usa
             // defaults.
-            var tester = StreamValidationTesterFactory.CreateTester(
-                TryLoadSharedValidationState() ?? StreamValidationTesterFactory.CreateIsolatedState());
+            var validationState = TryLoadSharedValidationState()
+                ?? StreamValidationTesterFactory.CreateIsolatedState();
+            var tester = StreamValidationTesterFactory.CreateTester(validationState);
+            // PHASE 9A.2 (2026-09-16): o validador de accounts reusa o MESMO
+            // state/cache/host-tracker que o tester.
+            var accountValidator = new AccountValidator(validationState, tester);
+            var maxConcurrentAccounts = validationState.Options.MaxConcurrentAccounts;
+            // PHASE 9A.3 (2026-09-16): coordenador GLOBAL por run. A mesma
+            // instancia e' partilhada por TODOS os candidate workers deste
+            // run, garantindo que um AccountId nunca testa dois streams em
+            // paralelo, mesmo que apareca em candidates diferentes. O limite
+            // global de accounts em teste e' MaxConcurrentAccounts.
+            var accountGateCoordinator = new AccountGateCoordinator(maxConcurrentAccounts);
             // PHASE-OBSERVABILITY (2026-09-15): associa o trace sink ao tester
             // para que todos os HTTP requests do worker tambem sejam observados.
             if (_trace is m3uCrawler.Services.Validation.PipelineTrace traceSink)
@@ -273,7 +284,7 @@ namespace m3uCrawler.Services
                             {
                                 await ProcessCandidateAsync(
                                     c, tester, parser, validator, countryCode, rep,
-                                    maxUrlsToTest, maxConcurrency,
+                                    maxUrlsToTest, accountValidator, accountGateCoordinator,
                                     candidateChannel.Writer, working, workingLock,
                                     cancellationToken);
                             }
@@ -369,7 +380,10 @@ namespace m3uCrawler.Services
             }
             finally
             {
+                // PHASE 9A.3: processingDone ja' completou, logo nao ha
+                // operacoes em voo no coordenador.
                 tester.Dispose();
+                accountGateCoordinator.Dispose();
             }
 
             rep.FinishedAt = DateTime.UtcNow;
@@ -444,7 +458,8 @@ namespace m3uCrawler.Services
             string countryCode,
             RunReport rep,
             int maxUrlsToTest,
-            int maxConcurrency,
+            AccountValidator accountValidator,
+            AccountGateCoordinator accountGateCoordinator,
             System.Threading.Channels.ChannelWriter<CandidatePlaylist> writer,
             List<M3uStream> working,
             object workingLock,
@@ -471,8 +486,8 @@ namespace m3uCrawler.Services
             //     em mutacao). O validador pode ser reentrant; e' imutavel.
             //   - M3uParserService.Parse (estatico, sem estado mutavel).
             //   - StreamValidationTesterFactory e StreamValidationCache
-            //     (os testes de streams sao single-threaded dentro de
-            //     TestStreamsAsync que tem `maxConcurrency` interno).
+            //     (a serializacao por account e' feita pelo
+            //     AccountGateCoordinator dentro de TestStreamsAsync).
             //   - ChannelWriter.TryWrite (NAO pede lock; e' lock-free).
             string? content = candidate.Content;
             // EXPERIMENT-SERIAL-PER-XTREAM (2026-09-16): se o candidate foi
@@ -626,7 +641,10 @@ namespace m3uCrawler.Services
                 return;
             }
 
-            var tested = await TestStreamsAsync(tester, countryStreams, maxConcurrency, maxUrlsToTest);
+            var tested = await TestStreamsAsync(
+                accountValidator.ValidateAccountAsync,
+                accountGateCoordinator,
+                candidate.Url, countryStreams, maxUrlsToTest, cancellationToken);
             Interlocked.Add(ref rep._StreamsTested, tested.Count);
             Interlocked.Add(ref rep._StreamsWorking, tested.Count(s => s.IsWorking));
             Interlocked.Add(ref rep._StreamsFailed, tested.Count(s => !s.IsWorking));
@@ -1540,27 +1558,90 @@ namespace m3uCrawler.Services
                 (error is null ? "" : $" error={error}"));
         }
 
-        private async Task<List<M3uStream>> TestStreamsAsync(
-            M3uTesterService tester, List<M3uStream> streams, int maxConcurrency, int maxUrlsToTest)
+        // PHASE 9A.3 (2026-09-16): testa os streams de UM candidate atraves
+        // do AccountGateCoordinator GLOBAL do run.
+        //
+        //   candidate (1 account) -> 1 AccountValidationWork
+        //     -> AccountGateCoordinator (slot global + gate por AccountId)
+        //       -> validateAccount (AccountValidator.ValidateAccountAsync)
+        //         -> tester.TestStreamForAccountAsync (HTTP, cache, host tracker)
+        //
+        // O coordinator e' partilhado por todos os candidate workers do run,
+        // pelo que o MESMO AccountId nunca tem dois streams em teste em
+        // paralelo, mesmo aparecendo em candidates diferentes. O numero
+        // global de accounts em teste e' MaxConcurrentAccounts.
+        //
+        // `validateAccount` e' injectado para permitir testes de integracao
+        // sem rede; em producao e' sempre AccountValidator.ValidateAccountAsync.
+        internal async Task<List<M3uStream>> TestStreamsAsync(
+            Func<AccountValidationWork, CancellationToken, Task<AccountValidationResult>> validateAccount,
+            AccountGateCoordinator accountGateCoordinator,
+            string? playlistUrl,
+            List<M3uStream> streams,
+            int maxUrlsToTest,
+            CancellationToken cancellationToken)
         {
             var toTest = (maxUrlsToTest > 0 ? streams.Take(maxUrlsToTest) : streams).ToList();
             if (toTest.Count == 0) return new List<M3uStream>();
 
-            var semaphore = new SemaphoreSlim(maxConcurrency);
-            var tasks = toTest.Select(async s =>
-            {
-                await semaphore.WaitAsync();
-                try
-                {
-                    return await tester.TestM3u8Stream(s.Url, s.Title, s.Group);
-                }
-                finally
-                {
-                    semaphore.Release();
-                }
-            });
+            var work = BuildAccountWork(playlistUrl, toTest);
 
-            return (await Task.WhenAll(tasks)).ToList();
+            AccountValidationResult? result = null;
+            try
+            {
+                // O cancellationToken do run impede a ADMISSAO (slot global e
+                // gate da account). Depois de admitida, a operacao corre ate'
+                // ao fim: o token cancelavel do run NAO e' propagado ao teste
+                // dos streams (semantica anterior a 9A.2).
+                result = await accountGateCoordinator.RunExclusiveAsync(
+                    work.AccountId,
+                    _ => validateAccount(work, CancellationToken.None),
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                // Nao admitida por cancelamento do run: devolver a mesma
+                // forma, com todos os streams marcados como nao-funcionais.
+            }
+
+            var outcomes = result?.Outcomes
+                ?? (IReadOnlyList<StreamTestOutcome>)Array.Empty<StreamTestOutcome>();
+
+            var tested = new List<M3uStream>(toTest.Count);
+            for (var i = 0; i < toTest.Count; i++)
+            {
+                var source = toTest[i];
+                var outcome = i < outcomes.Count
+                    ? outcomes[i]
+                    : StreamTestOutcome.Empty(source.Url) with { WasShortCircuited = true };
+                tested.Add(M3uTesterService.BuildStreamForAccountFromOutcome(
+                    source.Url, source.Title, source.Group, outcome));
+            }
+            return tested;
+        }
+
+        // PHASE 9A.2: constroi o work item de UMA account a partir dos streams
+        // de um candidate. Identity = (URL sem password) + "|" + username.
+        // A password nunca participa do fingerprint nem dos logs.
+        internal static AccountValidationWork BuildAccountWork(
+            string? playlistUrl,
+            IReadOnlyList<M3uStream> streams)
+        {
+            var username = AccountIdentity.ExtractUsername(playlistUrl);
+            var accountId = AccountIdentity.Compute(
+                AccountIdentity.ComputeSafeUrl(playlistUrl ?? string.Empty), username);
+
+            var accountStreams = new List<AccountStreamWork>(streams.Count);
+            foreach (var s in streams)
+            {
+                accountStreams.Add(new AccountStreamWork(s.Url, s.Title, s.Group));
+            }
+
+            return new AccountValidationWork(
+                accountId,
+                playlistUrl ?? string.Empty,
+                username,
+                accountStreams);
         }
 
         // Filtra streams individuais pelo país alvo usando CountryChannelValidator.ValidateStreams.

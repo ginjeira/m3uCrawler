@@ -7,6 +7,15 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Unreleased]
 
+### 🛡️ Correcções / Hardening
+- **PHASE 9A.3 (2026-09-16): concorrência global por Xtream account no run Telegram.** A Phase 9A.2 integrou `TestStreamsAsync` com o `AccountBoundedWorkerPool`, mas construía **um pool local por chamada**, pelo que dois `CandidatePlaylist` da MESMA account processados por workers diferentes podiam testar streams em paralelo, e `MaxConcurrentAccounts` não era um limite global efectivo (era ditado pelo semáforo de candidates). Correcção:
+  - Novo `m3uCrawler/Services/Validation/AccountGateCoordinator.cs`: coordenador com lifetime de **run**, `SemaphoreSlim` global limitado a `MaxConcurrentAccounts`, `ConcurrentDictionary<string, SemaphoreSlim(1,1)>` por `AccountId`, refcount/cleanup e `Dispose` determinístico. Aquisição slot global → gate da account; libertações sempre em `finally`.
+  - `TelegramScraperService.SearchAndTestM3UInTelegramAsync` cria **uma** instância do coordinator (ao lado de `validationState`/`tester`/`accountValidator`) e passa-a por `ProcessCandidateAsync` → `TestStreamsAsync`, sendo partilhada por todos os candidate workers; `Dispose` no `finally` do run, após `processingDone`.
+  - `TestStreamsAsync` deixa de criar o pool local e passa por `AccountGateCoordinator.RunExclusiveAsync` + `AccountValidator.ValidateAccountAsync` (delegate de validação injectável apenas para testes; em produção é sempre o validador real).
+  - **Cancellation**: o token do run controla apenas a admissão (slot global/gate); depois de admitida, a validação corre até ao fim (`CancellationToken.None`), repondo a semântica anterior à 9A.2. Se cancelada antes da admissão, devolve a mesma forma com streams não-funcionais.
+  - **Não alterado**: `AccountIdentity`, `AccountBoundedWorkerPool`, `AccountValidator`, `StreamValidationOptions`, `XtreamAccountLockManager`, timeouts HTTP, cache, `HostFailureTracker`, `XtreamPublicationResolver`, descoberta, parser e download. Sem dedup por `AccountId` nesta fase.
+  - Testes: `Phase93AccountGateCoordinatorTests` (regressão explícita do bug 9A.2 com dois workers concorrentes + A–H) e `Phase92TelegramAccountPoolIntegrationTests` reorganizado para exercer o caminho real `TestStreamsAsync` sem rede. Documentado em `docs/PHASE-9A-3-global-account-concurrency.md`.
+
 ### ✨ Adicionado
 - **Fallback URL-only no `XtreamPublicationResolver.ResolveFromHtml`** (introduzido 2026-09-14): quando os caminhos DOM-based e flat-text não produzem nenhuma conta mas o HTML contém URLs `get.php?username=…&password=…`, o resolver extrai credenciais directamente das URLs como último fallback. Cobre o caso do publisher `m3u-sᴄᴀɴ` cuja edição de 14-09-2026 (mensagem Telegram `110751`) deixou de emitir labels visíveis e passou a disponibilizar **apenas as URLs** em `get.php`. A nova lógica:
   - Detecta URLs `<scheme>://<host>[:<port>]/get.php?username=X&password=Y` independentemente dos atributos ou do texto à volta (`href`, texto puro, etc.).

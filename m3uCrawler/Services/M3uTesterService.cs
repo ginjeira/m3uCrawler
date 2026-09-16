@@ -419,6 +419,21 @@ public sealed class M3uTesterService : IDisposable
         return await TestSingleInternalAsync(url, _options, hostCacheStatus, metrics, cancellationToken);
     }
 
+    /// <summary>
+    /// PHASE 9A.1: helper para AccountValidator. Fornece um metrics e
+    /// hostCacheStatus externos. Mantem semantica identica a
+    /// TestSingleInternalAsync. Utilizado pelo AccountValidator para
+    /// agregar metrics por account sem criar dict descartavel por stream.
+    /// </summary>
+    internal async Task<StreamTestOutcome> TestStreamForAccountAsync(
+        string url,
+        ConcurrentDictionary<string, bool> hostCacheStatus,
+        StreamValidationMetrics metrics,
+        CancellationToken cancellationToken)
+    {
+        return await TestSingleInternalAsync(url, _options, hostCacheStatus, metrics, cancellationToken);
+    }
+
     private async Task<StreamTestOutcome> TestSingleInternalAsync(
         string url,
         StreamValidationOptions options,
@@ -767,6 +782,16 @@ public sealed class M3uTesterService : IDisposable
         Console.WriteLine(
             $"[DownloadPlaylist] kind={kind} durationMs={durationMs} status={status}{(errorName == null ? "" : " error=" + errorName)} url={safeUrl}");
     }
+
+    /// <summary>
+    /// PHASE 9A.2: exposicao do mapeamento outcome -> M3uStream para o
+    /// caminho AccountValidator (TelegramScraperService). Mantem a semantica
+    /// exacta de <see cref="TestM3u8Stream"/> (title fallback, LastTested,
+    /// ResponseTime).
+    /// </summary>
+    internal static M3uStream BuildStreamForAccountFromOutcome(
+        string url, string title, string group, StreamTestOutcome outcome)
+        => BuildStreamFromOutcome(url, title, group, outcome);
 
     private static M3uStream BuildStreamFromOutcome(string url, string title, string group, StreamTestOutcome outcome)
     {

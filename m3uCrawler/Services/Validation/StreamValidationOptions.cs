@@ -17,6 +17,12 @@ public sealed class StreamValidationOptions
     public static StreamValidationOptions DefaultClone() => new();
 
     public const int DefaultMaxConcurrency = 8;
+    /// <summary>
+    /// PHASE 9A.1: numero maximo de accounts/playlists processadas em
+    /// paralelo. Canais dentro da MESMA account sao SEMPRE seriais
+    /// (hardcoded em <see cref="AccountValidator.MaxConcurrentChannelsPerAccount"/>).
+    /// </summary>
+    public const int DefaultMaxConcurrentAccounts = 5;
     public const int DefaultConnectionTimeoutSeconds = 5;
     public const int DefaultReadTimeoutSeconds = 8;
     public const int DefaultOverallTimeoutSeconds = 12;
@@ -30,6 +36,10 @@ public sealed class StreamValidationOptions
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
 
     public int MaxConcurrency { get; set; } = DefaultMaxConcurrency;
+    /// <summary>
+    /// PHASE 9A.1: configuravel; CLAAMPED [1,128].
+    /// </summary>
+    public int MaxConcurrentAccounts { get; set; } = DefaultMaxConcurrentAccounts;
     public int ConnectionTimeoutSeconds { get; set; } = DefaultConnectionTimeoutSeconds;
     public int ReadTimeoutSeconds { get; set; } = DefaultReadTimeoutSeconds;
     public int OverallTimeoutSeconds { get; set; } = DefaultOverallTimeoutSeconds;
@@ -46,6 +56,7 @@ public sealed class StreamValidationOptions
     public StreamValidationOptions Clone() => new()
     {
         MaxConcurrency = MaxConcurrency,
+        MaxConcurrentAccounts = MaxConcurrentAccounts,
         ConnectionTimeoutSeconds = ConnectionTimeoutSeconds,
         ReadTimeoutSeconds = ReadTimeoutSeconds,
         OverallTimeoutSeconds = OverallTimeoutSeconds,
@@ -70,6 +81,7 @@ public sealed class StreamValidationOptions
     public void Sanitize()
     {
         MaxConcurrency = Math.Clamp(MaxConcurrency, 1, 256);
+        MaxConcurrentAccounts = Math.Clamp(MaxConcurrentAccounts, 1, 128);
         ConnectionTimeoutSeconds = Math.Clamp(ConnectionTimeoutSeconds, 1, 300);
         ReadTimeoutSeconds = Math.Clamp(ReadTimeoutSeconds, 1, 300);
         OverallTimeoutSeconds = Math.Clamp(OverallTimeoutSeconds, 1, 600);
