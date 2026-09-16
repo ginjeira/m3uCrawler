@@ -940,7 +940,8 @@ namespace m3uCrawler
         {
             var groups = await catalog.ListAffinityGroupsAsync();
             var byCountry = groups
-                .Where(g => !string.IsNullOrWhiteSpace(g.CountryCode))
+                .Where(g => g.Kind == AffinityKind.Country
+                    && !string.IsNullOrWhiteSpace(g.CountryCode))
                 .GroupBy(g => g.CountryCode!.ToLowerInvariant());
             foreach (var group in byCountry)
             {

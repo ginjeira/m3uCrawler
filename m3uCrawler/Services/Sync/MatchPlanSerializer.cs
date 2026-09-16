@@ -58,6 +58,8 @@ namespace m3uCrawler.Services.Sync
             {
                 Identity = c.Identity,
                 CanonicalName = c.CanonicalName,
+                CanonicalChannelKey = c.CanonicalChannelKey,
+                CanonicalChannelId = c.CanonicalChannelId,
                 Outcome = c.Outcome,
                 ExistingChannelId = c.ExistingChannelId,
                 ProposedChannelNumber = c.ProposedChannelNumber,

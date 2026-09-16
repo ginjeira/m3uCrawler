@@ -46,6 +46,7 @@ public sealed class ChannelCatalogDbContext : DbContext
             e.Property(x => x.Id).ValueGeneratedOnAdd();
             e.Property(x => x.Key).IsRequired().HasMaxLength(120);
             e.Property(x => x.DisplayName).IsRequired().HasMaxLength(200);
+            e.Property(x => x.Country).HasMaxLength(10);
             e.Property(x => x.PublicationPolicy).HasConversion<int>();
             e.Property(x => x.EditorialCategory).HasConversion<int>();
             e.Property(x => x.EditorialGroup).HasConversion<int>();
@@ -92,12 +93,16 @@ public sealed class ChannelCatalogDbContext : DbContext
             e.HasKey(x => x.Id);
             e.Property(x => x.Id).ValueGeneratedOnAdd();
             e.Property(x => x.Name).IsRequired().HasMaxLength(200);
+            e.Property(x => x.Kind).HasConversion<int>();
+            e.Property(x => x.CanonicalChannelKey).HasMaxLength(120);
             e.Property(x => x.CountryCode).HasMaxLength(10);
             e.Property(x => x.CanonicalChannelId).IsRequired(false);
             e.Property(x => x.CreatedAtUtc).IsRequired();
             e.Property(x => x.UpdatedAtUtc).IsRequired();
             e.HasIndex(x => x.Name).IsUnique();
+            e.HasIndex(x => x.Kind);
             e.HasIndex(x => x.CountryCode);
+            e.HasIndex(x => x.CanonicalChannelKey);
             e.HasOne(x => x.CanonicalChannel)
                 .WithMany()
                 .HasForeignKey(x => x.CanonicalChannelId)
@@ -115,9 +120,17 @@ public sealed class ChannelCatalogDbContext : DbContext
             e.HasKey(x => x.Id);
             e.Property(x => x.Id).ValueGeneratedOnAdd();
             e.Property(x => x.NormalizedMember).IsRequired().HasMaxLength(200);
+            e.Property(x => x.Kind).HasConversion<int>();
             e.Property(x => x.AffinityGroupId).IsRequired();
             e.Property(x => x.CreatedAtUtc).IsRequired();
-            e.HasIndex(x => x.NormalizedMember).IsUnique();
+            // Unicidade APENAS entre Channel affinities: uma variante
+            // não pode resolver para dois canais canónicos. Membros
+            // Country não são restringidos (podem coexistir com a
+            // mesma variante numa Channel affinity).
+            e.HasIndex(x => x.NormalizedMember)
+                .IsUnique()
+                .HasDatabaseName("IX_affinity_members_NormalizedMember_Channel")
+                .HasFilter("\"Kind\" = 0");
             e.HasOne(x => x.AffinityGroup)
                 .WithMany(g => g.Members)
                 .HasForeignKey(x => x.AffinityGroupId)

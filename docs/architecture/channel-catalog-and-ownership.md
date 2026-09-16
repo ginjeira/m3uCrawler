@@ -38,6 +38,7 @@ permanece apenas como **compatibilidade de categoria editorial**
 Id              long  PK
 Key             text  UK (ex.: "benfica-tv")
 DisplayName     text
+Country         text  NULL (ex.: "pt"; NULL = global/agnóstico)
 EditorialCategory    int (Live/Entretenimento/Desporto/Infantil/Documentarios)
 EditorialGroup  int (PortugalLive/PortugalFilmes24_7/...)
 PublicationPolicy    int (CreateEligible/MergeOnly/ReviewOnly/Excluded)
@@ -46,7 +47,9 @@ CreatedAtUtc    datetime
 UpdatedAtUtc    datetime
 ```
 
-`Key` é o identificador estável; `DisplayName` é o nome editorial;
+`Key` é o identificador estável; `DisplayName` é o nome editorial
+(mutável, sem impacto na `Key` nem nas afinidades); `Country` é o
+país do catálogo canónico (opcional, não faz parte da identidade);
 `EditorialCategory` é a categoria; `EditorialGroup` é o grupo final
 de publicação; `PublicationPolicy` é a autorização; `IsEnabled`
 desactiva temporariamente sem apagar.
@@ -389,3 +392,84 @@ SQLite in-memory (testes), o lock é ignorado.
 A BD SQLite usa WAL mode por defeito (EF Core SQLite default).
 Leituras concorrentes são seguras; escritas concorrentes são
 serializadas via `BEGIN IMMEDIATE`.
+
+## 12. Afinidades (PHASE 9C.3)
+
+### `AffinityGroup`
+
+```
+Id                  long  PK
+Name                text  UK
+Kind                int   (Channel=0 | Country=1)
+CanonicalChannelKey text  NULL (UK lógica para Channel)
+CountryCode         text  NULL
+CanonicalChannelId  long? FK → CanonicalChannel (transitório)
+CreatedAtUtc        datetime
+UpdatedAtUtc        datetime
+```
+
+### `AffinityMember`
+
+```
+Id                long  PK
+NormalizedMember  text
+Kind              int   (espelha o Kind do grupo)
+AffinityGroupId   long  FK → AffinityGroup (cascade)
+CreatedAtUtc      datetime
+```
+
+- **`Kind = Channel`**: `CanonicalChannelKey` obrigatório; a identidade é a
+  `Key` (nunca o `Id`). Cardinalidade **0..1 afinidade Channel por canal**.
+  `ResolveAsync` só considera membros Channel (`IdentityRule > Affinity >
+  ChannelAlias`).
+- **`Kind = Country`**: `CountryCode` obrigatório; `CanonicalChannelKey` nulo.
+  Membros injetados no `CountryChannelValidator` (country-level targeting).
+  Não resolvem canal.
+- **Unicidade de `NormalizedMember`**: índice único **filtrado**
+  (`WHERE Kind = 0`), pelo que uma variante não resolve para dois canais, mas
+  pode coexistir numa Channel affinity e numa Country affinity.
+- **Delimiter global** (`runtime-data/app_settings.json`,
+  `affinityVariantDelimiter`, default `,`): convenção de input; as variantes
+  persistem uma por registo. Alterar o delimiter não exige migration.
+- **Naming Dispatcharr**: canais criados pelo crawler usam o `DisplayName`
+  actual (`CanonicalChannelKey` presente no `ChannelDecision`); são registados
+  como `ChannelOwnership.CrawlerManaged` e só esses são renomeados. `External`/
+  `Unknown` nunca são renomeados.
+
+### Migração `AddCanonicalCountryAndAffinityKind`
+
+Aditiva e transaccional (toda a migration corre numa transação; uma falha
+reverte schema, dados e proveniência).
+
+**Up:**
+
+0. **Guard FK** (antes de qualquer mutação): deteta
+   `CanonicalChannelId` a apontar para um `CanonicalChannel` inexistente e
+   aborta com erro explícito.
+1. cria e popula a tabela de proveniência **`affinity_migration_backup`**
+   (`OriginalGroupId`, `OriginalCountryCode`, `GeneratedCountryGroupId`) antes
+   de alterar grupos mixed;
+2. classifica grupos (`Channel` se têm canal, `Country` caso contrário);
+3. backfill de `CanonicalChannelId → CanonicalChannel.Key` por JOIN (nunca por
+   nome); espelha o `Kind` nos membros;
+4. **split** de grupos mixed numa contrapartida Country (nome determinístico
+   `"<nome> #split-<id>"`, usado só para correlação interna do Up) e registo do
+   ID gerado na proveniência; guard de correlação completa;
+5. copia membros para a contrapartida; o grupo original fica Channel puro;
+   órfãos (sem canal e sem país) ficam `Country` com `CountryCode` nulo e são
+   preservados.
+
+`affinity_migration_backup` **não é mapeada no EF** (não entra no modelo nem no
+snapshot) e é mantida após a migration para permitir rollback; a sua remoção
+será feita numa migration dedicada posterior.
+
+**Down** (sem heurísticas de nome, sem `MIN(Id)`, sem deduplicação arbitrária):
+
+1. remove membros e grupos criados pelo Up, identificados exclusivamente por
+   `affinity_migration_backup.GeneratedCountryGroupId`;
+2. restaura `OriginalCountryCode` nos `OriginalGroupId`;
+3. valida o estado remanescente contra a unicidade global do modelo anterior:
+   se existirem `NormalizedMember` duplicados, **aborta** (transação revertida,
+   sem apagar nada) com mensagem explícita;
+4. só se válido: remove a proveniência, remove as colunas novas e recria o
+   índice único global.

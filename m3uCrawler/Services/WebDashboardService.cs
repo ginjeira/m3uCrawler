@@ -765,9 +765,12 @@ namespace m3uCrawler.Services
                     {
                         id = g.Id,
                         name = g.Name,
+                        kind = g.Kind.ToString(),
+                        canonicalChannelKey = g.CanonicalChannelKey,
                         countryCode = g.CountryCode,
                         canonicalChannelId = g.CanonicalChannelId,
                         canonicalChannelDisplayName = g.CanonicalChannel?.DisplayName,
+                        canonicalChannelCountry = g.CanonicalChannel?.Country,
                         members = g.Members.Select(m => m.NormalizedMember).ToList(),
                         createdAtUtc = g.CreatedAtUtc.ToString("o"),
                         updatedAtUtc = g.UpdatedAtUtc.ToString("o"),
@@ -795,12 +798,21 @@ namespace m3uCrawler.Services
                             return;
                         }
 
+                        var resolved = await ResolveAffinityPayloadAsync(payload);
+                        if (resolved.Error != null)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = resolved.Error });
+                            return;
+                        }
                         var group = await _catalogResolver.CreateAffinityGroupAsync(
-                            payload.Name, payload.CanonicalChannelId, payload.CountryCode, payload.Members);
+                            payload.Name, resolved.Kind, resolved.Key, resolved.Country, payload.Members);
                         await WriteJsonAsync(context.Response, new
                         {
                             id = group.Id,
                             name = group.Name,
+                            kind = group.Kind.ToString(),
+                            canonicalChannelKey = group.CanonicalChannelKey,
                             countryCode = group.CountryCode,
                             canonicalChannelId = group.CanonicalChannelId,
                             members = group.Members.Select(m => m.NormalizedMember).ToList(),
@@ -881,8 +893,15 @@ namespace m3uCrawler.Services
                             return;
                         }
 
+                        var resolved = await ResolveAffinityPayloadAsync(payload);
+                        if (resolved.Error != null)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = resolved.Error });
+                            return;
+                        }
                         var group = await _catalogResolver.UpdateAffinityGroupAsync(
-                            groupId, payload.Name, payload.CanonicalChannelId, payload.CountryCode, payload.Members);
+                            groupId, payload.Name, resolved.Kind, resolved.Key, resolved.Country, payload.Members);
                         if (group == null)
                         {
                             context.Response.StatusCode = (int)HttpStatusCode.NotFound;
@@ -893,6 +912,8 @@ namespace m3uCrawler.Services
                         {
                             id = group.Id,
                             name = group.Name,
+                            kind = group.Kind.ToString(),
+                            canonicalChannelKey = group.CanonicalChannelKey,
                             countryCode = group.CountryCode,
                             canonicalChannelId = group.CanonicalChannelId,
                             members = group.Members.Select(m => m.NormalizedMember).ToList(),
@@ -2091,7 +2112,7 @@ namespace m3uCrawler.Services
                             var isEnabled = payload.IsEnabled ?? true;
                             var updated = await _catalogResolver.UpdateCanonicalChannelAsync(
                                 channelId, payload.DisplayName, editorialCategory,
-                                editorialGroup, publicationPolicy, isEnabled);
+                                editorialGroup, publicationPolicy, isEnabled, payload.Country);
                             if (updated == null)
                             {
                                 context.Response.StatusCode = (int)HttpStatusCode.NotFound;
@@ -2234,7 +2255,7 @@ namespace m3uCrawler.Services
                     var created = await _catalogResolver.CreateCanonicalChannelAsync(
                         payload.Key.Trim(), payload.DisplayName,
                         editorialCategory, editorialGroup, publicationPolicy,
-                        payload.IsEnabled, aliases);
+                        payload.IsEnabled, aliases, payload.Country);
                     var reloaded = await _catalogResolver.GetCanonicalChannelAsync(created.Id);
                     await WriteJsonAsync(context.Response, ChannelToJson(reloaded!), HttpStatusCode.Created);
                     return;
@@ -2274,6 +2295,51 @@ namespace m3uCrawler.Services
                             return;
                         }
                         var saved = store.Save(incoming);
+                        await WriteJsonAsync(context.Response, saved);
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                        await WriteJsonAsync(context.Response, new { error = ex.Message });
+                        return;
+                    }
+                }
+                context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
+                return;
+            }
+
+            // === App settings (PHASE 9C.3) ===
+            // GET  /api/settings
+            // POST /api/settings
+            if (requestPath.Equals("/api/settings", StringComparison.OrdinalIgnoreCase))
+            {
+                var runtimeDir = Path.Combine(Directory.GetCurrentDirectory(), "runtime-data");
+                var settingsStore = new AppSettingsStore(runtimeDir);
+                if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteJsonAsync(context.Response, settingsStore.Load());
+                    return;
+                }
+                if (context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
+                        var body = await reader.ReadToEndAsync();
+                        var payload = JsonSerializer.Deserialize<AppSettingsPayload>(body, JsonOptions);
+                        if (payload == null)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "Payload inválido." });
+                            return;
+                        }
+                        var current = settingsStore.Load();
+                        if (payload.AffinityVariantDelimiter != null)
+                        {
+                            current.AffinityVariantDelimiter = payload.AffinityVariantDelimiter;
+                        }
+                        var saved = settingsStore.Save(current);
                         await WriteJsonAsync(context.Response, saved);
                         return;
                     }
@@ -2562,12 +2628,64 @@ namespace m3uCrawler.Services
     {
         [JsonPropertyName("name")]
         public string Name { get; set; } = string.Empty;
-        [JsonPropertyName("countryCode")]
-        public string? CountryCode { get; set; }
+        [JsonPropertyName("kind")]
+        public string? Kind { get; set; }
+        [JsonPropertyName("canonicalChannelKey")]
+        public string? CanonicalChannelKey { get; set; }
         [JsonPropertyName("canonicalChannelId")]
         public long? CanonicalChannelId { get; set; }
+        [JsonPropertyName("countryCode")]
+        public string? CountryCode { get; set; }
         [JsonPropertyName("members")]
         public List<string> Members { get; set; } = new();
+    }
+
+    private sealed class AppSettingsPayload
+    {
+        [JsonPropertyName("affinityVariantDelimiter")]
+        public string? AffinityVariantDelimiter { get; set; }
+    }
+
+    /// <summary>
+    /// Resolve o kind/país/canal de um payload de afinidade. O kind
+    /// explícito tem prioridade; caso ausente, é inferido
+    /// (canal → Channel, país → Country) para compatibilidade com
+    /// clientes antigos.
+    /// </summary>
+    private static async Task<(AffinityKind Kind, string? Key, string? Country, string? Error)>
+        ResolveAffinityPayloadAsync(AffinityGroupPayload payload)
+    {
+        var kindText = (payload.Kind ?? string.Empty).Trim().ToLowerInvariant();
+        AffinityKind? kind = kindText switch
+        {
+            "channel" => AffinityKind.Channel,
+            "country" => AffinityKind.Country,
+            "" => (AffinityKind?)null,
+            _ => (AffinityKind?)null,
+        };
+        if (kindText.Length > 0 && kind == null)
+        {
+            return (default, null, null, $"Kind inválido: '{payload.Kind}'.");
+        }
+
+        var key = (payload.CanonicalChannelKey ?? string.Empty).Trim();
+        if (key.Length == 0 && payload.CanonicalChannelId.HasValue && _catalogResolver != null)
+        {
+            var channel = await _catalogResolver.GetCanonicalChannelAsync(payload.CanonicalChannelId.Value);
+            key = channel?.Key ?? string.Empty;
+        }
+
+        if (kind == null)
+        {
+            if (key.Length > 0) kind = AffinityKind.Channel;
+            else if (!string.IsNullOrWhiteSpace(payload.CountryCode)) kind = AffinityKind.Country;
+        }
+        if (kind == null)
+        {
+            return (default, null, null, "Kind é obrigatório (Channel ou Country).");
+        }
+
+        return (kind.Value, key.Length > 0 ? key : null, payload.CountryCode, null);
     }
 
     private sealed class ApproveReviewPayload
@@ -2582,6 +2700,8 @@ namespace m3uCrawler.Services
         public string? Key { get; set; }
         [JsonPropertyName("displayName")]
         public string? DisplayName { get; set; }
+        [JsonPropertyName("country")]
+        public string? Country { get; set; }
         [JsonPropertyName("editorialCategory")]
         public string? EditorialCategory { get; set; }
         [JsonPropertyName("editorialGroup")]
@@ -2598,6 +2718,8 @@ namespace m3uCrawler.Services
     {
         [JsonPropertyName("displayName")]
         public string? DisplayName { get; set; }
+        [JsonPropertyName("country")]
+        public string? Country { get; set; }
         [JsonPropertyName("editorialCategory")]
         public string? EditorialCategory { get; set; }
         [JsonPropertyName("editorialGroup")]
@@ -2621,6 +2743,7 @@ namespace m3uCrawler.Services
             id = c.Id,
             key = c.Key,
             displayName = c.DisplayName,
+            country = c.Country,
             editorialCategory = c.EditorialCategory.ToString(),
             editorialGroup = c.EditorialGroup.ToString(),
             publicationPolicy = c.PublicationPolicy.ToString(),
@@ -3275,6 +3398,10 @@ namespace m3uCrawler.Services
                   <input id='newChannelDisplayName' type='text' placeholder='ex: RTP Memória' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
                 </div>
                 <div>
+                  <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>País (opcional, ex: pt)</label>
+                  <input id='newChannelCountry' type='text' maxlength='10' placeholder='pt, es…' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                </div>
+                <div>
                   <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Categoria</label>
                   <select id='newChannelCategory' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
                     <option value='Live'>Live</option>
@@ -3371,27 +3498,40 @@ namespace m3uCrawler.Services
           <span class='muted' id='affinityCount'></span>
           <button onclick='showAddAffinityForm()'>+ Novo Grupo</button>
         </div>
+        <div class='card' style='margin-top:12px;'>
+          <h4 style='margin:0 0 8px 0;'>Separador de variantes (global)</h4>
+          <p class='muted' style='margin:0 0 8px 0;'>Separador usado no campo único de variantes. É apenas uma convenção de edição; as variantes são guardadas individualmente.</p>
+          <div style='display:flex;gap:8px;align-items:center;'>
+            <input id='affinityDelimiter' type='text' maxlength='3' value=',' style='width:80px;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+            <button class='secondary' onclick='saveAffinityDelimiter()'>Guardar separador</button>
+          </div>
+        </div>
         <div id='addAffinityForm' hidden style='margin-bottom:16px;'>
           <div class='card'>
-            <h3 id='affinityFormTitle'>Novo Grupo de Afinidade</h3>
+            <h3 id='affinityFormTitle'>Nova Afinidade</h3>
             <div style='display:grid;gap:10px;grid-template-columns:1fr 1fr 1fr;'>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Tipo</label>
+                <select id='affinityKind' onchange='onAffinityKindChange()' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                  <option value='channel'>Canal (variantes → canal canónico)</option>
+                  <option value='country'>País (indicadores country-level)</option>
+                </select>
+              </div>
               <div>
                 <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Nome do grupo</label>
                 <input id='affinityName' type='text' placeholder='ex: TVI' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
               </div>
-              <div>
+              <div id='affinityCountryField' hidden>
                 <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Código do país</label>
                 <input id='affinityCountryCode' type='text' maxlength='10' placeholder='pt, es, br...' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
               </div>
-              <div>
-                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Canal canónico (ID)</label>
-                <input id='affinityChannelId' type='number' min='1' placeholder='ID do canal (opicional)' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              <div id='affinityChannelField' style='grid-column:1/-1;'>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Canal canónico (catálogo por país)</label>
+                <select id='affinityChannelKey' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'></select>
               </div>
               <div style='grid-column:1/-1;'>
-                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Membros (um por linha, já normalizados)</label>
-                <textarea id='affinityMembers' rows='5' placeholder='tvi24
-tvi 24
-tvi noticias' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;resize:vertical;'></textarea>
+                <label id='affinityVariantsLabel' style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Variantes do canal (separadas por ",")</label>
+                <textarea id='affinityMembers' rows='5' placeholder='tvi24, tvi 24, tvi noticias' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;resize:vertical;'></textarea>
               </div>
             </div>
             <div style='margin-top:10px;display:flex;gap:8px;'>
@@ -4235,7 +4375,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
         if (status === 'disabled' && c.isEnabled) return false;
         if (policy && c.publicationPolicy !== policy) return false;
         if (search) {
-          const hay = [c.displayName, c.key, ...(c.aliases || [])].filter(Boolean).join(' ').toLowerCase();
+          const hay = [c.displayName, c.key, c.country, ...(c.aliases || [])].filter(Boolean).join(' ').toLowerCase();
           if (!hay.includes(search)) return false;
         }
         return true;
@@ -4252,6 +4392,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
         return `<tr${selected}>
           <td><a href='#' onclick='event.preventDefault(); selectChannel(${c.id});'>${c.displayName || '—'}</a></td>
           <td><code>${c.key || '—'}</code></td>
+          <td>${c.country ? `<span class='badge' style='background:var(--accent);color:#fff;'>${escapeHtml(c.country)}</span>` : '—'}</td>
           <td>${c.editorialCategory || '—'}</td>
           <td>${c.editorialGroup || '—'}</td>
           <td>${policyBadge}</td>
@@ -4260,7 +4401,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
         </tr>`;
       }).join('');
       document.getElementById('catalogChannelsTable').innerHTML = `
-        <table><thead><tr><th>Display Name</th><th>Key</th><th>Categoria</th><th>Grupo</th><th>Política</th><th>Activo</th><th>Aliases</th></tr></thead><tbody>${rows}</tbody></table>`;
+        <table><thead><tr><th>Display Name</th><th>Key</th><th>País</th><th>Categoria</th><th>Grupo</th><th>Política</th><th>Activo</th><th>Aliases</th></tr></thead><tbody>${rows}</tbody></table>`;
     }
 
     async function selectChannel(id) {
@@ -4290,6 +4431,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
             <div><strong>Canonical ID:</strong> <code>${c.key}</code></div>
             <div><strong>Estado:</strong> ${c.isEnabled ? '<span class="badge ok">activo</span>' : '<span class="badge err">inactivo</span>'}</div>
             <div><strong>Display Name:</strong> <span id='detailDisplayName'>${escapeHtml(c.displayName)}</span></div>
+            <div><strong>País:</strong> ${c.country ? `<span class='badge' style='background:var(--accent);color:#fff;'>${escapeHtml(c.country)}</span>` : '<span class="muted">global</span>'}</div>
             <div><strong>Política:</strong> <span id='detailPolicyBadge'>${policyBadge}</span> <code>${c.publicationPolicy}</code></div>
             <div><strong>Categoria:</strong> ${c.editorialCategory}</div>
             <div><strong>Grupo Editorial:</strong> ${c.editorialGroup}</div>
@@ -4360,6 +4502,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
       if (!c) return;
       const payload = {
         displayName: c.displayName,
+        country: c.country,
         editorialCategory: c.editorialCategory,
         editorialGroup: c.editorialGroup,
         publicationPolicy: c.publicationPolicy,
@@ -4388,6 +4531,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
       if (!c) return;
       const payload = {
         displayName: c.displayName,
+        country: c.country,
         editorialCategory: c.editorialCategory,
         editorialGroup: c.editorialGroup,
         publicationPolicy: choice.trim(),
@@ -4411,8 +4555,11 @@ const rows = Object.entries(inv).map(([k, v]) => {
       if (!c) return;
       const newDisplay = prompt('Display Name:', c.displayName);
       if (newDisplay == null) return;
+      const newCountry = prompt('País (vazio = global):', c.country || '');
+      if (newCountry == null) return;
       const payload = {
         displayName: newDisplay,
+        country: newCountry.trim() || null,
         editorialCategory: c.editorialCategory,
         editorialGroup: c.editorialGroup,
         publicationPolicy: c.publicationPolicy,
@@ -4448,6 +4595,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
     function showCreateChannelForm() {
       document.getElementById('newChannelKey').value = '';
       document.getElementById('newChannelDisplayName').value = '';
+      document.getElementById('newChannelCountry').value = '';
       document.getElementById('newChannelCategory').value = 'Live';
       document.getElementById('newChannelGroup').value = 'PortugalLive';
       document.getElementById('newChannelPolicy').value = 'CreateEligible';
@@ -4462,6 +4610,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
       const payload = {
         key: document.getElementById('newChannelKey').value.trim(),
         displayName: document.getElementById('newChannelDisplayName').value.trim(),
+        country: (document.getElementById('newChannelCountry').value || '').trim() || null,
         editorialCategory: document.getElementById('newChannelCategory').value,
         editorialGroup: document.getElementById('newChannelGroup').value,
         publicationPolicy: document.getElementById('newChannelPolicy').value,
@@ -5406,19 +5555,31 @@ const rows = Object.entries(inv).map(([k, v]) => {
 
     let _affinityEditId = null;
 
+    let _affinityDelimiter = ',';
+    let _affinityEditKey = null;
+    let _affinityGroupsCache = [];
+
     async function loadAffinityGroups() {
+      await loadAppSettings();
       const groups = await safeFetchJson('/api/catalog/affinity-groups', []);
       if (!Array.isArray(groups)) { document.getElementById('catalogAffinityTable').innerHTML = '<p class="muted">Erro ao carregar grupos.</p>'; return; }
+      _affinityGroupsCache = groups;
       document.getElementById('affinityCount').textContent = `${groups.length} grupo(s).`;
       if (!groups.length) { document.getElementById('catalogAffinityTable').innerHTML = '<p class="muted">Nenhum grupo de afinidade.</p>'; return; }
       const rows = groups.map(g => {
         const members = (g.members || []).join(', ') || '—';
-        const ccBadge = g.countryCode ? `<span class='badge' style='background:var(--accent);color:#fff;'>${g.countryCode}</span>` : '—';
+        const ccBadge = g.countryCode ? `<span class='badge' style='background:var(--accent);color:#fff;'>${escapeHtml(g.countryCode)}</span>` : '—';
+        const isChannel = g.kind === 'Channel';
+        const kindBadge = isChannel ? "<span class='badge ok'>Canal</span>" : "<span class='badge warn'>País</span>";
+        const channel = isChannel
+          ? `${escapeHtml(g.canonicalChannelDisplayName || '—')} <code>${escapeHtml(g.canonicalChannelKey || '—')}</code>`
+          : '—';
         return `<tr>
-          <td>${g.name || '—'}</td>
+          <td>${escapeHtml(g.name || '—')}</td>
+          <td>${kindBadge}</td>
           <td>${ccBadge}</td>
-          <td>${g.canonicalChannelDisplayName || '—'} (${g.canonicalChannelId ?? '—'})</td>
-          <td><code>${members}</code></td>
+          <td>${channel}</td>
+          <td><code>${escapeHtml(members)}</code></td>
           <td>${tsLocal(g.createdAtUtc)}</td>
           <td>
             <button class='secondary' style='padding:4px 8px;' onclick='editAffinityGroup(${g.id})'>Editar</button>
@@ -5427,25 +5588,91 @@ const rows = Object.entries(inv).map(([k, v]) => {
         </tr>`;
       }).join('');
       document.getElementById('catalogAffinityTable').innerHTML = `
-        <table><thead><tr><th>Grupo</th><th>País</th><th>Canal</th><th>Membros</th><th>Criado</th><th>Ações</th></tr></thead><tbody>${rows}</tbody></table>`;
+        <table><thead><tr><th>Grupo</th><th>Tipo</th><th>País</th><th>Canal</th><th>Variantes</th><th>Criado</th><th>Ações</th></tr></thead><tbody>${rows}</tbody></table>`;
+    }
+
+    async function loadAppSettings() {
+      const s = await safeFetchJson('/api/settings', null);
+      if (s && s.affinityVariantDelimiter) {
+        _affinityDelimiter = s.affinityVariantDelimiter;
+        const input = document.getElementById('affinityDelimiter');
+        if (input) input.value = _affinityDelimiter;
+      }
+    }
+
+    async function saveAffinityDelimiter() {
+      const value = (document.getElementById('affinityDelimiter').value || '').trim();
+      const r = await fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ affinityVariantDelimiter: value })
+      });
+      if (r.ok) {
+        await loadAppSettings();
+        alert('Separador guardado: ' + _affinityDelimiter);
+      } else {
+        const err = await r.json();
+        alert('Erro: ' + (err.error || r.status));
+      }
+    }
+
+    async function loadAffinityFormOptions() {
+      await loadAppSettings();
+      const channels = await safeFetchJson('/api/catalog/channels', []);
+      const groups = _affinityGroupsCache.length
+        ? _affinityGroupsCache
+        : await safeFetchJson('/api/catalog/affinity-groups', []);
+      const usedKeys = new Set((groups || [])
+        .filter(g => g.kind === 'Channel')
+        .map(g => g.canonicalChannelKey));
+      const select = document.getElementById('affinityChannelKey');
+      if (!select) return;
+      const current = select.value;
+      const options = ['<option value="">— selecionar canal —</option>'];
+      (channels || [])
+        .filter(c => !usedKeys.has(c.key) || c.key === _affinityEditKey)
+        .sort((a, b) => (a.displayName || '').localeCompare(b.displayName || ''))
+        .forEach(c => {
+          const cc = c.country ? ' · ' + c.country : '';
+          options.push(`<option value="${escapeAttr(c.key)}">${escapeHtml(c.displayName)} (${escapeHtml(c.key)})${escapeHtml(cc)}</option>`);
+        });
+      select.innerHTML = options.join('');
+      if (current) select.value = current;
+    }
+
+    function onAffinityKindChange() {
+      const kind = document.getElementById('affinityKind').value;
+      const isChannel = kind !== 'country';
+      document.getElementById('affinityChannelField').hidden = !isChannel;
+      document.getElementById('affinityCountryField').hidden = isChannel;
+      const label = document.getElementById('affinityVariantsLabel');
+      if (label) {
+        label.textContent = (isChannel ? 'Variantes do canal' : 'Indicadores de país')
+          + ' (separadas por "' + _affinityDelimiter + '")';
+      }
     }
 
     function showAddAffinityForm() {
       _affinityEditId = null;
-      document.getElementById('affinityFormTitle').textContent = 'Novo Grupo de Afinidade';
+      _affinityEditKey = null;
+      document.getElementById('affinityFormTitle').textContent = 'Nova Afinidade';
       document.getElementById('affinitySubmitBtn').textContent = 'Guardar';
       document.getElementById('affinityEditCancelBtn').hidden = true;
+      document.getElementById('affinityKind').value = 'channel';
+      document.getElementById('affinityKind').disabled = false;
       document.getElementById('affinityName').value = '';
       document.getElementById('affinityCountryCode').value = '';
-      document.getElementById('affinityChannelId').value = '';
+      document.getElementById('affinityChannelKey').disabled = false;
       document.getElementById('affinityMembers').value = '';
       document.getElementById('addAffinityForm').hidden = false;
+      loadAffinityFormOptions().then(onAffinityKindChange);
     }
 
     function hideAddAffinityForm() {
       document.getElementById('addAffinityForm').hidden = true;
       _affinityEditId = null;
-      document.getElementById('affinityFormTitle').textContent = 'Novo Grupo de Afinidade';
+      _affinityEditKey = null;
+      document.getElementById('affinityFormTitle').textContent = 'Nova Afinidade';
       document.getElementById('affinitySubmitBtn').textContent = 'Guardar';
       document.getElementById('affinityEditCancelBtn').hidden = true;
     }
@@ -5453,43 +5680,57 @@ const rows = Object.entries(inv).map(([k, v]) => {
     async function editAffinityGroup(id) {
       const groups = await safeFetchJson('/api/catalog/affinity-groups', []);
       if (!Array.isArray(groups)) return;
+      _affinityGroupsCache = groups;
       const g = groups.find(x => x.id === id);
       if (!g) return;
       _affinityEditId = id;
-      document.getElementById('affinityFormTitle').textContent = 'Editar Grupo de Afinidade';
+      _affinityEditKey = g.kind === 'Channel' ? g.canonicalChannelKey : null;
+      document.getElementById('affinityFormTitle').textContent = 'Editar Afinidade';
       document.getElementById('affinitySubmitBtn').textContent = 'Atualizar';
       document.getElementById('affinityEditCancelBtn').hidden = false;
+      document.getElementById('affinityKind').value = g.kind === 'Channel' ? 'channel' : 'country';
+      document.getElementById('affinityKind').disabled = true;
       document.getElementById('affinityName').value = g.name || '';
       document.getElementById('affinityCountryCode').value = g.countryCode || '';
-      document.getElementById('affinityChannelId').value = g.canonicalChannelId || '';
-      document.getElementById('affinityMembers').value = (g.members || []).join('\n');
+      document.getElementById('affinityMembers').value = (g.members || []).join(_affinityDelimiter + ' ');
       document.getElementById('addAffinityForm').hidden = false;
+      await loadAffinityFormOptions();
+      if (g.kind === 'Channel') {
+        document.getElementById('affinityChannelKey').value = g.canonicalChannelKey || '';
+        document.getElementById('affinityChannelKey').disabled = true;
+      }
+      onAffinityKindChange();
       document.getElementById('addAffinityForm').scrollIntoView({ behavior: 'smooth' });
     }
 
     function cancelAffinityEdit() {
       _affinityEditId = null;
-      document.getElementById('affinityFormTitle').textContent = 'Novo Grupo de Afinidade';
+      _affinityEditKey = null;
+      document.getElementById('affinityFormTitle').textContent = 'Nova Afinidade';
       document.getElementById('affinitySubmitBtn').textContent = 'Guardar';
       document.getElementById('affinityEditCancelBtn').hidden = true;
       document.getElementById('affinityName').value = '';
       document.getElementById('affinityCountryCode').value = '';
-      document.getElementById('affinityChannelId').value = '';
+      document.getElementById('affinityChannelKey').value = '';
       document.getElementById('affinityMembers').value = '';
     }
 
     async function submitAddAffinityGroup() {
+      const kind = document.getElementById('affinityKind').value === 'country' ? 'country' : 'channel';
       const name = document.getElementById('affinityName').value.trim();
       const countryCode = document.getElementById('affinityCountryCode').value.trim() || null;
-      const channelIdStr = document.getElementById('affinityChannelId').value.trim();
-      const channelId = channelIdStr ? parseInt(channelIdStr, 10) : null;
+      const canonicalChannelKey = document.getElementById('affinityChannelKey').value || null;
       const membersRaw = document.getElementById('affinityMembers').value.trim();
       if (!name) { alert('Nome do grupo é obrigatório.'); return; }
-      if (!membersRaw) { alert('Membros são obrigatórios.'); return; }
-      const members = membersRaw.split('\n').map(m => m.trim()).filter(m => m.length > 0);
-      if (!members.length) { alert('Pelo menos um membro é obrigatório.'); return; }
-      const payload = { name, countryCode, members };
-      if (channelId && channelId > 0) payload.canonicalChannelId = channelId;
+      if (!membersRaw) { alert('Variantes são obrigatórias.'); return; }
+      if (kind === 'channel' && !canonicalChannelKey) { alert('Selecione o canal canónico.'); return; }
+      if (kind === 'country' && !countryCode) { alert('Indique o código do país.'); return; }
+      const delim = _affinityDelimiter || ',';
+      const members = membersRaw.split(delim).map(m => m.trim()).filter(m => m.length > 0);
+      if (!members.length) { alert('Pelo menos uma variante é obrigatória.'); return; }
+      const payload = { kind, name, members };
+      if (kind === 'channel') payload.canonicalChannelKey = canonicalChannelKey;
+      else payload.countryCode = countryCode;
       const url = _affinityEditId
         ? '/api/catalog/affinity-groups/' + _affinityEditId
         : '/api/catalog/affinity-groups';
@@ -5568,6 +5809,10 @@ const rows = Object.entries(inv).map(([k, v]) => {
     window.hideAddAffinityForm = hideAddAffinityForm;
     window.submitAddAffinityGroup = submitAddAffinityGroup;
     window.deleteAffinityGroup = deleteAffinityGroup;
+    window.editAffinityGroup = editAffinityGroup;
+    window.cancelAffinityEdit = cancelAffinityEdit;
+    window.onAffinityKindChange = onAffinityKindChange;
+    window.saveAffinityDelimiter = saveAffinityDelimiter;
   })();
   </script>
 </body>

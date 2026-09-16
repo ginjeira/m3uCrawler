@@ -479,9 +479,9 @@ O catálogo (`ChannelCatalogDbContext`, SQLite em `/data/channel-catalog.db`) ge
 | Separador | Conteúdo |
 |---|---|
 | **Visão Geral** | Estatísticas agregadas do catálogo (canais, aliases, regras, pending approvals). |
-| **Canais** | Lista de canais canónicos com DisplayName, Key, Categoria, Grupo editorial, Política de publicação, Activo, Aliases. |
+| **Canais** | Catálogo canónico por país: DisplayName, Key, **País**, Categoria, Grupo editorial, Política de publicação, Activo, Aliases. |
 | **Regras** | IdentityRules explícitas que sobrepõem o matching automático. Criar regra com `ReviewOnly` permite fuzzy matching futuro; `Excluded` bloqueia o canal permanentemente. |
-| **Afinidades** | Grupos de afinidade (e.g. "TVI" com membros "tvi24", "tvi 24", "tvi noticias"). Os membros são injetados no `CountryChannelValidator` como aliases adicionais para country-level targeting. |
+| **Afinidades** | Grupos com discriminator `Kind` (**Channel** ou **Country**). Uma Channel affinity liga variantes a um canal canónico (0..1 por `CanonicalChannelKey`); uma Country affinity liga variantes ao `CountryChannelValidator` para country-level targeting. As variantes são editadas num único campo separado pelo delimiter global (`/api/settings`, default `,`). |
 | **Reviews** | Itens de revisão do Dispatcharr (decisões ambíguas ou uncertainas pendentes de decisão humana). |
 | **Sync Runs** | Histórico de sincronizações Dispatcharr com contadores de created/merged/protected/removed. |
 | **Pending** | Canais que geraram dúvida no country-level targeting e aguardam decisão manual (ver secção seguinte). |
@@ -507,6 +507,44 @@ Quando um stream tem indicadores de país (e.g. "PT" no título ou group-title) 
 2. **Reprovar** → Cria uma `IdentityRule` com `Excluded` que impede o canal de ser aceite. Útil para descartar canais extranjeros que usam indicadores de país enganosos.
 
 **Nota de segurança**: As URLs mostradas na lista de pending approvals são sanitizadas antes de guardar (`CredentialSanitizer.SanitizeUrl`), pelo que nunca expõem credenciais Xtream.
+
+### Afinidades e catálogo canónico por país (PHASE 9C.3)
+
+- **Catálogo canónico por país**: `CanonicalChannelEntity.Country` (opcional,
+  máx. 10; `null` = global). O país **não** faz parte da identidade — a
+  identidade estável continua a ser `CanonicalChannel.Key`, imutável. Alterar
+  `DisplayName` nunca altera a `Key`, não quebra afinidades e nunca cria uma
+  nova afinidade.
+- **Dois tipos de afinidade** (`AffinityKind`):
+  - **Channel** — variantes que resolvem para um canal canónico
+    (`CanonicalChannelKey`). Cardinalidade **0..1 por canal** (imposta por
+    índice/validação). A resolução (`IdentityRule > Affinity > ChannelAlias`)
+    considera apenas afinidades `Channel`.
+  - **Country** — variantes/indicadores country-level injetados no
+    `CountryChannelValidator`; não resolvem canal. A mesma variante pode
+    coexistir numa Channel affinity e numa Country affinity (usos semânticos
+    diferentes); a unicidade de `NormalizedMember` aplica-se apenas a
+    `Channel` (índice único filtrado).
+- **Separador global**: as variantes de uma afinidade são editadas num único
+  campo, dividido pelo delimiter configurado em `runtime-data/app_settings.json`
+  (`affinityVariantDelimiter`, default `,`, exposto em `GET/POST /api/settings`).
+  É apenas uma convenção de edição: as variantes persistem como
+  `AffinityMember` (uma por registo); mudar o delimiter não exige migration.
+- **Dispatcharr**: canais criados pelo crawler usam o `DisplayName` actual do
+  canal canónico e ficam registados como `CrawlerManaged`; só esses podem ser
+  renomeados. Canais `External`/`Unknown` nunca são renomeados (read-only).
+- **Migração** (`AddCanonicalCountryAndAffinityKind`): aditiva e transaccional;
+  faz backfill de `CanonicalChannelId → CanonicalChannel.Key` por JOIN (nunca
+  pelo nome), classifica grupos, faz split controlado de grupos mixed
+  (Channel + Country, sem perder membros) e preserva órfãos para revisão. A
+  reversibilidade é garantida pela tabela de proveniência
+  `affinity_migration_backup` (não mapeada no EF, mantida para rollback). O
+  `Down()` identifica os artefactos criados pelo Up **exclusivamente** por
+  `GeneratedCountryGroupId` (sem `LIKE`, sem `MIN(Id)`, sem deduplicação
+  arbitrária), restaura o `OriginalCountryCode` e, se o estado remanescente
+  tiver `NormalizedMember` duplicados que impeçam restaurar a unicidade global
+  antiga, **aborta** com erro explícito sem apagar dados; só conclui a remoção
+  da proveniência e do schema novo quando o rollback é possível.
 
 ### Modelo de segurança do dashboard
 

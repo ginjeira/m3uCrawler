@@ -194,6 +194,21 @@ namespace m3uCrawler.Services.Sync
                 groupByName[g.Name] = g.Id;
             }
 
+            // Ownership de canais existentes: só CrawlerManaged pode ser
+            // renomeado. Sem catalog (legacy) não há ownership, logo
+            // não há rename (nunca se promove External/Unknown).
+            IReadOnlyDictionary<long, ChannelOwnership> channelOwnershipById =
+                new Dictionary<long, ChannelOwnership>();
+            if (_catalog != null)
+            {
+                var existingChannelIds = plan.Channels
+                    .Where(c => c.ExistingChannelId.HasValue)
+                    .Select(c => c.ExistingChannelId!.Value)
+                    .Distinct()
+                    .ToList();
+                channelOwnershipById = await _catalog.GetChannelOwnershipMapAsync(existingChannelIds, ct);
+            }
+
             // Cross-channel stream ownership:
             //
             // Dispatcharr's data model is M2M (Channel.streams ↔ Stream), but DELETE on a
@@ -218,7 +233,7 @@ namespace m3uCrawler.Services.Sync
                 if (channel.Outcome == SyncOutcome.Ambiguous || channel.Outcome == SyncOutcome.Skipped)
                     continue;
 
-                var ctx = await BeginChannelApplyAsync(channel, existing, groupByName, ct);
+                var ctx = await BeginChannelApplyAsync(channel, existing, groupByName, ct, channelOwnershipById);
 
                 // Record stream IDs the matcher intended to keep on this channel BEFORE
                 // any DELETE happens. NewStreamIds (Phase 2) are physical creations that
@@ -318,8 +333,10 @@ namespace m3uCrawler.Services.Sync
             ChannelDecision channel,
             DispatcharrState existing,
             Dictionary<string, long> groupByName,
-            CancellationToken ct)
+            CancellationToken ct,
+            IReadOnlyDictionary<long, ChannelOwnership>? channelOwnershipById = null)
         {
+            channelOwnershipById ??= new Dictionary<long, ChannelOwnership>();
             var ctx = new ChannelApplyContext { GroupByName = groupByName };
 
             // Phase 1: resolve group (no HTTP yet).
@@ -392,29 +409,64 @@ namespace m3uCrawler.Services.Sync
             {
                 if (channel.Outcome == SyncOutcome.NewChannel)
                 {
-                    await _channels.CreateAsync(new NewChannelRequest
+                    var createdId = await _channels.CreateAsync(new NewChannelRequest
                     {
                         Name = channel.CanonicalName,
                         ChannelGroupId = groupId,
                         Streams = ctx.AllStreamIds.ToList(),
                     }, ct);
-                }
-                else if (channel.ExistingChannelId.HasValue && ctx.AllStreamIds.Count > 0)
-                {
-                    var currentIds = await _channels.ListStreamIdsAsync(channel.ExistingChannelId.Value, ct);
-                    if (!currentIds.SequenceEqual(ctx.AllStreamIds))
+
+                    // Regista ownership CrawlerManaged para o canal
+                    // criado. Sem isto, o rename em runs futuros não é
+                    // possível (External/Unknown nunca é promovido).
+                    if (_catalog != null)
                     {
-                        await _channels.UpdateStreamsAsync(channel.ExistingChannelId.Value, ctx.AllStreamIds.ToList(), ct);
+                        await _catalog.EnsureChannelOwnershipAsync(
+                            createdId,
+                            "created-by-crawler",
+                            channel.CanonicalChannelId,
+                            ct,
+                            ChannelOwnership.CrawlerManaged);
                     }
                 }
-                else if (channel.ExistingChannelId.HasValue && channel.StreamsEmptied)
+                else
                 {
-                    // Scenario B: channel should be left with streams=[] on Dispatcharr.
-                    // PATCH unconditionally — even if currentIds is already empty, the explicit
-                    // PATCH documents the operator intent in the plan and is idempotent.
-                    await _channels.UpdateStreamsAsync(channel.ExistingChannelId.Value, Array.Empty<long>(), ct);
+                    // Rename canónico, independente do update de streams:
+                    // apenas canais CrawlerManaged com nome resolvido pelo
+                    // catálogo. External/Unknown nunca são renomeados
+                    // (respeita read-only e a regra de ownership).
+                    if (channel.ExistingChannelId.HasValue
+                        && !string.IsNullOrWhiteSpace(channel.CanonicalChannelKey)
+                        && channelOwnershipById.TryGetValue(channel.ExistingChannelId.Value, out var ownership)
+                        && ownership == ChannelOwnership.CrawlerManaged
+                        && !string.IsNullOrWhiteSpace(channel.CanonicalName))
+                    {
+                        var currentChannel = existing.Channels
+                            .FirstOrDefault(c => c.Id == channel.ExistingChannelId.Value);
+                        if (currentChannel != null
+                            && !string.Equals(currentChannel.Name, channel.CanonicalName, StringComparison.Ordinal))
+                        {
+                            await _channels.UpdateNameAsync(channel.ExistingChannelId.Value, channel.CanonicalName, ct);
+                        }
+                    }
+
+                    if (channel.ExistingChannelId.HasValue && ctx.AllStreamIds.Count > 0)
+                    {
+                        var currentIds = await _channels.ListStreamIdsAsync(channel.ExistingChannelId.Value, ct);
+                        if (!currentIds.SequenceEqual(ctx.AllStreamIds))
+                        {
+                            await _channels.UpdateStreamsAsync(channel.ExistingChannelId.Value, ctx.AllStreamIds.ToList(), ct);
+                        }
+                    }
+                    else if (channel.ExistingChannelId.HasValue && channel.StreamsEmptied)
+                    {
+                        // Scenario B: channel should be left with streams=[] on Dispatcharr.
+                        // PATCH unconditionally — even if currentIds is already empty, the explicit
+                        // PATCH documents the operator intent in the plan and is idempotent.
+                        await _channels.UpdateStreamsAsync(channel.ExistingChannelId.Value, Array.Empty<long>(), ct);
+                    }
+                    // else (scenario C): no PATCH, channel left untouched.
                 }
-                // else (scenario C): no PATCH, channel left untouched.
             }
             catch (Exception ex)
             {

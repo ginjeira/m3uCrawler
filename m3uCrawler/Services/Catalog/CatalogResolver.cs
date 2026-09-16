@@ -75,12 +75,15 @@ public sealed class CatalogResolver
             return CatalogResolution.FromRule(rule);
         }
 
-        // 2. AffinityMember -> AffinityGroup -> CanonicalChannel.
+        // 2. AffinityMember (Kind = Channel) -> AffinityGroup ->
+        //    CanonicalChannel. Membros Country não resolvem canal.
         var member = await context.AffinityMembers
             .AsNoTracking()
             .Include(m => m.AffinityGroup)
                 .ThenInclude(g => g!.CanonicalChannel)
-            .FirstOrDefaultAsync(m => m.NormalizedMember == normalizedIdentity, cancellationToken);
+            .FirstOrDefaultAsync(
+                m => m.NormalizedMember == normalizedIdentity && m.Kind == AffinityKind.Channel,
+                cancellationToken);
         if (member?.AffinityGroup?.CanonicalChannel != null && member.AffinityGroup.CanonicalChannel.IsEnabled)
         {
             return CatalogResolution.FromCanonical(member.AffinityGroup.CanonicalChannel);
@@ -164,7 +167,8 @@ public sealed class CatalogResolver
         long dispatcharrChannelId,
         string evidence,
         long? canonicalChannelId,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        ChannelOwnership ownership = ChannelOwnership.Unknown)
     {
         await using var context = await _factory.CreateDbContextAsync(cancellationToken);
         var existing = await context.DispatcharrChannelOwnerships
@@ -175,7 +179,7 @@ public sealed class CatalogResolver
             existing = new DispatcharrChannelOwnershipEntity
             {
                 DispatcharrChannelId = dispatcharrChannelId,
-                Ownership = ChannelOwnership.Unknown,
+                Ownership = ownership,
                 CanonicalChannelId = canonicalChannelId,
                 FirstObservedAtUtc = now,
                 LastObservedAtUtc = now,
@@ -305,6 +309,36 @@ public sealed class CatalogResolver
     }
 
     /// <summary>
+    /// Devolve um mapa de ownership por canal id para os ids
+    /// pedidos. Canais sem registo prévio ficam
+    /// <see cref="ChannelOwnership.Unknown"/> (bootstrap default).
+    /// Suporta a decisão de rename: só canais CrawlerManaged podem
+    /// ser renomeados.
+    /// </summary>
+    public async Task<IReadOnlyDictionary<long, ChannelOwnership>> GetChannelOwnershipMapAsync(
+        IReadOnlyCollection<long> dispatcharrChannelIds,
+        CancellationToken cancellationToken = default)
+    {
+        var result = new Dictionary<long, ChannelOwnership>();
+        if (dispatcharrChannelIds == null || dispatcharrChannelIds.Count == 0)
+        {
+            return result;
+        }
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var distinctIds = dispatcharrChannelIds.Distinct().ToList();
+        var rows = await context.DispatcharrChannelOwnerships
+            .AsNoTracking()
+            .Where(o => distinctIds.Contains(o.DispatcharrChannelId))
+            .Select(o => new { o.DispatcharrChannelId, o.Ownership })
+            .ToListAsync(cancellationToken);
+        foreach (var r in rows)
+        {
+            result[r.DispatcharrChannelId] = r.Ownership;
+        }
+        return result;
+    }
+
+    /// <summary>
     /// Devolve um mapa de ownership por stream id para os ids
     /// pedidos. Streams sem registo prévio ficam
     /// <see cref="StreamOwnership.Unknown"/> (bootstrap default).
@@ -421,39 +455,67 @@ public sealed class CatalogResolver
 
     public async Task<AffinityGroupEntity> CreateAffinityGroupAsync(
         string name,
-        long? canonicalChannelId,
+        AffinityKind kind,
+        string? canonicalChannelKey,
         string? countryCode,
         IReadOnlyList<string> normalizedMembers,
         CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(name))
             throw new ArgumentException("name required", nameof(name));
-        if (normalizedMembers == null || normalizedMembers.Count == 0)
+
+        var members = CleanMembers(normalizedMembers);
+        if (members.Count == 0)
             throw new ArgumentException("at least one member required", nameof(normalizedMembers));
 
         await using var context = await _factory.CreateDbContextAsync(cancellationToken);
 
-        if (canonicalChannelId.HasValue)
+        long? canonicalChannelId = null;
+        string? effectiveKey = null;
+        string? effectiveCountry = null;
+
+        if (kind == AffinityKind.Channel)
         {
+            effectiveKey = (canonicalChannelKey ?? string.Empty).Trim();
+            if (effectiveKey.Length == 0)
+                throw new InvalidOperationException("CanonicalChannelKey é obrigatório para afinidades de canal.");
+
             var canonical = await context.CanonicalChannels
-                .FirstOrDefaultAsync(c => c.Id == canonicalChannelId.Value, cancellationToken);
+                .FirstOrDefaultAsync(c => c.Key == effectiveKey, cancellationToken);
             if (canonical == null)
-                throw new InvalidOperationException($"CanonicalChannel {canonicalChannelId} not found.");
+                throw new InvalidOperationException($"Canal canónico '{effectiveKey}' não encontrado.");
+
+            var already = await context.AffinityGroups
+                .AnyAsync(g => g.Kind == AffinityKind.Channel && g.CanonicalChannelKey == effectiveKey, cancellationToken);
+            if (already)
+                throw new InvalidOperationException($"O canal '{effectiveKey}' já tem uma afinidade de canal (máximo 1).");
+
+            canonicalChannelId = canonical.Id;
+        }
+        else
+        {
+            effectiveCountry = (countryCode ?? string.Empty).Trim();
+            if (effectiveCountry.Length == 0)
+                throw new InvalidOperationException("CountryCode é obrigatório para afinidades de país.");
+            if (effectiveCountry.Length > 10)
+                throw new InvalidOperationException("CountryCode excede 10 caracteres.");
         }
 
         var now = DateTime.UtcNow;
         var group = new AffinityGroupEntity
         {
-            Name = name,
-            CountryCode = countryCode,
+            Name = name.Trim(),
+            Kind = kind,
+            CanonicalChannelKey = effectiveKey,
+            CountryCode = effectiveCountry,
             CanonicalChannelId = canonicalChannelId,
             CreatedAtUtc = now,
             UpdatedAtUtc = now,
-            Members = normalizedMembers
-                .Where(m => !string.IsNullOrWhiteSpace(m))
+            Members = members
                 .Select(m => new AffinityMemberEntity
                 {
-                    NormalizedMember = m.Trim(),
+                    NormalizedMember = m,
+                    Kind = kind,
                     CreatedAtUtc = now,
                 }).ToList(),
         };
@@ -463,16 +525,51 @@ public sealed class CatalogResolver
         return group;
     }
 
+    /// <summary>
+    /// Devolve as Keys dos canais canónicos que já têm uma Channel
+    /// affinity. Usado pela UI para excluir esses canais do dropdown
+    /// (cardinalidade 0..1).
+    /// </summary>
+    public async Task<IReadOnlyCollection<string>> ListChannelAffinityKeysAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.AffinityGroups
+            .AsNoTracking()
+            .Where(g => g.Kind == AffinityKind.Channel && g.CanonicalChannelKey != null)
+            .Select(g => g.CanonicalChannelKey!)
+            .ToListAsync(cancellationToken);
+    }
+
+    private static List<string> CleanMembers(IReadOnlyList<string>? normalizedMembers)
+    {
+        if (normalizedMembers == null) return new List<string>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var result = new List<string>();
+        foreach (var raw in normalizedMembers)
+        {
+            if (string.IsNullOrWhiteSpace(raw)) continue;
+            var value = raw.Trim();
+            if (seen.Add(value)) result.Add(value);
+        }
+        return result;
+    }
+
     public async Task<AffinityGroupEntity?> UpdateAffinityGroupAsync(
         long groupId,
         string name,
-        long? canonicalChannelId,
+        AffinityKind kind,
+        string? canonicalChannelKey,
         string? countryCode,
         IReadOnlyList<string> normalizedMembers,
         CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(name))
             throw new ArgumentException("name required", nameof(name));
+
+        var members = CleanMembers(normalizedMembers);
+        if (members.Count == 0)
+            throw new ArgumentException("at least one member required", nameof(normalizedMembers));
 
         await using var context = await _factory.CreateDbContextAsync(cancellationToken);
 
@@ -481,28 +578,44 @@ public sealed class CatalogResolver
             .FirstOrDefaultAsync(g => g.Id == groupId, cancellationToken);
         if (group == null) return null;
 
-        if (canonicalChannelId.HasValue)
+        if (kind != group.Kind)
+            throw new InvalidOperationException("Não é possível alterar o tipo de uma afinidade existente.");
+
+        if (kind == AffinityKind.Channel)
         {
-            var canonical = await context.CanonicalChannels
-                .FirstOrDefaultAsync(c => c.Id == canonicalChannelId.Value, cancellationToken);
-            if (canonical == null)
-                throw new InvalidOperationException($"CanonicalChannel {canonicalChannelId} not found.");
+            // A identidade (canal) é imutável após a criação. A UI
+            // não permite alterá-la; qualquer tentativa é rejeitada
+            // para não mudar implicitamente a afinidade de canal.
+            var incoming = (canonicalChannelKey ?? string.Empty).Trim();
+            if (incoming.Length > 0
+                && !string.Equals(incoming, group.CanonicalChannelKey, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException("O canal de uma afinidade existente não pode ser alterado.");
+            }
+        }
+        else
+        {
+            var effectiveCountry = (countryCode ?? string.Empty).Trim();
+            if (effectiveCountry.Length == 0)
+                throw new InvalidOperationException("CountryCode é obrigatório para afinidades de país.");
+            if (effectiveCountry.Length > 10)
+                throw new InvalidOperationException("CountryCode excede 10 caracteres.");
+            group.CountryCode = effectiveCountry;
         }
 
-        group.Name = name;
-        group.CanonicalChannelId = canonicalChannelId;
-        group.CountryCode = countryCode;
+        group.Name = name.Trim();
         group.UpdatedAtUtc = DateTime.UtcNow;
 
         context.AffinityMembers.RemoveRange(group.Members);
         group.Members.Clear();
 
         var now = DateTime.UtcNow;
-        foreach (var m in normalizedMembers.Where(m => !string.IsNullOrWhiteSpace(m)))
+        foreach (var m in members)
         {
             group.Members.Add(new AffinityMemberEntity
             {
-                NormalizedMember = m.Trim(),
+                NormalizedMember = m,
+                Kind = group.Kind,
                 AffinityGroupId = group.Id,
                 CreatedAtUtc = now,
             });
@@ -732,6 +845,7 @@ public sealed class CatalogResolver
         PublicationPolicy publicationPolicy,
         bool isEnabled,
         IReadOnlyList<string> normalizedAliases,
+        string? country = null,
         CancellationToken cancellationToken = default)
     {
         ValidateKey(key);
@@ -773,6 +887,7 @@ public sealed class CatalogResolver
         {
             Key = normalizedKey,
             DisplayName = displayName.Trim(),
+            Country = NormalizeCountry(country),
             EditorialCategory = editorialCategory,
             EditorialGroup = editorialGroup,
             PublicationPolicy = publicationPolicy,
@@ -801,6 +916,7 @@ public sealed class CatalogResolver
         CanonicalEditorialGroup editorialGroup,
         PublicationPolicy publicationPolicy,
         bool isEnabled,
+        string? country = null,
         CancellationToken cancellationToken = default)
     {
         ValidateDisplayName(displayName);
@@ -811,6 +927,7 @@ public sealed class CatalogResolver
         if (channel == null) return null;
 
         channel.DisplayName = displayName.Trim();
+        channel.Country = NormalizeCountry(country);
         channel.EditorialCategory = editorialCategory;
         channel.EditorialGroup = editorialGroup;
         channel.PublicationPolicy = publicationPolicy;
@@ -1010,6 +1127,23 @@ public sealed class CatalogResolver
                     "Key contém caracteres inválidos. Use letras, dígitos, '-', '_' ou '.'.");
             }
         }
+    }
+
+    /// <summary>
+    /// Normaliza o país do canal canónico: trim, vazio → null,
+    /// máximo 10 caracteres. Não faz parte da identidade (Key).
+    /// </summary>
+    private static string? NormalizeCountry(string? country)
+    {
+        if (string.IsNullOrWhiteSpace(country)) return null;
+        var trimmed = country.Trim();
+        if (trimmed.Length > 10)
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.InvalidInput,
+                "Country excede 10 caracteres.");
+        }
+        return trimmed;
     }
 
     private static void ValidateDisplayName(string displayName)

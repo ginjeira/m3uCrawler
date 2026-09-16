@@ -120,6 +120,19 @@ public static class CatalogBaselineImporter
     }
 
     /// <summary>
+    /// Normaliza o país declarado no baseline para o campo
+    /// <see cref="CanonicalChannelEntity.Country"/>: trim, vazio →
+    /// null, truncado a 10 caracteres (o baseline é dados
+    /// controlados; não bloqueia a importação).
+    /// </summary>
+    private static string? NormalizeBaselineCountry(string? country)
+    {
+        if (string.IsNullOrWhiteSpace(country)) return null;
+        var trimmed = country.Trim();
+        return trimmed.Length > 10 ? trimmed[..10] : trimmed;
+    }
+
+    /// <summary>
     /// Resolve o grupo editorial de um canal a partir do baseline.
     /// Olha para o <see cref="MatchingBaseline.Examples"/> e
     /// casa pelo número de position no <see cref="CatalogBaseline.Numbering"/>
@@ -237,6 +250,7 @@ public static class CatalogBaselineImporter
                 {
                     Key = key,
                     DisplayName = channelBaseline.Name,
+                    Country = NormalizeBaselineCountry(baseline.Country),
                     EditorialCategory = category,
                     EditorialGroup = group,
                     PublicationPolicy = PublicationPolicy.CreateEligible,
@@ -256,9 +270,13 @@ public static class CatalogBaselineImporter
                 // versão anterior do seed.
                 var displayNameChanged = !string.Equals(
                     channel.DisplayName, channelBaseline.Name, StringComparison.Ordinal);
-                if (displayNameChanged)
+                var baselineCountry = NormalizeBaselineCountry(baseline.Country);
+                var countryChanged = !string.Equals(
+                    channel.Country, baselineCountry, StringComparison.Ordinal);
+                if (displayNameChanged || countryChanged)
                 {
-                    channel.DisplayName = channelBaseline.Name;
+                    if (displayNameChanged) channel.DisplayName = channelBaseline.Name;
+                    if (countryChanged) channel.Country = baselineCountry;
                     channel.UpdatedAtUtc = now;
                     report.ChannelsUpdated++;
                 }

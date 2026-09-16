@@ -10,6 +10,16 @@ namespace m3uCrawler.Services.Dispatcharr
         Task<IReadOnlyList<DispatcharrChannel>> ListAsync(CancellationToken ct);
         Task<long> CreateAsync(NewChannelRequest request, CancellationToken ct);
         Task UpdateStreamsAsync(long channelId, IReadOnlyList<long> orderedStreamIds, CancellationToken ct);
+
+        /// <summary>
+        /// Actualiza o nome de um canal existente via PATCH parcial no
+        /// mesmo recurso usado por <see cref="UpdateStreamsAsync"/>
+        /// (<c>/api/channels/channels/{id}/</c>). Só deve ser usado em
+        /// canais CrawlerManaged; canais External/read-only recusam a
+        /// escrita do lado do Dispatcharr.
+        /// </summary>
+        Task UpdateNameAsync(long channelId, string name, CancellationToken ct);
+
         Task<IReadOnlyList<long>> ListStreamIdsAsync(long channelId, CancellationToken ct);
     }
 
@@ -50,6 +60,14 @@ namespace m3uCrawler.Services.Dispatcharr
                 JsonContent.Create(new { streams = orderedStreamIds.ToArray() }), ct);
             if (!resp.IsSuccessStatusCode)
                 throw await DispatcharrErrorHelper.ToExceptionAsync(resp, $"/api/channels/channels/{channelId}/", HttpMethod.Patch, "update-failed", ct);
+        }
+
+        public async Task UpdateNameAsync(long channelId, string name, CancellationToken ct)
+        {
+            using var resp = await _http.PatchAsync($"/api/channels/channels/{channelId}/",
+                JsonContent.Create(new { name }), ct);
+            if (!resp.IsSuccessStatusCode)
+                throw await DispatcharrErrorHelper.ToExceptionAsync(resp, $"/api/channels/channels/{channelId}/", HttpMethod.Patch, "rename-failed", ct);
         }
 
         public async Task<IReadOnlyList<long>> ListStreamIdsAsync(long channelId, CancellationToken ct)

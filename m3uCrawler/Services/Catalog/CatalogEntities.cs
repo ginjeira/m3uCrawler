@@ -22,9 +22,18 @@ public sealed class CanonicalChannelEntity
 
     /// <summary>
     /// Nome editorial a apresentar (em PT-PT). Exemplo:
-    /// "Benfica TV", "Sport TV 1".
+    /// "Benfica TV", "Sport TV 1". Mutável: alterar o nome nunca
+    /// altera <see cref="Key"/> nem quebra afinidades (que
+    /// referenciam a Key).
     /// </summary>
     public string DisplayName { get; set; } = string.Empty;
+
+    /// <summary>
+    /// País do catálogo canónico (código ISO, e.g. "pt", "es").
+    /// <c>null</c> significa global/agnóstico. Não faz parte da
+    /// identidade — <see cref="Key"/> continua a identidade estável.
+    /// </summary>
+    public string? Country { get; set; }
 
     /// <summary>
     /// Categoria editorial (Live, Desporto, etc.).
@@ -114,14 +123,42 @@ public enum RuleDisposition
 }
 
 /// <summary>
-/// Grupo de afinidade: um nome canónico e múltiplos membros que
-/// são considerados equivalentes (e.g. "tvi24", "tvi 24", "tvi notícias"
-/// pertencem todas ao grupo "TVI"). O grupo resolve para um
-/// <see cref="CanonicalChannelEntity"/>.
+/// Tipo de grupo de afinidade.
+/// <list type="bullet">
+///   <item><see cref="Channel"/> — as variantes resolvem para um
+///         canal canónico (<see cref="AffinityGroupEntity.CanonicalChannelKey"/>).
+///         Cardinalidade: 0..1 por canal.</item>
+///   <item><see cref="Country"/> — as variantes são indicadores
+///         country-level injetados no <see cref="CountryChannelValidator"/>;
+///         não resolvem para um canal.</item>
+/// </list>
+/// </summary>
+public enum AffinityKind
+{
+    Channel = 0,
+    Country = 1,
+}
+
+/// <summary>
+/// Grupo de afinidade: um nome e múltiplos membros considerados
+/// equivalentes (e.g. "tvi24", "tvi 24", "tvi notícias").
 ///
-/// Os membros de grupos com <see cref="CountryCode"/> definido
-/// são injetados em <see cref="CountryChannelValidator"/> como
-/// aliases adicionais para decisões de country-level targeting.
+/// <para>
+/// <see cref="Kind"/> discrimina a semântica:
+/// </para>
+/// <list type="bullet">
+///   <item><b>Channel</b> — resolve para o canal canónico
+///         identificado por <see cref="CanonicalChannelKey"/>;
+///         membros usados pela resolução de identidade.</item>
+///   <item><b>Country</b> — membros injetados no
+///         <see cref="CountryChannelValidator"/> como aliases
+///         country-level; não resolve canal.</item>
+/// </list>
+///
+/// <para>
+/// <see cref="CanonicalChannelId"/> mantém-se apenas como coluna
+/// de transição (a identidade passou a ser <see cref="CanonicalChannelKey"/>).
+/// </para>
 /// </summary>
 public sealed class AffinityGroupEntity
 {
@@ -130,17 +167,29 @@ public sealed class AffinityGroupEntity
     public string Name { get; set; } = string.Empty;
 
     /// <summary>
+    /// Tipo do grupo. Substitui a inferência implícita por
+    /// <c>CanonicalChannelId == null</c>.
+    /// </summary>
+    public AffinityKind Kind { get; set; } = AffinityKind.Channel;
+
+    /// <summary>
+    /// Identidade estável do canal canónico (referencia
+    /// <see cref="CanonicalChannelEntity.Key"/>). Obrigatório
+    /// quando <see cref="Kind"/> é <see cref="AffinityKind.Channel"/>.
+    /// </summary>
+    public string? CanonicalChannelKey { get; set; }
+
+    /// <summary>
     /// Código ISO do país que este grupo representa (e.g. "pt", "es").
-    /// Quando definido, os membros do grupo são usados como aliases
-    /// de país no CountryChannelValidator para AnalyzePlaylist e
-    /// ValidateStreams.
+    /// Obrigatório quando <see cref="Kind"/> é
+    /// <see cref="AffinityKind.Country"/>.
     /// </summary>
     public string? CountryCode { get; set; }
 
     /// <summary>
-    /// Canal canónico opcional. Um grupo pode existir apenas com
-    /// CountryCode para country-level targeting, sem ter ainda
-    /// um canal canónico associado.
+    /// Coluna de transição. A identidade passou a ser
+    /// <see cref="CanonicalChannelKey"/>; esta coluna será removida
+    /// numa migration posterior após validação completa.
     /// </summary>
     public long? CanonicalChannelId { get; set; }
     public CanonicalChannelEntity? CanonicalChannel { get; set; }
@@ -154,12 +203,24 @@ public sealed class AffinityGroupEntity
 /// <summary>
 /// Membro normalizado de um grupo de afinidade. O valor stored é
 /// a forma já normalizada pelo <see cref="ChannelNormalizer"/>.
+///
+/// <para>
+/// <see cref="Kind"/> espelha <see cref="AffinityGroupEntity.Kind"/>
+/// para permitir um índice único filtrado: a unicidade global de
+/// <see cref="NormalizedMember"/> aplica-se apenas a membros de
+/// grupos Channel (uma variante não pode resolver para dois
+/// canais). Membros Country não estão sujeitos a essa restrição,
+/// pelo que a mesma variante pode existir numa Channel affinity e
+/// numa Country affinity.
+/// </para>
 /// </summary>
 public sealed class AffinityMemberEntity
 {
     public long Id { get; set; }
 
     public string NormalizedMember { get; set; } = string.Empty;
+
+    public AffinityKind Kind { get; set; } = AffinityKind.Channel;
 
     public long AffinityGroupId { get; set; }
     public AffinityGroupEntity? AffinityGroup { get; set; }

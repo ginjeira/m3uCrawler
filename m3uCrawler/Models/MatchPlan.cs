@@ -84,6 +84,22 @@ namespace m3uCrawler.Models
     {
         [JsonPropertyName("identity")] public string Identity { get; init; } = string.Empty;
         [JsonPropertyName("canonicalName")] public string CanonicalName { get; init; } = string.Empty;
+
+        /// <summary>
+        /// Key do canal canónico quando a identidade foi resolvida
+        /// pelo catálogo (<c>CatalogResolutionKind.Canonical</c>).
+        /// <c>null</c> quando não há resolução canónica. Usado para
+        /// o naming/rename no Dispatcharr e para o ownership.
+        /// </summary>
+        [JsonPropertyName("canonicalChannelKey")] public string? CanonicalChannelKey { get; init; }
+
+        /// <summary>
+        /// Id do canal canónico resolvido (transitório, para o
+        /// registo de ownership no Dispatcharr). A identidade lógica
+        /// continua a ser <see cref="CanonicalChannelKey"/>.
+        /// </summary>
+        [JsonPropertyName("canonicalChannelId")] public long? CanonicalChannelId { get; init; }
+
         [JsonPropertyName("outcome")] public SyncOutcome Outcome { get; init; }
         [JsonPropertyName("existingChannelId")] public long? ExistingChannelId { get; init; }
         [JsonPropertyName("proposedChannelNumber")] public double? ProposedChannelNumber { get; init; }
