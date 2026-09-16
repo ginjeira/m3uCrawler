@@ -598,6 +598,68 @@ seguinte).
 
 Documentação de arquitectura: `docs/architecture/configuration-lifecycle.md`.
 
+## Autenticação e bootstrap (PHASE 9C.2)
+
+Numa instalação nova o Dashboard expõe um **wizard mínimo** que cria o primeiro
+administrador e conclui o bootstrap; só depois o lifecycle passa a `READY`.
+Não é necessário configurar Telegram, sources, ordering, import policies, grupos,
+source priority, affinities ou scheduler para ficar `READY` (esses itens
+continuam configuráveis depois).
+
+### Fluxo
+
+```
+NOT_CONFIGURED
+  → GET  /bootstrap
+  → POST /api/bootstrap/start     → CONFIGURING
+  → POST /api/bootstrap/admin     → cria o 1.º administrador
+  → POST /api/bootstrap/complete  → valida L2 → READY
+  → POST /api/session             → login (cookie de sessão)
+  → Dashboard normal autenticado
+```
+
+### Configuração mínima (L2) exigida para `READY`
+
+- administrador activo;
+- catálogo canónico utilizável (com canais);
+- output directory utilizável (verificado com escrita real);
+- Dispatcharr válido **apenas se estiver activado**.
+
+Telegram, sources, ordering, import policies, grupos, source priority e scheduler
+**não** são obrigatórios para `READY`.
+
+### Modelo de autenticação
+
+- **Primeiro administrador**: password definida explicitamente no wizard; mínimo
+  12 caracteres; sem regras artificiais de complexidade; sem password default.
+- **Hashing**: PBKDF2-HMAC-SHA256 nativo (210 000 iterações, salt 16 B, hash
+  32 B), formato versionado `pbkdf2-sha256$<iter>$<salt>$<hash>`.
+- **Sessões**: tabela `admin_sessions` em SQLite; cookie `m3u_session` com apenas
+  um id opaco de 256 bits (nunca username/password/hash), `HttpOnly`,
+  `SameSite=Strict` e `Secure` quando HTTPS. Sessão revogável (logout), expira
+  (12 h) e sobrevive a restart. Cada login roda o id (anti session-fixation).
+- **CSRF**: token por sessão exigido no header `X-CSRF-Token` em métodos mutantes.
+- Password e hash nunca aparecem em logs, respostas ou erros; utilizador
+  inexistente usa hash dummy (tempo uniforme) e erro genérico.
+
+### Modos de autorização
+
+| Modo | Condição | Efeito |
+|---|---|---|
+| Bootstrap | `NOT_CONFIGURED`/`CONFIGURING` | Só bootstrap/sessão/lifecycle/version; restantes endpoints → 403 |
+| UserAuth | `READY` + administrador | Endpoints normais exigem sessão; mutantes exigem CSRF |
+| Legacy | `READY` sem administrador | Mantém o comportamento actual de `--web-token`; não cria administrador |
+
+`--web-token` mantém-se como **credencial de máquina/automação** em todos os
+modos (quando configurado). Não substitui a autenticação humana e não é necessário
+numa instalação nova.
+
+### Limitação TLS
+
+O dashboard serve HTTP. Sem TLS não é possível garantir `Secure` nem proteger
+credenciais em trânsito; uma exposição fora de rede confiável deve usar reverse
+proxy/TLS.
+
 ## Comportamento funcional
 
 Os cenários abaixo descrevem o comportamento esperado e estão cobertos por testes unitários sempre que possível.

@@ -1,9 +1,12 @@
-# Configuration lifecycle (PHASE 9C.1)
+# Configuration lifecycle (PHASE 9C.1 / 9C.2)
 
-> Estado: implementado (PHASE 9C.1). Esta wave estabelece a fundação
-> (lifecycle + gates + persistência) sobre a qual o wizard da PHASE 9C.2 será
-> construído. Não implementa o wizard, nem redesenha o Dashboard, nem altera
-> a política de validação de streams, affinities ou autenticação.
+> Estado: PHASE 9C.1 implementada (lifecycle + gates + persistência).
+> PHASE 9C.2 implementada (wizard de primeira execução, primeiro
+> administrador, sessões persistentes e autenticação normal do Dashboard).
+> O wizard é **mínimo** e o `READY` assenta apenas na configuração mínima
+> determinística (L2). Não faz redesign do Dashboard, Live Run Monitor,
+> SignalR/WebSocket, affinities, Dispatcharr novo, discovery/scheduler
+> redesign ou correcção do `AccountGateCoordinator`.
 
 ## Objectivo
 
@@ -153,3 +156,91 @@ Nunca são registadas credenciais, passwords, tokens ou URLs sensíveis.
 - Testes: `m3uCrawler.Tests/ConfigurationLifecycleTests.cs`,
   `m3uCrawler.Tests/ConfigurationGateSchedulerTests.cs`,
   `m3uCrawler.Tests/ConfigurationLifecycleEndpointTests.cs`
+
+---
+
+# Autenticação e bootstrap (PHASE 9C.2)
+
+## Modelo de dados
+
+- `admin_users` — `Id` (PK), `Username` (unique, ≤64), `PasswordHash` (PHC, ≤256),
+  `IsEnabled`, `CreatedAtUtc`, `UpdatedAtUtc`, `LastLoginAtUtc`.
+  Nesta wave todas as linhas são administrador; não há role/claims.
+- `admin_sessions` — `Id` (PK), `SessionId` (unique, opaco 256 bits),
+  `AdminUserId` (FK→`admin_users`, cascade), `CsrfToken`, `CreatedAtUtc`,
+  `ExpiresAtUtc`, `LastSeenAtUtc`.
+- Migration aditiva `AddAdminUsersAndSessions` (apenas cria as duas tabelas e
+  índices; não altera/remove dados existentes).
+
+## Passwords
+
+- PBKDF2-HMAC-SHA256 nativo (`Rfc2898DeriveBytes`), 210 000 iterações,
+  salt 16 bytes, hash 32 bytes.
+- Formato persistido versionado:
+  `pbkdf2-sha256$<iterations>$<base64(salt)>$<base64(hash)>` — permite evolução
+  futura (mais iterações ou outro algoritmo) sem migration de dados.
+- Política: mínimo **12 caracteres**; sem regras artificiais de complexidade;
+  rejeita vazia, whitespace-only e > 256.
+- Utilizador inexistente/inactivo executa derivação **dummy** (tempo uniforme,
+  sem enumeração); comparação em tempo constante (`FixedTimeEquals`).
+- Password/hash nunca aparecem em logs, respostas ou erros.
+
+## Sessões
+
+- Cookie `m3u_session` com **apenas** um id opaco (256 bits); nunca username,
+  password ou hash.
+- `HttpOnly`, `SameSite=Strict`, `Path=/`, e `Secure` **apenas quando HTTPS**
+  (o deployment HTTP actual não protege credenciais em trânsito — exposição fora
+  de rede confiável deve usar reverse proxy/TLS).
+- Store server-side em SQLite (`admin_sessions`): sobrevive a restart, é
+  revogável (logout), expira (janela deslizante de 12 h, tecto absoluto de 12 h)
+  e é validada contra o administrador activo.
+- Rotação de id em cada login (anti session-fixation).
+- CSRF: token por sessão, exigido no header `X-CSRF-Token` em métodos mutantes
+  (login e endpoints de bootstrap são isentos).
+
+## Fluxo de bootstrap
+
+```
+NOT_CONFIGURED
+  → GET /bootstrap                (página mínima)
+  → POST /api/bootstrap/start     → CONFIGURING
+  → POST /api/bootstrap/admin     → cria o 1.º administrador (transaccional)
+  → POST /api/bootstrap/complete  → valida L2 → READY
+```
+
+- Serialização in-process (`SemaphoreSlim`) + transacção EF: nunca dois
+  primeiros administradores; retry idempotente (`AlreadyCreated`).
+- Invariantes: nunca `READY` sem administrador activo nem sem L2 válida;
+  `READY` só depois da criação e validação; restaurar em `CONFIGURING` retoma
+  (a existência do admin determina o passo); bootstrap fechado após `READY`.
+- `POST /api/bootstrap/admin` nunca devolve a password; apenas a chave de erro.
+
+## Configuração mínima (L2) para READY
+
+| Item | Obrigatório |
+|---|---|
+| Administrador activo | Sim |
+| Catálogo canónico utilizável (`canonical_channels` com canais) | Sim |
+| Output directory utilizável (criável/gravável, com probe real) | Sim |
+| Dispatcharr válido (`BaseUrl` + apiKey ou user/pass) **se activado** | Condicional |
+| Telegram, sources, ordering, import policies, grupos, source priority, scheduler | Não (advisory) |
+
+Nota: o loader existente normaliza `dispatcharr_enabled=true` sem
+`dispatcharr_base_url` para "desactivado"; esse caso não bloqueia `READY`.
+
+## Modos de autorização
+
+| Modo | Condição | Comportamento |
+|---|---|---|
+| **Bootstrap** | `NOT_CONFIGURED`/`CONFIGURING` | Só `/`, `/bootstrap`, `/api/bootstrap/*`, `/api/session`, `/api/version` e `/api/configuration/lifecycle`; restantes endpoints → `403 bootstrap-required` |
+| **UserAuth** | `READY` ∧ admin activo | Endpoints normais exigem sessão; mutantes exigem CSRF; `/` sem sessão serve página de login |
+| **Legacy** | `READY` ∧ sem admin | Mantém o comportamento actual baseado só em `--web-token`; não cria admin nem migra |
+
+`--web-token`, quando configurado, continua a ser exigido em **todos** os modos
+(credencial de máquina/automação) e é distinto da autenticação humana. Numa
+instalação nova não é necessário, mas não é proibido.
+
+Testes de referência: `AuthPrimitivesTests`, `AdminSessionStoreTests`,
+`BootstrapServiceTests`, `BootstrapConfigurationValidatorTests`,
+`DashboardBootstrapEndpointTests`.

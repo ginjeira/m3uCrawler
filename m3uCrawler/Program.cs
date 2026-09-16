@@ -1,5 +1,6 @@
 using m3uCrawler.Build;
 using m3uCrawler.Services;
+using m3uCrawler.Services.Auth;
 using m3uCrawler.Services.Automation;
 using m3uCrawler.Services.Catalog;
 using m3uCrawler.Services.Configuration;
@@ -82,6 +83,21 @@ namespace m3uCrawler
                     // e o runner entra em loop respeitando shutdown via Ctrl+C
                     // (CancellationToken propagado pelo _cts interno).
                     var dispatcharrConfig = DispatcharrConfigLoader.Load();
+
+                    // PHASE 9C.2 — Autenticação/bootstrap. Numa instalação
+                    // nova o wizard cria o primeiro administrador e só depois
+                    // o lifecycle passa a READY. Numa instalação legacy
+                    // adoptada READY sem administrador, o modo é Legacy e o
+                    // comportamento de --web-token é preservado.
+                    var adminUsers = new AdminUserStore(webCatalogResolver.GetFactory());
+                    var sessions = new SessionStore(webCatalogResolver.GetFactory());
+                    var authService = new AuthService(adminUsers, sessions);
+                    var bootstrapValidator = new BootstrapConfigurationValidator(
+                        webCatalogResolver.GetFactory(), dashboardOutputDir, dispatcharrConfig);
+                    var bootstrapService = new BootstrapService(
+                        lifecycle, adminUsers, bootstrapValidator);
+                    WebDashboardService.SetAuth(authService, bootstrapService);
+
                     automationHost = ScheduledAutomationHost.Build(
                         webCatalogResolver,
                         dashboardOutputDir,

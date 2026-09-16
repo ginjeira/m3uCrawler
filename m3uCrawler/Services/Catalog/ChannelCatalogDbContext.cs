@@ -1,4 +1,5 @@
 using System;
+using m3uCrawler.Services.Auth;
 using Microsoft.EntityFrameworkCore;
 
 namespace m3uCrawler.Services.Catalog;
@@ -32,6 +33,8 @@ public sealed class ChannelCatalogDbContext : DbContext
     public DbSet<ChannelSourceObservationEntity> ChannelSourceObservations => Set<ChannelSourceObservationEntity>();
     public DbSet<SyncRunStepEntity> SyncRunSteps => Set<SyncRunStepEntity>();
     public DbSet<ScheduledJobEntity> ScheduledJobs => Set<ScheduledJobEntity>();
+    public DbSet<AdminUserEntity> AdminUsers => Set<AdminUserEntity>();
+    public DbSet<AdminSessionEntity> AdminSessions => Set<AdminSessionEntity>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -436,6 +439,40 @@ public sealed class ChannelCatalogDbContext : DbContext
             e.Property(x => x.CreatedAtUtc).IsRequired();
             e.Property(x => x.UpdatedAtUtc).IsRequired();
             e.HasIndex(x => x.Name).IsUnique();
+        });
+
+        // PHASE 9C.2 — AdminUser
+        modelBuilder.Entity<AdminUserEntity>(e =>
+        {
+            e.ToTable("admin_users");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Id).ValueGeneratedOnAdd();
+            e.Property(x => x.Username).IsRequired().HasMaxLength(64);
+            e.Property(x => x.PasswordHash).IsRequired().HasMaxLength(256);
+            e.Property(x => x.IsEnabled).IsRequired();
+            e.Property(x => x.CreatedAtUtc).IsRequired();
+            e.Property(x => x.UpdatedAtUtc).IsRequired();
+            e.HasIndex(x => x.Username).IsUnique();
+        });
+
+        // PHASE 9C.2 — AdminSession
+        modelBuilder.Entity<AdminSessionEntity>(e =>
+        {
+            e.ToTable("admin_sessions");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Id).ValueGeneratedOnAdd();
+            e.Property(x => x.SessionId).IsRequired().HasMaxLength(128);
+            e.Property(x => x.AdminUserId).IsRequired();
+            e.Property(x => x.CsrfToken).IsRequired().HasMaxLength(128);
+            e.Property(x => x.CreatedAtUtc).IsRequired();
+            e.Property(x => x.ExpiresAtUtc).IsRequired();
+            e.Property(x => x.LastSeenAtUtc).IsRequired();
+            e.HasIndex(x => x.SessionId).IsUnique();
+            e.HasIndex(x => x.AdminUserId);
+            e.HasOne<AdminUserEntity>()
+                .WithMany()
+                .HasForeignKey(x => x.AdminUserId)
+                .OnDelete(DeleteBehavior.Cascade);
         });
     }
 }

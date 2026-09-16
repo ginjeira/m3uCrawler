@@ -1,5 +1,6 @@
 using m3uCrawler.Build;
 using m3uCrawler.Models;
+using m3uCrawler.Services.Auth;
 using m3uCrawler.Services.Automation;
 using m3uCrawler.Services.Catalog;
 using m3uCrawler.Services.Configuration;
@@ -18,10 +19,27 @@ namespace m3uCrawler.Services
         private static CatalogResolver? _catalogResolver;
         private static IReadOnlyList<IScheduledAction>? _scheduledActions;
         private static ConfigurationLifecycleService? _configurationLifecycle;
+        private static AuthService? _authService;
+        private static BootstrapService? _bootstrapService;
+
+        /// <summary>Nome do cookie de sessão de administrador.</summary>
+        public const string SessionCookieName = "m3u_session";
+        private const string CsrfHeaderName = "X-CSRF-Token";
 
         public static void SetCatalogResolver(CatalogResolver resolver)
         {
             _catalogResolver = resolver;
+        }
+
+        /// <summary>
+        /// PHASE 9C.2 — Regista os serviços de autenticação/bootstrap.
+        /// Passar <c>null</c> repõe o comportamento "não ligado" (equivalente
+        /// a legacy), usado em testes.
+        /// </summary>
+        public static void SetAuth(AuthService? authService, BootstrapService? bootstrapService)
+        {
+            _authService = authService;
+            _bootstrapService = bootstrapService;
         }
 
         /// <summary>
@@ -105,6 +123,54 @@ namespace m3uCrawler.Services
         }
 
         /// <summary>
+        /// PHASE 9C.2 — Variante testável com lifecycle/auth/bootstrap
+        /// isolados por chamada. Evita interferência entre testes que correm
+        /// em paralelo através dos campos estáticos.
+        /// </summary>
+        public static async Task HandleRequestWithAuthOnTestAsync(
+            HttpListenerContext context,
+            string outputDir,
+            CatalogResolver resolver,
+            PlaylistComposerService composer,
+            ImportHistoryService historyService,
+            ConfigurationLifecycleService? lifecycle,
+            AuthService? authService,
+            BootstrapService? bootstrapService,
+            string? webToken = null)
+        {
+            using var scope = new StaticResolverScope(resolver);
+            using var authScope = new StaticAuthScope(lifecycle, authService, bootstrapService);
+            await HandleRequestAsync(context, outputDir, historyService, webToken);
+        }
+
+        private sealed class StaticAuthScope : IDisposable
+        {
+            private readonly ConfigurationLifecycleService? _previousLifecycle;
+            private readonly AuthService? _previousAuth;
+            private readonly BootstrapService? _previousBootstrap;
+
+            public StaticAuthScope(
+                ConfigurationLifecycleService? lifecycle,
+                AuthService? authService,
+                BootstrapService? bootstrapService)
+            {
+                _previousLifecycle = _configurationLifecycle;
+                _previousAuth = _authService;
+                _previousBootstrap = _bootstrapService;
+                _configurationLifecycle = lifecycle;
+                _authService = authService;
+                _bootstrapService = bootstrapService;
+            }
+
+            public void Dispose()
+            {
+                _configurationLifecycle = _previousLifecycle;
+                _authService = _previousAuth;
+                _bootstrapService = _previousBootstrap;
+            }
+        }
+
+        /// <summary>
         /// Variante testável do runner: arranca o <see cref="HttpListener"/>
         /// em loopback com factory e runtimeDir fornecidos.
         /// </summary>
@@ -146,6 +212,81 @@ namespace m3uCrawler.Services
             {
                 await WriteUnauthorizedAsync(context.Response);
                 return;
+            }
+
+            // === PHASE 9C.2 — Authentication / bootstrap ===
+            // Gate único, avaliado antes de qualquer rota não pública.
+            var authMode = await ResolveAuthModeAsync();
+            var sessionId = GetCookieValue(context.Request, SessionCookieName);
+            var isRootPath = requestPath.Length == 0 || requestPath == "/";
+
+            // --- Bootstrap HTML + endpoints (só activos em bootstrap) ---
+            if (requestPath.Equals("/bootstrap", StringComparison.OrdinalIgnoreCase))
+            {
+                if (authMode == AuthMode.Bootstrap)
+                {
+                    await WriteHtmlAsync(context.Response, BuildBootstrapHtml());
+                }
+                else
+                {
+                    RedirectTo(context.Response, "/");
+                }
+                return;
+            }
+
+            if (requestPath.StartsWith("/api/bootstrap/", StringComparison.OrdinalIgnoreCase))
+            {
+                await HandleBootstrapEndpointAsync(context, requestPath, authMode);
+                return;
+            }
+
+            // --- Sessão (login/logout/user actual) ---
+            if (requestPath.Equals("/api/session", StringComparison.OrdinalIgnoreCase))
+            {
+                await HandleSessionEndpointAsync(context);
+                return;
+            }
+
+            // --- Enforcement para os restantes endpoints existentes ---
+            // Não é um segundo pipeline: é um único gate que decide, por modo,
+            // se o handler existente pode correr.
+            if (!isRootPath && !IsAlwaysPublicPath(requestPath))
+            {
+                if (authMode == AuthMode.Bootstrap)
+                {
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = "bootstrap-required", state = "NOT_CONFIGURED" },
+                        HttpStatusCode.Forbidden);
+                    return;
+                }
+
+                if (authMode == AuthMode.UserAuth)
+                {
+                    var session = await _authService!.ValidateSessionAsync(sessionId);
+                    if (session == null)
+                    {
+                        await WriteJsonAsync(
+                            context.Response,
+                            new { error = "authentication-required" },
+                            HttpStatusCode.Unauthorized);
+                        return;
+                    }
+
+                    var method = context.Request.HttpMethod;
+                    if (IsMutatingMethod(method))
+                    {
+                        var presented = context.Request.Headers[CsrfHeaderName];
+                        if (string.IsNullOrEmpty(presented) || !FixedEquals(presented, session.CsrfToken))
+                        {
+                            await WriteJsonAsync(
+                                context.Response,
+                                new { error = "csrf-invalid" },
+                                HttpStatusCode.Forbidden);
+                            return;
+                        }
+                    }
+                }
             }
 
             if (requestPath.Equals("/api/history", StringComparison.OrdinalIgnoreCase))
@@ -2149,6 +2290,22 @@ namespace m3uCrawler.Services
                 {
                     context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
                     await WriteJsonAsync(context.Response, new { error = ex.Message });
+                    return;
+                }
+            }
+
+            if (isRootPath && authMode == AuthMode.Bootstrap)
+            {
+                RedirectTo(context.Response, "/bootstrap");
+                return;
+            }
+
+            if (isRootPath && authMode == AuthMode.UserAuth)
+            {
+                var rootSession = await _authService!.ValidateSessionAsync(sessionId);
+                if (rootSession == null)
+                {
+                    await WriteHtmlAsync(context.Response, BuildLoginHtml());
                     return;
                 }
             }
@@ -5357,6 +5514,381 @@ const rows = Object.entries(inv).map(([k, v]) => {
         /// Caso contrário exige o token via header <c>Authorization: Bearer &lt;token&gt;</c>
         /// ou query string <c>?token=&lt;token&gt;</c>.
         /// </summary>
+        // ================= PHASE 9C.2 — Auth helpers =================
+
+        private sealed class CredentialsPayload
+        {
+            [JsonPropertyName("username")]
+            public string? Username { get; set; }
+
+            [JsonPropertyName("password")]
+            public string? Password { get; set; }
+        }
+
+        private static async Task<AuthMode> ResolveAuthModeAsync()
+        {
+            if (_configurationLifecycle == null && _authService == null)
+            {
+                return AuthMode.Legacy;
+            }
+
+            var state = _configurationLifecycle != null
+                ? (await _configurationLifecycle.GetStateAsync()).State
+                : ConfigurationLifecycleState.NotConfigured;
+            var hasAdmin = _authService != null && await _authService.HasActiveAdminAsync();
+            return AuthModeResolver.Resolve(state, hasAdmin);
+        }
+
+        private static bool IsAlwaysPublicPath(string requestPath)
+        {
+            return requestPath.Equals("/api/version", StringComparison.OrdinalIgnoreCase)
+                || requestPath.Equals("/api/configuration/lifecycle", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsMutatingMethod(string method)
+        {
+            return method.Equals("POST", StringComparison.OrdinalIgnoreCase)
+                || method.Equals("PUT", StringComparison.OrdinalIgnoreCase)
+                || method.Equals("PATCH", StringComparison.OrdinalIgnoreCase)
+                || method.Equals("DELETE", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string? GetCookieValue(HttpListenerRequest request, string name)
+        {
+            try
+            {
+                return request.Cookies?[name]?.Value;
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+
+        private static void RedirectTo(HttpListenerResponse response, string location)
+        {
+            response.StatusCode = (int)HttpStatusCode.Found;
+            response.RedirectLocation = location;
+            response.Close();
+        }
+
+        private static void SetSessionCookie(
+            HttpListenerContext context,
+            string sessionId,
+            DateTime expiresUtc)
+        {
+            var secure = context.Request.IsSecureConnection ? "; Secure" : string.Empty;
+            context.Response.AppendHeader(
+                "Set-Cookie",
+                $"{SessionCookieName}={sessionId}; Path=/; HttpOnly; SameSite=Strict{secure}; " +
+                $"Expires={expiresUtc.ToUniversalTime():R}");
+        }
+
+        private static void ClearSessionCookie(HttpListenerContext context)
+        {
+            var secure = context.Request.IsSecureConnection ? "; Secure" : string.Empty;
+            context.Response.AppendHeader(
+                "Set-Cookie",
+                $"{SessionCookieName}=; Path=/; HttpOnly; SameSite=Strict{secure}; Max-Age=0");
+        }
+
+        private static async Task<string> ReadJsonBodyAsync(HttpListenerRequest request)
+        {
+            using var reader = new StreamReader(
+                request.InputStream, request.ContentEncoding ?? Encoding.UTF8);
+            return await reader.ReadToEndAsync();
+        }
+
+        private static bool CsrfValid(HttpListenerRequest request, AdminSessionEntity session)
+        {
+            var presented = request.Headers[CsrfHeaderName];
+            return !string.IsNullOrEmpty(presented) && FixedEquals(presented, session.CsrfToken);
+        }
+
+        private static object BootstrapStatusToJson(BootstrapStatus status)
+        {
+            return new
+            {
+                state = status.State.ToWireName(),
+                hasActiveAdmin = status.HasActiveAdmin,
+                checks = status.Checks.Select(CheckToJson),
+            };
+        }
+
+        private static object CheckToJson(BootstrapCheck check)
+        {
+            return new
+            {
+                key = check.Key,
+                satisfied = check.Satisfied,
+                detail = check.Detail,
+            };
+        }
+
+        private static async Task HandleBootstrapEndpointAsync(
+            HttpListenerContext context,
+            string requestPath,
+            AuthMode mode)
+        {
+            if (mode != AuthMode.Bootstrap)
+            {
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = "bootstrap-closed" },
+                    HttpStatusCode.Conflict);
+                return;
+            }
+
+            if (_bootstrapService == null)
+            {
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = "bootstrap-unavailable" },
+                    HttpStatusCode.ServiceUnavailable);
+                return;
+            }
+
+            var method = context.Request.HttpMethod;
+
+            if (requestPath.Equals("/api/bootstrap/status", StringComparison.OrdinalIgnoreCase)
+                && method.Equals("GET", StringComparison.OrdinalIgnoreCase))
+            {
+                await WriteJsonAsync(
+                    context.Response,
+                    BootstrapStatusToJson(await _bootstrapService.GetStatusAsync()));
+                return;
+            }
+
+            if (requestPath.Equals("/api/bootstrap/start", StringComparison.OrdinalIgnoreCase)
+                && method.Equals("POST", StringComparison.OrdinalIgnoreCase))
+            {
+                var outcome = await _bootstrapService.StartAsync();
+                var status = await _bootstrapService.GetStatusAsync();
+                await WriteJsonAsync(
+                    context.Response,
+                    new { outcome = outcome.ToString(), state = status.State.ToWireName() });
+                return;
+            }
+
+            if (requestPath.Equals("/api/bootstrap/admin", StringComparison.OrdinalIgnoreCase)
+                && method.Equals("POST", StringComparison.OrdinalIgnoreCase))
+            {
+                var payload = await TryReadCredentialsAsync(context.Request);
+                var (outcome, error) = await _bootstrapService.CreateAdminAsync(
+                    payload?.Username, payload?.Password);
+
+                var code = outcome switch
+                {
+                    BootstrapAdminOutcome.Created => HttpStatusCode.OK,
+                    BootstrapAdminOutcome.AlreadyCreated => HttpStatusCode.OK,
+                    BootstrapAdminOutcome.AlreadyReady => HttpStatusCode.Conflict,
+                    BootstrapAdminOutcome.NotStarted => HttpStatusCode.Conflict,
+                    _ => HttpStatusCode.BadRequest,
+                };
+
+                // Nunca ecoar a password; apenas a chave de erro estável.
+                await WriteJsonAsync(
+                    context.Response,
+                    new { outcome = outcome.ToString(), error },
+                    code);
+                return;
+            }
+
+            if (requestPath.Equals("/api/bootstrap/complete", StringComparison.OrdinalIgnoreCase)
+                && method.Equals("POST", StringComparison.OrdinalIgnoreCase))
+            {
+                var validation = await _bootstrapService.CompleteAsync();
+                var status = await _bootstrapService.GetStatusAsync();
+                var code = validation.Outcome switch
+                {
+                    BootstrapCompleteOutcome.Completed => HttpStatusCode.OK,
+                    BootstrapCompleteOutcome.AlreadyReady => HttpStatusCode.OK,
+                    BootstrapCompleteOutcome.InvalidConfiguration => HttpStatusCode.BadRequest,
+                    _ => HttpStatusCode.Conflict,
+                };
+
+                await WriteJsonAsync(
+                    context.Response,
+                    new
+                    {
+                        outcome = validation.Outcome.ToString(),
+                        state = status.State.ToWireName(),
+                        checks = validation.Checks.Select(CheckToJson),
+                    },
+                    code);
+                return;
+            }
+
+            await WriteJsonAsync(context.Response, new { error = "not-found" }, HttpStatusCode.NotFound);
+        }
+
+        private static async Task HandleSessionEndpointAsync(HttpListenerContext context)
+        {
+            var method = context.Request.HttpMethod;
+
+            if (method.Equals("POST", StringComparison.OrdinalIgnoreCase))
+            {
+                if (_authService == null || !await _authService.HasActiveAdminAsync())
+                {
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = "login-unavailable" },
+                        HttpStatusCode.Conflict);
+                    return;
+                }
+
+                var payload = await TryReadCredentialsAsync(context.Request);
+                var throttleKey = context.Request.RemoteEndPoint?.Address?.ToString() ?? "unknown";
+                var outcome = await _authService.LoginAsync(
+                    payload?.Username, payload?.Password, throttleKey);
+
+                if (!outcome.Success || outcome.Session == null)
+                {
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = outcome.Error ?? "invalid-credentials" },
+                        HttpStatusCode.Unauthorized);
+                    return;
+                }
+
+                SetSessionCookie(context, outcome.Session.SessionId, outcome.Session.ExpiresAtUtc);
+                await WriteJsonAsync(context.Response, new
+                {
+                    authenticated = true,
+                    csrfToken = outcome.Session.CsrfToken,
+                    expiresAtUtc = outcome.Session.ExpiresAtUtc.ToString("o"),
+                });
+                return;
+            }
+
+            var sessionId = GetCookieValue(context.Request, SessionCookieName);
+
+            if (method.Equals("DELETE", StringComparison.OrdinalIgnoreCase))
+            {
+                var session = _authService != null
+                    ? await _authService.ValidateSessionAsync(sessionId)
+                    : null;
+
+                if (session == null || !CsrfValid(context.Request, session))
+                {
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = "authentication-required" },
+                        HttpStatusCode.Unauthorized);
+                    return;
+                }
+
+                await _authService!.LogoutAsync(sessionId);
+                ClearSessionCookie(context);
+                await WriteJsonAsync(context.Response, new { loggedOut = true });
+                return;
+            }
+
+            if (_authService == null)
+            {
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = "authentication-required" },
+                    HttpStatusCode.Unauthorized);
+                return;
+            }
+
+            var current = await _authService.ValidateSessionAsync(sessionId);
+            if (current == null)
+            {
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = "authentication-required" },
+                    HttpStatusCode.Unauthorized);
+                return;
+            }
+
+            await WriteJsonAsync(context.Response, new
+            {
+                authenticated = true,
+                csrfToken = current.CsrfToken,
+                expiresAtUtc = current.ExpiresAtUtc.ToString("o"),
+            });
+        }
+
+        private static async Task<CredentialsPayload?> TryReadCredentialsAsync(HttpListenerRequest request)
+        {
+            try
+            {
+                var body = await ReadJsonBodyAsync(request);
+                return string.IsNullOrWhiteSpace(body)
+                    ? null
+                    : JsonSerializer.Deserialize<CredentialsPayload>(body, JsonOptions);
+            }
+            catch (JsonException)
+            {
+                return null;
+            }
+        }
+
+        private static string BuildBootstrapHtml()
+        {
+            return """
+<!doctype html><html lang="pt"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>m3uCrawler — Configuração inicial</title>
+<style>
+body{font-family:system-ui,sans-serif;max-width:640px;margin:40px auto;padding:0 16px;color:#1b1b1b}
+h1{font-size:20px}fieldset{margin:16px 0;padding:12px;border:1px solid #ddd;border-radius:8px}
+label{display:block;margin:8px 0 4px}input{width:100%;padding:8px;box-sizing:border-box}
+button{margin-top:8px;padding:8px 14px;cursor:pointer}
+pre{background:#f6f6f6;padding:8px;border-radius:6px;white-space:pre-wrap;font-size:12px}
+#msg{margin-top:12px}
+</style></head><body>
+<h1>Configuração inicial</h1>
+<p>Estado: <b id="state">...</b></p>
+<pre id="status"></pre>
+<fieldset><legend>1. Iniciar bootstrap</legend><button id="start">Iniciar</button></fieldset>
+<fieldset><legend>2. Primeiro administrador</legend>
+<label>Utilizador</label><input id="u" autocomplete="username"/>
+<label>Password (mínimo 12 caracteres)</label><input id="p" type="password" autocomplete="new-password"/>
+<button id="create">Criar administrador</button></fieldset>
+<fieldset><legend>3. Concluir</legend><button id="complete">Concluir e activar</button></fieldset>
+<p id="msg"></p>
+<script>
+var msg=document.getElementById('msg');
+function api(path,method,body){return fetch(path,{method:method,headers:body?{'Content-Type':'application/json'}:{},body:body?JSON.stringify(body):undefined}).then(function(r){return r.text().then(function(t){var j=null;try{j=t?JSON.parse(t):null}catch(e){}return {status:r.status,json:j};});});}
+function refresh(){return api('/api/bootstrap/status','GET').then(function(r){if(r.json){document.getElementById('state').textContent=r.json.state;document.getElementById('status').textContent=JSON.stringify(r.json,null,2);}});}
+document.getElementById('start').onclick=function(){api('/api/bootstrap/start','POST',{}).then(function(r){msg.textContent='start: '+r.status;return refresh();});};
+document.getElementById('create').onclick=function(){var u=document.getElementById('u').value,p=document.getElementById('p').value;api('/api/bootstrap/admin','POST',{username:u,password:p}).then(function(r){var e=r.json&&r.json.error?(' ('+r.json.error+')'):'';msg.textContent='admin: '+r.status+e;return refresh();});};
+document.getElementById('complete').onclick=function(){api('/api/bootstrap/complete','POST',{}).then(function(r){msg.textContent='complete: '+r.status;return refresh().then(function(){if(r.status===200){location.href='/';}});});};
+refresh();
+</script></body></html>
+""";
+        }
+
+        private static string BuildLoginHtml()
+        {
+            return """
+<!doctype html><html lang="pt"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>m3uCrawler — Login</title>
+<style>
+body{font-family:system-ui,sans-serif;max-width:420px;margin:80px auto;padding:0 16px;color:#1b1b1b}
+h1{font-size:20px}label{display:block;margin:10px 0 4px}
+input{width:100%;padding:8px;box-sizing:border-box}button{margin-top:12px;padding:8px 14px;cursor:pointer}
+#msg{margin-top:12px;color:#b00020}
+</style></head><body>
+<h1>Entrar</h1>
+<label>Utilizador</label><input id="u" autocomplete="username"/>
+<label>Password</label><input id="p" type="password" autocomplete="current-password"/>
+<button id="go">Entrar</button>
+<p id="msg"></p>
+<script>
+document.getElementById('go').onclick=function(){
+var u=document.getElementById('u').value,p=document.getElementById('p').value;
+fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})})
+.then(function(r){if(r.ok){location.href='/';return;}document.getElementById('msg').textContent='Credenciais inválidas.';});
+};
+</script></body></html>
+""";
+        }
+
         public static bool IsRequestAuthorized(HttpListenerRequest request, string? expectedToken)
         {
             if (string.IsNullOrWhiteSpace(expectedToken)) return true;
