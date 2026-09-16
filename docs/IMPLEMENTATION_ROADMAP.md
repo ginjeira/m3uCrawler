@@ -3722,39 +3722,336 @@ A auditoria deve verificar especialmente:
 
 Não considerar uma operação "concluída" apenas porque o endpoint existe.
 
-## 10. Afinidades — correcção do modelo conceptual
+## 10. Afinidades — modelo funcional e identidade do canal
 
-As afinidades representam uma relação lógica de identidade/matching e não
-devem depender do identificador técnico de uma linha específica de
-`CanonicalChannel`.
+As afinidades são o mecanismo para associar as várias designações/notações
+encontradas nas fontes ao **canal canónico definido na Lista de canais por
+país**.
 
-O modelo deve permitir que uma afinidade sobreviva a:
+A **Lista de canais por país é a única autoridade para o canal canónico**:
+criação e alteração do nome e das restantes propriedades canónicas continuam
+a ser efectuadas nessa lista. A afinidade não cria nem altera o nome canónico.
 
-- alteração de `CanonicalChannelId`;
-- importação de uma nova baseline;
-- reconstrução do catálogo;
-- merge de canais;
-- mudança de keys técnicas;
-- migração do catálogo.
+### Modelo funcional
 
-A identidade lógica deve ser representada por uma chave estável apropriada
-ao domínio, ou por uma estrutura equivalente que não transforme um ID técnico
-de uma linha numa fonte de verdade de identidade.
+Cada definição de afinidade corresponde a **um único canal canónico**.
+
+A interface deve apresentar:
+
+- um campo `Canal canónico` em formato **dropdown**;
+- o dropdown deve ser alimentado pela **Lista de canais por país**;
+- ao criar uma nova afinidade, devem aparecer apenas os canais que **ainda não
+  possuem uma definição de afinidade**;
+- um canal que já possua afinidade não pode ser seleccionado para criar uma
+  segunda afinidade;
+- cada canal pode ter **uma e apenas uma definição de afinidade**;
+- a definição contém as várias designações/notações alternativas pelas quais
+  o canal pode surgir nas fontes;
+- as alternativas são introduzidas num único campo, utilizando o separador
+  configurado pela aplicação;
+- ao editar uma afinidade existente, o canal a que pertence continua a ser o
+  mesmo e as variantes podem ser alteradas.
+
+Exemplo:
+
+```text
+Canal canónico
+[ RTP 1                         ▼ ]
+
+Nomes / notações alternativas
+[ RTP1, RTP 1 HD, RTP1 HD ]
+```
+
+### Identidade
+
+A afinidade deve referenciar o **identificador estável do canal canónico no
+catálogo**, e não o nome textual.
+
+A alteração do nome na Lista de canais por país não deve criar uma nova
+afinidade nem quebrar uma afinidade existente. O relacionamento lógico deve
+continuar associado ao mesmo canal.
+
+Se o catálogo utilizar actualmente um ID técnico que possa ser reconstruído
+ou alterado por importações/migrações, deve ser utilizada a chave lógica
+estável prevista pelo catálogo (`CanonicalChannel.Key` ou equivalente), em vez
+de depender de `CanonicalChannelId`.
+
+### Resolução e Dispatcharr
+
+Quando uma fonte contém uma designação que corresponde a uma afinidade:
+
+1. a variante encontrada é resolvida para o canal canónico;
+2. a composição utiliza o canal canónico;
+3. ao criar ou actualizar o canal no Dispatcharr, o **nome publicado é sempre
+   o nome actualmente definido na Lista de canais por país**;
+4. nunca deve ser utilizado como nome canónico no Dispatcharr o alias/variante
+   encontrado na fonte.
+
+Exemplo:
+
+```text
+Fonte                 → "RTP1 HD"
+Afinidade             → canal canónico RTP 1
+Lista de canais PT    → "RTP 1"
+Dispatcharr            → "RTP 1"
+```
+
+Se o operador alterar posteriormente na Lista de canais por país:
+
+```text
+"RTP 1" → "RTP 1 HD"
+```
+
+a mesma afinidade continua ligada ao mesmo canal e as futuras criações ou
+actualizações no Dispatcharr devem utilizar `RTP 1 HD`.
+
+### Unicidade
+
+A regra de cardinalidade é:
+
+```text
+1 canal canónico → 0 ou 1 definição de afinidade
+1 definição de afinidade → 1 canal canónico
+1 definição de afinidade → N variantes
+```
+
+O sistema deve impedir ambiguidades de matching quando a mesma variante não
+puder ser resolvida deterministicamente.
 
 ### Migração
 
-Antes de alterar o modelo:
+Antes de alterar o modelo existente:
 
 1. inventariar todas as afinidades existentes;
-2. identificar a identidade lógica de cada lado;
-3. criar a representação estável;
-4. migrar todas as relações;
-5. validar cardinalidade;
-6. detectar relações ambíguas;
+2. identificar o canal canónico actualmente associado a cada afinidade;
+3. mapear essa associação para a chave estável do canal;
+4. consolidar eventuais duplicados por canal;
+5. validar a cardinalidade `0..1 afinidade por canal`;
+6. detectar variantes atribuídas a mais de um canal;
 7. preservar as decisões válidas;
 8. apenas depois remover a dependência técnica antiga.
 
 A migração deve ser idempotente e ter testes de regressão.
+
+A migração não deve alterar os nomes canónicos: estes continuam a ser
+determinados exclusivamente pela Lista de canais por país.
+
+
+## Observabilidade operacional em tempo real — Live Run Monitor
+
+O Dashboard deve disponibilizar uma visão em tempo real do que o **m3uCrawler
+está efectivamente a fazer durante uma execução**. O objectivo não é apenas
+mostrar o resultado final do `RunReport`, mas permitir ao operador perceber,
+enquanto o processo decorre:
+
+- se o crawler está `IDLE` ou em execução;
+- qual é a actividade/fase actual;
+- há quanto tempo a actividade está em curso;
+- se a execução continua activa;
+- quantas mensagens foram lidas/analisadas;
+- quantos candidatos/playlists foram encontrados;
+- quantos downloads foram concluídos, falharam ou foram ignorados;
+- quantas playlists foram validadas/invalidadas;
+- quantas contas Xtream foram descobertas;
+- quantos streams/canais foram descobertos;
+- quantos streams/canais foram testados;
+- quantos foram considerados funcionais/não funcionais;
+- quantos itens foram compostos/publicados/sincronizados no Dispatcharr,
+  quando essa etapa estiver activa;
+- erros e avisos relevantes;
+- timestamp da última actividade.
+
+A experiência pretendida deve ser equivalente, para um utilizador, a um
+`docker logs -f m3ucrawler` **perceptível e estruturado**, complementado por
+totalizadores.
+
+### Estado operacional
+
+Deve existir um estado explícito da execução, com uma enumeração equivalente
+a:
+
+```text
+IDLE
+READING_TELEGRAM
+DISCOVERING
+DOWNLOADING
+ANALYZING
+VALIDATING
+COMPOSING
+SYNCING_DISPATCHARR
+COMPLETED
+ERROR
+```
+
+A enumeração concreta pode ser ajustada à arquitectura existente, mas o
+Dashboard deve conseguir representar inequivocamente a actividade actual.
+
+O estado deve incluir pelo menos:
+
+- `runId`;
+- estado actual;
+- etapa/actividade actual;
+- `startedAt`;
+- `updatedAt`;
+- duração decorrido;
+- mensagem resumida para o operador.
+
+### Totalizadores em tempo real
+
+Os totalizadores devem estar associados ao `SyncRun` em curso e ser
+actualizados durante a execução, não apenas no final.
+
+A estrutura deve permitir pelo menos:
+
+```text
+Telegram
+  messagesRead
+  candidatesFound
+
+Playlists
+  playlistsFound
+  playlistsDownloaded
+  playlistsValid
+  playlistsInvalid
+  downloadFailures
+
+Xtream
+  accountsDiscovered
+  accountsValidated
+
+Streams
+  streamsDiscovered
+  streamsSelected
+  streamsTested
+  streamsWorking
+  streamsFailed
+
+Dispatcharr
+  channelsCreated
+  channelsUpdated
+  channelsFailed
+```
+
+Os contadores devem ser incrementados pelos pontos reais do pipeline. Não
+devem ser calculados retroactivamente a partir de texto de logs.
+
+Um contador só deve ser apresentado quando existir uma definição semântica
+clara para o seu significado; a lista acima é o modelo alvo e pode ser
+introduzida incrementalmente conforme cada fase disponibilize os eventos
+necessários.
+
+### Actividade em tempo real
+
+Além dos totalizadores, o Dashboard deve apresentar um feed das **últimas
+actividades relevantes**, por exemplo:
+
+```text
+17:51:02  Telegram       A ler mensagens...
+17:51:03  Telegram       260 mensagens analisadas
+17:51:04  Playlist       Candidato encontrado: message 110843
+17:51:04  Download        A descarregar playlist...
+17:51:06  Download        Download concluído — 4.2 MB / 2.1 s
+17:51:06  Xtream          751 contas encontradas
+17:51:07  Validation      Conta 1/751 — a validar
+17:51:08  Validation      Conta 1 — 127 testados / 74 OK / 53 falhados
+```
+
+O feed deve ser orientado ao utilizador e não reproduzir cegamente todo o
+`docker logs`. Os logs técnicos continuam a existir para diagnóstico.
+
+Cada actividade deve, quando aplicável, possuir:
+
+- timestamp;
+- categoria;
+- nível (`INFO`, `WARNING`, `ERROR`);
+- mensagem;
+- metadados estruturados.
+
+### Transporte
+
+A actualização do Dashboard deve ser realmente em tempo real.
+
+A solução preferencial é utilizar o mecanismo de comunicação em tempo real já
+suportado pela aplicação, ou **SignalR/WebSocket** se não existir outro
+mecanismo adequado.
+
+Polling periódico pode ser utilizado como fallback ou numa primeira
+implementação se isso reduzir significativamente o risco, mas não deve obrigar
+o operador a actualizar manualmente a página.
+
+### Persistência e desempenho
+
+Não persistir cada actividade individual na base de dados.
+
+O modelo deve distinguir:
+
+```text
+Persistente
+  SyncRun
+  estado actual
+  totalizadores
+  steps/resumo
+
+Em memória / buffer limitado
+  últimas actividades live
+```
+
+O feed pode utilizar um **ring buffer** de tamanho limitado (por exemplo, as
+últimas centenas de actividades), evitando crescimento ilimitado.
+
+Os totalizadores e o estado principal devem sobreviver ao refresh do Dashboard
+e permitir que o operador veja o estado actual de um run que continua em curso.
+
+### Relação com `SyncRun` / `SyncRunStep`
+
+Esta capacidade deve **reutilizar e estender o modelo de runs existente**.
+
+Não criar um segundo sistema independente de execução apenas para o Dashboard.
+
+`SyncRun` continua a representar a execução e `SyncRunStep` as etapas
+estruturais. A observabilidade live acrescenta estado actual, totalizadores e
+actividade operacional à mesma execução.
+
+### Logs técnicos
+
+O `docker logs -f m3ucrawler` deve continuar disponível e não deve ser
+substituído.
+
+Existem três níveis complementares:
+
+```text
+Dashboard
+  → estado actual + totalizadores + actividade live
+
+SyncRun
+  → estado/steps/resultados persistentes
+
+docker logs
+  → diagnóstico técnico detalhado
+```
+
+O Dashboard não deve depender de fazer parsing do `docker logs`.
+
+### Critérios de aceitação
+
+Uma execução em curso deve permitir ao operador responder, sem consultar
+directamente o container:
+
+1. O m3uCrawler está parado ou está a trabalhar?
+2. O que está a fazer neste momento?
+3. Quando começou a execução?
+4. Qual é a fase actual?
+5. Quantas mensagens já leu?
+6. Quantos candidatos/playlists encontrou?
+7. Quantos downloads foram feitos e quantos falharam?
+8. Quantas contas/streams/canais já foram processados?
+9. Quantos testes foram concluídos e quantos deram resultado funcional?
+10. Existem erros ou avisos relevantes?
+11. Quando ocorreu a última actividade?
+
+A informação deve actualizar-se automaticamente durante a execução e continuar
+coerente com o `SyncRun` terminado.
+
 
 ## 11. API
 
@@ -3767,7 +4064,7 @@ Deve existir uma representação clara de:
 - requisitos de configuração;
 - validação;
 - conclusão/revalidação do bootstrap;
-- operações de afinidade independentes de IDs técnicos.
+- operações de afinidade baseadas na identidade lógica estável do canal canónico, sem dependência de IDs técnicos mutáveis.
 
 As respostas devem ser adequadas tanto ao Dashboard como a testes
 automatizados.
@@ -3835,7 +4132,7 @@ Adicionar testes cobrindo pelo menos:
 - discovery é permitido em `READY`;
 - scheduler não executa discovery quando não está `READY`;
 - action bloqueada produz resultado auditável;
-- operações administrativas continuam disponíveis em `NOT_CONFIGURED`.
+- em `NOT_CONFIGURED`, apenas o fluxo necessário para o bootstrap inicial fica disponível; o acesso administrativo normal só é disponibilizado após `READY`.
 
 ### Dashboard/API
 
@@ -3847,12 +4144,16 @@ Adicionar testes cobrindo pelo menos:
 
 ### Afinidades
 
-- afinidade sobrevive a mudança do ID técnico;
-- migração preserva relações existentes;
+- afinidade referencia a identidade lógica estável do canal canónico, por `CanonicalChannel.Key` ou equivalente, e não um ID técnico mutável;
+- cada canal canónico tem 0 ou 1 definição de afinidade;
+- cada definição de afinidade referencia exactamente um canal canónico e pode conter N variantes;
+- a selecção do canal canónico na UI usa a Lista de canais por país e exclui canais que já possuem afinidade;
+- a alteração do nome canónico não quebra a afinidade existente;
+- o nome publicado no Dispatcharr é sempre o nome actualmente definido na Lista de canais por país;
+- migração preserva relações existentes e é idempotente;
 - bootstrap/importação não cria duplicados;
 - chaves lógicas resolvem deterministicamente;
-- migração é idempotente;
-- relações ambíguas são rejeitadas ou marcadas para revisão.
+- relações/variantes ambíguas são rejeitadas ou marcadas para revisão.
 
 ### Regressão
 
@@ -3922,7 +4223,7 @@ Além da Definition of Done global:
 - discovery gate aplicado a todas as entradas relevantes;
 - scheduler integrado com o gate;
 - auditoria completa do Dashboard concluída;
-- modelo de afinidades corrigido;
+- modelo funcional de afinidades implementado de acordo com a identidade lógica estável, cardinalidade 0..1 por canal canónico, variantes múltiplas e autoridade da Lista de canais por país;
 - migração das afinidades existentes executada e testada;
 - API documentada;
 - testes automatizados;

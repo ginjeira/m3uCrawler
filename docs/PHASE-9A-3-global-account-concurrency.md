@@ -106,3 +106,27 @@ caminho Telegram.
   mesma conta podem atrasar outras contas. Mitigação futura: dedup por
   `AccountId` no run.
 - Dois mecanismos coexistem (pool 9A.1 e coordinator 9A.3); unificação futura.
+
+### Known Issue / Follow-up — AccountGateCoordinator
+
+Foi identificada uma falha de concorrência **pré-existente** em
+`AccountGateCoordinator.ReleaseGate`, **anterior à PHASE 9C.1**.
+
+- **Sintoma**: `ObjectDisposedException` intermitente observada durante
+  o run de testes do coordinator.
+- **Reprodução**: a falha foi reproduzida no baseline pré-9C.1, ou seja,
+  sem qualquer alteração introduzida pela PHASE 9C.1.
+- **Causa identificada**: race condition envolvendo `SemaphoreSlim`.
+  `ReleaseGate` pode remover/dispor uma entrada do dicionário de gates
+  enquanto uma operação concorrente ainda se encontra a adquirir o
+  mesmo gate para o mesmo `AccountId`, levando à excepção.
+- **Não é uma regressão da PHASE 9C.1**: a falha já existia antes
+  dessas alterações e foi mantida deliberadamente fora do seu âmbito.
+- **Acção prevista**: abertura de uma tarefa dedicada de **follow-up da
+  PHASE 9A.3** para corrigir o problema e adicionar/validar os testes
+  de concorrência necessários (reprodutor determinístico + cobertura
+  de cenários de stress que exponham a race).
+- **Estado actual**: até essa tarefa ser concluída, este problema
+  permanece identificado como **Known Issue** da área de concorrência
+  do `AccountGateCoordinator`. Não é afirmado impacto em produção
+  para além do que foi demonstrado nos testes.
