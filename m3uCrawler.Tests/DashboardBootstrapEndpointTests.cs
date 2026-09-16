@@ -86,6 +86,25 @@ public class DashboardBootstrapEndpointTests : IAsyncLifetime
         return _harness;
     }
 
+    /// <summary>
+    /// PHASE 9C.2 (S1) — Harness com lifecycle mas SEM auth/bootstrap, para
+    /// simular falha de wiring do serviço de autenticação.
+    /// </summary>
+    private DashboardHarness StartHarnessWithoutAuth()
+    {
+        _harness = DashboardHarness.Start(
+            _outputDir, _resolver, _composer, _history,
+            _lifecycle, auth: null, bootstrap: null, webToken: null);
+        return _harness;
+    }
+
+    private static HttpRequestMessage WithBearer(HttpMethod method, string path, string token)
+    {
+        var request = new HttpRequestMessage(method, path);
+        request.Headers.Add("Authorization", $"Bearer {token}");
+        return request;
+    }
+
     private async Task ReachReadyAsync(DashboardHarness harness)
     {
         var start = await harness.Client.PostAsync("/api/bootstrap/start", EmptyJson());
@@ -304,6 +323,160 @@ public class DashboardBootstrapEndpointTests : IAsyncLifetime
         Assert.Equal(HttpStatusCode.OK, (await harness.Client.SendAsync(request)).StatusCode);
     }
 
+    private async Task ReachReadyWithTokenAsync(DashboardHarness harness, string token)
+    {
+        var start = await harness.Client.SendAsync(
+            WithBearerJson(HttpMethod.Post, "/api/bootstrap/start", token, "{}"));
+        Assert.Equal(HttpStatusCode.OK, start.StatusCode);
+
+        var admin = await harness.Client.SendAsync(
+            WithBearerJson(HttpMethod.Post, "/api/bootstrap/admin", token,
+                JsonSerializer.Serialize(new { username = "admin", password = ValidPassword })));
+        Assert.Equal(HttpStatusCode.OK, admin.StatusCode);
+
+        var complete = await harness.Client.SendAsync(
+            WithBearerJson(HttpMethod.Post, "/api/bootstrap/complete", token, "{}"));
+        Assert.Equal(HttpStatusCode.OK, complete.StatusCode);
+    }
+
+    private static HttpRequestMessage WithBearerJson(HttpMethod method, string path, string token, string json)
+    {
+        var request = WithBearer(method, path, token);
+        request.Content = new StringContent(json, Encoding.UTF8, "application/json");
+        return request;
+    }
+
+    // === B1 / T2 — credencial de máquina em READY + admin ===
+
+    [Fact]
+    public async Task Ready_with_valid_web_token_authorizes_machine_without_session()
+    {
+        const string token = "machine-token-value";
+        var harness = StartHarness(webToken: token);
+        await ReachReadyWithTokenAsync(harness, token);
+
+        // Token válido → autorizado, sem sessão humana.
+        var withToken = await harness.Client.SendAsync(WithBearer(HttpMethod.Get, "/api/history", token));
+        Assert.Equal(HttpStatusCode.OK, withToken.StatusCode);
+
+        // Token inválido → recusado.
+        var invalid = await harness.Client.SendAsync(WithBearer(HttpMethod.Get, "/api/history", "wrong-token"));
+        Assert.Equal(HttpStatusCode.Unauthorized, invalid.StatusCode);
+
+        // Sem token → recusado (token configurado é exigido a todos).
+        Assert.Equal(HttpStatusCode.Unauthorized, (await harness.Client.GetAsync("/api/history")).StatusCode);
+
+        // A credencial de máquina não cria utilizador nem sessão humana.
+        await using var context = _factory.CreateDbContext();
+        Assert.Equal(1, context.AdminUsers.Count());
+        Assert.Empty(context.AdminSessions);
+    }
+
+    [Fact]
+    public async Task Ready_with_session_and_valid_token_is_deterministic()
+    {
+        const string token = "machine-token-value";
+        var harness = StartHarness(webToken: token);
+        await ReachReadyWithTokenAsync(harness, token);
+
+        // Login humano requer também o token quando --web-token está configurado.
+        var login = await harness.Client.SendAsync(
+            WithBearerJson(HttpMethod.Post, "/api/session", token,
+                JsonSerializer.Serialize(new { username = "admin", password = ValidPassword })));
+        Assert.Equal(HttpStatusCode.OK, login.StatusCode);
+
+        // Sessão (cookie) + token → autorizado.
+        var both = await harness.Client.SendAsync(WithBearer(HttpMethod.Get, "/api/history", token));
+        Assert.Equal(HttpStatusCode.OK, both.StatusCode);
+
+        // Sessão sem token → recusado (o token continua a ser exigido).
+        Assert.Equal(HttpStatusCode.Unauthorized, (await harness.Client.GetAsync("/api/history")).StatusCode);
+    }
+
+    // === T3 — legacy + credencial de máquina ===
+
+    [Fact]
+    public async Task Legacy_with_web_token_keeps_machine_access()
+    {
+        const string token = "machine-token-value";
+        _lifecycle.SetState(ConfigurationLifecycleState.Ready, "legacy-adoption:sources");
+        var harness = StartHarness(webToken: token);
+
+        var withToken = await harness.Client.SendAsync(WithBearer(HttpMethod.Get, "/api/history", token));
+        Assert.Equal(HttpStatusCode.OK, withToken.StatusCode);
+
+        Assert.Equal(HttpStatusCode.Unauthorized, (await harness.Client.GetAsync("/api/history")).StatusCode);
+
+        await using var context = _factory.CreateDbContext();
+        Assert.Empty(context.AdminUsers);
+    }
+
+    // === B2 / T1 — CSRF real no Dashboard autenticado ===
+
+    [Fact]
+    public async Task Authenticated_dashboard_receives_csrf_and_real_mutation_succeeds()
+    {
+        var harness = StartHarness();
+        await ReachReadyAsync(harness);
+
+        var login = await harness.Client.PostAsync(
+            "/api/session",
+            new StringContent(
+                JsonSerializer.Serialize(new { username = "admin", password = ValidPassword }),
+                Encoding.UTF8, "application/json"));
+        Assert.Equal(HttpStatusCode.OK, login.StatusCode);
+
+        string csrf;
+        using (var doc = JsonDocument.Parse(await login.Content.ReadAsStringAsync()))
+        {
+            csrf = doc.RootElement.GetProperty("csrfToken").GetString()!;
+        }
+
+        // A página autenticada recebe o token (em memória) e o helper de fetch.
+        var page = await harness.Client.GetAsync("/");
+        Assert.Equal(HttpStatusCode.OK, page.StatusCode);
+        var html = await page.Content.ReadAsStringAsync();
+        Assert.Contains(csrf, html);
+        Assert.Contains("X-CSRF-Token", html);
+
+        // Operação mutável REAL (cria um job agendado) com o header que o helper envia.
+        var create = new HttpRequestMessage(HttpMethod.Post, "/api/catalog/scheduled-jobs")
+        {
+            Content = new StringContent(
+                JsonSerializer.Serialize(new
+                {
+                    name = "csrf-test",
+                    cronExpression = "*/5 * * * *",
+                    actionName = "discoverM3u",
+                    isEnabled = true,
+                }),
+                Encoding.UTF8, "application/json"),
+        };
+        create.Headers.Add("X-CSRF-Token", csrf);
+
+        var response = await harness.Client.SendAsync(create);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        // Prova de que o handler real executou e persistiu a alteração.
+        await using var context = _factory.CreateDbContext();
+        Assert.True(context.ScheduledJobs.Any(j => j.Name == "csrf-test"));
+    }
+
+    // === S1 — falha de wiring de auth não pode ser fail-open ===
+
+    [Fact]
+    public async Task Auth_wiring_failure_in_ready_fails_closed()
+    {
+        _lifecycle.SetState(ConfigurationLifecycleState.Ready, "test-ready-without-auth");
+        var harness = StartHarnessWithoutAuth();
+
+        // Fail-closed: não há acesso administrativo sem autenticação.
+        Assert.Equal(HttpStatusCode.Unauthorized, (await harness.Client.GetAsync("/api/history")).StatusCode);
+
+        // Diagnóstico permanece disponível.
+        Assert.Equal(HttpStatusCode.OK, (await harness.Client.GetAsync("/api/version")).StatusCode);
+    }
+
     private sealed class DashboardHarness : IAsyncDisposable
     {
         private readonly HttpListener _listener;
@@ -326,9 +499,9 @@ public class DashboardBootstrapEndpointTests : IAsyncLifetime
             CatalogResolver resolver,
             PlaylistComposerService composer,
             ImportHistoryService history,
-            ConfigurationLifecycleService lifecycle,
-            AuthService auth,
-            BootstrapService bootstrap,
+            ConfigurationLifecycleService? lifecycle,
+            AuthService? auth,
+            BootstrapService? bootstrap,
             string? webToken)
         {
             var port = GetFreePort();

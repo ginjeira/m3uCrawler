@@ -647,12 +647,23 @@ Telegram, sources, ordering, import policies, grupos, source priority e schedule
 | Modo | Condição | Efeito |
 |---|---|---|
 | Bootstrap | `NOT_CONFIGURED`/`CONFIGURING` | Só bootstrap/sessão/lifecycle/version; restantes endpoints → 403 |
-| UserAuth | `READY` + administrador | Endpoints normais exigem sessão; mutantes exigem CSRF |
+| UserAuth | `READY` + administrador | Endpoints normais exigem sessão humana **ou** credencial de máquina válida; mutantes exigem CSRF |
 | Legacy | `READY` sem administrador | Mantém o comportamento actual de `--web-token`; não cria administrador |
 
 `--web-token` mantém-se como **credencial de máquina/automação** em todos os
-modos (quando configurado). Não substitui a autenticação humana e não é necessário
-numa instalação nova.
+modos (quando configurado). Precedência: o token é avaliado primeiro e, quando
+válido, **autoriza o pedido sem exigir sessão humana** (inclusive em `READY` +
+administrador), sem criar utilizador nem sessão. Sem `--web-token`, em `READY` o
+acesso exige sessão humana (e CSRF nos métodos mutantes). Não substitui a
+autenticação humana e não é necessário numa instalação nova.
+
+A página autenticada do Dashboard recebe o token CSRF apenas **em memória
+JavaScript** (nunca em URL, query, `localStorage` ou logs) e envia-o
+automaticamente em métodos mutantes através de um helper de `fetch`.
+
+Se a inicialização do serviço de autenticação falhar, o Dashboard entra em
+**fail-closed** em `READY` (401, sem acesso administrativo anónimo) — nunca cai
+silenciosamente para o modo legacy.
 
 ### Limitação TLS
 

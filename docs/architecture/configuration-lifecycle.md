@@ -234,12 +234,40 @@ Nota: o loader existente normaliza `dispatcharr_enabled=true` sem
 | Modo | Condição | Comportamento |
 |---|---|---|
 | **Bootstrap** | `NOT_CONFIGURED`/`CONFIGURING` | Só `/`, `/bootstrap`, `/api/bootstrap/*`, `/api/session`, `/api/version` e `/api/configuration/lifecycle`; restantes endpoints → `403 bootstrap-required` |
-| **UserAuth** | `READY` ∧ admin activo | Endpoints normais exigem sessão; mutantes exigem CSRF; `/` sem sessão serve página de login |
+| **UserAuth** | `READY` ∧ admin activo | Endpoints normais exigem **sessão humana** (ou credencial de máquina válida); mutantes exigem CSRF; `/` sem sessão serve página de login |
 | **Legacy** | `READY` ∧ sem admin | Mantém o comportamento actual baseado só em `--web-token`; não cria admin nem migra |
 
-`--web-token`, quando configurado, continua a ser exigido em **todos** os modos
-(credencial de máquina/automação) e é distinto da autenticação humana. Numa
-instalação nova não é necessário, mas não é proibido.
+### Precedência `--web-token` vs sessão humana
+
+`--web-token`, quando configurado, é exigido em **todos** os modos (é avaliado
+antes de qualquer rota). Dentro disso:
+
+- **token válido** → autoriza o pedido, **sem** exigir sessão humana, incluindo
+  em `READY` + admin (`UserAuth`). É uma credencial de **máquina** para automação;
+  não cria utilizador nem sessão e não é uma password de utilizador.
+- **token ausente/inválido** com `--web-token` configurado → `401` (gate de token).
+- **sem `--web-token` configurado** em `UserAuth` → exige sessão humana e CSRF.
+- **token válido + sessão presente** → comportamento determinístico: o pedido é
+  autorizado (a credencial de máquina é suficiente); CSRF não é exigido para
+  pedidos autenticados por token, por não serem CSRF-able.
+
+Numa instalação nova `--web-token` não é necessário, mas não é proibido.
+
+### CSRF e a UI
+
+A protecção CSRF do servidor mantém-se (`X-CSRF-Token` obrigatório em métodos
+mutantes autenticados por sessão). A página autenticada do Dashboard recebe o
+token de sessão **apenas em memória JavaScript** (nunca em URL, query,
+`localStorage` ou logs) e injecta um helper que adiciona automaticamente o header
+a todos os `fetch` de mesma origem. Sem sessão humana (legacy/bootstrap) o helper
+não é injectado.
+
+### Falha de inicialização do auth (fail-closed)
+
+Se o `AuthService` não puder ser inicializado, o modo **não** cai para `Legacy`
+(autorização implícita). Em `READY` o gate exige autenticação e devolve `401`
+(fail-closed); fora de `READY` mantém-se em bootstrap. Nunca há acesso
+administrativo anónimo por falha de wiring.
 
 Testes de referência: `AuthPrimitivesTests`, `AdminSessionStoreTests`,
 `BootstrapServiceTests`, `BootstrapConfigurationValidatorTests`,

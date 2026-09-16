@@ -204,15 +204,21 @@ namespace m3uCrawler.Services
             var query = context.Request.Url?.Query ?? string.Empty;
 
             // Protecção opcional por token partilhado: se --web-token foi configurado,
-            // todos os endpoints (incluindo /api/playlist* que servem a playlist funcional
-            // com URLs Xtream reais) exigem o token via header Authorization: Bearer
+            // todos os endpoints exigem o token via header Authorization: Bearer
             // ou query ?token=. Se não configurado, mantém-se o comportamento aberto
             // (compatibilidade com deployments locais).
-            if (!IsRequestAuthorized(context.Request, webToken))
+            //
+            // PHASE 9C.2 (B1) — O token é uma credencial de MÁQUINA. Quando válido,
+            // autoriza o pedido sem exigir sessão humana, incluindo em READY + admin
+            // (UserAuth). É distinto da autenticação humana e não cria utilizador
+            // nem sessão.
+            var tokenAuthorization = EvaluateTokenAuthorization(context.Request, webToken);
+            if (tokenAuthorization == TokenAuthorization.Rejected)
             {
                 await WriteUnauthorizedAsync(context.Response);
                 return;
             }
+            var machineAuthorized = tokenAuthorization == TokenAuthorization.Authorized;
 
             // === PHASE 9C.2 — Authentication / bootstrap ===
             // Gate único, avaliado antes de qualquer rota não pública.
@@ -261,9 +267,14 @@ namespace m3uCrawler.Services
                     return;
                 }
 
-                if (authMode == AuthMode.UserAuth)
+                if (authMode == AuthMode.UserAuth && !machineAuthorized)
                 {
-                    var session = await _authService!.ValidateSessionAsync(sessionId);
+                    // Sem credencial de máquina válida, exige sessão humana.
+                    // Se o serviço de autenticação não estiver disponível, o
+                    // resultado é 401 (fail-closed) — nunca autorização implícita.
+                    var session = _authService != null
+                        ? await _authService.ValidateSessionAsync(sessionId)
+                        : null;
                     if (session == null)
                     {
                         await WriteJsonAsync(
@@ -2302,12 +2313,21 @@ namespace m3uCrawler.Services
 
             if (isRootPath && authMode == AuthMode.UserAuth)
             {
-                var rootSession = await _authService!.ValidateSessionAsync(sessionId);
+                var rootSession = _authService != null
+                    ? await _authService.ValidateSessionAsync(sessionId)
+                    : null;
                 if (rootSession == null)
                 {
                     await WriteHtmlAsync(context.Response, BuildLoginHtml());
                     return;
                 }
+
+                // PHASE 9C.2 (B2) — Entrega o token CSRF à página autenticada,
+                // apenas em memória JavaScript da página (nunca em URL, query,
+                // localStorage ou logs), para que o helper de fetch o envie
+                // automaticamente em métodos mutantes.
+                await WriteHtmlAsync(context.Response, BuildHtmlPage(rootSession.CsrfToken));
+                return;
             }
 
             await WriteHtmlAsync(context.Response, BuildHtmlPage());
@@ -2472,9 +2492,39 @@ namespace m3uCrawler.Services
             response.Close();
         }
 
-    private static string BuildHtmlPage()
+    /// <summary>
+    /// PHASE 9C.2 (B2) — Página do Dashboard. Quando <paramref name="csrfToken"/>
+    /// é fornecido (sessão humana autenticada), injecta um helper que adiciona o
+    /// header <c>X-CSRF-Token</c> a todos os <c>fetch</c> de mesma origem. O token
+    /// vive apenas em memória JavaScript da página — nunca em URL, query,
+    /// localStorage ou logs. Sem token (legacy/bootstrap) o helper não é injectado.
+    /// </summary>
+    private static string BuildHtmlPage(string? csrfToken = null)
     {
-        return BuildDashboardHtml();
+        var html = BuildDashboardHtml();
+        if (string.IsNullOrEmpty(csrfToken))
+        {
+            return html;
+        }
+
+        var tokenLiteral = JsonSerializer.Serialize(csrfToken);
+        var script =
+            "<script>(function(){var t=" + tokenLiteral + ";" +
+            "if(!t||typeof window.fetch!=='function'){return;}" +
+            "var f=window.fetch.bind(window);" +
+            "window.fetch=function(input,init){init=init||{};" +
+            "var h=new Headers(init.headers||{});" +
+            "if(!h.has('X-CSRF-Token')){h.set('X-CSRF-Token',t);}" +
+            "init.headers=h;return f(input,init);};})();</script>";
+
+        var bodyIndex = html.IndexOf("<body", StringComparison.OrdinalIgnoreCase);
+        if (bodyIndex < 0)
+        {
+            return script + html;
+        }
+
+        var bodyClose = html.IndexOf('>', bodyIndex);
+        return bodyClose < 0 ? script + html : html.Insert(bodyClose + 1, script);
     }
 
     private sealed class IdentityRulePayload
@@ -5529,13 +5579,27 @@ const rows = Object.entries(inv).map(([k, v]) => {
         {
             if (_configurationLifecycle == null && _authService == null)
             {
+                // Dashboard não gerido por lifecycle/auth (testes, uso standalone
+                // sem catálogo): mantém o comportamento legacy.
                 return AuthMode.Legacy;
             }
 
             var state = _configurationLifecycle != null
                 ? (await _configurationLifecycle.GetStateAsync()).State
                 : ConfigurationLifecycleState.NotConfigured;
-            var hasAdmin = _authService != null && await _authService.HasActiveAdminAsync();
+
+            if (_authService == null)
+            {
+                // PHASE 9C.2 (S1) — Auth indisponível (falha de wiring). NUNCA
+                // tratar isto como autorização implícita (Legacy). Em READY
+                // exige autenticação (fail-closed, 401); fora de READY é
+                // bootstrap. Não há mecanismo de fallback novo.
+                return state == ConfigurationLifecycleState.Ready
+                    ? AuthMode.UserAuth
+                    : AuthMode.Bootstrap;
+            }
+
+            var hasAdmin = await _authService.HasActiveAdminAsync();
             return AuthModeResolver.Resolve(state, hasAdmin);
         }
 
@@ -5543,6 +5607,43 @@ const rows = Object.entries(inv).map(([k, v]) => {
         {
             return requestPath.Equals("/api/version", StringComparison.OrdinalIgnoreCase)
                 || requestPath.Equals("/api/configuration/lifecycle", StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// Resultado da avaliação do token partilhado de máquina
+        /// (<c>--web-token</c>).
+        /// </summary>
+        private enum TokenAuthorization
+        {
+            /// <summary>Nenhum token configurado (comportamento aberto).</summary>
+            NotConfigured = 0,
+
+            /// <summary>Token configurado e válido para este pedido.</summary>
+            Authorized = 1,
+
+            /// <summary>Token configurado mas ausente/incorrecto.</summary>
+            Rejected = 2,
+        }
+
+        /// <summary>
+        /// PHASE 9C.2 (B1) — Distingue "sem token configurado" de "autorizado por
+        /// token". Permite que a credencial de máquina autorize pedidos sem exigir
+        /// sessão humana em READY + admin.
+        /// </summary>
+        private static TokenAuthorization EvaluateTokenAuthorization(
+            HttpListenerRequest request,
+            string? expectedToken)
+        {
+            if (string.IsNullOrWhiteSpace(expectedToken))
+            {
+                return TokenAuthorization.NotConfigured;
+            }
+
+            var authorized = IsAuthorized(
+                request.Headers?["Authorization"],
+                request.QueryString?["token"],
+                expectedToken);
+            return authorized ? TokenAuthorization.Authorized : TokenAuthorization.Rejected;
         }
 
         private static bool IsMutatingMethod(string method)

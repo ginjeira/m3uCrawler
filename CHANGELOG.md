@@ -7,6 +7,14 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Unreleased]
 
+### 🛡️ Correcções / Hardening
+- **PHASE 9C.2 — correcção pós-revisão (2026-09-16): preservar credencial de máquina e CSRF do Dashboard.**
+  - **B1 — `--web-token` volta a autorizar automação em `READY` + administrador.** O gate distinguia mal "sem token configurado" de "autorizado por token", pelo que o modo `UserAuth` exigia sessão humana mesmo com token válido (`401`). Agora a credencial de máquina válida autoriza o pedido sem sessão (e sem CSRF), mantendo-se distinta da autenticação humana e sem criar utilizador/sessão. Precedência documentada: token avaliado primeiro; token válido **ou** sessão humana autorizam; com `--web-token` configurado, o token continua a ser exigido a todos os pedidos.
+  - **B2 — operações mutáveis do Dashboard autenticado passam a funcionar.** O servidor exigia `X-CSRF-Token` mas a UI não o enviava (todas as escritas devolviam `403`). A página autenticada recebe agora o token **apenas em memória JavaScript** (nunca em URL/query/`localStorage`/logs) e um helper de `fetch` de mesma origem adiciona automaticamente o header. A protecção CSRF do servidor mantém-se intacta.
+  - **S1 — fail-closed em falha de inicialização do auth.** Se o `AuthService` não for inicializado, o modo deixa de cair para `Legacy` (autorização implícita); em `READY` exige autenticação (`401`) e fora de `READY` mantém-se em bootstrap. Diagnóstico (`/api/version`, `/api/configuration/lifecycle`) permanece acessível.
+  - **Testes**: `ready + admin + valid web-token → autorizado`, `token inválido → recusado`, `sessão + token → determinístico`, `legacy + web-token`, `token não cria utilizador/sessão`, operação mutável real do Dashboard (criação de job agendado via cookie + CSRF, com verificação de persistência) e falha de wiring de auth (fail-closed).
+  - Documentação alinhada (`docs/architecture/configuration-lifecycle.md`, `m3uCrawler/README.md`).
+
 ### ✨ Adicionado
 - **PHASE 9C.2 (2026-09-16): wizard de primeira execução, primeiro administrador e autenticação normal.**
   - **Bootstrap mínimo** sobre o lifecycle da 9C.1: `NOT_CONFIGURED → POST /api/bootstrap/start → CONFIGURING → POST /api/bootstrap/admin → POST /api/bootstrap/complete → READY`, com página mínima `GET /bootstrap`. `GET /` encaminha para o wizard em `NOT_CONFIGURED`.
