@@ -98,6 +98,32 @@ public class DashboardBootstrapEndpointTests : IAsyncLifetime
         return _harness;
     }
 
+    /// <summary>
+    /// PHASE 9C.2 (S1-E) — Harness sem lifecycle e sem auth em contexto de
+    /// produção (não-standalone), equivalente a falha de inicialização do
+    /// catálogo no arranque.
+    /// </summary>
+    private DashboardHarness StartHarnessUnwired()
+    {
+        _harness = DashboardHarness.Start(
+            _outputDir, _resolver, _composer, _history,
+            lifecycle: null, auth: null, bootstrap: null, webToken: null);
+        return _harness;
+    }
+
+    /// <summary>
+    /// PHASE 9C.2 (S1-E) — Harness em contexto explicitamente standalone/testes,
+    /// onde a ausência de lifecycle/auth mantém o comportamento legacy.
+    /// </summary>
+    private DashboardHarness StartHarnessStandalone()
+    {
+        _harness = DashboardHarness.Start(
+            _outputDir, _resolver, _composer, _history,
+            lifecycle: null, auth: null, bootstrap: null, webToken: null,
+            standalone: true);
+        return _harness;
+    }
+
     private static HttpRequestMessage WithBearer(HttpMethod method, string path, string token)
     {
         var request = new HttpRequestMessage(method, path);
@@ -477,6 +503,33 @@ public class DashboardBootstrapEndpointTests : IAsyncLifetime
         Assert.Equal(HttpStatusCode.OK, (await harness.Client.GetAsync("/api/version")).StatusCode);
     }
 
+    // === S1-E — ausência simultânea de lifecycle e auth ===
+
+    [Fact]
+    public async Task Unwired_production_dashboard_is_not_open()
+    {
+        // Contexto de produção (não-standalone): lifecycle == null e auth == null
+        // (equivalente a falha de inicialização do catálogo no arranque).
+        var harness = StartHarnessUnwired();
+
+        // Endpoint administrativo NÃO fica aberto.
+        Assert.Equal(HttpStatusCode.Unauthorized, (await harness.Client.GetAsync("/api/history")).StatusCode);
+        Assert.Equal(HttpStatusCode.Unauthorized, (await harness.Client.GetAsync("/api/catalog/channels")).StatusCode);
+
+        // Diagnóstico explicitamente público continua acessível.
+        Assert.Equal(HttpStatusCode.OK, (await harness.Client.GetAsync("/api/version")).StatusCode);
+        Assert.Equal(HttpStatusCode.OK, (await harness.Client.GetAsync("/api/configuration/lifecycle")).StatusCode);
+    }
+
+    [Fact]
+    public async Task Explicit_standalone_context_keeps_legacy_behaviour()
+    {
+        // Contexto explicitamente standalone/testes: comportamento legacy suportado.
+        var harness = StartHarnessStandalone();
+
+        Assert.Equal(HttpStatusCode.OK, (await harness.Client.GetAsync("/api/history")).StatusCode);
+    }
+
     private sealed class DashboardHarness : IAsyncDisposable
     {
         private readonly HttpListener _listener;
@@ -502,7 +555,8 @@ public class DashboardBootstrapEndpointTests : IAsyncLifetime
             ConfigurationLifecycleService? lifecycle,
             AuthService? auth,
             BootstrapService? bootstrap,
-            string? webToken)
+            string? webToken,
+            bool standalone = false)
         {
             var port = GetFreePort();
             var listener = new HttpListener();
@@ -529,9 +583,17 @@ public class DashboardBootstrapEndpointTests : IAsyncLifetime
                     try
                     {
                         // Handler sequencial: mantém determinismo de cookies/estado.
-                        await WebDashboardService.HandleRequestWithAuthOnTestAsync(
-                            context, outputDir, resolver, composer, history,
-                            lifecycle, auth, bootstrap, webToken);
+                        if (standalone)
+                        {
+                            await WebDashboardService.HandleRequestOnTestAsync(
+                                context, outputDir, resolver, composer, history, webToken);
+                        }
+                        else
+                        {
+                            await WebDashboardService.HandleRequestWithAuthOnTestAsync(
+                                context, outputDir, resolver, composer, history,
+                                lifecycle, auth, bootstrap, webToken);
+                        }
                     }
                     catch
                     {

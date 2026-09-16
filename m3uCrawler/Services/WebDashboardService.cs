@@ -22,6 +22,17 @@ namespace m3uCrawler.Services
         private static AuthService? _authService;
         private static BootstrapService? _bootstrapService;
 
+        /// <summary>
+        /// PHASE 9C.2 (S1-E) — Indica que o Dashboard corre num contexto
+        /// explicitamente standalone/testes, onde a ausência simultânea de
+        /// lifecycle e auth é legítima (comportamento legacy preservado).
+        ///
+        /// Em produção é sempre <c>false</c>: nesse caso, lifecycle e auth
+        /// ambos ausentes (p.ex. falha na inicialização do catálogo) é
+        /// fail-closed — nunca <c>Legacy</c> aberto.
+        /// </summary>
+        private static bool _standaloneAuthContext;
+
         /// <summary>Nome do cookie de sessão de administrador.</summary>
         public const string SessionCookieName = "m3u_session";
         private const string CsrfHeaderName = "X-CSRF-Token";
@@ -118,14 +129,15 @@ namespace m3uCrawler.Services
             ImportHistoryService historyService,
             string? webToken = null)
         {
-            using var scope = new StaticResolverScope(resolver);
+            using var scope = new StaticResolverScope(resolver, standaloneAuthContext: true);
             await HandleRequestAsync(context, outputDir, historyService, webToken);
         }
 
         /// <summary>
         /// PHASE 9C.2 — Variante testável com lifecycle/auth/bootstrap
         /// isolados por chamada. Evita interferência entre testes que correm
-        /// em paralelo através dos campos estáticos.
+        /// em paralelo através dos campos estáticos. Não marca contexto
+        /// standalone: sem lifecycle/auth o resultado é fail-closed.
         /// </summary>
         public static async Task HandleRequestWithAuthOnTestAsync(
             HttpListenerContext context,
@@ -183,19 +195,28 @@ namespace m3uCrawler.Services
             string? webToken = null,
             CancellationToken cancellationToken = default)
         {
-            using var scope = new StaticResolverScope(resolver);
+            using var scope = new StaticResolverScope(resolver, standaloneAuthContext: true);
             await RunDashboardAsync(outputDir, port, historyService, webToken, cancellationToken);
         }
 
         private sealed class StaticResolverScope : IDisposable
         {
             private readonly CatalogResolver? _previous;
-            public StaticResolverScope(CatalogResolver resolver)
+            private readonly bool _previousStandaloneAuthContext;
+
+            public StaticResolverScope(CatalogResolver resolver, bool standaloneAuthContext = false)
             {
                 _previous = _catalogResolver;
+                _previousStandaloneAuthContext = _standaloneAuthContext;
                 _catalogResolver = resolver;
+                _standaloneAuthContext = standaloneAuthContext;
             }
-            public void Dispose() => _catalogResolver = _previous;
+
+            public void Dispose()
+            {
+                _catalogResolver = _previous;
+                _standaloneAuthContext = _previousStandaloneAuthContext;
+            }
         }
 
         private static async Task HandleRequestAsync(HttpListenerContext context, string outputDir, ImportHistoryService historyService, string? webToken = null)
@@ -5579,9 +5600,12 @@ const rows = Object.entries(inv).map(([k, v]) => {
         {
             if (_configurationLifecycle == null && _authService == null)
             {
-                // Dashboard não gerido por lifecycle/auth (testes, uso standalone
-                // sem catálogo): mantém o comportamento legacy.
-                return AuthMode.Legacy;
+                // PHASE 9C.2 (S1-E) — Ausência simultânea de lifecycle e auth.
+                // Só é legítima num contexto explicitamente standalone/testes.
+                // Em produção (wiring falhou, p.ex. catálogo indisponível) é
+                // fail-closed: nunca Legacy aberto. UserAuth sem sessão resulta
+                // em 401, mantendo apenas os endpoints públicos de diagnóstico.
+                return _standaloneAuthContext ? AuthMode.Legacy : AuthMode.UserAuth;
             }
 
             var state = _configurationLifecycle != null
