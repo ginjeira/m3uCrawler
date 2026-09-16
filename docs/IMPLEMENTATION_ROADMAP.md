@@ -2199,6 +2199,9 @@ Quality / EPG / Availability
 PHASE 9A
 URL / Stream Validation Performance
    ↓
+PHASE 9C
+First-Run / Configuration Lifecycle / Dashboard Hardening
+   ↓
 PHASE 10
 Dispatcharr
    ↓
@@ -3402,6 +3405,451 @@ observar:
 
 ---
 
+# 32.18 — PHASE 9C — First-Run / Configuration Lifecycle / Dashboard Hardening
+
+> **Estado: `[pendente]` — próxima fase de execução.**
+>
+> Esta fase é uma condição de consolidação do produto antes de novas
+> funcionalidades. Não introduz uma segunda arquitectura: fecha o lifecycle
+> operacional sobre o catálogo, políticas, Dashboard e scheduler já existentes.
+
+## 1. Objectivo
+
+Uma instalação nova de `m3uCrawler` deve arrancar num estado explícito e seguro,
+sem depender de defaults implícitos ou de conhecimento técnico do operador.
+
+O sistema deve distinguir pelo menos:
+
+- `NOT_CONFIGURED` — instalação inicial ainda não configurada;
+- `CONFIGURING` — configuração inicial em progresso;
+- `READY` — configuração mínima válida e persistida, podendo executar discovery;
+- `RUNNING` — operação em execução;
+- `ERROR` — configuração existente mas inválida ou operação em erro.
+
+A regra fundamental desta fase é:
+
+> **Nenhuma operação de discovery automática deve arrancar numa instalação
+> nova antes de existir configuração mínima persistida e validada.**
+
+O Dashboard deve ser o **control plane** dessa configuração. O operador deve
+conseguir chegar de uma instalação vazia a `READY` sem editar ficheiros
+internos nem depender de valores hardcoded.
+
+## 2. Problemas a fechar
+
+A auditoria da evolução actual demonstrou que as fases funcionais estão
+implementadas, mas a consolidação operacional ainda precisa de uma camada
+explícita de lifecycle.
+
+Devem ser tratados, no mínimo:
+
+1. ausência de bootstrap explícito numa instalação nova;
+2. distinção entre configuração inexistente e configuração válida;
+3. defaults operacionais espalhados por código;
+4. scheduler capaz de existir sem uma configuração operacional completa;
+5. discovery manual/automática sem gate global de configuração;
+6. cobertura incompleta dos fluxos do Dashboard;
+7. operações do Dashboard que podem estar implementadas no backend mas não
+   suficientemente expostas/validadas na UI;
+8. dependência técnica das afinidades em `CanonicalChannelId`;
+9. necessidade de migrar afinidades existentes sem perder a decisão lógica
+   previamente registada;
+10. ausência de uma validação central que diga claramente ao operador o que
+    falta configurar e porquê.
+
+## 3. Princípio de configuração persistente
+
+Mantém-se a regra transversal do projecto:
+
+> **Se uma decisão puder razoavelmente ser tomada pelo operador do sistema,
+> não deve estar hardcoded no código. Deve existir uma configuração persistente
+> e ser possível geri-la pelo Dashboard.**
+
+Isto inclui, quando aplicável:
+
+- política de país;
+- fontes e prioridades;
+- ordering lists;
+- regras de matching;
+- aliases;
+- afinidades;
+- grupos;
+- política TV/Radio/VOD;
+- qualidade HD/SD/UHD;
+- EPG;
+- disponibilidade;
+- tratamento de unmatched/unknown;
+- política de streams;
+- scheduler;
+- janela de discovery;
+- políticas de validação;
+- inclusão/exclusão de grupos e categorias;
+- regras de geração da playlist.
+
+O código deve fornecer validação, invariantes e defaults seguros de bootstrap,
+mas não deve transformar esses defaults em decisões operacionais
+irreversíveis.
+
+## 4. Bootstrap e lifecycle
+
+Criar uma representação persistente de estado de configuração, sem duplicar
+as fontes de verdade existentes.
+
+O bootstrap deve:
+
+1. detectar instalação nova;
+2. criar apenas a estrutura mínima necessária;
+3. não iniciar discovery automaticamente;
+4. expor no Dashboard o estado `NOT_CONFIGURED`;
+5. apresentar os requisitos ainda não satisfeitos;
+6. permitir ao operador configurar os componentes necessários;
+7. validar a configuração de forma agregada;
+8. marcar a instalação como `READY` apenas quando os requisitos forem
+   satisfeitos;
+9. permitir revalidação posterior;
+10. voltar a estado não-operacional se uma alteração tornar a configuração
+    inválida.
+
+A transição para `READY` deve ser determinística e testável.
+
+## 5. Configuração mínima de uma instalação nova
+
+A validação deve definir explicitamente quais componentes são obrigatórios
+para considerar a instalação operacional.
+
+A lista final deve ser derivada do código e das entidades/policies existentes,
+não inventada como uma segunda configuração paralela.
+
+Como mínimo, a validação deve verificar:
+
+- catálogo canónico disponível;
+- baseline/lista de ordering operacional definida;
+- política de país válida;
+- políticas de importação válidas;
+- grupos necessários válidos;
+- fontes activas configuradas quando discovery exigir fontes;
+- política de source priority válida;
+- política de stream validation válida;
+- scheduler coerente com as actions registadas, quando activado;
+- paths/output necessários acessíveis;
+- configuração Dispatcharr válida apenas quando Dispatcharr estiver activado.
+
+Cada falha deve devolver uma chave/código estável e uma descrição orientada
+ao operador.
+
+## 6. Wizard de primeira configuração
+
+O Dashboard deve fornecer um fluxo explícito de primeira configuração.
+
+O wizard deve permitir, no mínimo:
+
+1. verificar estado da instalação;
+2. carregar/importar a baseline/catálogo;
+3. confirmar país;
+4. criar ou seleccionar ordering list activa;
+5. configurar sources;
+6. rever source priority;
+7. configurar políticas de importação/grupos;
+8. configurar validação de streams;
+9. configurar scheduler, se pretendido;
+10. validar tudo;
+11. concluir bootstrap e mudar para `READY`.
+
+O wizard não deve duplicar CRUD já existente. Deve apenas orquestrar os
+serviços/API existentes e apresentar ao operador o que falta.
+
+## 7. Discovery gate
+
+Todas as entradas que possam iniciar discovery devem passar pelo mesmo gate
+de configuração.
+
+O gate deve impedir, quando o estado não for `READY`:
+
+- scheduler discovery;
+- discovery automática;
+- comandos equivalentes;
+- endpoints de discovery;
+- outras entradas que executem o pipeline de descoberta.
+
+O comportamento deve ser explícito e seguro:
+
+```text
+NOT_CONFIGURED
+      ↓
+tentativa de discovery
+      ↓
+BLOCKED
+      ↓
+"Configure o sistema no Dashboard"
+```
+
+Depois:
+
+```text
+READY
+  ↓
+discovery manual ou agendada
+  ↓
+pipeline normal
+```
+
+O gate não deve bloquear operações administrativas necessárias para completar
+a configuração.
+
+## 8. Scheduler
+
+O scheduler existente da PHASE 12 deve passar a respeitar o lifecycle.
+
+Um job pode estar persistido mas não deve executar uma action operacional se
+a instalação não estiver `READY`.
+
+O Dashboard deve mostrar claramente:
+
+- estado global;
+- jobs activos;
+- próxima execução;
+- action;
+- motivo pelo qual uma execução foi bloqueada;
+- último resultado.
+
+Uma execução bloqueada por configuração deve ser registada como tal, sem ser
+tratada como sucesso.
+
+As quatro actions existentes continuam a ser reutilizadas:
+
+- `discoverM3u`;
+- `validatePlaylist`;
+- `generatePlaylist`;
+- `syncDispatcharr`.
+
+Não criar um segundo scheduler.
+
+## 9. Auditoria completa do Dashboard
+
+Fazer uma auditoria funcional de **todos os tabs, botões, formulários,
+endpoints e operações**.
+
+Para cada operação deve existir:
+
+```text
+Dashboard action
+    ↓
+API contract
+    ↓
+service/domain operation
+    ↓
+persistent result
+    ↓
+UI refresh / feedback
+```
+
+A auditoria deve verificar especialmente:
+
+- criação;
+- edição;
+- eliminação;
+- activação/desactivação;
+- duplicação;
+- ordenação;
+- preview;
+- filtros;
+- validação;
+- reload;
+- mensagens de erro;
+- estados vazios;
+- confirmação de operações destrutivas;
+- concorrência/duplo submit;
+- persistência após refresh;
+- consistência entre API e UI.
+
+Não considerar uma operação "concluída" apenas porque o endpoint existe.
+
+## 10. Afinidades — correcção do modelo conceptual
+
+As afinidades representam uma relação lógica de identidade/matching e não
+devem depender do identificador técnico de uma linha específica de
+`CanonicalChannel`.
+
+O modelo deve permitir que uma afinidade sobreviva a:
+
+- alteração de `CanonicalChannelId`;
+- importação de uma nova baseline;
+- reconstrução do catálogo;
+- merge de canais;
+- mudança de keys técnicas;
+- migração do catálogo.
+
+A identidade lógica deve ser representada por uma chave estável apropriada
+ao domínio, ou por uma estrutura equivalente que não transforme um ID técnico
+de uma linha numa fonte de verdade de identidade.
+
+### Migração
+
+Antes de alterar o modelo:
+
+1. inventariar todas as afinidades existentes;
+2. identificar a identidade lógica de cada lado;
+3. criar a representação estável;
+4. migrar todas as relações;
+5. validar cardinalidade;
+6. detectar relações ambíguas;
+7. preservar as decisões válidas;
+8. apenas depois remover a dependência técnica antiga.
+
+A migração deve ser idempotente e ter testes de regressão.
+
+## 11. API
+
+Adicionar apenas os contratos necessários para expor o lifecycle, sem criar
+uma API paralela.
+
+Deve existir uma representação clara de:
+
+- estado global;
+- requisitos de configuração;
+- validação;
+- conclusão/revalidação do bootstrap;
+- operações de afinidade independentes de IDs técnicos.
+
+As respostas devem ser adequadas tanto ao Dashboard como a testes
+automatizados.
+
+Erros de configuração devem ser estruturados, não apenas strings livres.
+
+## 12. Segurança
+
+A primeira execução deve seguir fail-safe:
+
+- não descobrir;
+- não sincronizar Dispatcharr;
+- não sobrescrever playlists;
+- não executar jobs operacionais;
+- não expor credenciais;
+- não considerar uma configuração parcialmente preenchida como `READY`.
+
+O Dashboard deve exigir autenticação em instalação normal e todas as APIs
+administrativas devem respeitar o mesmo controlo de acesso.
+
+Logs e respostas do Dashboard continuam sujeitos à sanitização existente.
+
+Nenhuma credencial deve ser devolvida em endpoints de configuração, preview,
+logs ou erros.
+
+## 13. Testes obrigatórios
+
+Adicionar testes cobrindo pelo menos:
+
+### Bootstrap
+
+- instalação nova começa em `NOT_CONFIGURED`;
+- bootstrap é idempotente;
+- configuração incompleta não passa a `READY`;
+- configuração válida passa a `READY`;
+- configuração inválida regressa a estado não-operacional;
+- mensagens/códigos de validação são determinísticos.
+
+### Discovery gate
+
+- discovery é bloqueado em `NOT_CONFIGURED`;
+- discovery é permitido em `READY`;
+- scheduler não executa discovery quando não está `READY`;
+- action bloqueada produz resultado auditável;
+- operações administrativas continuam disponíveis em `NOT_CONFIGURED`.
+
+### Dashboard/API
+
+- estado é persistido;
+- refresh mantém o estado;
+- CRUD existente continua funcional;
+- todos os endpoints novos têm testes de sucesso e erro;
+- operações destrutivas e inválidas não deixam estado parcial.
+
+### Afinidades
+
+- afinidade sobrevive a mudança do ID técnico;
+- migração preserva relações existentes;
+- bootstrap/importação não cria duplicados;
+- chaves lógicas resolvem deterministicamente;
+- migração é idempotente;
+- relações ambíguas são rejeitadas ou marcadas para revisão.
+
+### Regressão
+
+- suite completa existente continua verde;
+- pipeline Telegram continua a respeitar country gate;
+- matching R1/R2/R3 mantém comportamento;
+- playlist composition continua determinística;
+- Dispatcharr continua a consumir a composição existente;
+- scheduler continua a executar as quatro actions quando `READY`.
+
+## 14. Critérios de aceitação
+
+A fase só pode passar a `[concluído]` quando for possível demonstrar:
+
+```text
+instalação limpa
+      ↓
+Dashboard seguro
+      ↓
+NOT_CONFIGURED
+      ↓
+wizard
+      ↓
+configuração persistida
+      ↓
+validação
+      ↓
+READY
+      ↓
+discovery manual
+      ↓
+pipeline
+      ↓
+catálogo
+      ↓
+playlist
+      ↓
+scheduler
+      ↓
+operações automáticas
+```
+
+E, inversamente:
+
+```text
+NOT_CONFIGURED
+      ↓
+scheduler/discovery
+      ↓
+BLOCKED
+```
+
+Sem atalhos escondidos e sem editar código/configuração interna para concluir
+o bootstrap.
+
+## 15. Definition of Done específica
+
+Além da Definition of Done global:
+
+- lifecycle persistente implementado;
+- bootstrap implementado;
+- wizard funcional;
+- discovery gate aplicado a todas as entradas relevantes;
+- scheduler integrado com o gate;
+- auditoria completa do Dashboard concluída;
+- modelo de afinidades corrigido;
+- migração das afinidades existentes executada e testada;
+- API documentada;
+- testes automatizados;
+- instalação limpa validada;
+- suite Release verde;
+- documentação actualizada;
+- commit criado.
+
+Só depois desta fase se deve iniciar nova evolução funcional de maior dimensão.
+
+---
+
 # 33. Definition of Done
 
 Uma fase só está concluída quando:
@@ -3458,4 +3906,366 @@ Este documento define **como completar a evolução até ao sistema funcional pr
 | PHASE 10 — Dispatcharr | `[concluído]` | BuildPlanFromCompositionAsync + 2 testes. Ver 32.8. |
 | PHASE 11 — Operations | `[concluído]` | SyncRunStepEntity + API + Dashboard Passos + 4 testes. Ver 32.9. |
 | PHASE 12 — Automation / Scheduler | `[concluído]` | ScheduledJobEntity + CronExpression + Runner + 4 actions concretas (`discoverM3u`, `validatePlaylist`, `generatePlaylist`, `syncDispatcharr`) + arranque em produção via `Program.cs --web` + 19 testes. Ver 32.10 e 32.11. |
+| **PHASE 9C — First-Run / Configuration Lifecycle / Dashboard Hardening** | **`[pendente]`** | Próxima fase de execução: bootstrap, `NOT_CONFIGURED/CONFIGURING/READY`, wizard, discovery gate, scheduler gate, auditoria integral do Dashboard e correcção/migração das afinidades. Ver 32.18. |
 | PHASE-Bridge — Pipeline → Catálogo | `[concluído]` | `PipelineIngestionService` liga o pipeline real (Telegram/M3U8-search) ao catálogo persistente via `EnsureSourceAsync` + `ResolveAsync` + `RecordChannelSourceAsync` + novo `EnsureCanonicalChannelAsync` (upsert). 9 testes TDD. Ver 32.12. |
+# 32.19 — PHASE 13 — Dispatcharr Source Selection, Diversity & Source Limits
+
+> Estado: [pendente] — proposta de implementação.
+>
+> Esta fase fecha um problema operacional identificado na publicação para Dispatcharr:
+> actualmente, quando um canal é sincronizado, podem ser associadas ao mesmo canal todas
+> as fontes descobertas para esse canal. Em canais com elevada descoberta isto pode resultar
+> em dezenas ou mais de 100 fontes associadas, aumentando desnecessariamente o volume de
+> dados e o peso operacional do Dispatcharr sem garantir valor proporcional.
+>
+> A solução proposta é introduzir uma etapa explícita de **selecção/ranking de fontes por
+> canal**, imediatamente antes da sincronização para Dispatcharr.
+
+## 1. Objectivo
+
+Para cada canal a publicar no Dispatcharr:
+
+1. recolher as fontes elegíveis já descobertas, normalizadas e validadas;
+2. eliminar duplicados e fontes equivalentes;
+3. calcular uma classificação determinística de qualidade;
+4. privilegiar diversidade de fornecedor/host;
+5. seleccionar apenas as melhores fontes até ao limite configurado;
+6. publicar no Dispatcharr apenas o conjunto seleccionado.
+
+O limite inicial recomendado é **10 fontes por canal**, mas o valor **não deve ser
+hardcoded**. Deve ser uma política persistente e editável no Dashboard.
+
+O objectivo não é simplesmente cortar a lista aos primeiros 10 elementos: é produzir
+um conjunto pequeno, diversificado e de qualidade.
+
+## 2. Princípio de arquitectura
+
+A selecção deve acontecer **antes do Dispatcharr**, sem destruir nem limitar o catálogo
+interno de fontes descobertas.
+
+Devem existir conceptualmente três conjuntos distintos:
+
+- **Discovery/Source Catalog** — todas as fontes descobertas;
+- **Eligible Sources** — fontes que cumprem as políticas de matching/qualidade/validação;
+- **Dispatcharr Selection** — subconjunto escolhido para publicação naquele canal.
+
+Isto permite manter toda a informação descoberta para futuras reavaliações, sem obrigar
+o Dispatcharr a armazenar centenas de associações por canal.
+
+A política de selecção deve ser reutilizável e independente do cliente Dispatcharr.
+
+## 3. Configuração persistente
+
+Criar uma política de configuração, gerível no Dashboard, para a selecção de fontes.
+
+Configurações mínimas:
+
+- `MaxSourcesPerChannel` — limite máximo por canal; valor inicial sugerido: `10`;
+- `PreferDistinctProviders` — activar/desactivar diversidade de fornecedor;
+- `MaxSourcesPerProvider` — limite opcional por fornecedor;
+- `ProviderDefinition` — forma de determinar o fornecedor lógico de uma fonte;
+- `MinimumValidatedSources` — opcional;
+- `SelectionPolicy` — estratégia de ranking;
+- `AllowFallbackToSameProvider` — permitir preencher vagas quando há poucos
+  fornecedores distintos;
+- `RebalanceOnSync` — recalcular a selecção a cada sincronização;
+- `KeepExistingHealthySources` — opcional, para evitar churn desnecessário.
+
+Nenhum destes valores deve ficar fixo no código quando representar uma decisão
+operacional do administrador.
+
+## 4. Definição de fornecedor
+
+A diversidade deve ser calculada sobre o **fornecedor lógico**, não simplesmente sobre
+a string completa do URL.
+
+A identificação deve normalizar pelo menos:
+
+- scheme;
+- hostname;
+- porta quando relevante;
+- credenciais;
+- path;
+- parâmetros de URL quando estes não identificam realmente um fornecedor diferente.
+
+A implementação deve reutilizar as regras de normalização/sanitização de URL já
+existentes no projecto, evitando criar uma segunda interpretação de identidade.
+
+Quando não for possível determinar o fornecedor com confiança, a fonte deve ser marcada
+como `UnknownProvider` e não deve artificialmente ganhar diversidade por parecer
+diferente de outra fonte desconhecida.
+
+## 5. Critérios de ranking
+
+A classificação deve usar informação já disponível no pipeline.
+
+A implementação deve considerar, pelo menos:
+
+1. resultado de validação da stream;
+2. sucesso/qualidade histórica, quando disponível;
+3. estabilidade/recência da validação;
+4. prioridade da source, já definida pelas políticas existentes;
+5. qualidade técnica conhecida, quando confiável;
+6. qualidade/estado do EPG, quando relevante;
+7. preferência por fornecedor distinto;
+8. desempate determinístico pela identidade normalizada da fonte.
+
+Uma fonte que nunca foi validada não deve ultrapassar silenciosamente uma fonte
+validada e estável apenas por ter sido descoberta mais recentemente.
+
+A função de ranking deve ser determinística para o mesmo estado de entrada e configuração.
+
+## 6. Algoritmo de diversidade
+
+A selecção não deve ser simplesmente `sort -> Take(10)`.
+
+Deve ser uma selecção em duas fases:
+
+### Fase A — diversidade
+
+Percorrer as fontes ordenadas por qualidade e seleccionar primeiro fontes de
+fornecedores distintos, até atingir o limite ou esgotar os fornecedores disponíveis.
+
+### Fase B — preenchimento
+
+Se ainda existirem posições disponíveis:
+
+- seleccionar as melhores fontes restantes;
+- respeitar `MaxSourcesPerProvider`, se configurado;
+- permitir repetição de fornecedor conforme `AllowFallbackToSameProvider`.
+
+Exemplo:
+
+- limite = 10;
+- existem 7 fornecedores distintos;
+- são seleccionadas inicialmente 7 fontes, uma por fornecedor;
+- as 3 posições restantes são preenchidas pelas melhores fontes seguintes.
+
+Se existirem apenas 2 fornecedores, não se deve rejeitar artificialmente fontes boas
+apenas para manter uma diversidade impossível.
+
+## 7. Deduplicação
+
+Antes do ranking devem ser eliminadas fontes logicamente equivalentes.
+
+A deduplicação deve considerar:
+
+- URL normalizada;
+- identidade da stream quando disponível;
+- host/provider;
+- metadados relevantes;
+- variantes que apenas diferem por parâmetros transitórios.
+
+Não deve eliminar streams diferentes que pertençam legitimamente ao mesmo fornecedor.
+
+O resultado deve ser estável e auditável.
+
+## 8. Relação com Source Priority e Stream Validation
+
+A nova selecção **não substitui** Matching, Source Priority, Stream Validation ou as
+políticas de qualidade. É a etapa final de decisão do conjunto a publicar.
+
+Pipeline conceptual:
+
+```text
+Discovery
+   ↓
+Source normalization
+   ↓
+Channel matching
+   ↓
+Source priority
+   ↓
+Stream validation
+   ↓
+Eligible sources
+   ↓
+Deduplication
+   ↓
+Provider diversity
+   ↓
+Source ranking
+   ↓
+MaxSourcesPerChannel
+   ↓
+Dispatcharr selection
+   ↓
+Dispatcharr sync
+```
+
+## 9. Preview / Dry-run
+
+Antes de activar a política em produção deve existir um modo de preview no Dashboard.
+
+Para cada canal deve ser possível ver:
+
+- fontes descobertas;
+- fontes elegíveis;
+- duplicados removidos;
+- fornecedores distintos;
+- fontes seleccionadas;
+- fontes rejeitadas;
+- ranking;
+- fornecedor;
+- motivo de exclusão;
+- configuração aplicada.
+
+O preview não pode alterar o Dispatcharr.
+
+## 10. Dashboard
+
+Criar uma área:
+
+**Policies → Dispatcharr / Source Selection**
+
+Deve permitir:
+
+- definir o limite global;
+- activar/desactivar diversidade;
+- configurar limite por fornecedor;
+- configurar/visualizar a política de ranking;
+- executar preview;
+- consultar estatísticas;
+- visualizar a selecção por canal;
+- comparar `discovered` vs `selected`;
+- validar a configuração antes de a activar.
+
+O limite afecta **a publicação no Dispatcharr**, não a descoberta nem o catálogo interno.
+
+## 11. Dispatcharr Sync
+
+O sincronizador deve receber explicitamente o resultado da selecção.
+
+Não deve continuar a consultar directamente todas as fontes associadas ao canal para
+decidir o que publicar.
+
+A fronteira deve ser equivalente a:
+
+```text
+DispatcharrSync(MatchPlan + DispatcharrSourceSelection)
+```
+
+ou uma abstracção equivalente, mantendo a responsabilidade de selecção fora do cliente
+Dispatcharr.
+
+## 12. Gestão das associações já existentes
+
+A implementação deve tratar canais que já tenham dezenas/centenas de fontes no
+Dispatcharr.
+
+A sincronização deve:
+
+1. calcular a nova selecção;
+2. identificar fontes que permanecem;
+3. identificar fontes que deixam de pertencer à selecção;
+4. remover apenas associações geridas pelo m3uCrawler;
+5. nunca remover fontes pertencentes a outro proprietário/integração;
+6. registar as alterações.
+
+Se o ownership não puder ser determinado com segurança, a acção destrutiva deve ser
+bloqueada e apresentada como revisão necessária.
+
+## 13. Estabilidade e churn
+
+O algoritmo não deve provocar alterações constantes por pequenas variações de ranking.
+
+Deve ser considerada uma estratégia de estabilidade, por exemplo manter fontes saudáveis
+existentes quando a diferença de qualidade for pequena, ou substituir apenas quando uma
+alternativa tiver vantagem suficiente.
+
+A política escolhida deve ser configurável/documentada e coberta por testes.
+
+## 14. Métricas
+
+Adicionar métricas:
+
+- fontes descobertas por canal;
+- fontes elegíveis por canal;
+- fornecedores distintos;
+- fontes seleccionadas;
+- fontes removidas da publicação;
+- duplicados removidos;
+- canais acima do limite antes da selecção;
+- alterações no Dispatcharr;
+- selecções bloqueadas por ownership.
+
+## 15. Testes
+
+Criar testes unitários e de integração para:
+
+- 100 fontes / 1 fornecedor;
+- 100 fontes / 100 fornecedores;
+- 100 fontes / 10 fornecedores;
+- menos de 10 fontes;
+- exactamente 10;
+- mais de 10;
+- fornecedores repetidos;
+- `UnknownProvider`;
+- URLs equivalentes;
+- duplicados;
+- fontes inválidas;
+- não validadas;
+- empate de score;
+- ranking determinístico;
+- alteração de configuração;
+- `MaxSourcesPerProvider`;
+- fallback;
+- ownership;
+- limpeza de associações antigas;
+- dry-run sem alterações;
+- sincronização idempotente;
+- regressão sobre Source Priority e Stream Validation;
+- canais sem fontes elegíveis.
+
+Deve existir um teste explícito que prove que **100 fontes descobertas não implicam
+100 associações no Dispatcharr** quando `MaxSourcesPerChannel=10`.
+
+## 16. Critérios de aceitação
+
+Com a política configurada para 10:
+
+- um canal com 100 fontes elegíveis não recebe 100 fontes no Dispatcharr;
+- são seleccionadas no máximo 10;
+- a selecção privilegia fornecedores distintos;
+- validação/qualidade influencia o ranking;
+- o resultado é determinístico;
+- fontes não seleccionadas permanecem disponíveis internamente;
+- a sincronização não altera fontes de outros proprietários;
+- o Dashboard permite alterar a política sem recompilar;
+- o preview explica o resultado;
+- sincronizações repetidas não produzem churn desnecessário;
+- os relatórios explicam por que uma fonte foi seleccionada ou excluída.
+
+## 17. Definition of Done da fase
+
+- [ ] configuração persistente do limite;
+- [ ] valor inicial recomendado 10, não hardcoded;
+- [ ] identificação normalizada de fornecedor;
+- [ ] deduplicação;
+- [ ] ranking determinístico;
+- [ ] diversidade de fornecedor;
+- [ ] fallback configurável;
+- [ ] selecção antes do Dispatcharr;
+- [ ] Dispatcharr recebe apenas o conjunto seleccionado;
+- [ ] preview/dry-run;
+- [ ] Dashboard completo;
+- [ ] limpeza segura das associações antigas;
+- [ ] ownership respeitado;
+- [ ] métricas e auditoria;
+- [ ] testes unitários e integração;
+- [ ] idempotência;
+- [ ] documentação actualizada;
+- [ ] build e suite de testes passam;
+- [ ] commit.
+
+## 18. Regra de produto
+
+A existência de uma fonte no catálogo **não significa automaticamente que essa fonte
+deva ser publicada no Dispatcharr**.
+
+O catálogo deve conservar a informação descoberta; o Dispatcharr deve receber apenas
+o subconjunto que a política de publicação considera útil.
+
+Esta separação evita que o crescimento da descoberta provoque crescimento ilimitado das
+associações no sistema de destino.
+
