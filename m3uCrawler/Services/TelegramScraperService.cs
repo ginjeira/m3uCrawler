@@ -13,6 +13,13 @@ namespace m3uCrawler.Services
         private readonly WTelegram.Client? _client;
         private readonly M3uCandidateDetector _detector = new();
 
+        // EXPERIMENT-SERIAL-PER-XTREAM (2026-09-16): singleton do lock
+        // manager usado por ProcessCandidateAsync para serializar o download
+        // de candidatos Xtream promovidos por (URL, username). Nullable para
+        // manter back-compat com testes que instanciam o servico directamente;
+        // e' lazy-inicializado na primeira utilizacao.
+        private m3uCrawler.Services.Validation.XtreamAccountLockManager? _xtreamAccountLocks;
+
         // PHASE-OBSERVABILITY (2026-09-15): sink de tracing opcional. Por
         // defeito e' NullTraceSink.Instance (no-op) para nao alterar
         // comportamento dos testes que instanciam directamente.
@@ -468,9 +475,28 @@ namespace m3uCrawler.Services
             //     TestStreamsAsync que tem `maxConcurrency` interno).
             //   - ChannelWriter.TryWrite (NAO pede lock; e' lock-free).
             string? content = candidate.Content;
+            // EXPERIMENT-SERIAL-PER-XTREAM (2026-09-16): se o candidate foi
+            // promovido a partir de uma publicacao Xtream (DetectedFrom
+            // == "xtream publication"), serializamos o download por
+            // (URL, username) para impedir duas requests concorrentes ao
+            // mesmo servidor com a mesma conta. Outras formas de
+            // candidates (m3u url, html attachment, telegram media) nao
+            // sao afectadas.
             if (content == null)
             {
-                content = await DownloadPlaylistContentAsync(candidate.Url, tester);
+                var xtreamIdentity = TryExtractXtreamIdentity(candidate);
+                if (xtreamIdentity != null)
+                {
+                    _xtreamAccountLocks ??= new m3uCrawler.Services.Validation.XtreamAccountLockManager();
+                    await using (await _xtreamAccountLocks.AcquireAsync(xtreamIdentity, cancellationToken).ConfigureAwait(false))
+                    {
+                        content = await DownloadPlaylistContentAsync(candidate.Url, tester);
+                    }
+                }
+                else
+                {
+                    content = await DownloadPlaylistContentAsync(candidate.Url, tester);
+                }
             }
 
             // URL sem extensao (.m3u/.m3u8): detetada por heuristica. So' tratada
@@ -1757,6 +1783,104 @@ namespace m3uCrawler.Services
                 DetectedFrom = "xtream publication",
                 RequiresContentVerification = true
             };
+        }
+
+        /// <summary>
+        /// EXPERIMENT-SERIAL-PER-XTREAM (2026-09-16): extrai a identidade
+        /// (URL, username) de um candidate Xtream, ou devolve null se o
+        /// candidate nao for Xtream-promoted ou se a URL nao contiver um
+        /// username parseavel.
+        ///
+        /// O discriminator de origem e' <c>DetectedFrom == "xtream publication"</c>
+        /// (sinal posto por <see cref="PromoteXtreamAccount"/>).
+        ///
+        /// DEFINICAO (2026-09-16, revisao apos teste com password diferente):
+        /// a identidade e' (host:port/path-without-query + username). A password
+        /// e todos os outros parametros de query (type, output) sao REMOVIDOS
+        /// antes do hashing para que contas com passwords diferentes mas
+        /// mesmo (host:port + username) sejam consideradas a MESMA conta.
+        /// Caso contrario, URLs que diferem apenas em `password=` teriam
+        /// identidades diferentes, contradizendo a regra experimental.
+        ///
+        /// A password NUNCA aparece no fingerprint nem nos logs.
+        /// </summary>
+        internal static string? TryExtractXtreamIdentity(CandidatePlaylist candidate)
+        {
+            if (candidate == null) return null;
+            if (!string.Equals(candidate.DetectedFrom, "xtream publication", StringComparison.Ordinal))
+            {
+                return null;
+            }
+            var url = candidate.Url;
+            if (string.IsNullOrWhiteSpace(url)) return null;
+
+            string? username = null;
+            try
+            {
+                // Extrair username ANTES de strip da query.
+                var qIdx = url.IndexOf('?');
+                if (qIdx >= 0)
+                {
+                    var query = url.Substring(qIdx + 1);
+                    foreach (var pair in query.Split('&'))
+                    {
+                        var eq = pair.IndexOf('=');
+                        if (eq <= 0) continue;
+                        var k = Uri.UnescapeDataString(pair.Substring(0, eq));
+                        if (string.Equals(k, "username", StringComparison.OrdinalIgnoreCase))
+                        {
+                            username = Uri.UnescapeDataString(pair.Substring(eq + 1));
+                            break;
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                return null;
+            }
+            if (string.IsNullOrEmpty(username)) return null;
+
+            // Strip do parametro `password=` da query string para que contas
+            // com mesma (host:port/username) mas passwords diferentes tenham
+            // a mesma identidade.
+            var urlWithoutPassword = StripPasswordFromQuery(url);
+            return m3uCrawler.Services.Validation.XtreamAccountLockManager.ComputeIdentity(urlWithoutPassword, username);
+        }
+
+        /// <summary>
+        /// Remove o parametro <c>password=</c> da query string, mantendo os
+        /// restantes parametros pela mesma ordem. Devolve o URL original se
+        /// nao tiver query string ou se a sanitizacao falhar.
+        /// </summary>
+        private static string StripPasswordFromQuery(string url)
+        {
+            try
+            {
+                var qIdx = url.IndexOf('?');
+                if (qIdx < 0) return url;
+                var baseUrl = url.Substring(0, qIdx);
+                var query = url.Substring(qIdx + 1);
+                var pairs = query.Split('&');
+                var kept = new List<string>(pairs.Length);
+                foreach (var pair in pairs)
+                {
+                    if (pair.Length == 0) continue;
+                    var eq = pair.IndexOf('=');
+                    var key = eq <= 0 ? pair : pair.Substring(0, eq);
+                    if (string.Equals(Uri.UnescapeDataString(key), "password", StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+                    kept.Add(pair);
+                }
+                if (kept.Count == 0) return baseUrl;
+                return baseUrl + "?" + string.Join("&", kept);
+            }
+            catch
+            {
+                return url;
+            }
         }
 
         /// <summary>
