@@ -35,6 +35,8 @@ public sealed class ChannelCatalogDbContext : DbContext
     public DbSet<ScheduledJobEntity> ScheduledJobs => Set<ScheduledJobEntity>();
     public DbSet<AdminUserEntity> AdminUsers => Set<AdminUserEntity>();
     public DbSet<AdminSessionEntity> AdminSessions => Set<AdminSessionEntity>();
+    public DbSet<LiveRunEntity> LiveRuns => Set<LiveRunEntity>();
+    public DbSet<LiveRunStepEntity> LiveRunSteps => Set<LiveRunStepEntity>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -486,6 +488,48 @@ public sealed class ChannelCatalogDbContext : DbContext
                 .WithMany()
                 .HasForeignKey(x => x.AdminUserId)
                 .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        // PHASE 9C.4 — LiveRun (Telegram cycle)
+        modelBuilder.Entity<LiveRunEntity>(e =>
+        {
+            e.ToTable("live_run_runs");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Id).ValueGeneratedOnAdd();
+            e.Property(x => x.RunId).IsRequired().HasMaxLength(64);
+            e.Property(x => x.Mode).IsRequired().HasMaxLength(32);
+            e.Property(x => x.Source).IsRequired().HasMaxLength(32);
+            e.Property(x => x.StartedAtUtc).IsRequired();
+            e.Property(x => x.FinishedAtUtc);
+            e.Property(x => x.TerminalStatus).HasConversion<int>();
+            e.Property(x => x.LastMessage).HasMaxLength(200);
+            e.Property(x => x.CountsJson).IsRequired().HasMaxLength(4000);
+            e.Property(x => x.CreatedAtUtc).IsRequired();
+            e.Property(x => x.UpdatedAtUtc).IsRequired();
+            e.HasIndex(x => x.RunId).IsUnique();
+            e.HasIndex(x => x.StartedAtUtc);
+            e.HasIndex(x => x.FinishedAtUtc);
+            e.HasMany(x => x.Steps)
+                .WithOne(s => s.LiveRun)
+                .HasForeignKey(s => s.LiveRunId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        // PHASE 9C.4 — LiveRunStep
+        modelBuilder.Entity<LiveRunStepEntity>(e =>
+        {
+            e.ToTable("live_run_steps");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Id).ValueGeneratedOnAdd();
+            e.Property(x => x.LiveRunId).IsRequired();
+            e.Property(x => x.Phase).HasConversion<int>();
+            e.Property(x => x.PhaseIndex).IsRequired();
+            e.Property(x => x.PhaseStartedAtUtc).IsRequired();
+            e.Property(x => x.PhaseFinishedAtUtc);
+            e.Property(x => x.Message).HasMaxLength(200);
+            e.Property(x => x.Result).IsRequired().HasMaxLength(40);
+            e.HasIndex(x => new { x.LiveRunId, x.PhaseIndex }).IsUnique();
+            e.HasIndex(x => new { x.LiveRunId, x.Phase });
         });
     }
 }

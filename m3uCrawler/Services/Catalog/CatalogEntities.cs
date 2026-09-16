@@ -401,6 +401,161 @@ public sealed class SyncRunStepEntity
 }
 
 /// <summary>
+/// PHASE 9C.4 — Estado terminal de uma <see cref="LiveRunEntity"/>.
+/// </summary>
+public enum LiveRunTerminalStatus
+{
+    Unknown = 0,
+    Completed = 1,
+    Failed = 2,
+}
+
+/// <summary>
+/// PHASE 9C.4 — Fases da pipeline operacional de uma execução Telegram
+/// (Live Run Monitor). São fases sequenciais, não cumulativas: cada
+/// execução atravessa exactamente uma vez cada fase (com excepção das
+/// fases opcionais, marcadas <c>Optional</c>). Subwave 1 define o
+/// modelo persistente; a transição efectiva entre fases será
+/// instrumentada na subwave 3.
+/// </summary>
+public enum LiveRunPhase
+{
+    /// <summary>Sem fase activa (estado inicial).</summary>
+    Idle = 0,
+
+    /// <summary>Leitura de mensagens no Telegram.</summary>
+    ReadingTelegram = 1,
+
+    /// <summary>Detecção de candidatos a playlist.</summary>
+    Discovering = 2,
+
+    /// <summary>Download de playlists (URL ou anexo).</summary>
+    Downloading = 3,
+
+    /// <summary>Análise do conteúdo (parsing M3U).</summary>
+    Analyzing = 4,
+
+    /// <summary>Validação por país e por stream.</summary>
+    Validating = 5,
+
+    /// <summary>Composição da playlist final (modo maintain).</summary>
+    Composing = 6,
+
+    /// <summary>Sincronização com Dispatcharr (opcional, gated por dispatcharr_enabled).</summary>
+    SyncingDispatcharr = 7,
+
+    /// <summary>Execução terminada sem erro.</summary>
+    Completed = 8,
+
+    /// <summary>Execução terminada com erro.</summary>
+    Error = 9,
+}
+
+/// <summary>
+/// PHASE 9C.4 — Registo persistente de uma execução operacional
+/// (Live Run) do ciclo Telegram. Distinta de
+/// <see cref="SyncRunEntity"/>, que serve exclusivamente o caminho
+/// Dispatcharr. Ambos coexistem por granularidade semântica diferente;
+/// não há fusão física das tabelas nem reutilização dos modelos.
+///
+/// <para>
+/// O modelo é a fonte de verdade terminal: o estado in-memory do
+/// RunCoordinator é hidratado a partir desta tabela no arranque. Runs
+/// sem <see cref="FinishedAtUtc"/> após restart são reportados como
+/// <see cref="LiveRunTerminalStatus.Failed"/> (regra da subwave 1,
+/// sem estado "unknown" distinto).
+/// </para>
+/// </summary>
+public sealed class LiveRunEntity
+{
+    public long Id { get; set; }
+
+    /// <summary>GUID estável do run (correlaciona logs e endpoints).</summary>
+    public string RunId { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Modo da execução. Espera-se <c>"telegram"</c> ou
+    /// <c>"telegram-maintain"</c>. MaxLength 32 para acomodar
+    /// variantes futuras sem migration.
+    /// </summary>
+    public string Mode { get; set; } = string.Empty;
+
+    /// <summary>Origem da execução (e.g. <c>"cli"</c>, <c>"scheduler"</c>, <c>"manual"</c>).</summary>
+    public string Source { get; set; } = string.Empty;
+
+    public DateTime StartedAtUtc { get; set; }
+
+    /// <summary>
+    /// <c>null</c> enquanto a execução está activa. Após
+    /// conclusão (normal ou erro) é preenchido pelo RunCoordinator.
+    /// </summary>
+    public DateTime? FinishedAtUtc { get; set; }
+
+    /// <summary>
+    /// Estado terminal. <see cref="LiveRunTerminalStatus.Unknown"/>
+    /// enquanto a execução decorre; <see cref="LiveRunTerminalStatus.Completed"/>
+    /// ou <see cref="LiveRunTerminalStatus.Failed"/> no fecho.
+    /// </summary>
+    public LiveRunTerminalStatus TerminalStatus { get; set; } = LiveRunTerminalStatus.Unknown;
+
+    /// <summary>
+    /// Última mensagem sanitizada registada pelo RunCoordinator.
+    /// MaxLength 200 (mesmo limite do feed de actividades).
+    /// </summary>
+    public string? LastMessage { get; set; }
+
+    /// <summary>
+    /// Totalizadores persistidos (JSON serializado, schema livre mas
+    /// estável para a duração desta wave). MaxLength 4000 mantém o
+    /// payload compacto sem truncar cenários típicos.
+    /// </summary>
+    public string CountsJson { get; set; } = "{}";
+
+    public DateTime CreatedAtUtc { get; set; }
+    public DateTime UpdatedAtUtc { get; set; }
+
+    public List<LiveRunStepEntity> Steps { get; set; } = new();
+}
+
+/// <summary>
+/// PHASE 9C.4 — Passo detalhado dentro de uma <see cref="LiveRunEntity"/>.
+/// Cada execução regista um <c>LiveRunStepEntity</c> por transição de
+/// fase observada (PhaseStarted/PhaseFinished). A unicidade
+/// (LiveRunId, PhaseIndex) garante idempotência em retries de
+/// instrumentação.
+/// </summary>
+public sealed class LiveRunStepEntity
+{
+    public long Id { get; set; }
+
+    public long LiveRunId { get; set; }
+    public LiveRunEntity? LiveRun { get; set; }
+
+    /// <summary>Fase da pipeline operacional que este passo representa.</summary>
+    public LiveRunPhase Phase { get; set; }
+
+    /// <summary>
+    /// Índice sequencial da fase dentro do run (0..N). Usado
+    /// para unicidade e ordenação; coincide com a ordem de
+    /// declaração da enumeração <see cref="LiveRunPhase"/>.
+    /// </summary>
+    public int PhaseIndex { get; set; }
+
+    public DateTime PhaseStartedAtUtc { get; set; }
+    public DateTime? PhaseFinishedAtUtc { get; set; }
+
+    /// <summary>
+    /// Mensagem sanitizada associada a este passo (e.g.
+    /// "validated 38/142 streams"). MaxLength 200, mesmo limite
+    /// que <see cref="LiveRunEntity.LastMessage"/>.
+    /// </summary>
+    public string? Message { get; set; }
+
+    /// <summary>Resultado textual curto do passo (<c>"ok"</c>, <c>"error:..."</c>).</summary>
+    public string Result { get; set; } = "ok";
+}
+
+/// <summary>
 /// PHASE 12 — Job agendado. O operador define um nome, uma
 /// expressão cron (formato simplificado: <c>minuto hora dia-do-mês
 /// mês dia-da-semana</c>) e uma acção opaca por nome. O
