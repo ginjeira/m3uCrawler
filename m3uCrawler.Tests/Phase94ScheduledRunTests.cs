@@ -57,7 +57,8 @@ public class Phase94ScheduledRunTests : IAsyncLifetime
 
     public Task DisposeAsync()
     {
-        try { Directory.Delete(_outputDir, recursive: true); } catch { /* best effort */ }
+        TestTempDb.Cleanup(_dbPath);
+        TestTempDb.CleanupDirectory(_outputDir);
         return Task.CompletedTask;
     }
 

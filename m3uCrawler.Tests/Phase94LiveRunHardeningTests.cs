@@ -112,7 +112,16 @@ public class Phase94LiveRunHardeningTests : IAsyncLifetime
         await ctx.DisposeAsync();
     }
 
-    public Task DisposeAsync() => Task.CompletedTask;
+    /// <summary>
+    /// PHASE 9C.4 — Limpeza obrigatória: cada teste cria uma BD SQLite
+    /// temporária. Sem isto, a suite acumula ficheiros em <c>%TEMP%</c>
+    /// até esgotar o disco (observado: 53 823 ficheiros / 7,4 GB).
+    /// </summary>
+    public Task DisposeAsync()
+    {
+        TestTempDb.Cleanup(_dbPath);
+        return Task.CompletedTask;
+    }
 
     private static IRunPipeline IdlePipeline() => new AsyncDelegatePipeline(_ => Task.CompletedTask);
 

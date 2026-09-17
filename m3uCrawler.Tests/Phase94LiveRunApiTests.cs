@@ -95,7 +95,18 @@ public class Phase94LiveRunApiTests : IAsyncLifetime
         WebDashboardService.SetLiveRunHost(null);
         WebDashboardService.SetAuth(null, null);
         WebDashboardService.SetConfigurationLifecycle(null);
-        try { Directory.Delete(_root, recursive: true); } catch { /* best effort */ }
+        // Limpeza das BDs temporárias (evita esgotar o disco da CI/dev).
+        TestTempDb.Cleanup(_dbPath);
+        TestTempDb.Cleanup(_tempDbPaths.ToArray());
+        TestTempDb.CleanupDirectory(_root);
+    }
+
+    private readonly List<string> _tempDbPaths = new();
+
+    private string TrackDb(string path)
+    {
+        _tempDbPaths.Add(path);
+        return path;
     }
 
     private Phase94RunApiHarness StartHarness(
@@ -145,9 +156,9 @@ public class Phase94LiveRunApiTests : IAsyncLifetime
     private static StringContent EmptyJson() => new("{}", Encoding.UTF8, "application/json");
     private static StringContent JsonBody(string json) => new(json, Encoding.UTF8, "application/json");
 
-    private static async Task<LiveRunHost> BuildHostAsync(Func<LiveRunRequest, IRunPipeline>? executor = null)
+    private async Task<LiveRunHost> BuildHostAsync(Func<LiveRunRequest, IRunPipeline>? executor = null)
     {
-        var path = Path.Combine(Path.GetTempPath(), $"phase94-host-{Guid.NewGuid():N}.db");
+        var path = TrackDb(Path.Combine(Path.GetTempPath(), $"phase94-host-{Guid.NewGuid():N}.db"));
         var bootstrapper = new ChannelCatalogBootstrapper(path);
         await using (var bootstrapCtx = await bootstrapper.InitializeAsync())
         {
@@ -480,7 +491,7 @@ public class Phase94LiveRunApiTests : IAsyncLifetime
     {
         // Diagnóstico directo: KickStartAsync + pipeline que lança.
         // Verifica se a DB é actualizada sem passar pelo handler HTTP.
-        var path = Path.Combine(Path.GetTempPath(), $"phase94-direct-{Guid.NewGuid():N}.db");
+        var path = TrackDb(Path.Combine(Path.GetTempPath(), $"phase94-direct-{Guid.NewGuid():N}.db"));
         var bootstrapper = new ChannelCatalogBootstrapper(path);
         await using (var bootstrapCtx = await bootstrapper.InitializeAsync()) { }
 
@@ -676,7 +687,7 @@ public class Phase94LiveRunApiTests : IAsyncLifetime
     [Fact]
     public async Task Coordinator_lists_recent_finished_runs_ordered_and_capped()
     {
-        var path = Path.Combine(Path.GetTempPath(), $"phase94-recent-{Guid.NewGuid():N}.db");
+        var path = TrackDb(Path.Combine(Path.GetTempPath(), $"phase94-recent-{Guid.NewGuid():N}.db"));
         var bootstrapper = new ChannelCatalogBootstrapper(path);
         await using (var bootstrapCtx = await bootstrapper.InitializeAsync()) { }
 
