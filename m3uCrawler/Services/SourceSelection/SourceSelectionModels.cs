@@ -129,6 +129,23 @@ public sealed record SourceSelectionResult(
 
 /// <summary>
 /// Vocabulário estável dos motivos de selecção/rejeição.
+///
+/// <para>
+/// <b>Precedência dos motivos de rejeição</b> (avaliada por esta ordem):
+/// <list type="number">
+///   <item><c>duplicate-url</c> — a URL normalizada já foi considerada
+///         (antes de qualquer limite);</item>
+///   <item><c>invalid-url</c> / <c>not-working</c> / <c>unavailable</c> —
+///         inelegibilidade, independente dos limites;</item>
+///   <item><c>limit-reached</c> — <c>MaxSourcesPerChannel</c> atingido;
+///         tem precedência sobre os motivos de fornecedor;</item>
+///   <item><c>provider-limit</c> — <c>MaxSourcesPerProvider</c> atingido;</item>
+///   <item><c>fallback-disabled</c> — fornecedor já representado e
+///         <c>AllowFallbackToSameProvider=false</c>.</item>
+/// </list>
+/// Um candidato pode satisfazer mais de uma condição; o motivo emitido é o
+/// primeiro da precedência acima.
+/// </para>
 /// </summary>
 public static class SelectionReasons
 {
@@ -150,7 +167,11 @@ public static class SelectionReasons
     /// <summary>URL equivalente (após normalização) a um candidato já considerado.</summary>
     public const string DuplicateUrl = "duplicate-url";
 
-    /// <summary>Limite do canal (<c>MaxSourcesPerChannel</c>) já atingido.</summary>
+    /// <summary>
+    /// Limite do canal (<c>MaxSourcesPerChannel</c>) já atingido. Tem
+    /// precedência sobre <see cref="ProviderLimit"/> e
+    /// <see cref="FallbackDisabled"/>.
+    /// </summary>
     public const string LimitReached = "limit-reached";
 
     /// <summary>Limite por fornecedor (<c>MaxSourcesPerProvider</c>) atingido.</summary>
@@ -159,6 +180,14 @@ public static class SelectionReasons
     /// <summary>Fornecedor já representado e o fallback está desactivado.</summary>
     public const string FallbackDisabled = "fallback-disabled";
 
-    /// <summary>Elegível mas não seleccionado por outro motivo não classificado.</summary>
+    /// <summary>
+    /// <b>Reservado — nunca emitido.</b> A Fase B selecciona qualquer
+    /// candidato elegível não seleccionado enquanto houver vagas de canal e
+    /// de fornecedor e o fallback o permitir; logo, após a Fase B, todo o
+    /// candidato rejeitado cai necessariamente em <see cref="LimitReached"/>,
+    /// <see cref="ProviderLimit"/> ou <see cref="FallbackDisabled"/>.
+    /// Mantido apenas para estabilidade do vocabulário; consumidores
+    /// (preview/Dashboard/auditoria) não devem depender dele.
+    /// </summary>
     public const string NotSelected = "not-selected";
 }

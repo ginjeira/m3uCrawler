@@ -41,10 +41,17 @@ public interface IChannelSourceSelector
 ///   <item><b>Epg</b> — Available &gt; Unknown &gt; Unavailable;</item>
 ///   <item><b>LastResponseTimeMs</b> ascendente (0 = desconhecido, vai para o fim);</item>
 ///   <item><b>desempate estável</b> — URL normalizada (ordinal) → SourceId →
-///         ExternalStreamId (ordinal).</item>
+///         ExternalStreamId (ordinal) → <b>identidade total do candidato</b>
+///         (Provider, URL ordinal, SourceId, ExternalStreamId, prioridade,
+///         qualidade, EPG, disponibilidade, response time, IsWorking).</item>
 /// </list>
-/// Não são inventados sinais novos; critérios do roadmap sem campo no
-/// candidato (histórico/recência) ficam para waves seguintes.
+/// O último critério é uma ordem total sobre todos os campos do candidato:
+/// elimina qualquer dependência da ordem de entrada, mesmo em empates
+/// extremos, sem usar hashes, referências de objecto ou aleatoriedade.
+/// A URL <b>ordinal</b> é usada apenas como critério final e só distingue
+/// candidatos que a URL normalizada não distingue (ex.: diferenças de
+/// capitalização no path). Critérios do roadmap sem campo no candidato
+/// (histórico/recência) ficam para waves seguintes.
 /// </para>
 ///
 /// <para>
@@ -56,6 +63,39 @@ public interface IChannelSourceSelector
 /// </summary>
 public sealed class ChannelSourceSelector : IChannelSourceSelector
 {
+    /// <summary>
+    /// Ordem total determinística sobre <see cref="SelectionCandidate"/>
+    /// (Wave 13-1 hardening, R1). Compara todos os campos numa ordem fixa,
+    /// sem hashes, referências de objecto ou aleatoriedade. Dois candidatos
+    /// que comparem iguais são indistinguíveis em todos os campos expostos,
+    /// pelo que a sua ordem relativa não é observável. Usado como critério
+    /// final depois das chaves de ranking, garantindo que o resultado não
+    /// depende da ordem de entrada.
+    /// </summary>
+    private static readonly IComparer<SelectionCandidate> CandidateIdentityComparer =
+        Comparer<SelectionCandidate>.Create((a, b) =>
+        {
+            var c = string.CompareOrdinal(a.Provider.Key, b.Provider.Key);
+            if (c != 0) return c;
+            c = string.CompareOrdinal(a.StreamUrl, b.StreamUrl);
+            if (c != 0) return c;
+            c = a.SourceId.CompareTo(b.SourceId);
+            if (c != 0) return c;
+            c = string.CompareOrdinal(a.ExternalStreamId ?? string.Empty, b.ExternalStreamId ?? string.Empty);
+            if (c != 0) return c;
+            c = a.SourcePriority.CompareTo(b.SourcePriority);
+            if (c != 0) return c;
+            c = ((int)a.Quality).CompareTo((int)b.Quality);
+            if (c != 0) return c;
+            c = ((int)a.Epg).CompareTo((int)b.Epg);
+            if (c != 0) return c;
+            c = ((int)a.Availability).CompareTo((int)b.Availability);
+            if (c != 0) return c;
+            c = a.LastResponseTimeMs.CompareTo(b.LastResponseTimeMs);
+            if (c != 0) return c;
+            return a.IsWorking.CompareTo(b.IsWorking);
+        });
+
     public SourceSelectionResult Select(
         IReadOnlyList<SelectionCandidate> candidates,
         SourceSelectionPolicy policy)
@@ -89,13 +129,13 @@ public sealed class ChannelSourceSelector : IChannelSourceSelector
             .ThenBy(p => p.NormalizedUrl!, StringComparer.Ordinal)
             .ThenBy(p => p.Candidate.SourceId)
             .ThenBy(p => p.Candidate.ExternalStreamId ?? string.Empty, StringComparer.Ordinal)
+            .ThenBy(p => p.Candidate, CandidateIdentityComparer)
             .ToList();
 
         var ineligible = prepared
             .Where(p => p.IneligibilityReason != null)
             .OrderBy(p => p.Candidate.StreamUrl, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(p => p.Candidate.ExternalStreamId ?? string.Empty, StringComparer.Ordinal)
-            .ThenBy(p => p.Candidate.SourceId)
+            .ThenBy(p => p.Candidate, CandidateIdentityComparer)
             .ToList();
 
         // Deduplicação por URL normalizada, preservando o melhor rankeado.
@@ -172,6 +212,13 @@ public sealed class ChannelSourceSelector : IChannelSourceSelector
         return new SourceSelectionResult(selected, rejected, candidates.Count);
     }
 
+    /// <summary>
+    /// Motivo de rejeição de um candidato elegível não seleccionado.
+    /// Precedência (ver <see cref="SelectionReasons"/>): limite do canal →
+    /// limite por fornecedor → fallback desactivado. O ramo final é
+    /// inalcançável por construção (a Fase B esgota os casos possíveis),
+    /// pelo que <see cref="SelectionReasons.NotSelected"/> nunca é emitido.
+    /// </summary>
     private static string RejectionReason(
         Prepared p,
         SourceSelectionPolicy policy,

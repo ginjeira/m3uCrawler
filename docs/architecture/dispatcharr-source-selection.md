@@ -63,7 +63,13 @@ Critérios já existentes no domínio, por ordem:
 3. `Quality` descendente (`FourK > UHD > FHD > HD > SD > Unknown`);
 4. `Epg`: `Available` > `Unknown` > `Unavailable`;
 5. `LastResponseTimeMs` ascendente (`0` = desconhecido → fim);
-6. desempate estável: URL normalizada (`Ordinal`) → `SourceId` → `ExternalStreamId` (`Ordinal`).
+6. desempate estável: URL normalizada (`Ordinal`) → `SourceId` → `ExternalStreamId` (`Ordinal`) → **identidade total do candidato** (Provider, URL ordinal, `SourceId`, `ExternalStreamId`, prioridade, qualidade, EPG, disponibilidade, response time, `IsWorking`).
+
+O último critério é uma ordem total sobre todos os campos do candidato e
+elimina qualquer dependência da ordem de entrada em empates extremos, sem
+usar hashes, referências de objecto, relógio ou aleatoriedade. A URL
+**ordinal** só intervém depois da normalizada e apenas distingue candidatos
+que esta não distingue (ex.: diferenças de capitalização no path).
 
 Os critérios do roadmap sem campo no candidato (histórico de qualidade,
 recência de validação) ficam para waves seguintes. Esta wave **não** inventa
@@ -80,7 +86,17 @@ preservando o melhor rankeado de cada URL normalizada. A chave de identidade
 - **preserva** path, query e userinfo (distinguem streams legítimas);
 - nunca é apresentada/logada (não é uma URL de apresentação).
 
-Ocorrências duplicadas ficam em `Rejected` com `duplicate-url`.
+Ocorrências duplicadas ficam em `Rejected` com `duplicate-url`. Graças à ordem
+total (§4), o sobrevivente da deduplicação é determinístico e independente da
+ordem de entrada, mesmo quando a URL normalizada coincide e só a forma original
+difere.
+
+Casos de identidade (contrato):
+- fragmento (`#...`) **não** participa — `http://x/a#1` ≡ `http://x/a#2`;
+- `http` e `https` são **distintos**;
+- query é **preservada** — `?a=1` ≢ `?a=2`;
+- userinfo é **preservado** — `user:pass@host` ≢ `host`;
+- scheme/host em minúsculas e porta por omissão **normalizam** (equivalentes).
 
 ## 6. Algoritmo (duas fases)
 
@@ -111,16 +127,37 @@ artificial** entre si; contam como o mesmo fornecedor para
 ## 8. Motivos
 
 `diversity`, `fill`, `invalid-url`, `not-working`, `unavailable`,
-`duplicate-url`, `limit-reached`, `provider-limit`, `fallback-disabled`,
+`duplicate-url`, `limit-reached`, `provider-limit`, `fallback-disabled` e
 `not-selected`. `Selected`/`Rejected` cobrem todos os candidatos de entrada, o
 que permite, no futuro, preview/Dashboard/auditoria/métricas sem alterar o
 algoritmo.
 
+**Precedência** dos motivos de rejeição, avaliada por esta ordem:
+
+1. `duplicate-url` (URL normalizada já considerada);
+2. `invalid-url` / `not-working` / `unavailable` (inelegibilidade, independente de limites);
+3. `limit-reached` (`MaxSourcesPerChannel`; domina sobre os motivos de fornecedor);
+4. `provider-limit` (`MaxSourcesPerProvider`);
+5. `fallback-disabled` (fornecedor representado e fallback desactivado).
+
+Um candidato pode satisfazer mais de uma condição; é emitido o primeiro motivo
+da precedência acima.
+
+**`not-selected` é reservado e nunca emitido.** Após a Fase B, todo o candidato
+elegível rejeitado cai necessariamente em `limit-reached`, `provider-limit` ou
+`fallback-disabled`; o motivo existe apenas para estabilidade do vocabulário e
+os consumidores não devem depender dele.
+
 ## 9. Determinismo
 
 O mesmo conjunto de candidatos e a mesma política produzem exactamente a mesma
-selecção, ordem e motivos. A ordenação usa apenas chaves estáveis, pelo que a
-ordem de entrada não altera o resultado (coberto por teste).
+selecção, ordem e motivos, **independentemente da ordem de entrada**. A
+ordenação usa apenas chaves estáveis (sem hash/referência/aleatoriedade) e
+termina numa ordem total sobre os campos do candidato, pelo que mesmo empates
+extremos são resolvidos de forma determinística e estável entre processos.
+Coberto por testes que comparam a assinatura completa (Selected/rank/motivo e
+Rejected/motivo) em múltiplas permutações e num dataset com empates
+deliberados.
 
 ## 10. Fora de âmbito (Wave 13-1)
 
@@ -131,10 +168,12 @@ wave seguinte, sobre esta unidade já validada.
 
 ## 11. Testes de referência
 
-`m3uCrawler.Tests/ChannelSourceSelectorTests.cs` (44 testes): volume
-(100/1, 100/10, 100/100, <10, =10, >10), dedup, fornecedores (distintos, únicos,
-desconhecidos, mistos), diversidade on/off, limites por fornecedor, fallback,
-edge cases (URL inválida/vazia, não-working, disponibilidade terminal,
-desconhecidos, empate, vazio, unitário), razões, ranking e determinismo —
-incluindo o teste crítico **100 fontes → no máximo `MaxSourcesPerChannel`
-selecções**.
+`m3uCrawler.Tests/ChannelSourceSelectorTests.cs` (53 testes): volume
+(100/1, 100/10, 100/100, <10, =10, >10), dedup e identidade de URL (fragmento,
+scheme, porta por omissão, query, userinfo), fornecedores (distintos, únicos,
+desconhecidos, mistos), diversidade on/off, limites por fornecedor, limite do
+canal vs limite por fornecedor, fallback, edge cases (URL inválida/vazia,
+não-working, disponibilidade terminal, desconhecidos, empate, vazio, unitário),
+motivos e precedência, ranking e determinismo (permutações + empates
+deliberados) — incluindo o teste crítico **100 fontes → no máximo
+`MaxSourcesPerChannel` selecções**.

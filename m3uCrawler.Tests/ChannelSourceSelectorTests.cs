@@ -67,6 +67,29 @@ public class ChannelSourceSelectorTests
         + "||"
         + string.Join("|", r.Rejected.Select(x => $"{x.Candidate.StreamUrl}:{x.Reason}"));
 
+    /// <summary>
+    /// Permutações determinísticas de uma lista (original, inversa,
+    /// duas rotações e uma permutação fixa) para provar independência da
+    /// ordem de entrada sem usar aleatoriedade.
+    /// </summary>
+    private static IEnumerable<IReadOnlyList<SelectionCandidate>> Permutations(
+        IReadOnlyList<SelectionCandidate> list)
+    {
+        yield return list;
+        yield return list.Reverse().ToList();
+        yield return list.Skip(1).Concat(list.Take(1)).ToList();
+        yield return list.Skip(3).Concat(list.Take(3)).ToList();
+
+        var permuted = new List<SelectionCandidate>(list.Count);
+        var order = new[] { 4, 1, 5, 0, 3, 2 };
+        foreach (var i in order)
+        {
+            if (i < list.Count) permuted.Add(list[i]);
+        }
+        for (var i = 6; i < list.Count; i++) permuted.Add(list[i]);
+        yield return permuted;
+    }
+
     // ---------------- volume ----------------
 
     [Fact]
@@ -171,6 +194,63 @@ public class ChannelSourceSelectorTests
 
         Assert.Equal(2, result.Selected.Count);
         Assert.Empty(result.Rejected);
+    }
+
+    [Fact]
+    public void Urls_differing_only_by_fragment_are_equivalent()
+    {
+        var result = _selector.Select(
+            new[]
+            {
+                Candidate("http://frag.example/x#one", 1, "prov-a"),
+                Candidate("http://frag.example/x#two", 2, "prov-b"),
+            },
+            Policy(max: 10));
+
+        Assert.Single(result.Selected);
+        Assert.Equal(SelectionReasons.DuplicateUrl, result.Rejected.Single().Reason);
+    }
+
+    [Fact]
+    public void Urls_differing_only_by_scheme_are_not_equivalent()
+    {
+        var result = _selector.Select(
+            new[]
+            {
+                Candidate("http://scheme.example/x", 1, "prov-a"),
+                Candidate("https://scheme.example/x", 2, "prov-b"),
+            },
+            Policy(max: 10));
+
+        Assert.Equal(2, result.Selected.Count);
+    }
+
+    [Fact]
+    public void Urls_differing_only_by_query_are_not_equivalent()
+    {
+        var result = _selector.Select(
+            new[]
+            {
+                Candidate("http://query.example/x?a=1", 1, "prov-a"),
+                Candidate("http://query.example/x?a=2", 2, "prov-b"),
+            },
+            Policy(max: 10));
+
+        Assert.Equal(2, result.Selected.Count);
+    }
+
+    [Fact]
+    public void Urls_differing_only_by_userinfo_are_not_equivalent()
+    {
+        var result = _selector.Select(
+            new[]
+            {
+                Candidate("http://user:pass@auth.example/x", 1, "prov-a"),
+                Candidate("http://auth.example/x", 2, "prov-b"),
+            },
+            Policy(max: 10));
+
+        Assert.Equal(2, result.Selected.Count);
     }
 
     [Fact]
@@ -360,6 +440,22 @@ public class ChannelSourceSelectorTests
         var result = _selector.Select(Many(4, 2), Policy(max: 10, maxPerProvider: 5));
 
         Assert.Equal(4, result.Selected.Count);
+    }
+
+    [Fact]
+    public void Channel_limit_is_absolute_when_smaller_than_provider_limit()
+    {
+        var candidates = Enumerable.Range(1, 10)
+            .Select(i => Candidate($"http://one.example/{i}.ts", i, "prov-a"))
+            .ToList();
+
+        var result = _selector.Select(
+            candidates,
+            Policy(max: 2, distinctProviders: true, maxPerProvider: 5, allowFallback: true));
+
+        Assert.Equal(2, result.Selected.Count);
+        Assert.Equal(8, result.Rejected.Count);
+        Assert.All(result.Rejected, r => Assert.Equal(SelectionReasons.LimitReached, r.Reason));
     }
 
     // ---------------- fallback ----------------
@@ -603,6 +699,64 @@ public class ChannelSourceSelectorTests
         Assert.Contains(mixed.Rejected, r => r.Reason == SelectionReasons.InvalidUrl);
     }
 
+    [Fact]
+    public void Limit_reached_takes_precedence_over_provider_reasons()
+    {
+        // Max=1 com 2 providers × 2 candidatos: o limite do canal domina
+        // mesmo para candidatos que também seriam provider/fallback-limited.
+        var candidates = new[]
+        {
+            Candidate("http://a1.example/x.ts", 1, "prov-a"),
+            Candidate("http://a2.example/x.ts", 2, "prov-a"),
+            Candidate("http://b1.example/x.ts", 3, "prov-b"),
+            Candidate("http://b2.example/x.ts", 4, "prov-b"),
+        };
+
+        var result = _selector.Select(candidates, Policy(max: 1, maxPerProvider: 1, allowFallback: false));
+
+        Assert.Single(result.Selected);
+        Assert.All(result.Rejected, r => Assert.Equal(SelectionReasons.LimitReached, r.Reason));
+    }
+
+    [Fact]
+    public void Provider_limit_takes_precedence_over_fallback_disabled()
+    {
+        var candidates = new[]
+        {
+            Candidate("http://p1.example/x.ts", 1, "prov-a"),
+            Candidate("http://p2.example/x.ts", 2, "prov-a"),
+        };
+
+        var result = _selector.Select(candidates, Policy(max: 10, maxPerProvider: 1, allowFallback: false));
+
+        Assert.Single(result.Selected);
+        Assert.Equal(SelectionReasons.ProviderLimit, result.Rejected.Single().Reason);
+    }
+
+    [Fact]
+    public void Not_selected_reason_is_never_emitted()
+    {
+        var scenarios = new[]
+        {
+            _selector.Select(Many(20, 3), Policy(max: 5, maxPerProvider: 2)),
+            _selector.Select(Many(20, 3), Policy(max: 5, maxPerProvider: 1, allowFallback: false)),
+            _selector.Select(Many(20, 1), Policy(max: 5, allowFallback: false)),
+            _selector.Select(
+                new[]
+                {
+                    Candidate("http://dup.example/x.ts", 1, "prov-a"),
+                    Candidate("http://dup.example/x.ts", 2, "prov-b"),
+                    Candidate("not-a-url", 3, "prov-c"),
+                    Candidate("http://off.example/x.ts", 4, "prov-d", isWorking: false),
+                    Candidate("http://dead.example/x.ts", 5, "prov-e", availability: AvailabilityState.Dead),
+                },
+                Policy(max: 2)),
+        };
+
+        Assert.All(scenarios, s =>
+            Assert.DoesNotContain(s.Rejected, r => r.Reason == SelectionReasons.NotSelected));
+    }
+
     // ---------------- determinism ----------------
 
     [Fact]
@@ -618,16 +772,44 @@ public class ChannelSourceSelectorTests
     }
 
     [Fact]
-    public void Input_order_does_not_change_selection()
+    public void Selection_is_identical_across_permutations()
     {
-        var candidates = Many(50, 12);
-        var reversed = candidates.AsEnumerable().Reverse().ToList();
-        var policy = Policy(max: 10, maxPerProvider: 2);
+        var candidates = Many(30, 9);
+        var policy = Policy(max: 8, maxPerProvider: 2);
 
-        var first = _selector.Select(candidates, policy);
-        var second = _selector.Select(reversed, policy);
+        var signatures = Permutations(candidates)
+            .Select(order => Signature(_selector.Select(order, policy)))
+            .Distinct()
+            .ToList();
 
-        Assert.Equal(Signature(first), Signature(second));
+        Assert.Single(signatures);
+    }
+
+    [Fact]
+    public void Tied_candidates_are_deterministic_across_input_orders()
+    {
+        // Cada par empata em TODAS as chaves de ranking actuais: a URL difere
+        // só onde `NormalizeUrl` colapsa (scheme/host), e provider, SourceId,
+        // ExternalStreamId, prioridade, qualidade, EPG, disponibilidade e
+        // response time são iguais. Sem o tie-break total (R1), a dedup e a
+        // ordem dos rejeitados dependeriam da ordem de entrada.
+        var all = new List<SelectionCandidate>
+        {
+            Candidate("http://tie-a.example/x", 1, "prov-x"),
+            Candidate("HTTP://TIE-A.EXAMPLE/x", 1, "prov-x"),
+            Candidate("http://tie-b.example/x", 2, "prov-y"),
+            Candidate("HTTP://TIE-B.EXAMPLE/x", 2, "prov-y"),
+            Candidate("http://tie-c.example/x", 3, "prov-z"),
+            Candidate("HTTP://TIE-C.EXAMPLE/x", 3, "prov-z"),
+        };
+        var policy = Policy(max: 3, distinctProviders: true, allowFallback: true);
+
+        var signatures = Permutations(all)
+            .Select(order => Signature(_selector.Select(order, policy)))
+            .Distinct()
+            .ToList();
+
+        Assert.Single(signatures);
     }
 
     [Fact]

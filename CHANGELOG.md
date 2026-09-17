@@ -19,6 +19,15 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
   - **Documentação**: nova secção `# Upgrade de instalações existentes (decisão pós-9C.4)` em `docs/architecture/configuration-lifecycle.md`, usando exclusivamente terminologia já estabelecida no projecto (`ConfigurationLifecycleState`, `AdoptedFromLegacy`, `AuthMode.Legacy`, `L2`, `ConfigurationGate`, etc.).
 
 ### 🛡️ Correcções / Hardening
+- **PHASE 13 — Wave 13-1 hardening (2026-09-17): determinismo absoluto e cobertura de testes.**
+  - **R1 — determinismo em empates extremos:** `ChannelSourceSelector` passa a terminar a ordenação numa **ordem total** sobre todos os campos do candidato (Provider, URL ordinal, `SourceId`, `ExternalStreamId`, prioridade, qualidade, EPG, disponibilidade, response time, `IsWorking`), sem hashes, referências de objecto, relógio ou aleatoriedade. Elimina a dependência da ordem de entrada na deduplicação e na ordem dos rejeitados; a URL ordinal só distingue o que a URL normalizada não distingue.
+  - **R2 — `not-selected`:** mantido por estabilidade de vocabulário, mas marcado explicitamente como **reservado/nunca emitido** (a Fase B esgota os casos possíveis); documentado no XML e na arquitectura, com teste que fixa que não é emitido.
+  - **R3 — precedência de motivos:** documentada e fixada por testes de caracterização — `duplicate-url` → inelegibilidade → `limit-reached` → `provider-limit` → `fallback-disabled`.
+  - **R4 — identidade de URL:** cobertura explícita para fragmento (equivalente), scheme `http` vs `https` (distinto), query (preservada) e userinfo (preservado).
+  - **R5 — limites combinados:** teste de `MaxSourcesPerChannel < MaxSourcesPerProvider` (10 candidatos/1 provider, max=2, per=5 → 2 seleccionados, 8 `limit-reached`), confirmando o tecto absoluto do canal.
+  - **R6 — determinismo:** testes comparam a assinatura completa (Selected/rank/motivo, Rejected/motivo) em múltiplas permutações (original, inversa, rotações, permutação fixa) e num dataset com empates deliberados.
+  - **Testes:** `ChannelSourceSelectorTests` passa de 44 para 53; sem alterações ao pipeline de produção. Documentado em `docs/architecture/dispatcharr-source-selection.md`.
+
 - **Wave 10-0 (2026-09-17): consolidação segura do caminho agendado Dispatcharr.**
   - **Falha corrigida:** `ScheduledDispatcharrSyncAction` construía `new ChannelMatcher(aliases)` e `DispatcharrSyncService` **sem** `CatalogResolver`, activando o modo legacy (todas as streams tratadas como `CrawlerManaged`). O ownership guard ficava inactivo no caminho agendado, podendo emitir `DELETE`/rename de streams `External`/`Unknown`. A acção passa a injectar o `CatalogResolver` (DI singleton em `ScheduledAutomationHost`) no `ChannelMatcher` e no `DispatcharrSyncService`, exactamente como o caminho principal `Program.cs`.
   - **Contrato da playlist explicitado:** existe uma única playlist funcional, `output/playlist.m3u` (constante `FunctionalPlaylistFileName`), consumida pelo sync; não é criada uma segunda playlist. Documentado em `docs/architecture/channel-catalog-and-ownership.md` §13.
