@@ -54,6 +54,15 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
   - Documentação alinhada (`docs/architecture/configuration-lifecycle.md`, `m3uCrawler/README.md`).
 
 ### ✨ Adicionado
+- **PHASE 13 — Wave 13-3 (2026-09-17): selecção de fontes aplicada à publicação Telegram.**
+  - Nova `SourceSelectionStage` (`m3uCrawler/Services/SourceSelection/`): junta as streams do pipeline (URL real, só em memória) aos `ChannelSource` do catálogo pela chave `CredentialSanitizer.SanitizeUrl(realUrl)` — a mesma chave de unicidade do catálogo — projecta `SelectionCandidate`, aplica `IChannelSourceSelector` por canal canónico e devolve a lista publicável. Catálogo apenas lido; não escreve ficheiros.
+  - Projection: `Provider` = host normalizado (`Uri.Host`, lowercase, sem `www.`/ponto final/porta); `Availability` = runtime `IsWorking`; `LastResponseTimeMs` = runtime; `Quality`/`Epg` = `Unknown`; `SourcePriority` do catálogo (actualmente 0).
+  - Semântica: `ChannelSource.IsEnabled=false` → excluída (`source-disabled`); 0 correspondências ou URL mapeada a >1 canal canónico → pass-through (não conta para limites); catálogo ausente/vazio/falha de leitura → **no-op** (pipeline resiliente).
+  - Defaults em memória (sem persistência nem migration): `MaxSourcesPerChannel=10`, `MaxSourcesPerProvider=null`, `PreferDistinctProviders=true`, `AllowFallbackToSameProvider=true`.
+  - Integração nos dois pontos de publicação Telegram (single-cycle e manutenção, após `MergeStreams`); a playlist recebe apenas seleccionadas + não correspondidas, com as URLs reais preservadas; `DispatcharrSyncService`, `MatchPlan` e ownership inalterados.
+  - Diagnóstico agregado em `RunReport.SourceSelection` (contagens; nunca URLs/credenciais). Contrato congelado do `RunReport` actualizado (`+SourceSelection`, 55→56 propriedades).
+  - **25 testes** novos em `SourceSelectionStageTests` (junção exacta incl. URL Xtream, projecção, matching/ambiguous/no-op, `source-disabled`, limites/diversidade/fallback/dedup, ordem de publicação, determinismo, segurança de credenciais). Documentado em `docs/architecture/dispatcharr-source-selection.md` §10.
+
 - **PHASE 13 — Wave 13-1 (2026-09-17): política pura de selecção de ChannelSources.**
   - Nova abstracção isolada em `m3uCrawler/Services/SourceSelection/`: `SelectionCandidate`, `SourceSelectionPolicy`, `ProviderIdentity`, `IChannelSourceSelector`/`ChannelSourceSelector` e `SourceSelectionResult`. Função pura `Candidates + Policy → Result`, sem filesystem, base de dados, HTTP, Dispatcharr, scheduler, Telegram ou Dashboard.
   - Algoritmo em duas fases: **A** diversidade (um representante por fornecedor distinto quando `PreferDistinctProviders`) e **B** preenchimento (respeita `MaxSourcesPerProvider` e `AllowFallbackToSameProvider`). `MaxSourcesPerChannel` é o tecto absoluto; nenhum valor está hardcoded.

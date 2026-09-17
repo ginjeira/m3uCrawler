@@ -35,7 +35,8 @@ public class Phase94LiveRunHardeningTests : IAsyncLifetime
     /// <summary>
     /// Contrato congelado do <see cref="RunReport"/>. Qualquer adição,
     /// remoção ou renomeação deve ser uma decisão explícita — o 9C.4 não
-    /// altera este contrato.
+    /// altera este contrato. PHASE 13 (Wave 13-3) adicionou
+    /// <c>SourceSelection</c> (diagnóstico agregado, sem URLs).
     /// </summary>
     private static readonly string[] FrozenRunReportProperties =
     {
@@ -67,6 +68,7 @@ public class Phase94LiveRunHardeningTests : IAsyncLifetime
         "PublicationsTriageLog",
         "PublicationsUnsupported",
         "RejectionReasons",
+        "SourceSelection",
         "StartedAt",
         "Status",
         "StreamsAfterCountryFilter",
@@ -142,7 +144,7 @@ public class Phase94LiveRunHardeningTests : IAsyncLifetime
             .OrderBy(x => x, StringComparer.Ordinal)
             .ToArray();
 
-        Assert.Equal(55, actual.Length);
+        Assert.Equal(56, actual.Length);
         Assert.Equal(expected, actual);
     }
 

@@ -7,6 +7,7 @@ using m3uCrawler.Services.Configuration;
 using m3uCrawler.Services.LiveRun;
 using m3uCrawler.Services.Matching;
 using m3uCrawler.Services.SourceOrdering;
+using m3uCrawler.Services.SourceSelection;
 using m3uCrawler.Services.Validation;
 using m3uCrawler.Models;
 using System.Text;
@@ -347,6 +348,7 @@ namespace m3uCrawler
                                         telegramHistoryHours,
                                         args,
                                         pipelineIngestor,
+                                        catalogForIngestion,
                                         countryCode,
                                         countriesDirectory,
                                         progress,
@@ -462,6 +464,7 @@ namespace m3uCrawler
                                 telegramHistoryHours,
                                 args,
                                 pipelineIngestor,
+                                catalogForIngestion,
                                 countryCode,
                                 countriesDirectory);
                         }
@@ -532,6 +535,19 @@ namespace m3uCrawler
                         var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
                         var playlistPath = Path.Combine(outputDir, $"telegram_playlist_{timestamp}.m3u");
                         var reportPath = Path.Combine(outputDir, $"telegram_report_{timestamp}.json");
+
+                        // PHASE 13 (Wave 13-3) — selecção de fontes antes da publicação.
+                        var singleCycleSelection = await new SourceSelectionStage(catalogForIngestion)
+                            .ApplyAsync(workingStreams, SourceSelectionDefaults.DefaultPolicy, CancellationToken.None);
+                        runReport.SourceSelection = singleCycleSelection.ToReport();
+                        if (singleCycleSelection.Applied)
+                        {
+                            Console.WriteLine(
+                                $"🧩 Selecção Phase 13: selected={singleCycleSelection.Selected.Count} " +
+                                $"rejected={singleCycleSelection.Rejected.Count} unmatched={singleCycleSelection.Unmatched.Count} " +
+                                $"canais={singleCycleSelection.MatchedChannelCount} ambíguos={singleCycleSelection.AmbiguousCount}");
+                        }
+                        workingStreams = singleCycleSelection.Published.ToList();
 
                         await telegramPlaylistManager.SaveToM3uPlaylist(workingStreams, playlistPath);
                         await telegramPlaylistManager.SaveToJsonReport(workingStreams, reportPath);
@@ -960,6 +976,7 @@ namespace m3uCrawler
             int telegramHistoryHours,
             string[] args,
             PipelineIngestionService? pipelineIngestor,
+            CatalogResolver? catalog,
             string countryCode = "pt",
             string? countriesDir = null,
             ILiveRunProgress? liveRunProgress = null,
@@ -1086,6 +1103,19 @@ namespace m3uCrawler
                     .ConfigureAwait(false);
             }
             var finalStreams = TelegramScraperService.MergeStreams(stillWorkingMain, freshStreams);
+
+            // PHASE 13 (Wave 13-3) — selecção de fontes sobre a playlist final.
+            var maintenanceSelection = await new SourceSelectionStage(catalog)
+                .ApplyAsync(finalStreams, SourceSelectionDefaults.DefaultPolicy, cancellationToken);
+            runReport.SourceSelection = maintenanceSelection.ToReport();
+            if (maintenanceSelection.Applied)
+            {
+                Console.WriteLine(
+                    $"🧩 Selecção Phase 13: selected={maintenanceSelection.Selected.Count} " +
+                    $"rejected={maintenanceSelection.Rejected.Count} unmatched={maintenanceSelection.Unmatched.Count} " +
+                    $"canais={maintenanceSelection.MatchedChannelCount} ambíguos={maintenanceSelection.AmbiguousCount}");
+            }
+            finalStreams = maintenanceSelection.Published.ToList();
 
             liveRunProgress?.ReportCounts(counts =>
             {

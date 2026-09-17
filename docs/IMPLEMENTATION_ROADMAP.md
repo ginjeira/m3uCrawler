@@ -4332,7 +4332,7 @@ Este documento define **como completar a evolução até ao sistema funcional pr
 > implementada isoladamente em `m3uCrawler/Services/SourceSelection/`:
 > `SelectionCandidate`, `SourceSelectionPolicy`, `ProviderIdentity`,
 > `IChannelSourceSelector`/`ChannelSourceSelector` e `SourceSelectionResult`
-> (pura, sem I/O, 44 testes em `ChannelSourceSelectorTests`). Suporta
+> (pura, sem I/O, 53 testes em `ChannelSourceSelectorTests`, após o hardening 13-1a). Suporta
 > `MaxSourcesPerChannel` (sem valor hardcoded), `PreferDistinctProviders`,
 > `MaxSourcesPerProvider`, `AllowFallbackToSameProvider`, deduplicação por URL
 > normalizada, diversidade em duas fases, ranking determinístico e motivos por
@@ -4345,6 +4345,20 @@ Este documento define **como completar a evolução até ao sistema funcional pr
 > "sucesso/qualidade histórica" e "estabilidade/recência da validação" não são
 > suportados nesta wave porque o candidato não tem campos para eles; ficam para
 > wave posterior, como previsto.*
+
+> **Nota factual (Wave 13-3, 2026-09-17).** A aplicação da política ao pipeline
+> Telegram foi implementada (`SourceSelectionStage`): junção exacta das streams do
+> pipeline (URL real, só em runtime) aos `ChannelSource` do catálogo pela chave
+> sanitizada, projecção para `SelectionCandidate`, aplicação de
+> `IChannelSourceSelector` por canal canónico e devolução da lista publicável
+> (seleccionadas + não correspondidas) antes de `SaveToM3uPlaylist`, nos dois pontos
+> de publicação Telegram. `source-disabled` exclui; não correspondidas/ambíguas fazem
+> pass-through; catálogo ausente/vazio ⇒ no-op. Sem persistência nova, sem migration,
+> sem alterações ao Dispatcharr/`MatchPlan`/ownership. Diagnóstico agregado em
+> `RunReport.SourceSelection` (só contagens). Continuam pendentes: persistência/
+> Dashboard da política, produtores de Quality/EPG, correcção do reset de
+> `Source.Priority`, integração no composer/discovery. Detalhe em
+> `docs/architecture/dispatcharr-source-selection.md` §10.
 
 > **Nota factual (2026-09-17) — `BuildPlanFromCompositionAsync`.** O método
 > existe em `ChannelMatcher` mas continua **sem call site de produção e sem

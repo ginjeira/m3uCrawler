@@ -221,5 +221,29 @@ namespace m3uCrawler.Models
         public int TraceEventsAttachmentDownloadFailed { get; set; }
         public int TraceEventsXtreamAccount { get; set; }
         public int TraceEventsCandidatePromoted { get; set; }
+
+        // === PHASE 13 (Wave 13-3) — Source Selection ===
+        // Diagnóstico agregado da aplicação da política de selecção de
+        // fontes ao pipeline Telegram. Só contagens; nunca URLs nem
+        // credenciais. Null quando o estágio não correu (ex.: pipeline
+        // sem catálogo).
+        public SourceSelectionReport? SourceSelection { get; set; }
+    }
+
+    /// <summary>
+    /// PHASE 13 (Wave 13-3) — Contagens agregadas da selecção de fontes.
+    /// Não contém URLs, usernames, passwords nem tokens.
+    /// </summary>
+    public class SourceSelectionReport
+    {
+        public bool Applied { get; set; }
+        public int MatchedChannelCount { get; set; }
+        public int AmbiguousCount { get; set; }
+        public int SelectedCount { get; set; }
+        public int RejectedCount { get; set; }
+        public int UnmatchedCount { get; set; }
+
+        /// <summary>Contagens por motivo de rejeição (ex.: "source-disabled", "limit-reached").</summary>
+        public Dictionary<string, int> RejectionCounts { get; set; } = new();
     }
 }
