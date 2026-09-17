@@ -272,3 +272,236 @@ administrativo anónimo por falha de wiring.
 Testes de referência: `AuthPrimitivesTests`, `AdminSessionStoreTests`,
 `BootstrapServiceTests`, `BootstrapConfigurationValidatorTests`,
 `DashboardBootstrapEndpointTests`.
+
+---
+
+# Upgrade de instalações existentes (decisão pós-9C.4)
+
+> Esta secção regista **decisões de desenho** tomadas durante o fecho
+> da PHASE 9C (wave 9C.4, revisão independente final) sobre o
+> comportamento do lifecycle ao fazer upgrade de uma instalação já
+> existente. **Não altera o código nem os contratos do configuration
+> lifecycle implementados em 9C.1/9C.2.** Apenas formaliza a
+> interpretação do desenho actual quando o sistema arranca numa
+> instalação real pré-existente.
+
+A máquina de estados `ConfigurationLifecycleState` mantém-se
+exactamente como está (`NotConfigured` → `Configuring` → `Ready`). O
+que esta secção explicita é o **fluxo esperado** para cada cenário de
+arranque, separando "instalação nova" de "upgrade de instalação
+existente com dados persistentes".
+
+## Terminologia
+
+Reutiliza os conceitos já existentes no projecto:
+
+- **Estados**: `NotConfigured` (`NOT_CONFIGURED`), `Configuring`
+  (`CONFIGURING`), `Ready` (`READY`).
+- **Wire names** (forma canónica em serializações): `NOT_CONFIGURED`,
+  `CONFIGURING`, `READY`.
+- **Adoção legacy**: processo documentado em §"Critério de legacy
+  adoption" — recolha de evidência objectiva (entidades não criadas
+  por uma instalação nova, artefactos de output) e adopção do estado
+  `READY` com `AdoptedFromLegacy=true`. Os nomes da evidência são
+  registados.
+- **Configuração mínima L2**: conjunto mínimo para o estado
+  `READY` (administrador activo, catálogo canónico utilizável,
+  output directory utilizável, Dispatcharr válido se activado). Ver
+  tabela no §"Configuração mínima (L2) para READY".
+- **Bootstrap Wizard**: fluxo exposto pelos endpoints
+  `GET /bootstrap`, `POST /api/bootstrap/start`, `POST /api/bootstrap/admin`,
+  `POST /api/bootstrap/complete` (ver §"Fluxo de bootstrap").
+- **Modos de autorização** (Bootstrap / UserAuth / Legacy): ver
+  §"Modos de autorização". O modo `Legacy` aplica-se exactamente
+  quando `READY` ∧ sem administrador activo.
+
+## Estado conceptual de upgrade: `BOOTSTRAP_REQUIRED`
+
+Não é um novo `ConfigurationLifecycleState` (a enumeração do estado
+não muda). É um **rótulo conceptual** que descreve uma situação
+operacional reconhecida no arranque:
+
+> Uma instalação foi adoptada como `READY` via legacy adoption
+> (`AdoptedFromLegacy=true`), mas **não existe administrador activo**.
+> A configuração existente está preservada e operacional; o que falta
+> é apenas um administrador para passar o `AuthMode` de `Legacy`
+> (token-only) para `UserAuth` (sessão humana ou machine token).
+
+Em termos de estado persistido:
+
+| Persistido | Em memória | Rótulo conceptual |
+|---|---|---|
+| `READY` + `AdoptedFromLegacy=true` | sem administrador activo | `BOOTSTRAP_REQUIRED` |
+| `READY` + `AdoptedFromLegacy=true` | com administrador activo | `READY` (operacional) |
+| `READY` (sem `AdoptedFromLegacy`) | sem administrador activo | (não acontece na prática: só após criação manual de admin) |
+| `NOT_CONFIGURED` | — | instalação nova, bootstrap normal |
+
+O rótulo `BOOTSTRAP_REQUIRED` não aparece no JSON persistido nem na
+API; é apenas uma forma de designar este cenário para efeitos desta
+secção. Implementações futuras que queiram distingui-lo podem fazê-lo
+**sem** adicionar valores a `ConfigurationLifecycleState`.
+
+## Decisões
+
+### 1. Instalação nova (sem configuração persistente)
+
+Uma instalação sem `configuration_lifecycle.json` válido e sem
+evidência de legacy adoption arranca em `NOT_CONFIGURED`. O Dashboard
+fica disponível (no modo `Bootstrap`); discovery automático e
+scheduler permanecem bloqueados pelo `IConfigurationGate`. O primeiro
+acesso ao Dashboard conduz ao **First-Run / Setup Wizard** (já
+implementado em 9C.2), que:
+
+- permite criar explicitamente o primeiro administrador
+  (`POST /api/bootstrap/admin` cria-o transaccionalmente);
+- valida e mostra o estado da configuração (`GET /api/configuration/lifecycle`);
+- completa o mínimo necessário para atingir `READY`
+  (`POST /api/bootstrap/complete` valida L2);
+- **não reconfigura nem substitui** elementos já correctamente
+  configurados (sources, policies, etc.); apenas valida o mínimo
+  L2 e persiste o estado.
+
+### 2. Instalação legacy / upgrade (com dados persistentes, sem administrador)
+
+Esta é a situação coberta pelo rótulo `BOOTSTRAP_REQUIRED` descrito
+acima. O sistema:
+
+- **preserva integralmente** os dados e a configuração existentes
+  (sources, ordering, policies, scheduled_jobs, sync_runs, etc.);
+- **detecta** evidência objectiva via
+  `LegacyConfigurationEvidenceEvaluator` (já implementado em 9C.1)
+  — entidades não criadas por uma instalação nova e artefactos de
+  output listados no §"Critério de legacy adoption";
+- **adopta** a configuração existente com `AdoptedFromLegacy=true`,
+  entrando em `READY` (não em `NOT_CONFIGURED`);
+- fica em **modo `Legacy`** (token-only) enquanto não existir
+  administrador activo;
+- o Dashboard fica **disponível** neste estado com o **First-Run /
+  Setup Wizard** activo, exactamente como numa instalação nova em
+  `NOT_CONFIGURED`/`CONFIGURING`. **Não é necessário recriar nem
+  importar a configuração existente**; o wizard apenas recolhe o
+  primeiro administrador.
+
+> Importante: na implementação actual, o modo `Bootstrap` (gate que
+> permite aceder ao wizard) é activado em `NOT_CONFIGURED` e
+> `CONFIGURING` mas **não** em `READY` sem administrador. Esta é uma
+> **extensão** ao desenho registada aqui como decisão. A sua
+> implementação efectiva — alargar o gate `Bootstrap` para também
+> cobrir `READY` ∧ sem administrador activo — pertence à próxima
+> wave (PHASE 9C.5 ou posterior) e **não é implementada** nesta
+> wave documental. Até essa extensão, um upgrade real exige
+> reconfiguração manual do admin (ver §"Notas operacionais").
+
+- assim que o primeiro administrador for criado, o `AuthMode`
+  transita automaticamente para `UserAuth` e o sistema fica em
+  `READY` operacional (a L2 já está satisfeita pela adopção legacy).
+
+### 3. Instalação já configurada (administrador válido existente)
+
+Se já existir um administrador activo no arranque, o `AuthMode` é
+`UserAuth` directamente. **Não** se apresenta o First-Run Wizard; o
+fluxo é o login normal. Esta decisão já está reflectida em §"Modos de
+autorização".
+
+### 4. Separação entre bootstrap e configuração
+
+O bootstrap do primeiro administrador **não** se confunde com uma
+reinstalação ou reconfiguração. O sistema preserva sempre a
+configuração existente e trata apenas a ausência do administrador
+como condição de bootstrap. Esta decisão já está parcialmente
+reflectida em:
+
+- §"Modelo de dados" (tabela `admin_users` separada das tabelas de
+  configuração);
+- §"Autoridade do estado persistido" (o estado de lifecycle é
+  autoridade, e o bootstrap apenas administra admin, não
+  configuração);
+- §"Critério de legacy adoption" (a adopção legacy não cria nem
+  importa admin — preserva dados e adopta o estado).
+
+A decisão 4 formaliza que esta separação é **intencional e
+preservada** em waves futuras: qualquer tooling ou script que
+trabalhe sobre `admin_users` deve assumir que existe um único efeito
+sobre o `AuthMode` e não toca na configuração subjacente.
+
+### 5. Upgrade em produção
+
+As decisões 1–4 são decisões de desenho. Não há alterações de código
+nesta wave. Quando chegar o momento de fazer o upgrade da instalação
+real de produção:
+
+- o **processo deve primeiro ser testado** contra uma cópia do
+  `runtime-data` da instalação de produção (volume `/data` ou
+  equivalente que contém `channel-catalog.db`,
+  `configuration_lifecycle.json` se já existir,
+  `admin_users`/`admin_sessions`, etc.);
+- o procedimento concreto (passos, ordem, validações) será
+  definido quando a wave de implementação arrancar (PHASE 9C.5 ou
+  posterior);
+- até lá, este documento é a única referência para a interpretação
+  correcta do lifecycle num upgrade.
+
+## Compatibilidade com o desenho actual
+
+| Cenário | Comportamento actual (9C.1/9C.2) | Comportamento decidido (esta secção) |
+|---|---|---|
+| Instalação nova sem admin | `NOT_CONFIGURED` → wizard → `READY` | Idêntico (decisão 1) |
+| Instalação legacy com admin | `READY` (adopt) → login normal | Idêntico (decisão 3) |
+| Instalação legacy sem admin | `READY` (adopt) + modo `Legacy` (token-only); sem wizard | `READY` (adopt) + modo `Legacy` (token-only); **com wizard** (decisão 2 — requer extensão do gate `Bootstrap` numa wave futura) |
+| Instalação `NOT_CONFIGURED` re-arrancada | Wizard retoma em `CONFIGURING` ou reinicia em `NOT_CONFIGURED` | Idêntico (já tratado em §"Fluxo de bootstrap") |
+| Instalação já em `CONFIGURING` | Wizard retoma no passo correspondente ao estado | Idêntico (idem) |
+
+A única alteração conceptual introduzida por esta secção é o
+**rótulo `BOOTSTRAP_REQUIRED`** e a expectativa de que o wizard esteja
+disponível em `READY` ∧ sem administrador. **Não há** alteração de
+código nesta wave; a sua implementação efectiva pertence a uma wave
+futura e deve respeitar integralmente o desenho aqui registado.
+
+## Notas operacionais (não alteram contratos)
+
+- O **processo de upgrade** da instalação real não está definido
+  nesta wave. Quando for definido, deve começar por uma cópia do
+  `runtime-data` em ambiente isolado (já é prática do projecto —
+  ver `AGENTS.md` §9).
+- O **teste do upgrade** deve cobrir todos os cenários da tabela
+  acima e incluir um teste explícito do cenário `BOOTSTRAP_REQUIRED`
+  (instalação adoptada sem admin → wizard → primeiro admin →
+  `READY` operacional). Esse teste ainda não existe; pertence à wave
+  de implementação do upgrade.
+- O **`AdoptedFromLegacy`** continua a ser o sinal persistente de
+  que a configuração foi adoptada. Não há migração de dados;
+  nenhum ficheiro é reescrito durante o bootstrap.
+
+## Ficheiros relevantes (sem alterações)
+
+Esta secção não introduz ficheiros novos nem altera os existentes.
+Os ficheiros de implementação envolvidos nas decisões acima
+continuam a ser:
+
+- `m3uCrawler/Services/Configuration/ConfigurationLifecycleService.cs`
+- `m3uCrawler/Services/Configuration/LegacyConfigurationEvidenceEvaluator.cs`
+- `m3uCrawler/Services/Configuration/ConfigurationGate.cs`
+- `m3uCrawler/Services/Configuration/AuthService.cs`
+- `m3uCrawler/Services/Configuration/AuthMode.cs`
+- `m3uCrawler/Services/Configuration/BootstrapService.cs`
+- `m3uCrawler/Services/Configuration/BootstrapConfigurationValidator.cs`
+- `m3uCrawler/Services/WebDashboardService.cs`
+
+## Testes de referência (sem alterações)
+
+Esta secção não introduz testes novos. Os testes existentes que
+continuam a validar o lifecycle e o bootstrap são:
+
+- `m3uCrawler.Tests/ConfigurationLifecycleTests.cs`
+- `m3uCrawler.Tests/ConfigurationGateSchedulerTests.cs`
+- `m3uCrawler.Tests/ConfigurationLifecycleEndpointTests.cs`
+- `m3uCrawler.Tests/AuthPrimitivesTests.cs`
+- `m3uCrawler.Tests/AdminSessionStoreTests.cs`
+- `m3uCrawler.Tests/BootstrapServiceTests.cs`
+- `m3uCrawler.Tests/BootstrapConfigurationValidatorTests.cs`
+- `m3uCrawler.Tests/DashboardBootstrapEndpointTests.cs`
+
+Os testes do cenário `BOOTSTRAP_REQUIRED` (instalação adoptada sem
+admin, wizard activo, criação do primeiro admin, transição para
+`READY` operacional) **não existem** ainda e pertencem à wave de
+implementação do upgrade.

@@ -3411,6 +3411,8 @@ observar:
 >
 > *Nota documental (2026-09-16, commit `ad1d3f6`): 9C.3 (canonical country, affinity kind e naming canónico para Dispatcharr) também se encontra implementada. O presente §32.18 será actualizado para reflectir o estado consolidado das três sub-waves numa próxima passagem documental dedicada.*
 >
+> *Nota documental (2026-09-17, pós-fecho 9C.4): 9C.2, 9C.3 e 9C.4 encontram-se igualmente implementadas e fechadas após revisão independente (`READY FOR CLOSURE`, commit `394061e`). A tabela de fases em §32 foi consolidada nesse fecho. As **decisões sobre o upgrade de instalações existentes** (cenário `BOOTSTRAP_REQUIRED` — instalação adoptada sem administrador) foram formalizadas em `docs/architecture/configuration-lifecycle.md` §"Upgrade de instalações existentes (decisão pós-9C.4)". Sem alterações de código nesta passagem; a extensão efectiva do gate `Bootstrap` para `READY` ∧ sem administrador activo pertence a uma wave de implementação futura (PHASE 9C.5 ou posterior).*
+>
 > Esta fase é uma condição de consolidação do produto antes de novas
 > funcionalidades. Não introduz uma segunda arquitectura: fecha o lifecycle
 > operacional sobre o catálogo, políticas, Dashboard e scheduler já existentes.

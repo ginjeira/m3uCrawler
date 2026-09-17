@@ -7,6 +7,16 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Unreleased]
 
+### 📋 Decisões
+- **PHASE 9C.4 — fecho (2026-09-17): decisões sobre upgrade de instalações existentes (bootstrap).**
+  - **1. Instalação nova** (sem configuração persistente): arranca em `NOT_CONFIGURED`; Dashboard disponível em modo `Bootstrap`; primeiro acesso conduz ao First-Run / Setup Wizard; o wizard cria o primeiro administrador e valida o mínimo (L2) para atingir `READY`; **não** reconfigura elementos já correctamente configurados.
+  - **2. Instalação legacy / upgrade** (com dados persistentes, sem administrador): detecta a evidência via `LegacyConfigurationEvidenceEvaluator`, adopta `READY` com `AdoptedFromLegacy=true`, preserva integralmente os dados existentes, entra em modo `Legacy` (token-only) e mantém o First-Run Wizard disponível para criar o primeiro administrador. Após a criação, transita automaticamente para `READY` operacional. **Não** é necessário recriar nem importar a configuração. O rótulo conceptual deste cenário é `BOOTSTRAP_REQUIRED` (`READY` ∧ sem admin); não é um novo valor da enumeração `ConfigurationLifecycleState`.
+  - **3. Instalação já configurada** (administrador válido existente): fluxo normal de login em `UserAuth`. **Não** se apresenta o First-Run Wizard.
+  - **4. Separação entre bootstrap e configuração**: o bootstrap do primeiro administrador é independente da configuração subjacente. O sistema preserva sempre a configuração existente e trata apenas a ausência de administrador como condição de bootstrap. Nenhum tooling sobre `admin_users` deve assumir reconfiguração.
+  - **5. Upgrade em produção**: quando chegar o momento de fazer o upgrade da instalação real, o processo deve primeiro ser testado contra uma cópia do `runtime-data` da instalação de produção, conforme prática já descrita em `AGENTS.md` §9.
+  - **Sem alterações de código nesta wave.** A extensão efectiva do gate `Bootstrap` para cobrir `READY` ∧ sem administrador activo (decisão 2) pertence a uma wave de implementação futura (PHASE 9C.5 ou posterior) e **não** é feita aqui. Esta é uma onda exclusivamente documental.
+  - **Documentação**: nova secção `# Upgrade de instalações existentes (decisão pós-9C.4)` em `docs/architecture/configuration-lifecycle.md`, usando exclusivamente terminologia já estabelecida no projecto (`ConfigurationLifecycleState`, `AdoptedFromLegacy`, `AuthMode.Legacy`, `L2`, `ConfigurationGate`, etc.).
+
 ### 🛡️ Correcções / Hardening
 - **PHASE 9C.4 — correcções pós-revisão (2026-09-17): wiring de recovery e isolamento do sweeper.**
   - **F-002 (recovery)**: `RunCoordinator.RecoverInterruptedRunsAsync()` é agora invocado no startup de produção, em ambos os caminhos (`--web --telegram` e `--telegram` standalone), imediatamente após o `RunCoordinator` ser configurado e **antes** de qualquer `StartAsync`. Runs interrompidos por crash anterior são marcados como `Failed` antes do próximo ciclo arrancar. A chamada é best-effort: uma falha não bloqueia o startup.
