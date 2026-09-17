@@ -254,6 +254,14 @@ todas as streams são tratadas como `CrawlerManaged` (fallback).
 Isto preserva o comportamento histórico para testes e para
 cenários onde o catalog ainda não foi activado.
 
+> **Wave 10-0 (2026-09-17)** — este fallback deixou de ser alcançável
+> nos **entry points de produção**. O caminho agendado
+> (`ScheduledDispatcharrSyncAction`) passou a construir o mesmo pipeline
+> canónico do caminho principal (`Program.cs`), injectando o
+> `CatalogResolver` no `ChannelMatcher` e no `DispatcharrSyncService`.
+> O modo legacy fica restrito à construção explícita sem catalog
+> (testes/caracterização). Ver §13.
+
 ### Regras invariantes
 
 - Streams com `Ownership = External` ou `Unknown` (ou sem
@@ -473,3 +481,43 @@ será feita numa migration dedicada posterior.
    sem apagar nada) com mensagem explícita;
 4. só se válido: remove a proveniência, remove as colunas novas e recria o
    índice único global.
+
+## 13. Caminho agendado e contrato da playlist (Wave 10-0)
+
+### Sincronização agendada com o pipeline canónico
+
+A acção `syncDispatcharr` (`ScheduledDispatcharrSyncAction`) construía o
+`ChannelMatcher` sem `CatalogResolver` (`new ChannelMatcher(aliases)`),
+o que activava o modo legacy e desligava o ownership registry na fase de
+apply. A Wave 10-0 corrige o wiring:
+
+- o `CatalogResolver` é injectado por DI (`ScheduledAutomationHost.Build`
+  regista-o como singleton) e passado a `ChannelMatcher(aliases, null, catalog)`;
+- o mesmo `CatalogResolver` é passado a `DispatcharrSyncService`;
+- o `DispatcharrSyncService` continua a aplicar a salvaguarda redundante
+  de ownership antes de qualquer `DELETE`.
+
+A partir daqui, **todos os entry points de produção** (pipeline Telegram em
+`Program.cs`, scheduler `syncDispatcharr`) respeitam as mesmas regras:
+`CrawlerManaged` pode ser actualizado/removido conforme o plano;
+`External`, `Unknown` e streams sem registo (com catalog) nunca geram
+`Removed`, `DELETE` nem rename. Sem catalog, a construção entra no modo
+legacy descrito em §6 — comportamento preservado apenas para testes.
+
+### Contrato da playlist funcional
+
+Existe **um único** artefacto funcional: `output/playlist.m3u`
+(`ScheduledDispatcharrSyncAction.FunctionalPlaylistFileName`). Não é criada
+uma segunda playlist para o sync. Este ficheiro é escrito pelas várias
+fases do crawler — `ScheduledM3uDiscoveryAction`, `ScheduledValidationAction`,
+`ScheduledPlaylistGenerationAction` (composição a partir de uma
+`OrderingList`) e o pipeline Telegram — e é consumido por:
+
+- `syncDispatcharr` (input do matching/apply);
+- `GET /api/playlist` no Dashboard;
+- `LegacyConfigurationEvidenceEvaluator` (evidência de adopção legacy).
+
+A origem efectiva é, portanto, o **último produtor** que correu. Isto é o
+comportamento histórico e não é alterado nesta wave; o que fica explícito é
+que o sync usa exactamente `output/playlist.m3u` e que não existe uma
+segunda fonte. A futura selecção de fontes (PHASE 13) parte deste contrato.

@@ -2247,7 +2247,7 @@ têm de ser fechados antes da consolidação final (PHASE 12).
 | **PHASE 9 — Quality / EPG / Availability** | **`[concluído]`** | PHASE 9A (performance), PHASE 9 b (histórico de observações) e visão agregada (dashboard de degradação) concluídos. |
 | **PHASE 9A — URL/Stream Validation Performance** | **`[concluído]`** | Ver secção 32.2. |
 | **PHASE 9 b — ChannelSource observation history** | **`[concluído]`** | `ChannelSourceObservationEntity` + endpoint GET/POST; Dashboard em construção para mostrar timeline. Ver detalhes em 32.7. |
-| **PHASE 10 — Dispatcharr** | **`[concluído]`** | `ChannelMatcher.BuildPlanFromCompositionAsync` consome `PlaylistComposition` (PHASE 7 + 6 + 4). Ver detalhes em 32.8. |
+| **PHASE 10 — Dispatcharr** | **`[concluído]`** | `ChannelMatcher.BuildPlanFromCompositionAsync` consome `PlaylistComposition` (PHASE 7 + 6 + 4). **Correcção factual (2026-09-17):** o adapter existe mas está sem call site de produção e sem testes; ver 32.8 e a nota em 32.19. |
 | **PHASE 11 — Runs dashboard detalhado** | **`[concluído]`** | `SyncRunStepEntity` + `GET/POST /api/catalog/sync-runs/{id}/steps` + Dashboard `Passos` por run. Ver detalhes em 32.9. |
 | **PHASE 12 — Automation / Scheduler** | **`[concluído]`** | `ScheduledJobEntity` + `CronExpression` + `ScheduledJobRunner` + 4 actions concretas (`discoverM3u`, `validatePlaylist`, `generatePlaylist`, `syncDispatcharr`) + `ScheduledAutomationHost` + arranque em produção no `--web` + 19 testes. Ver detalhes em 32.10 e 32.11. |
 
@@ -2745,6 +2745,12 @@ e ambiguity-detection sobre essas escolhas.
 2 testes em `DispatcharrCompositionTests.cs`:
 - `BuildPlanFromCompositionAsync_returns_plan_with_each_composed_channel`.
 - `BuildPlanFromCompositionAsync_throws_on_null_composition`.
+
+> **Correcção factual (2026-09-17):** a afirmação acima é **inexacta**. O
+> ficheiro `DispatcharrCompositionTests.cs` não existe e
+> `BuildPlanFromCompositionAsync` não tem call site de produção nem testes.
+> A PHASE 10 não é reaberta por esta correcção; a decisão fica pendente
+> (ver §32.19, nota "BuildPlanFromCompositionAsync").
 
 Resultado: PHASE 10 passa a `[concluído]`.
 
@@ -4297,7 +4303,7 @@ Este documento define **como completar a evolução até ao sistema funcional pr
 | PHASE 9 — Quality / EPG / Availability | `[concluído]` | 9A + 9b + visão agregada concluídos. |
 | PHASE 9A — URL/Stream Validation Perf. | `[concluído]` | 14 testes + 1 benchmark. Ver 32.2. |
 | PHASE 9b — ChannelSource observations | `[concluído]` | ChannelSourceObservationEntity + API + 3 testes. Ver 32.7. |
-| PHASE 10 — Dispatcharr | `[concluído]` | BuildPlanFromCompositionAsync + 2 testes. Ver 32.8. |
+| PHASE 10 — Dispatcharr | `[concluído]` | `BuildPlanFromCompositionAsync` existe mas sem call site de produção e sem testes (correcção factual 2026-09-17). Ver 32.8 e nota em 32.19. |
 | PHASE 11 — Operations | `[concluído]` | SyncRunStepEntity + API + Dashboard Passos + 4 testes. Ver 32.9. |
 | PHASE 12 — Automation / Scheduler | `[concluído]` | ScheduledJobEntity + CronExpression + Runner + 4 actions concretas (`discoverM3u`, `validatePlaylist`, `generatePlaylist`, `syncDispatcharr`) + arranque em produção via `Program.cs --web` + 19 testes. Ver 32.10 e 32.11. |
 | **PHASE 9C — First-Run / Configuration Lifecycle / Dashboard Hardening** | **`[em curso]`** | 9C.1 (lifecycle persistido `NOT_CONFIGURED/CONFIGURING/READY`, adopção legacy, gate de discovery/scheduler), 9C.2 (wizard de first-run, admin/sessões/CSRF, gate de autorização único), 9C.3 (affinity por país/canal, naming canónico normalizado, migration aditiva `AddCanonicalCountryAndAffinityKind`), 9C.4 (Live Run Monitor: `live_runs`/`live_run_steps`, `RunCoordinator` único, `GET /api/run/status` + `POST /api/run/start`, `--web-allow-trigger`, acções agendadas `telegramRun`/`telegramMaintainRun`, vista "Live Run" com polling) e 9C.5 (first-run/legacy bootstrap: `READY` ∧ sem admin resolve para `AuthMode.Bootstrap` em vez de `Legacy`, criação do primeiro admin sem alterar o estado nem reconfigurar a instalação, confirmação de password no wizard) implementadas. Nota documental 2026-09-17: esta linha descrevia 9C.2 como pendente apesar de já estar implementada; corrigida. Pendente: redesign do Dashboard, gate de command/endpoints, migração das afinidades e Manual/Ajuda contextual. Ver 32.18. |
@@ -4314,6 +4320,20 @@ Este documento define **como completar a evolução até ao sistema funcional pr
 >
 > A solução proposta é introduzir uma etapa explícita de **selecção/ranking de fontes por
 > canal**, imediatamente antes da sincronização para Dispatcharr.
+
+> **Nota factual (Wave 10-0, 2026-09-17).** Esta fase permanece `[pendente]`.
+> Antes de a iniciar, o caminho agendado `syncDispatcharr` foi consolidado:
+> passou a injectar o `CatalogResolver` (catálogo canónico + ownership) no
+> `ChannelMatcher` e no `DispatcharrSyncService`, eliminando o modo legacy
+> nesse caminho (ver `docs/architecture/channel-catalog-and-ownership.md` §13).
+> Nada da selecção/diversidade/limites descrita abaixo foi implementado.
+
+> **Nota factual (2026-09-17) — `BuildPlanFromCompositionAsync`.** O método
+> existe em `ChannelMatcher` mas continua **sem call site de produção e sem
+> testes**. A PHASE 10 não é reaberta nesta wave e o método não é integrado
+> apenas para satisfazer a documentação. A afirmação do §32.8 de que dois
+> testes em `DispatcharrCompositionTests.cs` fecharam a PHASE 10 é
+> **inexacta** (esse ficheiro não existe); decisão futura pendente.
 
 ## 1. Objectivo
 
