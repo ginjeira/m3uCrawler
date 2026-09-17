@@ -532,6 +532,174 @@ public class Phase94LiveRunApiTests : IAsyncLifetime
         Assert.DoesNotContain("Bearer", combined, StringComparison.OrdinalIgnoreCase);
     }
 
+    // ================ Subwave 6 — dashboard/UI + polling ================
+
+    [Fact]
+    public async Task Dashboard_page_exposes_live_run_view_with_light_polling()
+    {
+        _lifecycle.SetState(ConfigurationLifecycleState.Ready, "legacy-adoption:sources");
+        var host = await BuildHostAsync(executor: _ => IdlePipeline());
+        var harness = StartHarness(host, webAllowTrigger: true);
+
+        var response = await harness.Client.GetAsync("/");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var html = await response.Content.ReadAsStringAsync();
+
+        // Vista + controlos mínimos.
+        Assert.Contains("view-liverun", html, StringComparison.Ordinal);
+        Assert.Contains("loadLiveRun", html, StringComparison.Ordinal);
+        Assert.Contains("startLiveRun", html, StringComparison.Ordinal);
+        Assert.Contains("Run now", html, StringComparison.Ordinal);
+        Assert.Contains("/api/run/status", html, StringComparison.Ordinal);
+        Assert.Contains("/api/run/start", html, StringComparison.Ordinal);
+        // Polling leve (setInterval), sem SSE nem WebSocket.
+        Assert.Contains("setInterval", html, StringComparison.Ordinal);
+        Assert.DoesNotContain("EventSource", html, StringComparison.Ordinal);
+        Assert.DoesNotContain("new WebSocket", html, StringComparison.Ordinal);
+        // Nunca faz parsing de logs Docker.
+        Assert.DoesNotContain("docker logs", html, StringComparison.OrdinalIgnoreCase);
+        // Mostra as secções exigidas pelo plano.
+        Assert.Contains("Últimas actividades", html, StringComparison.Ordinal);
+        Assert.Contains("Últimas execuções", html, StringComparison.Ordinal);
+        Assert.Contains("telegramRun", html, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Status_payload_running_shape_exposes_counts_activities_and_recent_runs()
+    {
+        var running = new LiveRunSnapshot
+        {
+            RunId = "run-123",
+            Mode = LiveRunMode.Telegram,
+            Source = LiveRunSource.Manual,
+            StartedAtUtc = DateTime.UtcNow.AddSeconds(-10),
+            CurrentPhase = LiveRunPhase.Validating,
+            IsRunning = true,
+            PhaseIndex = 5,
+            PhaseStartedAtUtc = DateTime.UtcNow.AddSeconds(-2),
+            UpdatedAtUtc = DateTime.UtcNow,
+            Counts = new LiveRunCounts { StreamsTested = 7 },
+            RecentActivities = new[]
+            {
+                new LiveRunActivity(
+                    DateTime.UtcNow,
+                    LiveRunActivityCategory.Phase,
+                    LiveRunActivityLevel.Info,
+                    "fase validando iniciada",
+                    null),
+            },
+            Sanitized = true,
+        };
+        var previous = new LiveRunSnapshot
+        {
+            RunId = "run-old",
+            Mode = LiveRunMode.Telegram,
+            Source = LiveRunSource.Scheduler,
+            StartedAtUtc = DateTime.UtcNow.AddHours(-1),
+            FinishedAtUtc = DateTime.UtcNow.AddMinutes(-50),
+            TerminalStatus = LiveRunTerminalStatus.Completed,
+            Sanitized = true,
+        };
+
+        var payload = LiveRunApiMappings.ToStatusPayload(
+            live: running,
+            recentFinished: null,
+            pipelineConfigured: true,
+            webAllowTrigger: true,
+            coordinatorRunning: true,
+            recentRuns: new[] { previous });
+
+        var json = JsonSerializer.Serialize(payload);
+
+        Assert.Contains("\"status\":\"running\"", json, StringComparison.Ordinal);
+        Assert.Contains("run-123", json, StringComparison.Ordinal);
+        Assert.Contains("\"phase\":\"validating\"", json, StringComparison.Ordinal);
+        Assert.Contains("streamsTested", json, StringComparison.Ordinal);
+        Assert.Contains("recentActivities", json, StringComparison.Ordinal);
+        Assert.Contains("recentRuns", json, StringComparison.Ordinal);
+        Assert.Contains("run-old", json, StringComparison.Ordinal);
+        Assert.Contains("\"source\":\"scheduler\"", json, StringComparison.Ordinal);
+        Assert.Contains("\"webAllowTrigger\":true", json, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Status_payload_finished_shape_reports_terminal_status()
+    {
+        var finished = new LiveRunSnapshot
+        {
+            RunId = "run-456",
+            Mode = LiveRunMode.TelegramMaintain,
+            Source = LiveRunSource.Cli,
+            StartedAtUtc = DateTime.UtcNow.AddMinutes(-5),
+            FinishedAtUtc = DateTime.UtcNow.AddMinutes(-1),
+            TerminalStatus = LiveRunTerminalStatus.Failed,
+            IsRunning = false,
+            LastMessage = "failed: pipeline exception",
+            Sanitized = true,
+        };
+
+        var payload = LiveRunApiMappings.ToStatusPayload(
+            live: null,
+            recentFinished: finished,
+            pipelineConfigured: true,
+            webAllowTrigger: false);
+
+        var json = JsonSerializer.Serialize(payload);
+
+        Assert.Contains("\"status\":\"failed\"", json, StringComparison.Ordinal);
+        Assert.Contains("\"terminalStatus\":\"failed\"", json, StringComparison.Ordinal);
+        Assert.Contains("\"mode\":\"telegram-maintain\"", json, StringComparison.Ordinal);
+        Assert.Contains("\"source\":\"cli\"", json, StringComparison.Ordinal);
+        Assert.Contains("\"webAllowTrigger\":false", json, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Dashboard_and_status_never_expose_secret_markers()
+    {
+        _lifecycle.SetState(ConfigurationLifecycleState.Ready, "legacy-adoption:sources");
+        var host = await BuildHostAsync(executor: _ => IdlePipeline());
+        var harness = StartHarness(host, webAllowTrigger: true);
+
+        var page = await harness.Client.GetAsync("/");
+        var html = await page.Content.ReadAsStringAsync();
+        var status = await harness.Client.GetAsync("/api/run/status");
+        var statusBody = await status.Content.ReadAsStringAsync();
+        var combined = html + "\n" + statusBody;
+
+        Assert.DoesNotContain("password", combined, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("api_key", combined, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Begin ", combined, StringComparison.Ordinal);
+        Assert.DoesNotContain("Authorization: Bearer", combined, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("password=", combined, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Coordinator_lists_recent_finished_runs_ordered_and_capped()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"phase94-recent-{Guid.NewGuid():N}.db");
+        var bootstrapper = new ChannelCatalogBootstrapper(path);
+        await using (var bootstrapCtx = await bootstrapper.InitializeAsync()) { }
+
+        var factory = new TestDbContextFactory(path);
+        var coordinator = new RunCoordinator(factory, _ => IdlePipeline(), null);
+
+        for (var i = 0; i < 3; i++)
+        {
+            await coordinator.StartAsync(
+                new LiveRunRequest { Mode = LiveRunMode.Telegram, Source = LiveRunSource.Cli },
+                CancellationToken.None);
+        }
+
+        var recent = await coordinator.GetRecentFinishedSnapshotsAsync(2, CancellationToken.None);
+
+        Assert.Equal(2, recent.Count);
+        Assert.True(recent[0].FinishedAtUtc >= recent[1].FinishedAtUtc);
+        Assert.All(recent, r => Assert.Equal(LiveRunTerminalStatus.Completed, r.TerminalStatus));
+
+        var all = await coordinator.GetRecentFinishedSnapshotsAsync(10, CancellationToken.None);
+        Assert.Equal(3, all.Count);
+    }
+
     /// <summary>
     /// Harness isolado: regista explicitamente o <see cref="LiveRunHost"/>
     /// e o flag <c>--web-allow-trigger</c> antes de cada request.

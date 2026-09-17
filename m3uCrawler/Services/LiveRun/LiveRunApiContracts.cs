@@ -65,7 +65,8 @@ internal static class LiveRunApiMappings
         LiveRunSnapshot? recentFinished,
         bool pipelineConfigured,
         bool webAllowTrigger,
-        bool coordinatorRunning = false)
+        bool coordinatorRunning = false,
+        IReadOnlyList<LiveRunSnapshot>? recentRuns = null)
     {
         if (!pipelineConfigured)
         {
@@ -74,6 +75,7 @@ internal static class LiveRunApiMappings
                 isRunning = false,
                 status = "pipeline-not-configured",
                 lastRun = (object?)null,
+                recentRuns = RecentRunsToPayload(recentRuns),
                 webAllowTrigger,
             };
         }
@@ -86,12 +88,12 @@ internal static class LiveRunApiMappings
             // caso reportamos o estado terminal, nunca "idle".
             if (live.TerminalStatus is LiveRunTerminalStatus.Completed or LiveRunTerminalStatus.Failed)
             {
-                return SnapshotToFinishedPayload(live, webAllowTrigger);
+                return SnapshotToFinishedPayload(live, webAllowTrigger, recentRuns);
             }
 
             if (live.IsRunning)
             {
-                return SnapshotToRunningPayload(live, webAllowTrigger);
+                return SnapshotToRunningPayload(live, webAllowTrigger, recentRuns);
             }
         }
 
@@ -117,15 +119,17 @@ internal static class LiveRunApiMappings
                 phaseStartedAtUtc = (string?)null,
                 phases = AllPhases,
                 counts = (object?)null,
+                recentActivities = (object?)null,
                 lastMessage = (string?)null,
                 lastRun = (object?)null,
+                recentRuns = RecentRunsToPayload(recentRuns),
                 webAllowTrigger,
             };
         }
 
         if (recentFinished is not null)
         {
-            return SnapshotToFinishedPayload(recentFinished, webAllowTrigger);
+            return SnapshotToFinishedPayload(recentFinished, webAllowTrigger, recentRuns);
         }
 
         return new
@@ -133,11 +137,26 @@ internal static class LiveRunApiMappings
             isRunning = false,
             status = "idle",
             lastRun = (object?)null,
+            recentRuns = RecentRunsToPayload(recentRuns),
             webAllowTrigger,
         };
     }
 
-    private static object SnapshotToRunningPayload(LiveRunSnapshot s, bool webAllowTrigger)
+    private static object? RecentRunsToPayload(IReadOnlyList<LiveRunSnapshot>? recentRuns)
+    {
+        if (recentRuns is null || recentRuns.Count == 0) return null;
+        var items = new List<object>(recentRuns.Count);
+        foreach (var run in recentRuns)
+        {
+            items.Add(SnapshotToRecentRunItem(run));
+        }
+        return items;
+    }
+
+    private static object SnapshotToRunningPayload(
+        LiveRunSnapshot s,
+        bool webAllowTrigger,
+        IReadOnlyList<LiveRunSnapshot>? recentRuns)
     {
         return new
         {
@@ -155,17 +174,24 @@ internal static class LiveRunApiMappings
             phaseStartedAtUtc = s.PhaseStartedAtUtc?.ToString("o"),
             phases = AllPhases,
             counts = CountsToPayload(s.Counts),
+            recentActivities = ActivitiesToPayload(s.RecentActivities),
             lastMessage = s.LastMessage,
             lastRun = (object?)null,
+            recentRuns = RecentRunsToPayload(recentRuns),
             webAllowTrigger,
         };
     }
 
-    private static object SnapshotToFinishedPayload(LiveRunSnapshot s, bool webAllowTrigger)
+    private static object SnapshotToFinishedPayload(
+        LiveRunSnapshot s,
+        bool webAllowTrigger,
+        IReadOnlyList<LiveRunSnapshot>? recentRuns)
     {
-        var status = s.TerminalStatus == LiveRunTerminalStatus.Completed
+        var terminal = s.TerminalStatus == LiveRunTerminalStatus.Completed
             ? "completed"
-            : (s.TerminalStatus == LiveRunTerminalStatus.Failed ? "failed" : "idle");
+            : (s.TerminalStatus == LiveRunTerminalStatus.Failed ? "failed" : "unknown");
+
+        var status = terminal == "unknown" ? "idle" : terminal;
 
         return new
         {
@@ -175,7 +201,7 @@ internal static class LiveRunApiMappings
             {
                 runId = s.RunId,
                 mode = s.Mode.ToWireName(),
-                source = "persisted",
+                source = s.Source.ToWireName(),
                 startedAtUtc = s.StartedAtUtc.ToString("o"),
                 finishedAtUtc = s.FinishedAtUtc?.ToString("o"),
                 durationMs = s.FinishedAtUtc.HasValue
@@ -186,63 +212,57 @@ internal static class LiveRunApiMappings
                 phaseStartedAtUtc = s.PhaseStartedAtUtc?.ToString("o"),
                 phases = AllPhases,
                 counts = CountsToPayload(s.Counts),
+                recentActivities = ActivitiesToPayload(s.RecentActivities),
+                terminalStatus = terminal,
                 lastMessage = s.LastMessage,
             },
+            recentRuns = RecentRunsToPayload(recentRuns),
             webAllowTrigger,
         };
     }
 
-    private static object SnapshotToRunningPayload(LiveRunSnapshot s)
+    /// <summary>
+    /// Últimas execuções terminadas, em forma compacta, para a lista
+    /// "últimas execuções" do dashboard. Não inclui actividades (o feed
+    /// só existe para o run corrente/last in-process).
+    /// </summary>
+    private static object SnapshotToRecentRunItem(LiveRunSnapshot s)
     {
+        var terminal = s.TerminalStatus == LiveRunTerminalStatus.Completed
+            ? "completed"
+            : (s.TerminalStatus == LiveRunTerminalStatus.Failed ? "failed" : "unknown");
+
         return new
         {
-            isRunning = true,
             runId = s.RunId,
             mode = s.Mode.ToWireName(),
-            status = "running",
-            source = "live",
+            source = s.Source.ToWireName(),
+            terminalStatus = terminal,
             startedAtUtc = s.StartedAtUtc.ToString("o"),
-            lastUpdatedAtUtc = s.UpdatedAtUtc.ToString("o"),
-            finishedAtUtc = (string?)null,
-            durationMs = (long)(DateTime.UtcNow - s.StartedAtUtc).TotalMilliseconds,
-            phase = s.CurrentPhase?.ToString().ToLowerInvariant(),
-            phaseIndex = s.PhaseIndex,
-            phaseStartedAtUtc = s.PhaseStartedAtUtc?.ToString("o"),
-            phases = AllPhases,
-            counts = CountsToPayload(s.Counts),
+            finishedAtUtc = s.FinishedAtUtc?.ToString("o"),
+            durationMs = s.FinishedAtUtc.HasValue
+                ? (long)(s.FinishedAtUtc.Value - s.StartedAtUtc).TotalMilliseconds
+                : 0L,
             lastMessage = s.LastMessage,
-            lastRun = (object?)null,
         };
     }
 
-    private static object SnapshotToFinishedPayload(LiveRunSnapshot s)
+    private static object? ActivitiesToPayload(IReadOnlyList<LiveRunActivity>? activities)
     {
-        var status = s.TerminalStatus == LiveRunTerminalStatus.Completed
-            ? "completed"
-            : (s.TerminalStatus == LiveRunTerminalStatus.Failed ? "failed" : "idle");
+        if (activities is null || activities.Count == 0) return null;
 
-        return new
+        var items = new List<object>(activities.Count);
+        foreach (var a in activities)
         {
-            isRunning = false,
-            status,
-            lastRun = new
+            items.Add(new
             {
-                runId = s.RunId,
-                mode = s.Mode.ToWireName(),
-                source = "persisted",
-                startedAtUtc = s.StartedAtUtc.ToString("o"),
-                finishedAtUtc = s.FinishedAtUtc?.ToString("o"),
-                durationMs = s.FinishedAtUtc.HasValue
-                    ? (long)(s.FinishedAtUtc.Value - s.StartedAtUtc).TotalMilliseconds
-                    : 0L,
-                phase = s.CurrentPhase?.ToString().ToLowerInvariant(),
-                phaseIndex = s.PhaseIndex,
-                phaseStartedAtUtc = s.PhaseStartedAtUtc?.ToString("o"),
-                phases = AllPhases,
-                counts = CountsToPayload(s.Counts),
-                lastMessage = s.LastMessage,
-            },
-        };
+                timestampUtc = a.TimestampUtc.ToString("o"),
+                category = a.Category.ToString().ToLowerInvariant(),
+                level = a.Level.ToString().ToLowerInvariant(),
+                message = a.Message,
+            });
+        }
+        return items;
     }
 
     private static object? CountsToPayload(LiveRunCounts? counts)

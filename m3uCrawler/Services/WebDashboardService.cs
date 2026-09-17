@@ -3305,6 +3305,7 @@ namespace m3uCrawler.Services
     <button data-view='dispatcharr'>Dispatcharr</button>
     <button data-view='catalog'>Catálogo</button>
     <button data-view='validation'>Stream Validation</button>
+    <button data-view='liverun'>Live Run</button>
     <button data-view='diagnostics'>Diagnóstico</button>
   </nav>
 
@@ -3961,6 +3962,34 @@ namespace m3uCrawler.Services
       <details><summary>Ver RunReport completo</summary><pre id='diagRawRunReport'>a carregar…</pre></details>
       <h3 style='font-size:14px;margin-top:24px;'>Glossário de métricas</h3>
       <div id='diagGlossary'></div>
+    </section>
+
+    <!-- LIVE RUN (PHASE 9C.4) -->
+    <section id='view-liverun' hidden>
+      <h2 style='font-size:18px;margin-top:0;'>Live Run</h2>
+      <div class='toolbar'>
+        <span class='muted' id='liveRunPollState'>a actualizar automaticamente…</span>
+        <button id='liveRunStartBtn' onclick='startLiveRun()' disabled>Run now</button>
+        <button class='secondary' onclick='loadLiveRun()'>Recarregar</button>
+      </div>
+      <div class='card' style='margin-bottom:12px;'>
+        <div id='liveRunTriggerState' class='muted'></div>
+      </div>
+      <div id='liveRunStatus'></div>
+      <h3 style='font-size:14px;margin-top:24px;'>Contadores</h3>
+      <div class='grid' id='liveRunCounts'></div>
+      <h3 style='font-size:14px;margin-top:24px;'>Últimas actividades</h3>
+      <div id='liveRunActivities' class='muted'>—</div>
+      <h3 style='font-size:14px;margin-top:24px;'>Últimas execuções (24h)</h3>
+      <div id='liveRunRecent'></div>
+      <h3 style='font-size:14px;margin-top:24px;'>Execução agendada (Telegram)</h3>
+      <div class='muted' style='margin-bottom:8px;'>
+        O agendamento usa as expressões cron existentes em
+        <b>Scheduled Jobs</b> com as acções <code>telegramRun</code> e
+        <code>telegramMaintainRun</code>. Não há um segundo scheduler nem
+        <code>StartAtUtc</code>: a UI calcula a expressão cron.
+      </div>
+      <div id='liveRunScheduled'></div>
     </section>
   </main>
 
@@ -5839,6 +5868,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
 
     function showView(name) {
       console.log('[DEBUG] showView called:', name);
+      if (name !== 'liverun') stopLiveRunPolling();
       document.querySelectorAll('main > section').forEach(s => s.hidden = true);
       const targetSection = document.getElementById('view-' + name);
       targetSection.hidden = false;
@@ -5853,6 +5883,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
         case 'dispatcharr': loadDispatcharr(); break;
         case 'catalog': loadCatalog(); break;
         case 'validation': loadValidationPolicy(); break;
+        case 'liverun': loadLiveRun(); startLiveRunPolling(); break;
         case 'diagnostics': loadDiagnostics(); break;
       }
     }
@@ -5881,6 +5912,240 @@ const rows = Object.entries(inv).map(([k, v]) => {
     window.cancelAffinityEdit = cancelAffinityEdit;
     window.onAffinityKindChange = onAffinityKindChange;
     window.saveAffinityDelimiter = saveAffinityDelimiter;
+
+    // === PHASE 9C.4 — Live Run (polling leve; sem SSE/WebSocket, sem tail de logs) ===
+    var liveRunTimer = null;
+    var liveRunInFlight = false;
+    var liveRunLastPollUtc = null;
+
+    function liveRunStatusBadge(status) {
+      if (status === 'running') return "<span class='badge warn'>em execução</span>";
+      if (status === 'completed') return "<span class='badge ok'>concluída</span>";
+      if (status === 'failed') return "<span class='badge err'>falhada</span>";
+      if (status === 'pipeline-not-configured') return "<span class='badge muted'>pipeline não configurada</span>";
+      if (status === 'idle') return "<span class='badge muted'>idle</span>";
+      return "<span class='badge muted'>" + escapeHtml(status || '—') + "</span>";
+    }
+
+    function liveRunPhaseLabel(phase, phases) {
+      if (!phase) return '—';
+      var list = Array.isArray(phases) ? phases : [];
+      var idx = list.indexOf(phase);
+      var pos = idx >= 0 ? (' (' + (idx + 1) + '/' + list.length + ')') : '';
+      return escapeHtml(phase) + pos;
+    }
+
+    function liveRunDuration(ms) {
+      if (typeof ms !== 'number' || ms < 0 || !isFinite(ms)) return '—';
+      var s = Math.floor(ms / 1000);
+      if (s < 60) return s + 's';
+      var m = Math.floor(s / 60);
+      if (m < 60) return m + 'm ' + (s % 60) + 's';
+      var h = Math.floor(m / 60);
+      return h + 'h ' + (m % 60) + 'm';
+    }
+
+    function liveRunCountEntries(counts) {
+      if (!counts || typeof counts !== 'object') return [];
+      var out = [];
+      Object.keys(counts).forEach(function (k) {
+        var v = counts[k];
+        if (typeof v !== 'number' || v === 0) return;
+        out.push([k, v]);
+      });
+      return out;
+    }
+
+    function renderLiveRun(data) {
+      var host = document.getElementById('liveRunStatus');
+      var trigger = document.getElementById('liveRunTriggerState');
+      var btn = document.getElementById('liveRunStartBtn');
+      var countsEl = document.getElementById('liveRunCounts');
+      var actsEl = document.getElementById('liveRunActivities');
+      var recentEl = document.getElementById('liveRunRecent');
+      var allow = !!(data && data.webAllowTrigger);
+
+      if (trigger) {
+        trigger.innerHTML = allow
+          ? "Trigger manual: <span class='badge ok'>activado</span> (<code>--web-allow-trigger</code>)."
+          : "Trigger manual: <span class='badge muted'>desactivado</span>. Arranque via <code>--web-allow-trigger</code>.";
+      }
+      if (btn) {
+        btn.disabled = !allow || !!(data && data.isRunning);
+        btn.textContent = (data && data.isRunning) ? 'A executar…' : 'Run now';
+      }
+
+      if (!data || data.error) {
+        host.innerHTML = "<div class='card'><p class='badge err'>erro de API</p><p class='muted'>" +
+          escapeHtml((data && data.error) ? data.error : 'Sem resposta do servidor.') + "</p></div>";
+        if (countsEl) countsEl.innerHTML = '';
+        if (actsEl) actsEl.textContent = '—';
+        if (recentEl) recentEl.innerHTML = '';
+        return;
+      }
+
+      var status = data.status || 'idle';
+      var running = status === 'running';
+      var run = running ? data : (data.lastRun || null);
+
+      var rows = [];
+      rows.push(['Estado', liveRunStatusBadge(status)]);
+      rows.push(['Run ID', run && run.runId ? "<code>" + escapeHtml(run.runId) + "</code>" : '—']);
+      if (run && run.mode) rows.push(['Modo', "<code>" + escapeHtml(run.mode) + "</code>"]);
+      if (run && run.source) rows.push(['Origem', "<code>" + escapeHtml(run.source) + "</code>"]);
+      rows.push(['Fase', run ? liveRunPhaseLabel(run.phase, run.phases) : '—']);
+      if (run && run.phaseStartedAtUtc) rows.push(['Fase desde', escapeHtml(tsLocal(run.phaseStartedAtUtc))]);
+      if (run && run.startedAtUtc) rows.push(['Início', escapeHtml(tsLocal(run.startedAtUtc))]);
+      if (run) rows.push(['Duração', liveRunDuration(run.durationMs)]);
+      var updated = running ? data.lastUpdatedAtUtc : (run ? run.finishedAtUtc : null);
+      if (updated) rows.push(['Última actualização', escapeHtml(tsLocal(updated))]);
+      if (run && run.lastMessage) rows.push(['Mensagem', escapeHtml(run.lastMessage)]);
+
+      host.innerHTML = "<div class='card'><table><tbody>" + rows.map(function (r) {
+        return "<tr><th style='width:200px;'>" + escapeHtml(r[0]) + "</th><td>" + r[1] + "</td></tr>";
+      }).join('') + "</tbody></table></div>";
+
+      // Contadores (LiveRunCounts tipado; nunca derivado de logs).
+      var entries = liveRunCountEntries(run && run.counts ? run.counts : null);
+      if (countsEl) {
+        countsEl.innerHTML = entries.length
+          ? entries.map(function (e) {
+              return "<div class='card'><div class='muted'>" + escapeHtml(e[0]) + "</div><div style='font-size:20px;'>" + nfmt(e[1]) + "</div></div>";
+            }).join('')
+          : "<div class='muted'>Sem contadores para mostrar.</div>";
+      }
+
+      // Últimas actividades (feed ring buffer; só existe para o run em memória).
+      var acts = run && Array.isArray(run.recentActivities) ? run.recentActivities : [];
+      if (actsEl) {
+        if (!acts.length) {
+          actsEl.textContent = 'Sem actividades disponíveis (o feed é em memória e não é persistido).';
+        } else {
+          var lastActs = acts.slice(-25).reverse();
+          actsEl.innerHTML = "<table><thead><tr><th>Quando</th><th>Nível</th><th>Mensagem</th></tr></thead><tbody>" +
+            lastActs.map(function (a) {
+              var cls = a.level === 'error' ? 'badge err' : (a.level === 'warning' ? 'badge warn' : 'badge muted');
+              return "<tr><td>" + escapeHtml(tsLocal(a.timestampUtc)) + "</td><td><span class='" + cls + "'>" +
+                escapeHtml(a.level || 'info') + "</span></td><td>" + escapeHtml(a.message || '') + "</td></tr>";
+            }).join('') + "</tbody></table>";
+        }
+      }
+
+      // Últimas execuções (24h).
+      var recent = Array.isArray(data.recentRuns) ? data.recentRuns : [];
+      if (recentEl) {
+        if (!recent.length) {
+          recentEl.innerHTML = "<p class='muted'>Sem execuções registadas nas últimas 24h.</p>";
+        } else {
+          recentEl.innerHTML = "<table><thead><tr><th>Run ID</th><th>Modo</th><th>Origem</th><th>Início</th><th>Fim</th><th>Duração</th><th>Estado</th></tr></thead><tbody>" +
+            recent.map(function (r) {
+              var badge = r.terminalStatus === 'completed' ? "<span class='badge ok'>ok</span>"
+                : (r.terminalStatus === 'failed' ? "<span class='badge err'>falhou</span>" : "<span class='badge muted'>—</span>");
+              return "<tr><td><code>" + escapeHtml(r.runId || '') + "</code></td><td>" + escapeHtml(r.mode || '') +
+                "</td><td>" + escapeHtml(r.source || '') + "</td><td>" + escapeHtml(tsLocal(r.startedAtUtc)) +
+                "</td><td>" + escapeHtml(tsLocal(r.finishedAtUtc)) + "</td><td>" + liveRunDuration(r.durationMs) +
+                "</td><td>" + badge + "</td></tr>";
+            }).join('') + "</tbody></table>";
+        }
+      }
+    }
+
+    async function loadLiveRun() {
+      if (liveRunInFlight) return;
+      liveRunInFlight = true;
+      try {
+        var r = await fetch('/api/run/status');
+        var data = null;
+        try { data = await r.json(); } catch (e) { data = null; }
+        if (!r.ok && data && data.status !== 'pipeline-not-configured') {
+          data = data || { error: 'HTTP ' + r.status };
+        }
+        liveRunLastPollUtc = new Date();
+        renderLiveRun(data);
+        var st = document.getElementById('liveRunPollState');
+        if (st) st.textContent = 'actualizado às ' + liveRunLastPollUtc.toLocaleTimeString() + ' (polling 3s)';
+        await loadLiveRunScheduled();
+      } catch (e) {
+        renderLiveRun({ error: e && e.message ? e.message : 'falha de rede' });
+      } finally {
+        liveRunInFlight = false;
+      }
+    }
+
+    async function loadLiveRunScheduled() {
+      var el = document.getElementById('liveRunScheduled');
+      if (!el) return;
+      var list = await safeFetchJson('/api/catalog/scheduled-jobs', []);
+      if (!Array.isArray(list)) { el.innerHTML = "<p class='muted'>Erro ao carregar agendamentos.</p>"; return; }
+      var mine = list.filter(function (j) {
+        return j && (j.actionName === 'telegramRun' || j.actionName === 'telegramMaintainRun');
+      });
+      if (!mine.length) {
+        el.innerHTML = "<p class='muted'>Nenhuma execução Telegram agendada. Crie um job em <b>Scheduled Jobs</b> com a acção <code>telegramRun</code>.</p>";
+        return;
+      }
+      el.innerHTML = "<table><thead><tr><th>Nome</th><th>Cron</th><th>Acção</th><th>Activo</th><th>Próximo</th><th>Último resultado</th></tr></thead><tbody>" +
+        mine.map(function (j) {
+          return "<tr><td><code>" + escapeHtml(j.name || '') + "</code></td><td><code>" + escapeHtml(j.cronExpression || '') +
+            "</code></td><td>" + escapeHtml(j.actionName || '') + "</td><td>" +
+            (j.isEnabled ? "<span class='badge ok'>sim</span>" : "<span class='badge err'>não</span>") +
+            "</td><td>" + escapeHtml(j.nextRunAtUtc ? tsLocal(j.nextRunAtUtc) : '—') +
+            "</td><td>" + escapeHtml(j.lastResult || '—') + "</td></tr>";
+        }).join('') + "</tbody></table>";
+    }
+
+    async function startLiveRun() {
+      var btn = document.getElementById('liveRunStartBtn');
+      if (btn) { btn.disabled = true; btn.textContent = 'A arrancar…'; }
+      try {
+        var r = await fetch('/api/run/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: '{}'
+        });
+        var body = null;
+        try { body = await r.json(); } catch (e) { body = null; }
+        if (r.status === 503) {
+          var msg = (body && body.error) ? body.error : 'trigger indisponível';
+          if (btn) { btn.textContent = 'Run now'; }
+          renderLiveRun({ error: msg, webAllowTrigger: false });
+          return;
+        }
+        if (r.status === 409) {
+          // Já existe execução: o polling mostra o estado real.
+          if (btn) { btn.textContent = 'Run now'; }
+          await loadLiveRun();
+          return;
+        }
+        if (!r.ok) {
+          if (btn) { btn.textContent = 'Run now'; }
+          renderLiveRun({ error: (body && body.error) ? body.error : ('HTTP ' + r.status) });
+          return;
+        }
+        await loadLiveRun();
+      } catch (e) {
+        renderLiveRun({ error: e && e.message ? e.message : 'falha de rede' });
+      }
+    }
+
+    function stopLiveRunPolling() {
+      if (liveRunTimer !== null) { clearInterval(liveRunTimer); liveRunTimer = null; }
+    }
+
+    function startLiveRunPolling() {
+      stopLiveRunPolling();
+      // Polling leve: 3s, apenas enquanto a vista estiver activa e sem
+      // pedidos sobrepostos (liveRunInFlight). Sem SSE/WebSocket.
+      liveRunTimer = setInterval(function () {
+        var section = document.getElementById('view-liverun');
+        if (!section || section.hidden) { stopLiveRunPolling(); return; }
+        if (document.hidden) return;
+        loadLiveRun();
+      }, 3000);
+    }
+
+    window.startLiveRun = startLiveRun;
+    window.loadLiveRun = loadLiveRun;
   })();
   </script>
 </body>
@@ -6277,11 +6542,33 @@ const rows = Object.entries(inv).map(([k, v]) => {
 
             var running = coordinator!.IsRunning;
             var current = coordinator.CurrentSnapshot;
+
+            // Últimas execuções terminadas (janela de 24h) para a lista do
+            // dashboard. Uma única query; nunca expõe credenciais.
+            var recentRuns = await coordinator
+                .GetRecentFinishedSnapshotsAsync(10, CancellationToken.None)
+                .ConfigureAwait(false);
+
             LiveRunSnapshot? recent = null;
             if (!running)
             {
-                recent = await coordinator.GetRecentFinishedSnapshotAsync(CancellationToken.None)
-                    .ConfigureAwait(false);
+                // Preferir o snapshot terminal em memória: é o único que
+                // transporta as actividades do feed (ring buffer em
+                // memória, deliberadamente não persistido). Só se aplica
+                // enquanto estiver dentro da janela de 24h; após restart a
+                // BD é a fonte de verdade.
+                var cutoff = DateTime.UtcNow.AddHours(-RunCoordinator.RecentRunWindowHours);
+                if (current is not null
+                    && current.TerminalStatus is LiveRunTerminalStatus.Completed or LiveRunTerminalStatus.Failed
+                    && current.FinishedAtUtc is { } finishedAt
+                    && finishedAt >= cutoff)
+                {
+                    recent = current;
+                }
+                else
+                {
+                    recent = recentRuns.Count > 0 ? recentRuns[0] : null;
+                }
             }
 
             await WriteJsonAsync(context.Response, LiveRunApiMappings.ToStatusPayload(
@@ -6289,7 +6576,8 @@ const rows = Object.entries(inv).map(([k, v]) => {
                 recentFinished: recent,
                 pipelineConfigured: true,
                 webAllowTrigger: _webAllowTrigger,
-                coordinatorRunning: running));
+                coordinatorRunning: running,
+                recentRuns: recentRuns));
         }
 
         /// <summary>

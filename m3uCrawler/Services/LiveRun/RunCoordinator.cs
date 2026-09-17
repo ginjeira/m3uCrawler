@@ -404,6 +404,37 @@ public sealed class RunCoordinator
         return entity is null ? null : BuildLiveSnapshot(entity, isRunning: false, currentPhase: null);
     }
 
+    /// <summary>
+    /// PHASE 9C.4 (subwave 6) — Últimas execuções terminadas dentro da
+    /// janela de 24h, da mais recente para a mais antiga. Alimenta a
+    /// lista "últimas execuções" do dashboard sem introduzir um novo
+    /// endpoint (o contrato continua a ser
+    /// <c>GET /api/run/status</c>).
+    /// </summary>
+    public async Task<IReadOnlyList<LiveRunSnapshot>> GetRecentFinishedSnapshotsAsync(
+        int limit,
+        CancellationToken cancellationToken)
+    {
+        if (limit <= 0) return Array.Empty<LiveRunSnapshot>();
+
+        var cutoff = DateTime.UtcNow.AddHours(-RecentRunWindowHours);
+        await using var context = await _dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var entities = await context.LiveRuns
+            .AsNoTracking()
+            .Where(r => r.FinishedAtUtc != null && r.FinishedAtUtc >= cutoff)
+            .OrderByDescending(r => r.FinishedAtUtc)
+            .Take(limit)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        var result = new LiveRunSnapshot[entities.Count];
+        for (var i = 0; i < entities.Count; i++)
+        {
+            result[i] = BuildLiveSnapshot(entities[i], isRunning: false, currentPhase: null);
+        }
+        return result;
+    }
+
     // ===================== Helpers internos =====================
 
     private async Task<LiveRunEntity> PersistRunStartAsync(
