@@ -45,6 +45,14 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
   - Documentação alinhada (`docs/architecture/configuration-lifecycle.md`, `m3uCrawler/README.md`).
 
 ### ✨ Adicionado
+- **PHASE 13 — Wave 13-1 (2026-09-17): política pura de selecção de ChannelSources.**
+  - Nova abstracção isolada em `m3uCrawler/Services/SourceSelection/`: `SelectionCandidate`, `SourceSelectionPolicy`, `ProviderIdentity`, `IChannelSourceSelector`/`ChannelSourceSelector` e `SourceSelectionResult`. Função pura `Candidates + Policy → Result`, sem filesystem, base de dados, HTTP, Dispatcharr, scheduler, Telegram ou Dashboard.
+  - Algoritmo em duas fases: **A** diversidade (um representante por fornecedor distinto quando `PreferDistinctProviders`) e **B** preenchimento (respeita `MaxSourcesPerProvider` e `AllowFallbackToSameProvider`). `MaxSourcesPerChannel` é o tecto absoluto; nenhum valor está hardcoded.
+  - Deduplicação por URL normalizada (http/https, scheme/host em minúsculas, porta por omissão e fragmento removidos; path/query/userinfo preservados). Ranking determinístico por `Availability` → `SourcePriority` → `Quality` → `Epg` → `LastResponseTimeMs` → desempate estável (URL normalizada/SourceId/ExternalStreamId).
+  - `ProviderIdentity.Unknown` colapsa todos os fornecedores não determináveis numa única identidade (desconhecidos não ganham diversidade artificial). `SourceSelectionResult` expõe `Selected` (com `Rank`/motivo) e `Rejected` (com motivo) — base para preview/auditoria futura.
+  - **44 testes** em `ChannelSourceSelectorTests` (volume 100/1, 100/10, 100/100, <10, =10, >10; dedup; fornecedores; diversidade on/off; limites por fornecedor; fallback; edge cases; motivos; ranking; determinismo), incluindo o teste crítico **100 fontes → no máximo `MaxSourcesPerChannel` selecções**.
+  - Integração (persistência, migrations, Dashboard/preview, composer, `MatchPlan`, `DispatcharrSyncService`) **não** incluída nesta wave. Documentado em `docs/architecture/dispatcharr-source-selection.md`.
+
 - **PHASE 9C.5 (2026-09-17): first-run / legacy bootstrap — `READY` sem administrador passa a `Bootstrap`.**
   - **AuthMode**: `AuthModeResolver` passa a resolver `READY` ∧ sem administrador activo para `AuthMode.Bootstrap` (cenário conceptual `BOOTSTRAP_REQUIRED`) em vez de `AuthMode.Legacy`. Fecha o gap identificado na documentação pós-9C.4: uma instalação legacy adoptada `READY` sem admin deixa de ter o Dashboard aberto e passa a disponibilizar o First-Run Wizard. O modo `Legacy` mantém-se apenas no contexto explicitamente standalone/testes (lifecycle e auth não ligados).
   - **BootstrapService**: `CreateAdminAsync` permite criar o primeiro administrador em `READY` sem qualquer admin, **sem** descer o estado para `CONFIGURING` e **sem** reconfigurar nada; `AdoptedFromLegacy`/`AdoptedAtUtc`/`LastReason` são preservados. Assim que exista administrador, a criação fecha (`AlreadyReady`) e o modo transita para `UserAuth`.

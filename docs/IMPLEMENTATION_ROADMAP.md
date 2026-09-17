@@ -4328,6 +4328,24 @@ Este documento define **como completar a evolução até ao sistema funcional pr
 > nesse caminho (ver `docs/architecture/channel-catalog-and-ownership.md` §13).
 > Nada da selecção/diversidade/limites descrita abaixo foi implementado.
 
+> **Nota factual (Wave 13-1, 2026-09-17).** A unidade algorítmica central foi
+> implementada isoladamente em `m3uCrawler/Services/SourceSelection/`:
+> `SelectionCandidate`, `SourceSelectionPolicy`, `ProviderIdentity`,
+> `IChannelSourceSelector`/`ChannelSourceSelector` e `SourceSelectionResult`
+> (pura, sem I/O, 44 testes em `ChannelSourceSelectorTests`). Suporta
+> `MaxSourcesPerChannel` (sem valor hardcoded), `PreferDistinctProviders`,
+> `MaxSourcesPerProvider`, `AllowFallbackToSameProvider`, deduplicação por URL
+> normalizada, diversidade em duas fases, ranking determinístico e motivos por
+> candidato. **Não** estão implementados: persistência da política, migrations,
+> Dashboard/preview, `ProviderDefinition` completa, ingestão de Quality/EPG e
+> integração no composer/`MatchPlan`/`DispatcharrSyncService`. Detalhe em
+> `docs/architecture/dispatcharr-source-selection.md`.
+>
+> *Nota de desenho registada (não corrigida): dos critérios de ranking do §5,
+> "sucesso/qualidade histórica" e "estabilidade/recência da validação" não são
+> suportados nesta wave porque o candidato não tem campos para eles; ficam para
+> wave posterior, como previsto.*
+
 > **Nota factual (2026-09-17) — `BuildPlanFromCompositionAsync`.** O método
 > existe em `ChannelMatcher` mas continua **sem call site de produção e sem
 > testes**. A PHASE 10 não é reaberta nesta wave e o método não é integrado
