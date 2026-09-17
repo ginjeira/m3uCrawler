@@ -56,7 +56,11 @@ public sealed record BootstrapValidation(
 ///   persistido idempotente);</item>
 ///   <item>restart em <c>CONFIGURING</c> recuperável (a existência do admin
 ///   determina o passo de retoma);</item>
-///   <item>bootstrap impossível depois de <c>READY</c>.</item>
+///   <item>PHASE 9C.5 — em <c>READY</c> sem administrador (<c>BOOTSTRAP_REQUIRED</c>,
+///   tipicamente legacy adoption) o primeiro administrador ainda pode ser criado,
+///   sem alterar o estado nem reconfigurar nada; a partir do momento em que
+///   exista qualquer administrador, a criação fecha definitivamente
+///   (<c>AlreadyReady</c>).</item>
 /// </list>
 /// </summary>
 public sealed class BootstrapService
@@ -117,21 +121,34 @@ public sealed class BootstrapService
         try
         {
             var state = (await _lifecycle.GetStateAsync(cancellationToken)).State;
-            if (state == ConfigurationLifecycleState.Ready)
-            {
-                return (BootstrapAdminOutcome.AlreadyReady, "already-ready");
-            }
+            var hasAnyAdmin = await _users.HasAnyAsync(cancellationToken);
 
-            if (state != ConfigurationLifecycleState.Configuring)
-            {
-                return (BootstrapAdminOutcome.NotStarted, "bootstrap-not-started");
-            }
+            // PHASE 9C.5 — BOOTSTRAP_REQUIRED: instalação já adoptada como
+            // READY (tipicamente legacy adoption) mas ainda sem qualquer
+            // administrador. A configuração existente está preservada e válida;
+            // falta apenas o primeiro administrador. A criação é permitida sem
+            // descer o estado para CONFIGURING e sem reconfigurar nada.
+            var bootstrapRequired =
+                state == ConfigurationLifecycleState.Ready && !hasAnyAdmin;
 
-            // Idempotência: se já existe administrador, não criar outro nem
-            // o substituir.
-            if (await _users.HasAnyAsync(cancellationToken))
+            if (!bootstrapRequired)
             {
-                return (BootstrapAdminOutcome.AlreadyCreated, null);
+                if (state == ConfigurationLifecycleState.Ready)
+                {
+                    return (BootstrapAdminOutcome.AlreadyReady, "already-ready");
+                }
+
+                if (state != ConfigurationLifecycleState.Configuring)
+                {
+                    return (BootstrapAdminOutcome.NotStarted, "bootstrap-not-started");
+                }
+
+                // Idempotência: se já existe administrador, não criar outro
+                // nem o substituir.
+                if (hasAnyAdmin)
+                {
+                    return (BootstrapAdminOutcome.AlreadyCreated, null);
+                }
             }
 
             var usernameError = CredentialPolicy.ValidateUsername(username);

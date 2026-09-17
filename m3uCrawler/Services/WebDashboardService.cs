@@ -6706,20 +6706,22 @@ pre{background:#f6f6f6;padding:8px;border-radius:6px;white-space:pre-wrap;font-s
 </style></head><body>
 <h1>Configuração inicial</h1>
 <p>Estado: <b id="state">...</b></p>
+<p id="legacy" style="display:none">Configuração existente detectada (READY). Não é necessário iniciar o bootstrap: crie apenas o primeiro administrador.</p>
 <pre id="status"></pre>
 <fieldset><legend>1. Iniciar bootstrap</legend><button id="start">Iniciar</button></fieldset>
 <fieldset><legend>2. Primeiro administrador</legend>
 <label>Utilizador</label><input id="u" autocomplete="username"/>
 <label>Password (mínimo 12 caracteres)</label><input id="p" type="password" autocomplete="new-password"/>
+<label>Confirmar password</label><input id="p2" type="password" autocomplete="new-password"/>
 <button id="create">Criar administrador</button></fieldset>
 <fieldset><legend>3. Concluir</legend><button id="complete">Concluir e activar</button></fieldset>
 <p id="msg"></p>
 <script>
 var msg=document.getElementById('msg');
 function api(path,method,body){return fetch(path,{method:method,headers:body?{'Content-Type':'application/json'}:{},body:body?JSON.stringify(body):undefined}).then(function(r){return r.text().then(function(t){var j=null;try{j=t?JSON.parse(t):null}catch(e){}return {status:r.status,json:j};});});}
-function refresh(){return api('/api/bootstrap/status','GET').then(function(r){if(r.json){document.getElementById('state').textContent=r.json.state;document.getElementById('status').textContent=JSON.stringify(r.json,null,2);}});}
+function refresh(){return api('/api/bootstrap/status','GET').then(function(r){if(r.json){document.getElementById('state').textContent=r.json.state;document.getElementById('status').textContent=JSON.stringify(r.json,null,2);var ready=r.json.state==='READY';document.getElementById('legacy').style.display=ready?'block':'none';document.getElementById('start').disabled=ready;}});}
 document.getElementById('start').onclick=function(){api('/api/bootstrap/start','POST',{}).then(function(r){msg.textContent='start: '+r.status;return refresh();});};
-document.getElementById('create').onclick=function(){var u=document.getElementById('u').value,p=document.getElementById('p').value;api('/api/bootstrap/admin','POST',{username:u,password:p}).then(function(r){var e=r.json&&r.json.error?(' ('+r.json.error+')'):'';msg.textContent='admin: '+r.status+e;return refresh();});};
+document.getElementById('create').onclick=function(){var u=document.getElementById('u').value,p=document.getElementById('p').value,p2=document.getElementById('p2').value;if(p!==p2){msg.textContent='As passwords não coincidem.';return;}api('/api/bootstrap/admin','POST',{username:u,password:p}).then(function(r){var e=r.json&&r.json.error?(' ('+r.json.error+')'):'';msg.textContent='admin: '+r.status+e;return refresh().then(function(){if(r.status===200&&document.getElementById('state').textContent==='READY'){location.href='/';}});});};
 document.getElementById('complete').onclick=function(){api('/api/bootstrap/complete','POST',{}).then(function(r){msg.textContent='complete: '+r.status;return refresh().then(function(){if(r.status===200){location.href='/';}});});};
 refresh();
 </script></body></html>

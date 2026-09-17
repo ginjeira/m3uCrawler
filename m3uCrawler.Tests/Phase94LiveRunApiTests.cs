@@ -202,17 +202,19 @@ public class Phase94LiveRunApiTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task Get_status_legacy_ready_no_admin_allows_open_access()
+    public async Task Get_status_ready_without_admin_requires_bootstrap()
     {
+        // PHASE 9C.5 — READY sem administrador activo é BOOTSTRAP_REQUIRED:
+        // o gate bloqueia o handler dos runs (403 bootstrap-required) e o
+        // Dashboard encaminha para o wizard, onde o primeiro administrador
+        // é criado.
         _lifecycle.SetState(ConfigurationLifecycleState.Ready, "legacy-adoption:sources");
         var host = await BuildHostAsync(executor: _ => IdlePipeline());
         var harness = StartHarness(host, webAllowTrigger: false);
 
         var response = await harness.Client.GetAsync("/api/run/status");
-        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
-        Assert.False(doc.RootElement.GetProperty("isRunning").GetBoolean());
-        Assert.Equal("idle", doc.RootElement.GetProperty("status").GetString());
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+        Assert.Contains("bootstrap-required", await response.Content.ReadAsStringAsync());
     }
 
     [Fact]
@@ -282,14 +284,17 @@ public class Phase94LiveRunApiTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task Post_start_legacy_ready_allows_with_no_admin()
+    public async Task Post_start_ready_without_admin_requires_bootstrap()
     {
+        // PHASE 9C.5 — READY sem administrador activo deixa de ser Legacy
+        // aberto: o POST é bloqueado pelo gate de bootstrap.
         _lifecycle.SetState(ConfigurationLifecycleState.Ready, "legacy-adoption:sources");
         var host = await BuildHostAsync(executor: _ => IdlePipeline());
         var harness = StartHarness(host, webAllowTrigger: true);
 
         var response = await harness.Client.PostAsync("/api/run/start", EmptyJson());
-        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+        Assert.Contains("bootstrap-required", await response.Content.ReadAsStringAsync());
     }
 
     [Fact]
@@ -342,9 +347,8 @@ public class Phase94LiveRunApiTests : IAsyncLifetime
     [Fact]
     public async Task Post_start_when_trigger_disabled_returns_503()
     {
-        _lifecycle.SetState(ConfigurationLifecycleState.Ready, "legacy-adoption:sources");
         var host = await BuildHostAsync(executor: _ => IdlePipeline());
-        var harness = StartHarness(host, webAllowTrigger: false);
+        var harness = StartHarness(host, webAllowTrigger: false, standalone: true);
 
         var response = await harness.Client.PostAsync("/api/run/start", EmptyJson());
         Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
@@ -365,8 +369,6 @@ public class Phase94LiveRunApiTests : IAsyncLifetime
     [Fact]
     public async Task Post_start_concurrent_returns_409_already_running()
     {
-        _lifecycle.SetState(ConfigurationLifecycleState.Ready, "legacy-adoption:sources");
-
         var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var pipeline = new Phase94RunApiHarness.AsyncDelegatePipeline(async _ =>
@@ -376,7 +378,7 @@ public class Phase94LiveRunApiTests : IAsyncLifetime
         });
 
         var host = await BuildHostAsync(executor: _ => pipeline);
-        var harness = StartHarness(host, webAllowTrigger: true);
+        var harness = StartHarness(host, webAllowTrigger: true, standalone: true);
 
         var first = harness.Client.PostAsync("/api/run/start", EmptyJson());
         await started.Task;
@@ -393,9 +395,8 @@ public class Phase94LiveRunApiTests : IAsyncLifetime
     [Fact]
     public async Task Post_start_with_invalid_mode_returns_400()
     {
-        _lifecycle.SetState(ConfigurationLifecycleState.Ready, "legacy-adoption:sources");
         var host = await BuildHostAsync(executor: _ => IdlePipeline());
-        var harness = StartHarness(host, webAllowTrigger: true);
+        var harness = StartHarness(host, webAllowTrigger: true, standalone: true);
 
         var response = await harness.Client.PostAsync(
             "/api/run/start",
@@ -407,8 +408,6 @@ public class Phase94LiveRunApiTests : IAsyncLifetime
     [Fact]
     public async Task Status_during_run_reports_running_then_completed()
     {
-        _lifecycle.SetState(ConfigurationLifecycleState.Ready, "legacy-adoption:sources");
-
         var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var pipeline = new Phase94RunApiHarness.AsyncDelegatePipeline(async _ =>
@@ -418,7 +417,7 @@ public class Phase94LiveRunApiTests : IAsyncLifetime
         });
 
         var host = await BuildHostAsync(executor: _ => pipeline);
-        var harness = StartHarness(host, webAllowTrigger: true);
+        var harness = StartHarness(host, webAllowTrigger: true, standalone: true);
 
         var first = harness.Client.PostAsync("/api/run/start", EmptyJson());
         await started.Task;
@@ -454,8 +453,6 @@ public class Phase94LiveRunApiTests : IAsyncLifetime
     [Fact]
     public async Task Status_after_run_failure_reports_failed()
     {
-        _lifecycle.SetState(ConfigurationLifecycleState.Ready, "legacy-adoption:sources");
-
         var pipeline = new Phase94RunApiHarness.AsyncDelegatePipeline(async _ =>
         {
             await Task.Yield();
@@ -463,7 +460,7 @@ public class Phase94LiveRunApiTests : IAsyncLifetime
         });
 
         var host = await BuildHostAsync(executor: _ => pipeline);
-        var harness = StartHarness(host, webAllowTrigger: true);
+        var harness = StartHarness(host, webAllowTrigger: true, standalone: true);
 
         var first = harness.Client.PostAsync("/api/run/start", EmptyJson());
         var firstResponse = await first;
@@ -524,9 +521,8 @@ public class Phase94LiveRunApiTests : IAsyncLifetime
     [Fact]
     public async Task Responses_never_expose_secrets()
     {
-        _lifecycle.SetState(ConfigurationLifecycleState.Ready, "legacy-adoption:sources");
         var host = await BuildHostAsync(executor: _ => IdlePipeline());
-        var harness = StartHarness(host, webAllowTrigger: true);
+        var harness = StartHarness(host, webAllowTrigger: true, standalone: true);
 
         var status = await harness.Client.GetAsync("/api/run/status");
         var statusBody = await status.Content.ReadAsStringAsync();
@@ -548,9 +544,8 @@ public class Phase94LiveRunApiTests : IAsyncLifetime
     [Fact]
     public async Task Dashboard_page_exposes_live_run_view_with_light_polling()
     {
-        _lifecycle.SetState(ConfigurationLifecycleState.Ready, "legacy-adoption:sources");
         var host = await BuildHostAsync(executor: _ => IdlePipeline());
-        var harness = StartHarness(host, webAllowTrigger: true);
+        var harness = StartHarness(host, webAllowTrigger: true, standalone: true);
 
         var response = await harness.Client.GetAsync("/");
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
@@ -667,9 +662,8 @@ public class Phase94LiveRunApiTests : IAsyncLifetime
     [Fact]
     public async Task Dashboard_and_status_never_expose_secret_markers()
     {
-        _lifecycle.SetState(ConfigurationLifecycleState.Ready, "legacy-adoption:sources");
         var host = await BuildHostAsync(executor: _ => IdlePipeline());
-        var harness = StartHarness(host, webAllowTrigger: true);
+        var harness = StartHarness(host, webAllowTrigger: true, standalone: true);
 
         var page = await harness.Client.GetAsync("/");
         var html = await page.Content.ReadAsStringAsync();

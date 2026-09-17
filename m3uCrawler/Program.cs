@@ -97,8 +97,10 @@ namespace m3uCrawler
                     // PHASE 9C.2 — Autenticação/bootstrap. Numa instalação
                     // nova o wizard cria o primeiro administrador e só depois
                     // o lifecycle passa a READY. Numa instalação legacy
-                    // adoptada READY sem administrador, o modo é Legacy e o
-                    // comportamento de --web-token é preservado.
+                    // adoptada READY sem administrador (PHASE 9C.5,
+                    // BOOTSTRAP_REQUIRED), o wizard fica activo apenas para
+                    // criar o primeiro administrador, sem reconfigurar nem
+                    // alterar o estado; após a criação passa a UserAuth.
                     var adminUsers = new AdminUserStore(webCatalogResolver.GetFactory());
                     var sessions = new SessionStore(webCatalogResolver.GetFactory());
                     var authService = new AuthService(adminUsers, sessions);

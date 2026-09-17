@@ -657,6 +657,26 @@ NOT_CONFIGURED
   → Dashboard normal autenticado
 ```
 
+### Caminho `BOOTSTRAP_REQUIRED` (PHASE 9C.5)
+
+Numa instalação legacy adoptada (`READY` persistido, `AdoptedFromLegacy=true`)
+mas **sem administrador**, o wizard é servido sem passar por `CONFIGURING`:
+
+```
+READY (sem administrador)
+  → GET  /bootstrap
+  → POST /api/bootstrap/admin     → cria o 1.º administrador (estado PERMANECE READY)
+  → POST /api/session             → login (AuthMode passa a UserAuth)
+  → Dashboard normal autenticado
+```
+
+A configuração existente não é recriada nem reconfigurada (apenas uma linha
+é acrescentada a `admin_users`) e o estado persistido não é alterado. Antes
+da criação, os endpoints administrativos normais ficam bloqueados
+(`403 bootstrap-required`). Depois de existir qualquer administrador, o
+bootstrap da criação fecha (`AlreadyReady`). O wizard exige confirmação da
+password no cliente; as regras de validação (mínimo 12 caracteres) mantêm-se.
+
 ### Configuração mínima (L2) exigida para `READY`
 
 - administrador activo;
@@ -685,9 +705,9 @@ Telegram, sources, ordering, import policies, grupos, source priority e schedule
 
 | Modo | Condição | Efeito |
 |---|---|---|
-| Bootstrap | `NOT_CONFIGURED`/`CONFIGURING` | Só bootstrap/sessão/lifecycle/version; restantes endpoints → 403 |
+| Bootstrap | `NOT_CONFIGURED`/`CONFIGURING`, **ou** `READY` sem administrador (`BOOTSTRAP_REQUIRED`) | Só bootstrap/sessão/lifecycle/version; restantes endpoints → 403 |
 | UserAuth | `READY` + administrador | Endpoints normais exigem sessão humana **ou** credencial de máquina válida; mutantes exigem CSRF |
-| Legacy | `READY` sem administrador | Mantém o comportamento actual de `--web-token`; não cria administrador |
+| Legacy | contexto explicitamente standalone/testes (lifecycle e auth não ligados) | Mantém o comportamento aberto de `--web-token`; não cria administrador. Deixou de ser o modo de `READY` sem administrador na PHASE 9C.5 |
 
 `--web-token` mantém-se como **credencial de máquina/automação** em todos os
 modos (quando configurado). Precedência: o token é avaliado primeiro e, quando
@@ -745,10 +765,11 @@ registados. A pipeline invocada é sempre a existente
 | `GET /api/run/status` | Snapshot sanitizado: `isRunning`, `status`, `runId`, `mode`, `source`, `phase`, `phaseStartedAtUtc`, `durationMs`, `counts`, `recentActivities`, `recentRuns` (24 h), `webAllowTrigger`. `503 pipeline-not-configured` quando não há pipeline Telegram no processo. |
 | `POST /api/run/start` | Arranque assíncrono (não bloqueia até ao fim). `202` aceite · `409 already-running` · `503 web-allow-trigger-disabled` · `503 pipeline-not-configured` · `400 invalid payload` · `401`/`403` conforme o gate 9C.2. |
 
-A autorização reutiliza o gate da 9C.2 (sessão + CSRF em `UserAuth`,
-`--web-token` como credencial de máquina, Bootstrap bloqueado, Legacy
-preservado). **Não existe autenticação dedicada.** O trigger manual exige
-`--web-allow-trigger` (opt-in, default desactivado).
+A autorização reutiliza o gate da 9C.2/9C.5 (sessão + CSRF em `UserAuth`,
+`--web-token` como credencial de máquina, Bootstrap bloqueado; `READY` sem
+administrador é `BOOTSTRAP_REQUIRED` e também bloqueia). **Não existe
+autenticação dedicada.** O trigger manual exige `--web-allow-trigger`
+(opt-in, default desactivado).
 
 Em **standalone** (`--web` sem `--telegram`) ambos os endpoints devolvem
 `503 pipeline-not-configured` — o dashboard continua a arrancar normalmente.

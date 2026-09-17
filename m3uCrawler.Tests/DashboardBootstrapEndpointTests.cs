@@ -315,25 +315,77 @@ public class DashboardBootstrapEndpointTests : IAsyncLifetime
         Assert.DoesNotContain("wrong-password-00", body);
     }
 
+    /// <summary>
+    /// PHASE 9C.5 — Instalação legacy adoptada READY sem administrador
+    /// (<c>BOOTSTRAP_REQUIRED</c>): o Dashboard deixa de estar aberto, passa a
+    /// servir o wizard e permite criar o primeiro administrador sem
+    /// reconfigurar nem alterar o estado; a partir daí o modo é UserAuth.
+    /// </summary>
     [Fact]
-    public async Task Legacy_ready_without_admin_keeps_open_behaviour()
+    public async Task Legacy_ready_without_admin_serves_wizard_and_creates_first_admin()
     {
-        _lifecycle.SetState(ConfigurationLifecycleState.Ready, "legacy-adoption:sources");
+        new ConfigurationLifecycleStore(_storePath).Save(new ConfigurationLifecycleSnapshot(
+            ConfigurationLifecycleState.Ready,
+            AdoptedFromLegacy: true,
+            AdoptedAtUtc: DateTime.UtcNow,
+            LastReason: "legacy-adoption:sources",
+            UpdatedAtUtc: DateTime.UtcNow));
+
         var harness = StartHarness();
 
-        // Sem admin e sem web-token → comportamento legacy (aberto).
-        Assert.Equal(HttpStatusCode.OK, (await harness.Client.GetAsync("/api/history")).StatusCode);
+        // READY sem admin já não é modo Legacy aberto: os endpoints normais
+        // ficam bloqueados pelo gate de bootstrap (403).
+        Assert.Equal(HttpStatusCode.Forbidden, (await harness.Client.GetAsync("/api/history")).StatusCode);
 
-        // Login indisponível: não há administrador.
+        // Root encaminha para o wizard; wizard é servido.
+        var root = await harness.Client.GetAsync("/");
+        Assert.Equal(HttpStatusCode.Found, root.StatusCode);
+        Assert.Equal("/bootstrap", root.Headers.Location?.ToString());
+
+        var page = await harness.Client.GetAsync("/bootstrap");
+        Assert.Equal(HttpStatusCode.OK, page.StatusCode);
+        Assert.Contains("Configuração inicial", await page.Content.ReadAsStringAsync());
+
+        // Status reporta READY (configuração preservada) e sem administrador.
+        var status = await harness.Client.GetAsync("/api/bootstrap/status");
+        Assert.Equal(HttpStatusCode.OK, status.StatusCode);
+        using (var doc = JsonDocument.Parse(await status.Content.ReadAsStringAsync()))
+        {
+            Assert.Equal("READY", doc.RootElement.GetProperty("state").GetString());
+            Assert.False(doc.RootElement.GetProperty("hasActiveAdmin").GetBoolean());
+        }
+
+        // Cria o primeiro administrador sem passar por /start e sem alterar
+        // o estado persistido.
+        var created = await harness.Client.PostAsync(
+            "/api/bootstrap/admin",
+            new StringContent(
+                JsonSerializer.Serialize(new { username = "admin", password = ValidPassword }),
+                Encoding.UTF8, "application/json"));
+        Assert.Equal(HttpStatusCode.OK, created.StatusCode);
+        Assert.Contains("Created", await created.Content.ReadAsStringAsync());
+
+        // Transição para UserAuth: sem sessão, os endpoints normais exigem
+        // autenticação (401) e o bootstrap fecha.
+        Assert.Equal(HttpStatusCode.Unauthorized, (await harness.Client.GetAsync("/api/history")).StatusCode);
+        var closed = await harness.Client.GetAsync("/api/bootstrap/status");
+        Assert.Equal(HttpStatusCode.Conflict, closed.StatusCode);
+        Assert.Contains("bootstrap-closed", await closed.Content.ReadAsStringAsync());
+
+        // Login humano passa a estar disponível.
         var login = await harness.Client.PostAsync(
             "/api/session",
             new StringContent(
                 JsonSerializer.Serialize(new { username = "admin", password = ValidPassword }),
                 Encoding.UTF8, "application/json"));
-        Assert.Equal(HttpStatusCode.Conflict, login.StatusCode);
+        Assert.Equal(HttpStatusCode.OK, login.StatusCode);
+
+        // O estado persistido permanece READY — nada foi recriado.
+        Assert.Equal(ConfigurationLifecycleState.Ready, (await _lifecycle.GetStateAsync()).State);
 
         await using var context = _factory.CreateDbContext();
-        Assert.Empty(context.AdminUsers);
+        Assert.Equal(1, context.AdminUsers.Count());
+        Assert.Equal("admin", context.AdminUsers.Single().Username);
     }
 
     [Fact]

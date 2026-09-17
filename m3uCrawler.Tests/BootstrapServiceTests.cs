@@ -137,6 +137,29 @@ public class BootstrapServiceTests : IAsyncLifetime
         Assert.DoesNotContain(results, r => r.Outcome == BootstrapAdminOutcome.Invalid);
     }
 
+    /// <summary>
+    /// PHASE 9C.5 — Garantia na camada de persistência: duas instâncias do
+    /// store a tentar criar o primeiro administrador em simultâneo, sem a
+    /// serialização do serviço, nunca produzem duas linhas (transacção +
+    /// verificação de tabela vazia; a unique de username é salvaguarda
+    /// adicional quando os nomes coincidem).
+    /// </summary>
+    [Fact]
+    public async Task Admin_user_store_concurrent_first_admin_persists_single_row()
+    {
+        var first = new AdminUserStore(_factory);
+        var second = new AdminUserStore(_factory);
+
+        var results = await Task.WhenAll(
+            first.CreateFirstAdminAsync("admin-a", "a-strong-password-12"),
+            second.CreateFirstAdminAsync("admin-b", "a-strong-password-12"));
+
+        await using var context = _factory.CreateDbContext();
+        Assert.Equal(1, context.AdminUsers.Count());
+        Assert.Contains(CreateAdminResult.Created, results);
+        Assert.Contains(CreateAdminResult.AlreadyExists, results);
+    }
+
     [Fact]
     public async Task Complete_without_admin_is_rejected_and_never_ready()
     {
@@ -239,16 +262,127 @@ public class BootstrapServiceTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task Legacy_ready_installation_cannot_bootstrap()
+    public async Task Legacy_ready_start_is_already_ready_and_does_not_create_admin()
     {
         var lifecycle = NewLifecycle();
         lifecycle.SetState(ConfigurationLifecycleState.Ready, "legacy-adoption:sources");
         var service = NewBootstrap(lifecycle);
 
+        // O estado já está READY (legacy adoption): iniciar o bootstrap é
+        // idempotente e não cria administrador por si só.
         Assert.Equal(BootstrapStartOutcome.AlreadyReady, await service.StartAsync());
 
         await using var context = _factory.CreateDbContext();
         Assert.Empty(context.AdminUsers);
+    }
+
+    /// <summary>
+    /// PHASE 9C.5 — Cenário A/D: instalação legacy adoptada READY sem admin
+    /// (BOOTSTRAP_REQUIRED) permite criar o primeiro administrador sem alterar
+    /// o estado nem reconfigurar nada; a partir daí o modo passa a UserAuth.
+    /// </summary>
+    [Fact]
+    public async Task Legacy_ready_without_admin_creates_first_admin_and_keeps_ready()
+    {
+        var lifecycle = NewLifecycle();
+        lifecycle.SetState(ConfigurationLifecycleState.Ready, "legacy-adoption:sources");
+        var service = NewBootstrap(lifecycle);
+
+        var before = await service.GetStatusAsync();
+        Assert.Equal(ConfigurationLifecycleState.Ready, before.State);
+        Assert.False(before.HasActiveAdmin);
+
+        var (outcome, error) = await service.CreateAdminAsync("admin", "a-strong-password-12");
+
+        Assert.Equal(BootstrapAdminOutcome.Created, outcome);
+        Assert.Null(error);
+
+        var after = await service.GetStatusAsync();
+        Assert.Equal(ConfigurationLifecycleState.Ready, after.State);
+        Assert.True(after.HasActiveAdmin);
+
+        // O estado persistido permanece READY — nunca desce para CONFIGURING.
+        Assert.Equal(ConfigurationLifecycleState.Ready, (await lifecycle.GetStateAsync()).State);
+        Assert.Equal(
+            AuthMode.UserAuth,
+            AuthModeResolver.Resolve(after.State, after.HasActiveAdmin));
+    }
+
+    /// <summary>
+    /// PHASE 9C.5 — Preservação: numa instalação legacy adoptada sem admin,
+    /// apenas o administrador é acrescentado; a marca de adopção e a razão
+    /// originais permanecem intactas (sem reset/recriação da configuração).
+    /// </summary>
+    [Fact]
+    public async Task Legacy_ready_admin_creation_preserves_adoption_metadata()
+    {
+        var adoptedAt = new DateTime(2026, 9, 10, 8, 30, 0, DateTimeKind.Utc);
+        new ConfigurationLifecycleStore(_storePath).Save(new ConfigurationLifecycleSnapshot(
+            ConfigurationLifecycleState.Ready,
+            AdoptedFromLegacy: true,
+            AdoptedAtUtc: adoptedAt,
+            LastReason: "legacy-adoption:sources,ordering_lists",
+            UpdatedAtUtc: adoptedAt));
+
+        var lifecycle = NewLifecycle();
+        var service = NewBootstrap(lifecycle);
+
+        var (outcome, _) = await service.CreateAdminAsync("admin", "a-strong-password-12");
+        Assert.Equal(BootstrapAdminOutcome.Created, outcome);
+
+        var snapshot = await lifecycle.GetStateAsync();
+        Assert.Equal(ConfigurationLifecycleState.Ready, snapshot.State);
+        Assert.True(snapshot.AdoptedFromLegacy);
+        Assert.Equal(adoptedAt, snapshot.AdoptedAtUtc);
+        Assert.Equal("legacy-adoption:sources,ordering_lists", snapshot.LastReason);
+    }
+
+    /// <summary>
+    /// PHASE 9C.5 — Cenário E: depois de existir administrador, um segundo
+    /// bootstrap é rejeitado e não cria nem substitui nada.
+    /// </summary>
+    [Fact]
+    public async Task Legacy_ready_second_admin_after_creation_is_rejected()
+    {
+        var lifecycle = NewLifecycle();
+        lifecycle.SetState(ConfigurationLifecycleState.Ready, "legacy-adoption:sources");
+        var service = NewBootstrap(lifecycle);
+
+        Assert.Equal(
+            BootstrapAdminOutcome.Created,
+            (await service.CreateAdminAsync("admin", "a-strong-password-12")).Outcome);
+
+        var second = await service.CreateAdminAsync("intruder", "another-strong-pw-12");
+
+        Assert.Equal(BootstrapAdminOutcome.AlreadyReady, second.Outcome);
+
+        await using var context = _factory.CreateDbContext();
+        Assert.Equal(1, context.AdminUsers.Count());
+        Assert.Equal("admin", context.AdminUsers.Single().Username);
+    }
+
+    /// <summary>
+    /// PHASE 9C.5 — Cenário F: duas tentativas concorrentes de primeiro
+    /// bootstrap numa instalação legacy READY criam apenas um administrador.
+    /// A garantia combina a serialização do serviço com a transacção e a
+    /// unique constraint de username na persistência.
+    /// </summary>
+    [Fact]
+    public async Task Legacy_ready_concurrent_admin_creation_creates_only_one()
+    {
+        var lifecycle = NewLifecycle();
+        lifecycle.SetState(ConfigurationLifecycleState.Ready, "legacy-adoption:sources");
+        var service = NewBootstrap(lifecycle);
+
+        var results = await Task.WhenAll(
+            service.CreateAdminAsync("admin-a", "a-strong-password-12"),
+            service.CreateAdminAsync("admin-b", "a-strong-password-12"));
+
+        await using var context = _factory.CreateDbContext();
+        Assert.Equal(1, context.AdminUsers.Count());
+        Assert.Contains(results, r => r.Outcome == BootstrapAdminOutcome.Created);
+        Assert.DoesNotContain(results, r => r.Outcome == BootstrapAdminOutcome.Invalid);
+        Assert.Equal(ConfigurationLifecycleState.Ready, (await lifecycle.GetStateAsync()).State);
     }
 
     [Fact]

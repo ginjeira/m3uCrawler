@@ -95,7 +95,11 @@ public class AuthPrimitivesTests
     [InlineData(ConfigurationLifecycleState.Configuring, false, AuthMode.Bootstrap)]
     [InlineData(ConfigurationLifecycleState.Configuring, true, AuthMode.Bootstrap)]
     [InlineData(ConfigurationLifecycleState.Ready, true, AuthMode.UserAuth)]
-    [InlineData(ConfigurationLifecycleState.Ready, false, AuthMode.Legacy)]
+    // PHASE 9C.5 — READY sem administrador activo deixa de ser Legacy:
+    // é BOOTSTRAP_REQUIRED e resolve para Bootstrap (wizard alcançável numa
+    // instalação legacy adoptada). O modo Legacy mantém-se apenas no contexto
+    // explicitamente standalone/testes (ver DashboardBootstrapEndpointTests).
+    [InlineData(ConfigurationLifecycleState.Ready, false, AuthMode.Bootstrap)]
     public void Auth_mode_resolution_is_deterministic(
         ConfigurationLifecycleState state,
         bool hasAdmin,

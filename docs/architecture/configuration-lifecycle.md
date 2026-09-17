@@ -3,6 +3,9 @@
 > Estado: PHASE 9C.1 implementada (lifecycle + gates + persistência).
 > PHASE 9C.2 implementada (wizard de primeira execução, primeiro
 > administrador, sessões persistentes e autenticação normal do Dashboard).
+> PHASE 9C.5 implementada (first-run / legacy bootstrap: `READY` sem
+> administrador activo resolve para `Bootstrap`/`BOOTSTRAP_REQUIRED`,
+> com criação do primeiro administrador sem reconfigurar a instalação).
 > O wizard é **mínimo** e o `READY` assenta apenas na configuração mínima
 > determinística (L2). Não faz redesign do Dashboard, Live Run Monitor,
 > SignalR/WebSocket, affinities, Dispatcharr novo, discovery/scheduler
@@ -213,8 +216,30 @@ NOT_CONFIGURED
   primeiros administradores; retry idempotente (`AlreadyCreated`).
 - Invariantes: nunca `READY` sem administrador activo nem sem L2 válida;
   `READY` só depois da criação e validação; restaurar em `CONFIGURING` retoma
-  (a existência do admin determina o passo); bootstrap fechado após `READY`.
+  (a existência do admin determina o passo); o *bootstrap* da criação de
+  administrador fecha quando existir **qualquer** administrador.
 - `POST /api/bootstrap/admin` nunca devolve a password; apenas a chave de erro.
+
+### Caminho `BOOTSTRAP_REQUIRED` (PHASE 9C.5)
+
+Quando o lifecycle persistido já é `READY` mas não existe administrador
+(tipicamente legacy adoption, ver §"Upgrade de instalações existentes"),
+o wizard é servido e o primeiro administrador é criado **sem** passar por
+`CONFIGURING` e **sem** reexecutar `complete`:
+
+```
+READY (sem administrador)
+  → GET /bootstrap                (wizard; POST /api/bootstrap/start devolve AlreadyReady)
+  → POST /api/bootstrap/admin     → cria o 1.º administrador; o estado PERMANECE READY
+  → AuthMode passa a UserAuth
+```
+
+- A configuração existente não é reconfigurada nem recriada: `AdoptedFromLegacy`,
+  `AdoptedAtUtc` e `LastReason` do snapshot persistido permanecem inalterados.
+- Criado o administrador, `AuthModeResolver` devolve `UserAuth`; a partir daí
+  `POST /api/bootstrap/admin` devolve `AlreadyReady` e não cria nem substitui
+  nada (`HasAnyAsync`, logo qualquer linha de `admin_users` fecha o bootstrap).
+- `discovery`/scheduler não são afectados: o estado continua `READY`.
 
 ## Configuração mínima (L2) para READY
 
@@ -233,9 +258,16 @@ Nota: o loader existente normaliza `dispatcharr_enabled=true` sem
 
 | Modo | Condição | Comportamento |
 |---|---|---|
-| **Bootstrap** | `NOT_CONFIGURED`/`CONFIGURING` | Só `/`, `/bootstrap`, `/api/bootstrap/*`, `/api/session`, `/api/version` e `/api/configuration/lifecycle`; restantes endpoints → `403 bootstrap-required` |
+| **Bootstrap** | `NOT_CONFIGURED`/`CONFIGURING`, **ou** `READY` sem administrador activo (`BOOTSTRAP_REQUIRED`) | Só `/`, `/bootstrap`, `/api/bootstrap/*`, `/api/session`, `/api/version` e `/api/configuration/lifecycle`; restantes endpoints → `403 bootstrap-required` |
 | **UserAuth** | `READY` ∧ admin activo | Endpoints normais exigem **sessão humana** (ou credencial de máquina válida); mutantes exigem CSRF; `/` sem sessão serve página de login |
-| **Legacy** | `READY` ∧ sem admin | Mantém o comportamento actual baseado só em `--web-token`; não cria admin nem migra |
+| **Legacy** | contexto explicitamente standalone/testes (lifecycle e auth não ligados, `_standaloneAuthContext`) | Mantém o comportamento aberto baseado só em `--web-token`; não cria admin nem migra. Deixou de ser o modo de `READY` sem admin a partir da PHASE 9C.5 |
+
+> **PHASE 9C.5** — `READY` sem administrador activo passou a resolver para
+> `AuthMode.Bootstrap` (`AuthModeResolver.Resolve`), cobrindo o cenário
+> conceptual `BOOTSTRAP_REQUIRED`. O wizard fica alcançável numa instalação
+> legacy adoptada sem que nada seja reconfigurado. O modo `Legacy` mantém-se
+> apenas no contexto explicitamente standalone/testes, onde lifecycle e auth
+> estão ambos ausentes.
 
 ### Precedência `--web-token` vs sessão humana
 
@@ -374,27 +406,25 @@ acima. O sistema:
   output listados no §"Critério de legacy adoption";
 - **adopta** a configuração existente com `AdoptedFromLegacy=true`,
   entrando em `READY` (não em `NOT_CONFIGURED`);
-- fica em **modo `Legacy`** (token-only) enquanto não existir
-  administrador activo;
-- o Dashboard fica **disponível** neste estado com o **First-Run /
-  Setup Wizard** activo, exactamente como numa instalação nova em
-  `NOT_CONFIGURED`/`CONFIGURING`. **Não é necessário recriar nem
-  importar a configuração existente**; o wizard apenas recolhe o
-  primeiro administrador.
-
-> Importante: na implementação actual, o modo `Bootstrap` (gate que
-> permite aceder ao wizard) é activado em `NOT_CONFIGURED` e
-> `CONFIGURING` mas **não** em `READY` sem administrador. Esta é uma
-> **extensão** ao desenho registada aqui como decisão. A sua
-> implementação efectiva — alargar o gate `Bootstrap` para também
-> cobrir `READY` ∧ sem administrador activo — pertence à próxima
-> wave (PHASE 9C.5 ou posterior) e **não é implementada** nesta
-> wave documental. Até essa extensão, um upgrade real exige
-> reconfiguração manual do admin (ver §"Notas operacionais").
+- **passa a `AuthMode.Bootstrap`** (`BOOTSTRAP_REQUIRED`) enquanto
+  não existir administrador activo; o Dashboard fica disponível com o
+  **First-Run / Setup Wizard** activo, exactamente como numa instalação
+  nova em `NOT_CONFIGURED`/`CONFIGURING`. **Não é necessário recriar
+  nem importar a configuração existente**; o wizard apenas recolhe o
+  primeiro administrador. Os endpoints administrativos normais ficam
+  bloqueados (`403 bootstrap-required`) até existir administrador;
+- a partir da PHASE 9C.5, o alargamento do gate `Bootstrap` para
+  cobrir `READY` ∧ sem administrador activo está **implementado**
+  (`AuthModeResolver` e `BootstrapService.CreateAdminAsync`). A
+  criação do primeiro administrador ocorre **sem** descer o estado
+  para `CONFIGURING` e **sem** reexecutar a validação L2: a
+  configuração existente permanece intacta e apenas uma linha é
+  acrescentada a `admin_users`.
 
 - assim que o primeiro administrador for criado, o `AuthMode`
-  transita automaticamente para `UserAuth` e o sistema fica em
-  `READY` operacional (a L2 já está satisfeita pela adopção legacy).
+  transita automaticamente para `UserAuth` e o sistema continua em
+  `READY` operacional (o estado persistido já era `READY`; não é
+  reavaliada L2 nem reconfigurada a instalação).
 
 ### 3. Instalação já configurada (administrador válido existente)
 
@@ -443,19 +473,20 @@ real de produção:
 
 ## Compatibilidade com o desenho actual
 
-| Cenário | Comportamento actual (9C.1/9C.2) | Comportamento decidido (esta secção) |
+| Cenário | Comportamento anterior (9C.1/9C.2) | Comportamento implementado (9C.5) |
 |---|---|---|
 | Instalação nova sem admin | `NOT_CONFIGURED` → wizard → `READY` | Idêntico (decisão 1) |
 | Instalação legacy com admin | `READY` (adopt) → login normal | Idêntico (decisão 3) |
-| Instalação legacy sem admin | `READY` (adopt) + modo `Legacy` (token-only); sem wizard | `READY` (adopt) + modo `Legacy` (token-only); **com wizard** (decisão 2 — requer extensão do gate `Bootstrap` numa wave futura) |
+| Instalação legacy sem admin | `READY` (adopt) + modo `Legacy` (token-only); sem wizard | `READY` (adopt) + `AuthMode.Bootstrap` (`BOOTSTRAP_REQUIRED`); **com wizard**; primeiro admin criado sem reconfigurar e sem alterar o estado (decisão 2) |
 | Instalação `NOT_CONFIGURED` re-arrancada | Wizard retoma em `CONFIGURING` ou reinicia em `NOT_CONFIGURED` | Idêntico (já tratado em §"Fluxo de bootstrap") |
 | Instalação já em `CONFIGURING` | Wizard retoma no passo correspondente ao estado | Idêntico (idem) |
 
-A única alteração conceptual introduzida por esta secção é o
-**rótulo `BOOTSTRAP_REQUIRED`** e a expectativa de que o wizard esteja
-disponível em `READY` ∧ sem administrador. **Não há** alteração de
-código nesta wave; a sua implementação efectiva pertence a uma wave
-futura e deve respeitar integralmente o desenho aqui registado.
+A alteração conceptual introduzida por esta secção — o rótulo
+**`BOOTSTRAP_REQUIRED`** e o wizard disponível em `READY` ∧ sem
+administrador — foi **implementada na PHASE 9C.5**. O código relevante
+é `AuthModeResolver` (`m3uCrawler/Services/Auth/AuthMode.cs`) e
+`BootstrapService.CreateAdminAsync`
+(`m3uCrawler/Services/Configuration/BootstrapService.cs`).
 
 ## Notas operacionais (não alteram contratos)
 
@@ -463,34 +494,33 @@ futura e deve respeitar integralmente o desenho aqui registado.
   nesta wave. Quando for definido, deve começar por uma cópia do
   `runtime-data` em ambiente isolado (já é prática do projecto —
   ver `AGENTS.md` §9).
-- O **teste do upgrade** deve cobrir todos os cenários da tabela
-  acima e incluir um teste explícito do cenário `BOOTSTRAP_REQUIRED`
-  (instalação adoptada sem admin → wizard → primeiro admin →
-  `READY` operacional). Esse teste ainda não existe; pertence à wave
-  de implementação do upgrade.
+- O **cenário `BOOTSTRAP_REQUIRED`** (instalação adoptada sem admin →
+  wizard → primeiro admin → `READY` operacional) está coberto pelos
+  testes introduzidos na PHASE 9C.5 (ver §"Testes de referência").
 - O **`AdoptedFromLegacy`** continua a ser o sinal persistente de
   que a configuração foi adoptada. Não há migração de dados;
-  nenhum ficheiro é reescrito durante o bootstrap.
+  nenhum ficheiro é reescrito durante o bootstrap. A criação do
+  primeiro administrador em `READY` acrescenta apenas uma linha a
+  `admin_users`.
 
-## Ficheiros relevantes (sem alterações)
+## Ficheiros relevantes
 
-Esta secção não introduz ficheiros novos nem altera os existentes.
-Os ficheiros de implementação envolvidos nas decisões acima
-continuam a ser:
+A PHASE 9C.5 alterou `AuthMode.cs` e `BootstrapService.cs` (e o
+wizard HTML em `WebDashboardService.cs`). Os ficheiros de
+implementação envolvidos nas decisões acima são:
 
 - `m3uCrawler/Services/Configuration/ConfigurationLifecycleService.cs`
 - `m3uCrawler/Services/Configuration/LegacyConfigurationEvidenceEvaluator.cs`
 - `m3uCrawler/Services/Configuration/ConfigurationGate.cs`
-- `m3uCrawler/Services/Configuration/AuthService.cs`
-- `m3uCrawler/Services/Configuration/AuthMode.cs`
+- `m3uCrawler/Services/Auth/AuthService.cs`
+- `m3uCrawler/Services/Auth/AuthMode.cs`
 - `m3uCrawler/Services/Configuration/BootstrapService.cs`
 - `m3uCrawler/Services/Configuration/BootstrapConfigurationValidator.cs`
 - `m3uCrawler/Services/WebDashboardService.cs`
 
-## Testes de referência (sem alterações)
+## Testes de referência
 
-Esta secção não introduz testes novos. Os testes existentes que
-continuam a validar o lifecycle e o bootstrap são:
+Testes que validam o lifecycle e o bootstrap:
 
 - `m3uCrawler.Tests/ConfigurationLifecycleTests.cs`
 - `m3uCrawler.Tests/ConfigurationGateSchedulerTests.cs`
@@ -501,7 +531,14 @@ continuam a validar o lifecycle e o bootstrap são:
 - `m3uCrawler.Tests/BootstrapConfigurationValidatorTests.cs`
 - `m3uCrawler.Tests/DashboardBootstrapEndpointTests.cs`
 
-Os testes do cenário `BOOTSTRAP_REQUIRED` (instalação adoptada sem
+PHASE 9C.5 — cenário `BOOTSTRAP_REQUIRED` (instalação adoptada sem
 admin, wizard activo, criação do primeiro admin, transição para
-`READY` operacional) **não existem** ainda e pertencem à wave de
-implementação do upgrade.
+`UserAuth`, preservação da configuração e concorrência):
+
+- `BootstrapServiceTests.Legacy_ready_without_admin_creates_first_admin_and_keeps_ready`
+- `BootstrapServiceTests.Legacy_ready_admin_creation_preserves_adoption_metadata`
+- `BootstrapServiceTests.Legacy_ready_second_admin_after_creation_is_rejected`
+- `BootstrapServiceTests.Legacy_ready_concurrent_admin_creation_creates_only_one`
+- `BootstrapServiceTests.Admin_user_store_concurrent_first_admin_persists_single_row`
+- `DashboardBootstrapEndpointTests.Legacy_ready_without_admin_serves_wizard_and_creates_first_admin`
+- `AuthPrimitivesTests.Auth_mode_resolution_is_deterministic` (`READY` ∧ sem admin → `Bootstrap`)
