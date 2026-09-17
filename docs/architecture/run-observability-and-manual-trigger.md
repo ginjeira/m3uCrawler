@@ -1467,3 +1467,119 @@ principal com:
 Não tocar: tudo o que está na §14 do plano principal +
 `CronExpression.cs` (já cobre o formato necessário) +
 `ScheduledJobRunner.cs` (mecanismo já existe, basta ligar).
+
+---
+
+## 18. Estado implementado (PHASE 9C.4)
+
+> Esta secção é **normativa sobre o que existe**, não sobre o que foi
+> desenhado. O plano acima (§1–§17) é o documento de desenho; onde as
+> duas versões divergem, esta secção descreve o comportamento actual e
+> identifica o desvio explicitamente.
+
+### 18.1 Modelo persistente
+
+- `live_runs` + `live_run_steps` (`LiveRunEntity` / `LiveRunStepEntity`),
+  migration aditiva `AddLiveRuns`. `CountsJson` é a representação
+  persistente tipada (`LiveRunCounts`); nenhuma contagem é derivada de
+  logs.
+- `LiveRun` cobre apenas a execução Telegram. `SyncRun`/`SyncRunStep`
+  continuam uma família separada e **não** foram alterados.
+- Estados de fase implementados (`LiveRunPhase`): `Idle`,
+  `ReadingTelegram`, `Discovering`, `Downloading`, `Analyzing`,
+  `Validating`, `Composing`, `SyncingDispatcharr`, `Completed`,
+  `Error`.
+- `LiveRunTerminalStatus`: `Unknown`, `Completed`, `Failed`.
+  `TerminalStatus.Failed` e `LiveRunPhase.Error` são deliberadamente
+  conceitos distintos.
+- Run interrompido por restart: `FinishedAtUtc == null` **e**
+  `TerminalStatus == Unknown` ⇒ recuperado como `Failed` por
+  `RunCoordinator.RecoverInterruptedRunsAsync`. Não existe estado
+  `Unknown` operacional adicional.
+
+### 18.2 Execução única
+
+- Um único `RunCoordinator` (`LiveRunHost.Coordinator`) serve CLI,
+  scheduler e API manual. O lock é um flag atómico
+  (`Interlocked.CompareExchange`); um segundo pedido recebe
+  `RunAlreadyInProgressException`.
+- `StartAsync` (bloqueante) é usado pela CLI e pelo scheduler;
+  `KickStartAsync` (não bloqueante, com o mesmo lock) é usado por
+  `POST /api/run/start`. Ambos invocam **a mesma** pipeline Telegram
+  (`SearchAndTestM3UInTelegramAsync` / `RunTelegramMaintenanceCycle`) —
+  não existe segundo pipeline.
+- `Source` identifica a origem (`cli`, `manual`, `scheduler`) e `Mode`
+  identifica `telegram` / `telegram-maintain`.
+
+### 18.3 API e autenticação
+
+- `GET /api/run/status` — snapshot operacional sanitizado.
+  Responde `503 pipeline-not-configured` quando a pipeline Telegram não
+  está configurada neste processo (`--web` sem `--telegram`).
+  O payload inclui `isRunning`, `status`, `runId`, `mode`, `source`,
+  `phase`, `phases`, `phaseStartedAtUtc`, `durationMs`, `counts`,
+  `recentActivities`, `recentRuns` e `webAllowTrigger`.
+- `POST /api/run/start` — arranque assíncrono. Contrato:
+  `202` aceite, `409 already-running`, `503 web-allow-trigger-disabled`,
+  `503 pipeline-not-configured`, `400 invalid payload`,
+  `401`/`403` conforme o gate 9C.2.
+- **Não foi criada autenticação própria.** Reutiliza-se o gate 9C.2
+  (`UserAuth`: sessão + CSRF; `--web-token`: credencial de máquina;
+  Bootstrap bloqueado; Legacy preservado).
+- `--web-allow-trigger` é opt-in (default `false`). Quando ausente,
+  `POST /api/run/start` devolve `503 web-allow-trigger-disabled`.
+
+### 18.4 Actividades
+
+- `LiveRunActivityFeed` é um **ring buffer em memória** (capacidade
+  200, thread-safe, `LiveRunActivity` com mensagem/metadata já
+  sanitizados por `LiveRunSanitizer`). **Não é persistido** em SQLite
+  nem em disco: o feed existe apenas enquanto o processo vive e só
+  acompanha o run corrente/último run in-process. Esta é a decisão
+  implementada na subwave 3 e substitui qualquer formulação anterior
+  do plano que sugerisse persistência de actividades.
+
+### 18.5 Scheduler (Scheduled Start Time)
+
+- A integração é feita **no scheduler existente**
+  (`ScheduledJobRunner` + `ScheduledAutomationHost`), através de duas
+  acções com nomes estáveis:
+  `telegramRun` (`Mode=telegram`) e `telegramMaintainRun`
+  (`Mode=telegram-maintain`). A corrida scheduler/manual e
+  scheduler/scheduler é resolvida pelo lock único do coordinator.
+- **Não existe `StartAtUtc`** nem scheduler paralelo. A UI calcula a
+  `CronExpression`; o agendamento reutiliza `CronExpression` e a
+  tabela `scheduled_jobs` existentes.
+- **Cron inválido é rejeitado de forma segura**: o job não executa, é
+  neutralizado (`NextRunAtUtc = null`, `LastResult = invalid-cron:…`)
+  e o tick continua a processar os restantes jobs.
+
+### 18.6 Dashboard
+
+- Nova vista `view-liverun` ("Live Run"), com estado, runId, fase,
+  duração, última actualização, mensagem, contadores, últimas
+  actividades, últimas execuções (24 h), estado do trigger, botão
+  **Run now** e a lista dos jobs agendados Telegram.
+- Actualização automática por **polling leve de 3 s** (apenas com a
+  vista activa e sem pedidos sobrepostos), via `GET /api/run/status`.
+  **Não há SSE/WebSocket, tail de logs nem parsing de `docker logs`.**
+- O `fetch` de mesma origem recebe automaticamente o `X-CSRF-Token`
+  injectado na página autenticada (helper 9C.2).
+
+### 18.7 Desvios face ao desenho original
+
+| Desenho (§1–§17) | Implementado (9C.4) |
+|---|---|
+| `RunProgressSnapshot` / `RunProgressSink` | `LiveRunSnapshot` / `ILiveRunProgress` + `NullLiveRunProgress` |
+| Tab "Runs" no Overview + bloco Overview | Vista dedicada `view-liverun` |
+| `startAtUtc` + `EffectiveCronExpression` | apenas `CronExpression` (a UI calcula a expressão) |
+| Acção `runTelegramCycle` | `telegramRun` + `telegramMaintainRun` |
+| Actividades possivelmente persistidas | ring buffer em memória, não persistido |
+| `RunId` em `RunReport` (§12.1) | **não implementado**: `RunReport` permanece inalterado (55 propriedades congeladas por teste) |
+
+### 18.8 Não implementado (mantido fora de âmbito)
+
+- Cancelamento de run em curso (§12.3).
+- ETA / estimativa de duração (§12.4).
+- `StartAtUtc` / hora fixa da primeira execução (§16).
+- Qualquer forma de `live-log tail`.

@@ -260,7 +260,7 @@ public class Phase94ScheduledRunTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task Two_concurrent_scheduler_ticks_produce_a_single_execution()
+    public async Task Two_due_scheduler_jobs_run_sequentially_without_overlap()
     {
         var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -274,29 +274,72 @@ public class Phase94ScheduledRunTests : IAsyncLifetime
         liveRunHost.ConfigureExecutor(_ => pipeline);
         using var host = BuildHost(_resolver, _outputDir, liveRunHost);
 
-        // Dois jobs diferentes ambos vencidos, ambos a apontar para o
-        // mesmo pipeline: o primeiro tick ganha o lock, o segundo é
-        // rejeitado com blocked:already-running.
+        // Dois jobs diferentes ambos vencidos. O runner é sequencial: o
+        // primeiro corre até ao fim, só depois o segundo é considerado.
         await SeedDueJobAsync("race-a", "0 7 * * *", ScheduledTelegramRunAction.TelegramActionName);
         await SeedDueJobAsync("race-b", "0 8 * * *", ScheduledTelegramRunAction.TelegramActionName);
 
         var tick = host.Runner.TickOnceAsync();
         await started.Task;
-
-        // Segundo job processado enquanto o primeiro ainda corre.
         release.TrySetResult();
         var ran = await tick;
 
-        // Ambos os jobs foram processados (2 execuções, sequenciais — não
-        // concorrentes). O invariante é: nunca há duas execuções em
-        // paralelo, o que é garantido pelo lock do coordinator.
         Assert.Equal(2, ran);
         Assert.Equal(2, await CountLiveRunsAsync());
 
-        // As execuções são estritamente sequenciais (não sobrepostas).
+        // As execuções são estritamente sequenciais (nunca sobrepostas).
         await using var ctx = _factory.CreateDbContext();
         var runs = await ctx.LiveRuns.AsNoTracking().OrderBy(r => r.StartedAtUtc).ToListAsync();
         Assert.All(runs, r => Assert.Equal(LiveRunSource.Scheduler.ToWireName(), r.Source));
+        for (var i = 1; i < runs.Count; i++)
+        {
+            Assert.True(
+                runs[i].StartedAtUtc >= runs[i - 1].FinishedAtUtc,
+                "Execuções agendadas sobrepuseram-se no tempo.");
+        }
+    }
+
+    [Fact]
+    public async Task Two_concurrent_scheduler_ticks_never_run_two_pipelines_in_parallel()
+    {
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var inFlight = 0;
+        var maxInFlight = 0;
+        var pipeline = new AsyncDelegatePipeline(async _ =>
+        {
+            var current = Interlocked.Increment(ref inFlight);
+            Interlocked.Exchange(ref maxInFlight, Math.Max(Volatile.Read(ref maxInFlight), current));
+            started.TrySetResult();
+            await release.Task;
+            Interlocked.Decrement(ref inFlight);
+        });
+
+        var liveRunHost = new LiveRunHost(_factory);
+        liveRunHost.ConfigureExecutor(_ => pipeline);
+        using var host = BuildHost(_resolver, _outputDir, liveRunHost);
+        await SeedDueJobAsync("race-sched", "0 7 * * *", ScheduledTelegramRunAction.TelegramActionName);
+
+        // Dois ticks concorrentes sobre o MESMO job vencido.
+        var tick1 = host.Runner.TickOnceAsync();
+        var tick2 = host.Runner.TickOnceAsync();
+
+        await started.Task;
+        release.TrySetResult();
+        await Task.WhenAll(tick1, tick2);
+
+        // Invariante: nunca há duas execuções da pipeline em paralelo.
+        Assert.Equal(1, Volatile.Read(ref maxInFlight));
+        Assert.Equal(0, Volatile.Read(ref inFlight));
+
+        // Todas as execuções persistidas são do scheduler.
+        await using var ctx = _factory.CreateDbContext();
+        var runs = await ctx.LiveRuns.AsNoTracking().OrderBy(r => r.StartedAtUtc).ToListAsync();
+        Assert.NotEmpty(runs);
+        Assert.All(runs, r => Assert.Equal(LiveRunSource.Scheduler.ToWireName(), r.Source));
+
+        // E nunca se sobrepõem no tempo.
         for (var i = 1; i < runs.Count; i++)
         {
             Assert.True(

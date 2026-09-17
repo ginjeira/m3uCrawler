@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace m3uCrawler.Services.LiveRun;
 
@@ -27,6 +28,37 @@ public static class LiveRunSanitizer
     private const int MaxMetadataKeyLength = 40;
 
     /// <summary>
+    /// PHASE 9C.4 (subwave 7) — Redacção defensiva de segredos que
+    /// aparecem em texto livre (não em URL): cabeçalhos
+    /// <c>Authorization</c>/<c>Proxy-Authorization</c> com esquema, e
+    /// pares <c>chave: valor</c> / <c>chave=valor</c> para nomes de
+    /// campo que transportam credenciais. <see cref="CredentialSanitizer"/>
+    /// cobre credenciais embutidas em URLs; este passo cobre o resto,
+    /// para que o invariante documentado ("nada do que é escrito...
+    /// pode conter credenciais, tokens, cookies, session IDs") seja
+    /// verdadeiro também fora de URLs.
+    /// </summary>
+    private static readonly Regex SecretSchemeRegex = new(
+        @"\b(?:Bearer|Basic)\s+[A-Za-z0-9\-._~+/=]{6,}",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static readonly Regex SecretKeyValueRegex = new(
+        @"(?<key>\b(?:password|passwd|pwd|token|api[_-]?key|apikey|secret|session(?:id|_id)?|authorization|cookie)\b)" +
+        @"(?<sep>\s*[:=]\s*)(?<value>[^\s&;""']+)",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    /// <summary>Aplica a redacção defensiva de segredos em texto livre.</summary>
+    private static string RedactFreeTextSecrets(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return text;
+        var redacted = SecretSchemeRegex.Replace(text, m => m.Value.Split(' ')[0] + " ***");
+        redacted = SecretKeyValueRegex.Replace(
+            redacted,
+            m => m.Groups["key"].Value + m.Groups["sep"].Value + "***");
+        return redacted;
+    }
+
+    /// <summary>
     /// Sanitiza e trunca uma mensagem para uso em estado persistido.
     /// Remove quebras de linha (que degradariam leitura em coluna
     /// única) e nunca devolve <c>null</c>.
@@ -36,8 +68,9 @@ public static class LiveRunSanitizer
         if (string.IsNullOrWhiteSpace(text)) return string.Empty;
 
         // SanitizeText cobre URLs embutidas (userinfo, /live/USER/PASS/,
-        // query username/password/token).
-        var sanitized = CredentialSanitizer.SanitizeText(text);
+        // query username/password/token); RedactFreeTextSecrets cobre
+        // segredos fora de URLs (Authorization, cookie, api_key=…).
+        var sanitized = RedactFreeTextSecrets(CredentialSanitizer.SanitizeText(text));
         var compact = Compact(sanitized);
 
         if (compact.Length <= MaxMessageLength) return compact;
@@ -62,7 +95,8 @@ public static class LiveRunSanitizer
             if (key.Length == 0) continue;
             if (key.Length > MaxMetadataKeyLength) key = key[..MaxMetadataKeyLength];
 
-            var value = Compact(CredentialSanitizer.SanitizeText(pair.Value ?? string.Empty));
+            var value = Compact(RedactFreeTextSecrets(
+                CredentialSanitizer.SanitizeText(pair.Value ?? string.Empty)));
             if (value.Length > MaxMetadataValueLength) value = value[..MaxMetadataValueLength];
 
             // Chaves duplicadas após compactação: mantém a primeira.

@@ -94,6 +94,7 @@ As opções abaixo são as efectivamente reconhecidas pelo `Program.cs`. Opçõe
 | `--web` | Inicia o dashboard web. |
 | `--web-port PORTA` | Porta do dashboard (padrão: 5000). |
 | `--web-token TOKEN` | Token partilhado para proteger o dashboard (ver secção "Modelo de segurança do dashboard"). Opcional. |
+| `--web-allow-trigger` | Opt-in: permite `POST /api/run/start` (trigger manual) no dashboard. Default: desactivado ⇒ `503 web-allow-trigger-disabled`. |
 | `--output-dir DIR` | Directório de saída (padrão: `output`). |
 | `--bot` | Modo bot Telegram. |
 | `--fast` / `--high-performance` | Aumenta a concorrência (modo de pesquisa web). |
@@ -708,6 +709,79 @@ silenciosamente para o modo legacy.
 O dashboard serve HTTP. Sem TLS não é possível garantir `Secure` nem proteger
 credenciais em trânsito; uma exposição fora de rede confiável deve usar reverse
 proxy/TLS.
+
+## Live Run Monitor (PHASE 9C.4)
+
+Observabilidade da execução Telegram (descoberta + validação + composição +
+sync) com trigger manual opt-in e arranque agendado, **sem** duplicar pipeline
+nem scheduler.
+
+### Modelo persistente
+
+- `live_runs` + `live_run_steps` (migration aditiva `AddLiveRuns`).
+- Fases: `idle`, `reading-telegram`, `discovering`, `downloading`, `analyzing`,
+  `validating`, `composing`, `syncing-dispatcharr`, `completed`, `error`.
+- Estado terminal: `Unknown`, `Completed`, `Failed`
+  (`Failed` ≠ fase `Error` — são conceitos distintos).
+- `CountsJson` é a representação persistente de `LiveRunCounts` (tipado). Nada
+  é contado a partir de logs.
+- Um run interrompido por restart (`FinishedAtUtc == null` e
+  `TerminalStatus == Unknown`) é recuperado como `Failed`.
+- `SyncRun`/`SyncRunStep` continuam uma família separada e não são tocados.
+
+### Execução única (`RunCoordinator`)
+
+CLI, scheduler e API manual convergem no **mesmo** `RunCoordinator`
+(`LiveRunHost`). O lock é partilhado, pelo que uma corrida manual/scheduler
+resulta numa única execução (`409 already-running` para o perdedor). `Source`
+(`cli`/`manual`/`scheduler`) e `Mode` (`telegram`/`telegram-maintain`) ficam
+registados. A pipeline invocada é sempre a existente
+(`SearchAndTestM3UInTelegramAsync` / `RunTelegramMaintenanceCycle`).
+
+### API
+
+| Endpoint | Comportamento |
+|---|---|
+| `GET /api/run/status` | Snapshot sanitizado: `isRunning`, `status`, `runId`, `mode`, `source`, `phase`, `phaseStartedAtUtc`, `durationMs`, `counts`, `recentActivities`, `recentRuns` (24 h), `webAllowTrigger`. `503 pipeline-not-configured` quando não há pipeline Telegram no processo. |
+| `POST /api/run/start` | Arranque assíncrono (não bloqueia até ao fim). `202` aceite · `409 already-running` · `503 web-allow-trigger-disabled` · `503 pipeline-not-configured` · `400 invalid payload` · `401`/`403` conforme o gate 9C.2. |
+
+A autorização reutiliza o gate da 9C.2 (sessão + CSRF em `UserAuth`,
+`--web-token` como credencial de máquina, Bootstrap bloqueado, Legacy
+preservado). **Não existe autenticação dedicada.** O trigger manual exige
+`--web-allow-trigger` (opt-in, default desactivado).
+
+Em **standalone** (`--web` sem `--telegram`) ambos os endpoints devolvem
+`503 pipeline-not-configured` — o dashboard continua a arrancar normalmente.
+
+### Actividades (ring buffer em memória)
+
+`LiveRunActivityFeed` é um ring buffer thread-safe de capacidade 200, **não
+persistido** em SQLite nem em disco. Só acompanha o run corrente/último run
+in-process; após restart não existem actividades. Mensagens e metadata passam
+por `LiveRunSanitizer` (URLs com credenciais, `Authorization: Bearer …`,
+`cookie`, `api_key=…`, `session=…`).
+
+### Arranque agendado (sem `StartAtUtc`)
+
+Duas acções estáveis no scheduler existente (`ScheduledJobRunner`):
+
+| Acção | Modo |
+|---|---|
+| `telegramRun` | `telegram` |
+| `telegramMaintainRun` | `telegram-maintain` |
+
+A UI calcula a `CronExpression` (não existe `startAtUtc` nem scheduler
+paralelo). Cron inválido é rejeitado de forma segura: o job não executa, é
+neutralizado (`LastResult = invalid-cron:…`) e o tick continua a processar os
+restantes jobs.
+
+### Vista "Live Run" no dashboard
+
+Estado, runId, fase, desde quando, duração, última actualização, mensagem,
+contadores, últimas actividades, últimas execuções (24 h), estado do trigger,
+botão **Run now** e os jobs agendados Telegram. Actualização automática por
+**polling de 3 s** (apenas com a vista activa e sem pedidos sobrepostos). Não
+há SSE/WebSocket, tail de logs nem parsing de `docker logs`.
 
 ## Comportamento funcional
 
