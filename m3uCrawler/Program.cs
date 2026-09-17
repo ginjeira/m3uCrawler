@@ -389,6 +389,27 @@ namespace m3uCrawler
                         liveRunCoordinator = new RunCoordinator(
                             catalogForIngestion.GetFactory(), liveRunPipelineFactory);
                     }
+
+                    // PHASE 9C.4 — Recuperar runs interrompidos por crash
+                    // anterior: marca-os como Failed antes de iniciar
+                    // qualquer nova execução. Idempotente.
+                    try
+                    {
+                        var recovered = await liveRunCoordinator
+                            .RecoverInterruptedRunsAsync(CancellationToken.None);
+                        if (recovered > 0)
+                        {
+                            Console.WriteLine(
+                                $"🩹 RecoverInterruptedRunsAsync: {recovered} run(s) marcado(s) como Failed.");
+                        }
+                    }
+                    catch (Exception recoveryEx)
+                    {
+                        // Não bloquear o startup por causa de falha de
+                        // recovery: o coordinator continua utilizável.
+                        Console.WriteLine(
+                            $"⚠️ Falha em RecoverInterruptedRunsAsync: {recoveryEx.GetType().Name}: {recoveryEx.Message}");
+                    }
                 }
 
                 do

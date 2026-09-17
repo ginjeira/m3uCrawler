@@ -41,8 +41,8 @@ public class Phase94ScheduledRunTests : IAsyncLifetime
 
     public Phase94ScheduledRunTests()
     {
-        _dbPath = Path.Combine(Path.GetTempPath(), $"sched-liverun-{Guid.NewGuid():N}.db");
-        _outputDir = Path.Combine(Path.GetTempPath(), $"sched-liverun-out-{Guid.NewGuid():N}");
+        _dbPath = TestTempDb.SuitePath($"sched-liverun-{Guid.NewGuid():N}.db");
+        _outputDir = TestTempDb.SuitePath($"sched-liverun-out-{Guid.NewGuid():N}");
     }
 
     public async Task InitializeAsync()

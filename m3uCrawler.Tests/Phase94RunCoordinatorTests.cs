@@ -20,7 +20,7 @@ namespace m3uCrawler.Tests;
 public class Phase94RunCoordinatorTests
 {
     private static string NewDbPath() =>
-        Path.Combine(Path.GetTempPath(), $"phase94-coord-{Guid.NewGuid():N}.db");
+        TestTempDb.SuitePath($"phase94-coord-{Guid.NewGuid():N}.db");
 
     private static async Task<IDbContextFactory<ChannelCatalogDbContext>> NewCatalogAsync()
     {

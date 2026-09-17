@@ -13,31 +13,51 @@ namespace m3uCrawler.Tests;
 /// criados pelos testes.
 ///
 /// <para>
-/// <b>Motivo.</b> A suite cria uma BD temporária por teste
-/// (<c>%TEMP%\*.db</c>, <c>%TEMP%\*.json</c>, <c>%TEMP%\*.m3u</c>).
-/// Sem limpeza, execuções repetidas acumulam dezenas de milhares de
-/// ficheiros até esgotar o disco (observado em 2026-09-17: 53 823
-/// ficheiros, 7,4 GB, <c>C:</c> com 0 bytes livres → falha sistémica
-/// de todos os testes que tocam em SQLite).
+/// <b>Directório dedicado.</b> Todos os artefactos da suite vivem
+/// sob <c>%TEMP%\m3uCrawler.Tests.tmp\</c>. O directório é criado
+/// pela primeira chamada a <see cref="EnsureSuiteRoot"/> e os
+/// artefactos têm nomes prefixados (e.g. <c>phase94-host-</c>,
+/// <c>phase94-coord-</c>) para que o sweeper possa identificá-los
+/// sem ambiguidade.
+/// </para>
+///
+/// <para>
+/// <b>Porquê um directório dedicado?</b> O sweeper NUNCA opera sobre
+/// <c>%TEMP%</c> global: só apaga ficheiros dentro do seu próprio
+/// directório, cujos nomes correspondam a prefixos explícitos. Isto
+/// garante que:
+/// <list type="bullet">
+///   <item>ficheiros de outros processos/utilizadores em <c>%TEMP%</c>
+///         são preservados;</item>
+///   <item>o espaço dedicado é estabilizado entre execuções.</item>
+/// </list>
 /// </para>
 ///
 /// <para>
 /// <b>Camadas de defesa.</b>
 /// <list type="number">
 ///   <item>
-///     Por teste (<see cref="Cleanup(string[])"/>): as classes que
-///     implementam <see cref="IAsyncLifetime"/> chamam isto no seu
-///     <c>DisposeAsync</c>. Fecha pools de conexão, apaga o ficheiro
-///     principal e os sidecars <c>-wal</c>/<c>-shm</c>, ignora falhas.
+///     Por teste (<see cref="Cleanup"/>): a suite chama isto no
+///     seu <c>DisposeAsync</c>. Fecha pools de conexão, apaga o
+///     ficheiro principal e os sidecars <c>-wal</c>/<c>-shm</c>,
+///     ignora falhas.
 ///   </item>
 ///   <item>
-///     Por processo (<see cref="SweepKnownPatterns"/>): um
-///     <see cref="ModuleInitializerAttribute"/> regista um
-///     <c>ProcessExit</c> que varre <c>%TEMP%</c> e apaga tudo o que
-///     corresponda a padrões conhecidos de fixtures de teste.
-///     Apanha as classes que não implementam <c>IAsyncLifetime</c>.
+///     Por processo (<see cref="SweepSuiteRoot"/>): um
+///     <see cref="ModuleInitializerAttribute"/> corre no início
+///     do processo e apaga apenas ficheiros do namespace dedicado
+///     cujo nome comece por um dos prefixos conhecidos. Ficheiros
+///     que não correspondam são preservados.
 ///   </item>
 /// </list>
+/// </para>
+///
+/// <para>
+/// <b>Não há heurísticas wildcard.</b> A heurística anterior que
+/// combinava <c>*.db.lock</c> com <c>Contains("-") || Contains("_")</c>
+/// operava efectivamente como wildcard sobre <c>%TEMP%</c> e foi
+/// removida por razões de segurança (review independente de
+/// 2026-09-17, finding F-001).
 /// </para>
 /// </summary>
 internal static class TestTempDb
@@ -49,11 +69,16 @@ internal static class TestTempDb
     private static readonly string[] SidecarSuffixes = { string.Empty, "-wal", "-shm" };
 
     /// <summary>
+    /// Nome do directório dedicado da suite. Concatenado a
+    /// <see cref="Path.GetTempPath"/> na primeira utilização e criado
+    /// com <see cref="Directory.CreateDirectory(string)"/> (que é
+    /// idempotente e seguro).
+    /// </summary>
+    public const string SuiteRootName = "m3uCrawler.Tests.tmp";
+
+    /// <summary>
     /// Prefixos de ficheiros/directórios temporários pertencentes a
-    /// fixtures da suite de testes. O sweeper no fim do processo
-    /// apanha qualquer ficheiro que tenha ficado para trás porque a
-    /// classe produtora não implementa <see cref="IAsyncLifetime"/>
-    /// ou porque uma <c>try/catch</c> falhou.
+    /// fixtures da suite. O sweeper compara com <c>String.StartsWith</c>.
     /// </summary>
     private static readonly string[] KnownTestPrefixes =
     {
@@ -82,9 +107,8 @@ internal static class TestTempDb
     };
 
     /// <summary>
-    /// Sufixos temporais e separadores que algumas fixtures usam para
-    /// distinguir runs (underscore + timestamp). O sweeper trata-os
-    /// como equivalentes aos prefixos <see cref="KnownTestPrefixes"/>.
+    /// Variantes dos prefixos com separador <c>_</c> em vez de
+    /// <c>-</c>. Algumas fixtures usam timestamp <c>_YYYYMMDD_HHMMSS</c>.
     /// </summary>
     private static readonly string[] KnownTestPrefixesAltSeparator =
     {
@@ -115,39 +139,51 @@ internal static class TestTempDb
         "diag_", "diag-",
     };
 
-    private static readonly string[] KnownTestDirectoryPrefixes =
-    {
-        "dash-liverun-", "sched-liverun-",
-    };
-
     /// <summary>
-    /// Sufixos de ficheiros auxiliares SQLite ou sidecars (lock, journal,
-    /// shm, wal) que algumas fixtures criam com nomes como
-    /// <c>prefix-guid.db.lock</c>.
+    /// Lock files SQLite (lock de migrations): apaga <c>*.db.lock</c>
+    /// apenas quando o baseName começa por um dos prefixos conhecidos.
+    /// Sem heurística wildcard.
     /// </summary>
-    private static readonly string[] AuxiliarySuffixes = { ".db.lock" };
+    private const string DbLockSuffix = ".db.lock";
 
     [ModuleInitializer]
     public static void ModuleInit()
     {
-        // O test runner do `dotnet test` (vstest) mantém o processo
-        // host vivo entre runs e `ProcessExit` raramente dispara de
-        // forma fiável. Em vez disso, limpamos no *início* do
-        // processo: cada execução arranca com `%TEMP%` livre de
-        // artefactos de runs anteriores.
         try
         {
-            SweepKnownPatterns();
+            SweepSuiteRoot();
         }
         catch
         {
             // best effort: nunca bloqueia a suite
         }
 
-        // Também registamos um hook de saída como rede de segurança
-        // (caso o processo termine de facto — por exemplo, em testes
-        // individuais via `dotnet run`).
+        // Hook de saída como rede de segurança (em geral, não dispara
+        // no `dotnet test`, mas fica disponível para `dotnet run`).
         AppDomain.CurrentDomain.ProcessExit += static (_, _) => SafeSweep();
+    }
+
+    /// <summary>
+    /// Devolve e cria (se necessário) o directório dedicado da suite.
+    /// Idempotente: chamar várias vezes devolve sempre o mesmo path.
+    /// </summary>
+    public static string EnsureSuiteRoot()
+    {
+        var root = Path.Combine(Path.GetTempPath(), SuiteRootName);
+        Directory.CreateDirectory(root); // no-op se já existir
+        return root;
+    }
+
+    /// <summary>
+    /// Devolve o caminho completo para um ficheiro dentro do directório
+    /// dedicado da suite. Útil para testes que opt-in por usar este
+    /// namespace isolado. <b>Não</b> cria o ficheiro (responsabilidade
+    /// do teste).
+    /// </summary>
+    public static string SuitePath(string fileName)
+    {
+        ArgumentNullException.ThrowIfNull(fileName);
+        return Path.Combine(EnsureSuiteRoot(), fileName);
     }
 
     /// <summary>Apaga <paramref name="paths"/> e respectivos sidecars.</summary>
@@ -177,6 +213,9 @@ internal static class TestTempDb
                     }
                 }
             }
+            // Sidecar de lock files apenas se o main path bater um prefixo
+            // conhecido. Sem heurística wildcard.
+            TryDeleteDbLockIfKnown(path);
         }
     }
 
@@ -205,14 +244,16 @@ internal static class TestTempDb
     }
 
     /// <summary>
-    /// Varre <c>%TEMP%</c> e apaga todos os ficheiros/directórios cujo
-    /// nome comece por um padrão conhecido de fixture de teste.
-    /// Útil como rede de segurança a correr no fim do processo.
+    /// Varre o <b>directório dedicado da suite</b> e apaga apenas
+    /// ficheiros cujo nome comece por um prefixo conhecido. Nunca
+    /// toca em ficheiros fora do namespace da suite. Nunca aplica
+    /// heurísticas wildcard.
     /// </summary>
-    public static int SweepKnownPatterns(string? tempRoot = null)
+    /// <returns>número de ficheiros (principais) efectivamente removidos.</returns>
+    public static int SweepSuiteRoot()
     {
-        tempRoot ??= Path.GetTempPath();
-        if (!Directory.Exists(tempRoot)) return 0;
+        var root = EnsureSuiteRoot();
+        if (!Directory.Exists(root)) return 0;
 
         try { SqliteConnection.ClearAllPools(); } catch { /* best effort */ }
         Thread.Sleep(50);
@@ -220,60 +261,45 @@ internal static class TestTempDb
         var deleted = 0;
         try
         {
-            // Apaga directórios em primeiro lugar para libertar
-            // handles que impeçam a remoção de ficheiros contidos.
-            foreach (var prefix in KnownTestDirectoryPrefixes)
-            {
-                foreach (var dir in Directory.EnumerateDirectories(tempRoot, prefix + "*", SearchOption.TopDirectoryOnly))
-                {
-                    if (TryDeleteDirectory(dir)) deleted++;
-                }
-            }
-
-            // Apaga ficheiros principais + sidecars.
+            // Ficheiros principais + sidecars.
             foreach (var prefix in AllPrefixes())
             {
-                foreach (var path in Directory.EnumerateFiles(tempRoot, prefix + "*", SearchOption.TopDirectoryOnly))
+                foreach (var path in Directory.EnumerateFiles(root, prefix + "*", SearchOption.TopDirectoryOnly))
                 {
                     DeleteWithSidecars(path);
                     if (!File.Exists(path)) deleted++;
                 }
 
-                // Sidecars cujo nome não começa pelo prefixo mas
-                // segue o ficheiro principal (ex.: "phase94-x.db-wal").
-                foreach (var path in Directory.EnumerateFiles(tempRoot, "*-wal", SearchOption.TopDirectoryOnly))
+                // Sidecars cujo nome não começa pelo prefixo (ex.:
+                // "phase94-x.db-wal"). Apenas se o mainPath bater
+                // um prefixo conhecido.
+                foreach (var path in Directory.EnumerateFiles(root, "*-wal", SearchOption.TopDirectoryOnly))
                 {
                     var mainPath = Path.ChangeExtension(path, null);
-                    if (AllPrefixes().Any(p => mainPath.StartsWith(Path.Combine(tempRoot, p), StringComparison.OrdinalIgnoreCase)))
+                    if (AllPrefixes().Any(p => mainPath.StartsWith(Path.Combine(root, p), StringComparison.OrdinalIgnoreCase)))
                     {
                         DeleteFileSafely(path);
                     }
                 }
-                foreach (var path in Directory.EnumerateFiles(tempRoot, "*-shm", SearchOption.TopDirectoryOnly))
+                foreach (var path in Directory.EnumerateFiles(root, "*-shm", SearchOption.TopDirectoryOnly))
                 {
                     var mainPath = Path.ChangeExtension(path, null);
-                    if (AllPrefixes().Any(p => mainPath.StartsWith(Path.Combine(tempRoot, p), StringComparison.OrdinalIgnoreCase)))
+                    if (AllPrefixes().Any(p => mainPath.StartsWith(Path.Combine(root, p), StringComparison.OrdinalIgnoreCase)))
                     {
                         DeleteFileSafely(path);
                     }
                 }
             }
 
-            // Auxiliares SQLite: *.db.lock (lock file de migrations)
-            foreach (var suffix in AuxiliarySuffixes)
+            // Lock files SQLite (*.db.lock) apenas quando o baseName
+            // começar por um dos prefixos conhecidos. SEM wildcard.
+            foreach (var path in Directory.EnumerateFiles(root, "*" + DbLockSuffix, SearchOption.TopDirectoryOnly))
             {
-                foreach (var path in Directory.EnumerateFiles(tempRoot, "*" + suffix, SearchOption.TopDirectoryOnly))
+                var baseName = Path.GetFileNameWithoutExtension(
+                    Path.GetFileNameWithoutExtension(path));
+                if (AllPrefixes().Any(p => baseName.StartsWith(p, StringComparison.OrdinalIgnoreCase)))
                 {
-                    var baseName = Path.GetFileNameWithoutExtension(Path.GetFileNameWithoutExtension(path));
-                    // baseName é o nome antes de ".db.lock"; tenta
-                    // casar com algum prefixo conhecido.
-                    if (AllPrefixes().Any(p => baseName.StartsWith(p, StringComparison.OrdinalIgnoreCase))
-                        || baseName.Contains("-") || baseName.Contains("_"))
-                    {
-                        // Heurística segura: nomes com GUID/timestamp
-                        // pertencem a fixtures.
-                        DeleteFileSafely(path);
-                    }
+                    DeleteFileSafely(path);
                 }
             }
         }
@@ -293,19 +319,18 @@ internal static class TestTempDb
 
     private static void SafeSweep()
     {
-        try { SweepKnownPatterns(); } catch { /* best effort */ }
+        try { SweepSuiteRoot(); } catch { /* best effort */ }
     }
 
-    private static bool TryDeleteDirectory(string dir)
+    private static void TryDeleteDbLockIfKnown(string mainPath)
     {
-        try
+        // O nome é "<mainname>.db.lock". Strip do ".db.lock" dá o base.
+        var baseName = Path.GetFileName(mainPath);
+        var lockPath = mainPath + DbLockSuffix;
+        if (!File.Exists(lockPath)) return;
+        if (AllPrefixes().Any(p => baseName.StartsWith(p, StringComparison.OrdinalIgnoreCase)))
         {
-            Directory.Delete(dir, recursive: true);
-            return true;
-        }
-        catch
-        {
-            return false;
+            DeleteFileSafely(lockPath);
         }
     }
 

@@ -56,7 +56,7 @@ public class Phase94LiveRunApiTests : IAsyncLifetime
 
     public Phase94LiveRunApiTests()
     {
-        _root = Path.Combine(Path.GetTempPath(), $"dash-liverun-{Guid.NewGuid():N}");
+        _root = TestTempDb.SuitePath($"dash-liverun-{Guid.NewGuid():N}");
         _dbPath = Path.Combine(_root, "channel-catalog.db");
         _outputDir = Path.Combine(_root, "output");
         _storePath = Path.Combine(_root, ConfigurationLifecycleStore.FileName);
@@ -158,7 +158,7 @@ public class Phase94LiveRunApiTests : IAsyncLifetime
 
     private async Task<LiveRunHost> BuildHostAsync(Func<LiveRunRequest, IRunPipeline>? executor = null)
     {
-        var path = TrackDb(Path.Combine(Path.GetTempPath(), $"phase94-host-{Guid.NewGuid():N}.db"));
+        var path = TrackDb(TestTempDb.SuitePath($"phase94-host-{Guid.NewGuid():N}.db"));
         var bootstrapper = new ChannelCatalogBootstrapper(path);
         await using (var bootstrapCtx = await bootstrapper.InitializeAsync())
         {
@@ -491,7 +491,7 @@ public class Phase94LiveRunApiTests : IAsyncLifetime
     {
         // Diagnóstico directo: KickStartAsync + pipeline que lança.
         // Verifica se a DB é actualizada sem passar pelo handler HTTP.
-        var path = TrackDb(Path.Combine(Path.GetTempPath(), $"phase94-direct-{Guid.NewGuid():N}.db"));
+        var path = TrackDb(TestTempDb.SuitePath($"phase94-direct-{Guid.NewGuid():N}.db"));
         var bootstrapper = new ChannelCatalogBootstrapper(path);
         await using (var bootstrapCtx = await bootstrapper.InitializeAsync()) { }
 
@@ -687,7 +687,7 @@ public class Phase94LiveRunApiTests : IAsyncLifetime
     [Fact]
     public async Task Coordinator_lists_recent_finished_runs_ordered_and_capped()
     {
-        var path = TrackDb(Path.Combine(Path.GetTempPath(), $"phase94-recent-{Guid.NewGuid():N}.db"));
+        var path = TrackDb(TestTempDb.SuitePath($"phase94-recent-{Guid.NewGuid():N}.db"));
         var bootstrapper = new ChannelCatalogBootstrapper(path);
         await using (var bootstrapCtx = await bootstrapper.InitializeAsync()) { }
 

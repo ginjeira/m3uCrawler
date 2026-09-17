@@ -18,7 +18,7 @@ namespace m3uCrawler.Tests;
 public class Phase94LiveRunModelTests
 {
     private static string NewDbPath() =>
-        Path.Combine(Path.GetTempPath(), $"phase94-liverun-{Guid.NewGuid():N}.db");
+        TestTempDb.SuitePath($"phase94-liverun-{Guid.NewGuid():N}.db");
 
     private static DbContextOptions<ChannelCatalogDbContext> OptionsFor(string dbPath) =>
         new DbContextOptionsBuilder<ChannelCatalogDbContext>()

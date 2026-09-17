@@ -101,7 +101,7 @@ public class Phase94LiveRunHardeningTests : IAsyncLifetime
 
     public Phase94LiveRunHardeningTests()
     {
-        _dbPath = Path.Combine(Path.GetTempPath(), $"liverun-harden-{Guid.NewGuid():N}.db");
+        _dbPath = TestTempDb.SuitePath($"liverun-harden-{Guid.NewGuid():N}.db");
     }
 
     public async Task InitializeAsync()

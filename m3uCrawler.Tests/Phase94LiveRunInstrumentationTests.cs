@@ -661,7 +661,7 @@ public sealed class LiveRunInstrumentationFixture : IAsyncLifetime
 
     public async Task InitializeAsync()
     {
-        _dbPath = Path.Combine(Path.GetTempPath(), $"phase94-instr-fixture-{Guid.NewGuid():N}.db");
+        _dbPath = TestTempDb.SuitePath($"phase94-instr-fixture-{Guid.NewGuid():N}.db");
         Factory = new TestDbContextFactory(_dbPath);
         await using var ctx = await Factory.CreateDbContextAsync();
         await ctx.Database.EnsureCreatedAsync();

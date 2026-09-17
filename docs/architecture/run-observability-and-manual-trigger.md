@@ -1494,8 +1494,12 @@ Não tocar: tudo o que está na §14 do plano principal +
   conceitos distintos.
 - Run interrompido por restart: `FinishedAtUtc == null` **e**
   `TerminalStatus == Unknown` ⇒ recuperado como `Failed` por
-  `RunCoordinator.RecoverInterruptedRunsAsync`. Não existe estado
-  `Unknown` operacional adicional.
+  `RunCoordinator.RecoverInterruptedRunsAsync()`. **O método é
+  invocado no startup de produção**, em ambos os caminhos onde o
+  `RunCoordinator` é configurado (`--web --telegram` e `--telegram`
+  standalone), imediatamente antes do primeiro `StartAsync`. Não existe
+  estado `Unknown` operacional adicional. A chamada é best-effort:
+  uma falha no recovery não bloqueia o arranque.
 
 ### 18.2 Execução única
 
@@ -1576,6 +1580,7 @@ Não tocar: tudo o que está na §14 do plano principal +
 | Acção `runTelegramCycle` | `telegramRun` + `telegramMaintainRun` |
 | Actividades possivelmente persistidas | ring buffer em memória, não persistido |
 | `RunId` em `RunReport` (§12.1) | **não implementado**: `RunReport` permanece inalterado (55 propriedades congeladas por teste) |
+| Sweeper de teste sobre `%TEMP%` global | Sweeper scoped a `%TEMP%\m3uCrawler.Tests.tmp\` (correcção pós-revisão F-001) |
 
 ### 18.8 Não implementado (mantido fora de âmbito)
 
