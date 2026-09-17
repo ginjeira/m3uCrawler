@@ -52,7 +52,8 @@ public sealed class ScheduledAutomationHost : IDisposable
         DispatcharrConfig dispatcharrConfig,
         TimeSpan? pollInterval = null,
         Action<ScheduledActionOptions>? configureOptions = null,
-        IConfigurationGate? gate = null)
+        IConfigurationGate? gate = null,
+        LiveRun.LiveRunHost? liveRunHost = null)
     {
         var options = new ScheduledActionOptions { OutputDir = outputDir };
         configureOptions?.Invoke(options);
@@ -77,6 +78,14 @@ public sealed class ScheduledAutomationHost : IDisposable
         sc.AddSingleton<IScheduledAction, ScheduledValidationAction>();
         sc.AddSingleton<IScheduledAction, ScheduledPlaylistGenerationAction>();
         sc.AddSingleton<IScheduledAction, ScheduledDispatcharrSyncAction>();
+
+        // PHASE 9C.4 (subwave 5) — Execução Telegram agendada. Converge no
+        // RunCoordinator único (Source=Scheduler). Se o host não tiver
+        // coordinator configurado, a acção devolve um resultado seguro.
+        sc.AddSingleton<IScheduledAction>(
+            new ScheduledTelegramRunAction(liveRunHost, LiveRun.LiveRunMode.Telegram));
+        sc.AddSingleton<IScheduledAction>(
+            new ScheduledTelegramRunAction(liveRunHost, LiveRun.LiveRunMode.TelegramMaintain));
 
         var provider = sc.BuildServiceProvider();
 

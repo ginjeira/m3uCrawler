@@ -35,6 +35,7 @@ namespace m3uCrawler.Tests;
 ///   <item>Não-exposição de segredos em qualquer resposta.</item>
 /// </list>
 /// </summary>
+[Collection("DashboardStaticState")]
 public class Phase94LiveRunApiTests : IAsyncLifetime
 {
     private const string ValidPassword = "a-very-strong-password";

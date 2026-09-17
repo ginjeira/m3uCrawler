@@ -18,6 +18,7 @@ namespace m3uCrawler.Tests;
 /// e reporta o estado de configuração de forma inequívoca, sem contornar
 /// a autenticação nem expor operações destrutivas.
 /// </summary>
+[Collection("DashboardStaticState")]
 public class ConfigurationLifecycleEndpointTests : IAsyncLifetime
 {
     private readonly string _root;

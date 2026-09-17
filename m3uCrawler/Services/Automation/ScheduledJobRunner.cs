@@ -121,6 +121,23 @@ public sealed class ScheduledJobRunner : IDisposable
         var ran = 0;
         foreach (var job in due)
         {
+            // PHASE 9C.4 (subwave 5) — Rejeição segura de configuração
+            // inválida, ANTES de executar a acção: um cron inválido não
+            // corre o job, não aborta o tick e não impede os restantes.
+            // O job é neutralizado (NextRunAtUtc=null) para não entrar num
+            // ciclo de retry; LastResult explica o motivo. Reconfigurar o
+            // job (upsert) repõe o agendamento.
+            if (!TryNextOccurrence(job.CronExpression, now, out var nextAfterNow))
+            {
+                await using var cInvalid = await _dbFactory.CreateDbContextAsync(cancellationToken);
+                var jobInvalid = await cInvalid.ScheduledJobs.FirstAsync(j => j.Id == job.Id, cancellationToken);
+                jobInvalid.LastResult = Truncate($"invalid-cron:{job.CronExpression}", 120);
+                jobInvalid.NextRunAtUtc = null;
+                jobInvalid.UpdatedAtUtc = now;
+                await cInvalid.SaveChangesAsync(cancellationToken);
+                continue;
+            }
+
             var action = ResolveAction(job.ActionName);
             if (action == null)
             {
@@ -128,7 +145,7 @@ public sealed class ScheduledJobRunner : IDisposable
                 var job2 = await c2.ScheduledJobs.FirstAsync(j => j.Id == job.Id, cancellationToken);
                 job2.LastResult = $"unknown-action:{job.ActionName}";
                 job2.LastRunAtUtc = now;
-                job2.NextRunAtUtc = CronExpression.Parse(job.CronExpression).NextOccurrence(now);
+                job2.NextRunAtUtc = nextAfterNow;
                 job2.UpdatedAtUtc = now;
                 await c2.SaveChangesAsync(cancellationToken);
                 continue;
@@ -144,16 +161,37 @@ public sealed class ScheduledJobRunner : IDisposable
                 result = $"error:{ex.GetType().Name}:{ex.Message}";
             }
             var finished = DateTime.UtcNow;
+            var hasNext = TryNextOccurrence(job.CronExpression, finished, out var nextRun);
+
             await using var c3 = await _dbFactory.CreateDbContextAsync(cancellationToken);
             var job3 = await c3.ScheduledJobs.FirstAsync(j => j.Id == job.Id, cancellationToken);
             job3.LastRunAtUtc = started;
-            job3.LastResult = Truncate(result, 120);
+            job3.LastResult = hasNext ? Truncate(result, 120) : Truncate($"invalid-cron:{result}", 120);
             job3.UpdatedAtUtc = finished;
-            job3.NextRunAtUtc = CronExpression.Parse(job3.CronExpression).NextOccurrence(finished);
+            job3.NextRunAtUtc = hasNext ? nextRun : null;
             await c3.SaveChangesAsync(cancellationToken);
             ran++;
         }
         return ran;
+    }
+
+    /// <summary>
+    /// Calcula o próximo tick de forma segura: uma expressão cron
+    /// inválida devolve <c>false</c> em vez de lançar, para que o
+    /// tick possa continuar a processar os restantes jobs.
+    /// </summary>
+    private static bool TryNextOccurrence(string cronExpression, DateTime fromUtc, out DateTime next)
+    {
+        try
+        {
+            next = CronExpression.Parse(cronExpression).NextOccurrence(fromUtc);
+            return true;
+        }
+        catch
+        {
+            next = default;
+            return false;
+        }
     }
 
     /// <summary>

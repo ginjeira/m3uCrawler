@@ -50,7 +50,7 @@ public class ScheduledActionsTests : IAsyncLifetime
     // ---------- IScheduledAction resolution via DI ----------
 
     [Fact]
-    public void ScheduledAutomationHost_resolves_all_four_actions_via_DI()
+    public void ScheduledAutomationHost_resolves_all_six_actions_via_DI()
     {
         var tempDir = Path.Combine(Path.GetTempPath(), $"sched-out-{Guid.NewGuid():N}");
         using var host = ScheduledAutomationHost.Build(
@@ -61,7 +61,10 @@ public class ScheduledActionsTests : IAsyncLifetime
         Assert.Contains(ScheduledValidationAction.ActionName, names);
         Assert.Contains(ScheduledPlaylistGenerationAction.ActionName, names);
         Assert.Contains(ScheduledDispatcharrSyncAction.ActionName, names);
-        Assert.Equal(4, names.Length);
+        // PHASE 9C.4 (subwave 5): execução Telegram agendada via RunCoordinator.
+        Assert.Contains(ScheduledTelegramRunAction.TelegramActionName, names);
+        Assert.Contains(ScheduledTelegramRunAction.TelegramMaintainActionName, names);
+        Assert.Equal(6, names.Length);
     }
 
     [Fact]
@@ -84,13 +87,18 @@ public class ScheduledActionsTests : IAsyncLifetime
         Assert.Equal("validatePlaylist", ScheduledValidationAction.ActionName);
         Assert.Equal("generatePlaylist", ScheduledPlaylistGenerationAction.ActionName);
         Assert.Equal("syncDispatcharr", ScheduledDispatcharrSyncAction.ActionName);
+        // PHASE 9C.4 (subwave 5) — nomes estáveis da execução Telegram agendada.
+        Assert.Equal("telegramRun", ScheduledTelegramRunAction.TelegramActionName);
+        Assert.Equal("telegramMaintainRun", ScheduledTelegramRunAction.TelegramMaintainActionName);
         Assert.Equal(
-            4,
+            6,
             new[] {
                 ScheduledM3uDiscoveryAction.ActionName,
                 ScheduledValidationAction.ActionName,
                 ScheduledPlaylistGenerationAction.ActionName,
                 ScheduledDispatcharrSyncAction.ActionName,
+                ScheduledTelegramRunAction.TelegramActionName,
+                ScheduledTelegramRunAction.TelegramMaintainActionName,
             }.Distinct(StringComparer.Ordinal).Count());
     }
 

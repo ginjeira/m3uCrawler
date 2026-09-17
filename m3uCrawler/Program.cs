@@ -121,7 +121,8 @@ namespace m3uCrawler
                         webCatalogResolver,
                         dashboardOutputDir,
                         dispatcharrConfig,
-                        gate: new ConfigurationGate(lifecycle));
+                        gate: new ConfigurationGate(lifecycle),
+                        liveRunHost: liveRunHost);
                     WebDashboardService.SetScheduledActions(automationHost.RegisteredActions);
                     automationHost.Start();
                     Console.WriteLine(

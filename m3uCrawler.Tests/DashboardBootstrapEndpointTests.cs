@@ -20,6 +20,7 @@ namespace m3uCrawler.Tests;
 /// PHASE 9C.2 — Integração HTTP real do bootstrap, sessão e gate de
 /// autorização. Cobre fresh install, invariantes, CSRF, logout e legacy.
 /// </summary>
+[Collection("DashboardStaticState")]
 public class DashboardBootstrapEndpointTests : IAsyncLifetime
 {
     private const string ValidPassword = "a-very-strong-password";
