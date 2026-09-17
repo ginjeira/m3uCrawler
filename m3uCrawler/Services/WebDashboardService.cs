@@ -4,8 +4,10 @@ using m3uCrawler.Services.Auth;
 using m3uCrawler.Services.Automation;
 using m3uCrawler.Services.Catalog;
 using m3uCrawler.Services.Configuration;
+using m3uCrawler.Services.LiveRun;
 using m3uCrawler.Services.Sync;
 using m3uCrawler.Services.Validation;
+using System.IO;
 using System.Net;
 using System.Security.Cryptography;
 using System.Text;
@@ -21,6 +23,8 @@ namespace m3uCrawler.Services
         private static ConfigurationLifecycleService? _configurationLifecycle;
         private static AuthService? _authService;
         private static BootstrapService? _bootstrapService;
+        private static LiveRunHost? _liveRunHost;
+        private static bool _webAllowTrigger;
 
         /// <summary>
         /// PHASE 9C.2 (S1-E) — Indica que o Dashboard corre num contexto
@@ -73,6 +77,29 @@ namespace m3uCrawler.Services
         public static void SetScheduledActions(IEnumerable<IScheduledAction> actions)
         {
             _scheduledActions = actions.ToArray();
+        }
+
+        /// <summary>
+        /// PHASE 9C.4 — Regista o <see cref="LiveRunHost"/> que faz a ponte
+        /// entre o <see cref="RunCoordinator"/> único e os endpoints
+        /// <c>GET /api/run/status</c> e <c>POST /api/run/start</c>. Sem
+        /// host, os endpoints respondem <c>pipeline-not-configured</c>.
+        /// </summary>
+        public static void SetLiveRunHost(LiveRunHost? host)
+        {
+            _liveRunHost = host;
+        }
+
+        /// <summary>
+        /// PHASE 9C.4 — Activa o trigger manual (botão "Run now") no
+        /// dashboard. Default: <c>false</c>. Quando <c>false</c>,
+        /// <c>POST /api/run/start</c> devolve 503
+        /// <c>web-allow-trigger-disabled</c>; <c>GET /api/run/status</c>
+        /// não é afectado.
+        /// </summary>
+        public static void SetWebAllowTrigger(bool allow)
+        {
+            _webAllowTrigger = allow;
         }
 
         public static async Task RunDashboardAsync(string outputDir, int port, ImportHistoryService historyService, string? webToken = null, CancellationToken cancellationToken = default)
@@ -183,6 +210,32 @@ namespace m3uCrawler.Services
         }
 
         /// <summary>
+        /// PHASE 9C.4 — Scope testável para o <see cref="LiveRunHost"/> e
+        /// o flag <c>--web-allow-trigger</c>. Restaura o estado anterior
+        /// em <see cref="Dispose"/>, garantindo isolamento entre testes
+        /// paralelos.
+        /// </summary>
+        public sealed class StaticLiveRunHostScope : IDisposable
+        {
+            private readonly LiveRunHost? _previousHost;
+            private readonly bool _previousAllow;
+
+            public StaticLiveRunHostScope(LiveRunHost? host, bool allowTrigger)
+            {
+                _previousHost = _liveRunHost;
+                _previousAllow = _webAllowTrigger;
+                _liveRunHost = host;
+                _webAllowTrigger = allowTrigger;
+            }
+
+            public void Dispose()
+            {
+                _liveRunHost = _previousHost;
+                _webAllowTrigger = _previousAllow;
+            }
+        }
+
+        /// <summary>
         /// Variante testável do runner: arranca o <see cref="HttpListener"/>
         /// em loopback com factory e runtimeDir fornecidos.
         /// </summary>
@@ -279,7 +332,7 @@ namespace m3uCrawler.Services
             // se o handler existente pode correr.
             if (!isRootPath && !IsAlwaysPublicPath(requestPath))
             {
-                if (authMode == AuthMode.Bootstrap)
+                if (authMode == AuthMode.Bootstrap && !machineAuthorized)
                 {
                     await WriteJsonAsync(
                         context.Response,
@@ -650,6 +703,21 @@ namespace m3uCrawler.Services
                     }
                 }
                 await WriteJsonAsync(context.Response, inv);
+                return;
+            }
+
+            // === PHASE 9C.4 — Live Run endpoints ===
+            // Gate único já avaliado acima (UserAuth + CSRF, Bootstrap,
+            // machine token). O host decide se há pipeline configurada.
+            if (requestPath.Equals("/api/run/status", StringComparison.OrdinalIgnoreCase))
+            {
+                await HandleRunStatusEndpointAsync(context);
+                return;
+            }
+            if (requestPath.Equals("/api/run/start", StringComparison.OrdinalIgnoreCase)
+                && context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+            {
+                await HandleRunStartEndpointAsync(context);
                 return;
             }
 
@@ -6179,6 +6247,144 @@ const rows = Object.entries(inv).map(([k, v]) => {
                 csrfToken = current.CsrfToken,
                 expiresAtUtc = current.ExpiresAtUtc.ToString("o"),
             });
+        }
+
+        /// <summary>
+        /// PHASE 9C.4 — <c>GET /api/run/status</c>: devolve o estado
+        /// operacional seguro. Lê do host (que detém o coordinator);
+        /// se a pipeline Telegram não estiver configurada neste
+        /// processo (apenas <c>--web</c> sem <c>--telegram</c>) responde
+        /// 503 com <c>pipeline-not-configured</c> (ver §N do plano).
+        /// </summary>
+        private static async Task HandleRunStatusEndpointAsync(HttpListenerContext context)
+        {
+            var host = _liveRunHost;
+            var coordinator = host?.Coordinator;
+            var pipelineConfigured = host is not null && host.PipelineConfigured && coordinator is not null;
+
+            if (!pipelineConfigured)
+            {
+                await WriteJsonAsync(
+                    context.Response,
+                    LiveRunApiMappings.ToStatusPayload(
+                        live: null,
+                        recentFinished: null,
+                        pipelineConfigured: false,
+                        webAllowTrigger: _webAllowTrigger),
+                    HttpStatusCode.ServiceUnavailable);
+                return;
+            }
+
+            var running = coordinator!.IsRunning;
+            var current = coordinator.CurrentSnapshot;
+            LiveRunSnapshot? recent = null;
+            if (!running)
+            {
+                recent = await coordinator.GetRecentFinishedSnapshotAsync(CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+
+            await WriteJsonAsync(context.Response, LiveRunApiMappings.ToStatusPayload(
+                live: running ? current : null,
+                recentFinished: recent,
+                pipelineConfigured: true,
+                webAllowTrigger: _webAllowTrigger,
+                coordinatorRunning: running));
+        }
+
+        /// <summary>
+        /// PHASE 9C.4 — <c>POST /api/run/start</c>: arranca uma execução
+        /// operacional. Não bloqueia até ao fim do run (devolve 202 com
+        /// o snapshot inicial; o caller usa <c>GET /api/run/status</c>
+        /// para seguir o progresso).
+        /// </summary>
+        private static async Task HandleRunStartEndpointAsync(HttpListenerContext context)
+        {
+            var host = _liveRunHost;
+            if (host is null || host.Coordinator is null)
+            {
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = "pipeline-not-configured" },
+                    HttpStatusCode.ServiceUnavailable);
+                return;
+            }
+
+            if (!_webAllowTrigger)
+            {
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = "web-allow-trigger-disabled" },
+                    HttpStatusCode.ServiceUnavailable);
+                return;
+            }
+
+            LiveRunStartPayload? payload;
+            try
+            {
+                using var reader = new StreamReader(
+                    context.Request.InputStream,
+                    context.Request.ContentEncoding ?? Encoding.UTF8);
+                var body = await reader.ReadToEndAsync().ConfigureAwait(false);
+                payload = string.IsNullOrWhiteSpace(body)
+                    ? new LiveRunStartPayload()
+                    : JsonSerializer.Deserialize<LiveRunStartPayload>(body, JsonOptions);
+            }
+            catch
+            {
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = "invalid payload" },
+                    HttpStatusCode.BadRequest);
+                return;
+            }
+
+            var request = LiveRunApiMappings.ParseStartPayload(payload);
+            if (request is null)
+            {
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = "invalid payload (mode/historyHours/maxStreams)" },
+                    HttpStatusCode.BadRequest);
+                return;
+            }
+
+            try
+            {
+                var outcome = await host.Coordinator.KickStartAsync(request, CancellationToken.None)
+                    .ConfigureAwait(false);
+                await WriteJsonAsync(
+                    context.Response,
+                    LiveRunApiMappings.ToStartAcceptedPayload(outcome.Snapshot),
+                    HttpStatusCode.Accepted);
+            }
+            catch (LiveRunPipelineNotConfiguredException)
+            {
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = "pipeline-not-configured" },
+                    HttpStatusCode.ServiceUnavailable);
+            }
+            catch (RunAlreadyInProgressException)
+            {
+                // 409: o snapshot corrente é construído pelo coordinator
+                // (se já terminou uma run entretanto e outra começou, é
+                // possível CurrentSnapshot ser null; nesse caso devolvemos
+                // apenas o erro com runId desconhecido).
+                var current = host.Coordinator.CurrentSnapshot;
+                if (current is null)
+                {
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = "already-running" },
+                        HttpStatusCode.Conflict);
+                    return;
+                }
+                await WriteJsonAsync(
+                    context.Response,
+                    LiveRunApiMappings.ToAlreadyRunningPayload(current),
+                    HttpStatusCode.Conflict);
+            }
         }
 
         private static async Task<CredentialsPayload?> TryReadCredentialsAsync(HttpListenerRequest request)

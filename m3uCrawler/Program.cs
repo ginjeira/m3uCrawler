@@ -47,9 +47,18 @@ namespace m3uCrawler
                 webPort = parsedWebPort;
             }
             string? webToken = webEnabled ? GetOptionValue(args, "--web-token") : null;
+            // PHASE 9C.4 — opt-in para o botão "Run now" no dashboard.
+            // Default: false. Sem esta flag, POST /api/run/start devolve
+            // 503 web-allow-trigger-disabled (regra congelada).
+            bool webAllowTrigger = webEnabled && args.Contains("--web-allow-trigger");
             Task? webTask = null;
             CatalogResolver? webCatalogResolver = null;
             ScheduledAutomationHost? automationHost = null;
+            // PHASE 9C.4 — Host que detém o RunCoordinator único. Construído
+            // quando o catálogo está disponível (i.e. --web foi passado
+            // e o InitializeCatalogAsync foi bem-sucedido). O executor da
+            // pipeline Telegram é registado dentro do bloco --telegram.
+            LiveRunHost? liveRunHost = null;
             if (webEnabled)
             {
                 var dashboardOutputDir = GetOptionValue(args, "--output-dir") ?? "output";
@@ -98,6 +107,15 @@ namespace m3uCrawler
                     var bootstrapService = new BootstrapService(
                         lifecycle, adminUsers, bootstrapValidator);
                     WebDashboardService.SetAuth(authService, bootstrapService);
+
+                    // PHASE 9C.4 — Host do Live Run (RunCoordinator único).
+                    // É construído aqui (antes de automationHost.Start) e
+                    // partilhado entre o dashboard e o bloco --telegram
+                    // abaixo. Sem este host, o dashboard responde
+                    // pipeline-not-configured (GET) e 503 (POST).
+                    liveRunHost = new LiveRunHost(webCatalogResolver.GetFactory());
+                    WebDashboardService.SetLiveRunHost(liveRunHost);
+                    WebDashboardService.SetWebAllowTrigger(webAllowTrigger);
 
                     automationHost = ScheduledAutomationHost.Build(
                         webCatalogResolver,
@@ -290,10 +308,14 @@ namespace m3uCrawler
 
                 // PHASE 9C.4 — Live Run Monitor. O RunCoordinator é o
                 // único ponto de orquestração da execução Telegram: CLI,
-                // scheduler e futura API convergem aqui. É construído
-                // apenas quando o catálogo persistente está disponível
-                // (fonte de verdade dos runs); sem catálogo, o caminho
-                // directo actual é preservado (degradação graciosa).
+                // scheduler e dashboard convergem aqui. O coordinator é
+                // obtido de duas formas:
+                //  1. Via LiveRunHost, quando --web está activo (o host
+                //     foi construído no top-level e é partilhado com o
+                //     dashboard — um único coordinator para tudo).
+                //  2. Via construção local, apenas quando --telegram corre
+                //     sem --web (degradação graciosa, comportamento
+                //     preservado).
                 RunCoordinator? liveRunCoordinator = null;
                 List<M3uStream>? liveRunStreams = null;
                 RunReport? liveRunReport = null;
@@ -356,8 +378,16 @@ namespace m3uCrawler
                             }
                         });
 
-                    liveRunCoordinator = new RunCoordinator(
-                        catalogForIngestion.GetFactory(), liveRunPipelineFactory);
+                    if (liveRunHost is not null)
+                    {
+                        liveRunCoordinator = liveRunHost.ConfigureExecutor(liveRunPipelineFactory);
+                        Console.WriteLine("🔁 RunCoordinator partilhado com o dashboard (LiveRunHost).");
+                    }
+                    else
+                    {
+                        liveRunCoordinator = new RunCoordinator(
+                            catalogForIngestion.GetFactory(), liveRunPipelineFactory);
+                    }
                 }
 
                 do
@@ -833,6 +863,7 @@ namespace m3uCrawler
             Console.WriteLine("  --web             Ativa uma interface web para ver histórico e playlist");
             Console.WriteLine("  --web-port N      Porta do servidor web (padrão: 5000)");
             Console.WriteLine("  --web-token TOKEN Bearer token para autorização no dashboard (protege timing-attack via FixedTimeEquals)");
+            Console.WriteLine("  --web-allow-trigger   Permite POST /api/run/start a partir do dashboard (opt-in; default: 503)");
             Console.WriteLine("  --bot             Modo bot Telegram (legacy M3U8-search)");
             Console.WriteLine("  --bot-token TOKEN Token do bot Telegram (também via M3U_BOT_TOKEN); obrigatorio com --bot");
             Console.WriteLine("  --scan-domain D   Faz scan direto ao domínio para procurar playlists (sem Telegram)");

@@ -143,26 +143,8 @@ public sealed class RunCoordinator
                 "Live run started: runId={RunId} mode={Mode} source={Source}",
                 runId, request.Mode, request.Source);
 
-            var pipeline = _pipelineFactory(request);
-            if (pipeline is ILiveRunProgressAware progressAware)
-            {
-                progressAware.Progress = monitor;
-            }
-
-            await pipeline.ExecuteAsync(request, cancellationToken).ConfigureAwait(false);
-
-            await monitor.EnterPhaseAsync(Catalog.LiveRunPhase.Completed, "completed", cancellationToken)
+            return await RunCoreAsync(entity, request, monitor, cancellationToken)
                 .ConfigureAwait(false);
-            await MarkCompletedAsync(entity, cancellationToken).ConfigureAwait(false);
-
-            var finalSnapshot = BuildLiveSnapshot(entity, isRunning: false, currentPhase: null, monitor);
-            SetCurrentSnapshot(finalSnapshot);
-
-            return new LiveRunOutcome
-            {
-                Snapshot = finalSnapshot,
-                Succeeded = true,
-            };
         }
         catch (OperationCanceledException)
         {
@@ -199,6 +181,149 @@ public sealed class RunCoordinator
             Volatile.Write(ref _isRunningFlag, 0);
         }
     }
+
+    /// <summary>
+    /// PHASE 9C.4 — Inicia um run e devolve IMEDIATAMENTE o snapshot
+    /// inicial (com runId, startedAtUtc). A execução da pipeline corre
+    /// em background. O resultado final é consultável em
+    /// <see cref="CurrentSnapshot"/> e persistido em SQLite.
+    ///
+    /// <para>
+    /// Adequado para o endpoint <c>POST /api/run/start</c> (HTTP 202
+    /// "Accepted"). Lança <see cref="RunAlreadyInProgressException"/>
+    /// se já houver um run activo (mapeado para HTTP 409).
+    /// </para>
+    ///
+    /// <para>
+    /// O lock é libertado quando a tarefa em background termina; quem
+    /// quiser observar a conclusão deve ler
+    /// <see cref="CurrentSnapshot"/> ou
+    /// <see cref="GetRecentFinishedSnapshotAsync"/>.
+    /// </para>
+    /// </summary>
+    public async Task<LiveRunOutcome> KickStartAsync(LiveRunRequest request, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        if (Interlocked.CompareExchange(ref _isRunningFlag, 1, 0) != 0)
+        {
+            var current = CurrentSnapshot;
+            throw new RunAlreadyInProgressException(
+                current?.RunId ?? string.Empty,
+                current?.StartedAtUtc ?? DateTime.UtcNow,
+                request.Mode,
+                request.Source);
+        }
+
+        LiveRunEntity? entity = null;
+        LiveRunMonitor? monitor = null;
+        var startedAtUtc = DateTime.UtcNow;
+        var runId = Guid.NewGuid().ToString();
+        try
+        {
+            entity = await PersistRunStartAsync(runId, request, startedAtUtc, cancellationToken)
+                .ConfigureAwait(false);
+
+            monitor = new LiveRunMonitor(
+                _dbFactory,
+                entity.Id,
+                entity.RunId,
+                request.Mode,
+                request.Source,
+                entity.StartedAtUtc,
+                SetCurrentSnapshot,
+                null,
+                LiveRunActivityFeed.DefaultCapacity);
+            await monitor.InitializeAsync(cancellationToken).ConfigureAwait(false);
+
+            var initialSnapshot = monitor.BuildSnapshot();
+            SetCurrentSnapshot(initialSnapshot);
+
+            _logger.LogInformation(
+                "Live run kick-started: runId={RunId} mode={Mode} source={Source}",
+                runId, request.Mode, request.Source);
+
+            // Dispara a pipeline em background. A gestão do terminal
+            // (Completed/Failed) segue a mesma lógica de StartAsync: o
+            // lock é libertado quando a tarefa termina.
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await RunCoreAsync(entity!, request, monitor!, CancellationToken.None)
+                        .ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Live run background task failed: runId={RunId}", runId);
+                    try
+                    {
+                        await SafeEnterPhaseAsync(monitor, Catalog.LiveRunPhase.Error,
+                            "failed: pipeline exception").ConfigureAwait(false);
+                        await MarkTerminalAsync(entity, LiveRunTerminalStatus.Failed,
+                            "failed: pipeline exception", CancellationToken.None).ConfigureAwait(false);
+                        var snapshot = BuildLiveSnapshot(entity!, isRunning: false, currentPhase: null, monitor);
+                        SetCurrentSnapshot(snapshot);
+                    }
+                    catch (Exception innerEx)
+                    {
+                        _logger.LogError(innerEx, "Failed to mark terminal: runId={RunId}", runId);
+                    }
+                }
+                finally
+                {
+                    Volatile.Write(ref _isRunningFlag, 0);
+                }
+            }, CancellationToken.None);
+
+            return new LiveRunOutcome
+            {
+                Snapshot = initialSnapshot,
+                Succeeded = true,
+            };
+        }
+        catch
+        {
+            // Em caso de falha síncrona (e.g. persistência falhou antes
+            // de podermos devolver 202), libertar o lock para não ficar preso.
+            Volatile.Write(ref _isRunningFlag, 0);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Corpo principal partilhado por <see cref="StartAsync"/> e
+    /// <see cref="KickStartAsync"/>: invoca a pipeline, marca
+    /// <c>Completed</c>/<c>Failed</c> e devolve o resultado terminal.
+    /// </summary>
+    private async Task<LiveRunOutcome> RunCoreAsync(
+        LiveRunEntity entity,
+        LiveRunRequest request,
+        LiveRunMonitor monitor,
+        CancellationToken cancellationToken)
+    {
+        var pipeline = _pipelineFactory(request);
+        if (pipeline is ILiveRunProgressAware progressAware)
+        {
+            progressAware.Progress = monitor;
+        }
+
+        await pipeline.ExecuteAsync(request, cancellationToken).ConfigureAwait(false);
+
+        await monitor.EnterPhaseAsync(Catalog.LiveRunPhase.Completed, "completed", cancellationToken)
+            .ConfigureAwait(false);
+        await MarkCompletedAsync(entity, cancellationToken).ConfigureAwait(false);
+
+        var finalSnapshot = BuildLiveSnapshot(entity, isRunning: false, currentPhase: null, monitor);
+        SetCurrentSnapshot(finalSnapshot);
+
+        return new LiveRunOutcome
+        {
+            Snapshot = finalSnapshot,
+            Succeeded = true,
+        };
+    }
+
 
     /// <summary>
     /// Transição terminal best-effort: usa <see cref="CancellationToken.None"/>
@@ -376,6 +501,23 @@ public sealed class RunCoordinator
     {
         lock (_snapshotLock)
         {
+            // PHASE 9C.4 — Invariante de transição terminal: enquanto o
+            // run está activo (flag=1) nunca publicamos um snapshot
+            // "não-running" cujo estado terminal ainda é Unknown. O
+            // monitor publica a fase terminal (Completed/Error) antes
+            // de o coordinator persistir TerminalStatus/FinishedAtUtc;
+            // aceitar esse snapshot intermédio faria a API
+            // /api/run/status reportar "idle" durante alguns
+            // milissegundos. O coordinator publica depois o snapshot
+            // terminal definitivo (com TerminalStatus conhecido), que
+            // é aceite porque a condição deixa de se aplicar.
+            if (Volatile.Read(ref _isRunningFlag) == 1
+                && !snapshot.IsRunning
+                && snapshot.TerminalStatus == LiveRunTerminalStatus.Unknown)
+            {
+                return;
+            }
+
             _currentSnapshot = snapshot;
         }
     }
