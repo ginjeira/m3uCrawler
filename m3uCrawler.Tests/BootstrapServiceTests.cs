@@ -362,6 +362,51 @@ public class BootstrapServiceTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// PHASE 9C.5 (revisão / decisão de scope) — READY com administrador
+    /// existente mas DESACTIVADO. Este estado é uma situação administrativa
+    /// <b>não suportada</b> neste projecto: não há migração/recuperação de
+    /// configuração de versões anteriores e uma instalação inconsistente pode
+    /// ser reinicializada de raiz. Invariante fixada: qualquer registo em
+    /// <c>admin_users</c> fecha a criação do primeiro administrador
+    /// (<c>HasAnyAsync</c>), independentemente de estar activo.
+    /// </summary>
+    [Fact]
+    public async Task Legacy_ready_with_disabled_admin_is_bootstrap_but_creation_closed()
+    {
+        var lifecycle = NewLifecycle();
+        lifecycle.SetState(ConfigurationLifecycleState.Ready, "legacy-adoption:sources");
+        var service = NewBootstrap(lifecycle);
+
+        Assert.Equal(
+            BootstrapAdminOutcome.Created,
+            (await service.CreateAdminAsync("admin", "a-strong-password-12")).Outcome);
+
+        await using (var context = _factory.CreateDbContext())
+        {
+            var user = context.AdminUsers.Single();
+            user.IsEnabled = false;
+            await context.SaveChangesAsync();
+        }
+
+        var status = await service.GetStatusAsync();
+        Assert.Equal(ConfigurationLifecycleState.Ready, status.State);
+        Assert.False(status.HasActiveAdmin);
+        Assert.Equal(AuthMode.Bootstrap, AuthModeResolver.Resolve(status.State, status.HasActiveAdmin));
+
+        // A criação do primeiro/novo administrador continua recusada.
+        Assert.Equal(
+            BootstrapAdminOutcome.AlreadyReady,
+            (await service.CreateAdminAsync("replacement", "a-strong-password-12")).Outcome);
+
+        await using (var context = _factory.CreateDbContext())
+        {
+            Assert.Equal(1, context.AdminUsers.Count());
+            Assert.False(context.AdminUsers.Single().IsEnabled);
+            Assert.Equal("admin", context.AdminUsers.Single().Username);
+        }
+    }
+
+    /// <summary>
     /// PHASE 9C.5 — Cenário F: duas tentativas concorrentes de primeiro
     /// bootstrap numa instalação legacy READY criam apenas um administrador.
     /// A garantia combina a serialização do serviço com a transacção e a

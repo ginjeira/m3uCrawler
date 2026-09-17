@@ -240,6 +240,12 @@ READY (sem administrador)
   `POST /api/bootstrap/admin` devolve `AlreadyReady` e não cria nem substitui
   nada (`HasAnyAsync`, logo qualquer linha de `admin_users` fecha o bootstrap).
 - `discovery`/scheduler não são afectados: o estado continua `READY`.
+- Não existe recuperação in-app para estados administrativos inconsistentes
+  (ex.: `READY` com registo de administrador desactivado): a criação é
+  sempre fechada por qualquer registo em `admin_users` e não há endpoint de
+  reactivação. Este cenário está fora do ciclo de vida suportado; a
+  instalação pode ser reinicializada de raiz (ver §"Upgrade de instalações
+  existentes").
 
 ## Configuração mínima (L2) para READY
 
@@ -395,6 +401,20 @@ implementado em 9C.2), que:
 
 ### 2. Instalação legacy / upgrade (com dados persistentes, sem administrador)
 
+> **Âmbito (decisão de projecto, 2026-09-17).** O modelo first-run da 9C
+> destina-se a instalações **novas/limpas**. A adopção legacy da 9C.1
+> mantém-se como fallback de leitura, mas **não** faz parte do ciclo de
+> vida suportado migrar nem recuperar configuração de administrador de
+> versões anteriores. Não existem (nem estão previstos) mecanismos de
+> recuperação/reactivação de administradores. O bootstrap de criação do
+> primeiro administrador fica fechado assim que exista **qualquer**
+> registo em `admin_users`, activo ou desactivado (`HasAnyAsync`). Um
+> estado inconsistente — `READY` com registo de administrador
+> desactivado — **não é suportado**: resulta em modo `Bootstrap` com a
+> criação rejeitada e sem login humano disponível, e pode exigir a
+> reinicialização da instalação (`runtime-data`) e nova configuração de
+> raiz.
+
 Esta é a situação coberta pelo rótulo `BOOTSTRAP_REQUIRED` descrito
 acima. O sistema:
 
@@ -542,3 +562,12 @@ admin, wizard activo, criação do primeiro admin, transição para
 - `BootstrapServiceTests.Admin_user_store_concurrent_first_admin_persists_single_row`
 - `DashboardBootstrapEndpointTests.Legacy_ready_without_admin_serves_wizard_and_creates_first_admin`
 - `AuthPrimitivesTests.Auth_mode_resolution_is_deterministic` (`READY` ∧ sem admin → `Bootstrap`)
+
+Estado administrativo não suportado (`READY` + registo de admin
+desactivado) e diagnóstico do gate:
+
+- `BootstrapServiceTests.Legacy_ready_with_disabled_admin_is_bootstrap_but_creation_closed`
+- `DashboardBootstrapEndpointTests.Ready_with_disabled_admin_is_bootstrap_locked_out`
+- `DashboardBootstrapEndpointTests.Ready_with_disabled_admin_and_web_token_keeps_machine_access_only`
+- `DashboardBootstrapEndpointTests.Bootstrap_required_reports_not_configured_for_fresh_install`
+- `DashboardBootstrapEndpointTests.Bootstrap_required_reports_ready_when_ready_without_admin`

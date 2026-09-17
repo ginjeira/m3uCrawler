@@ -388,6 +388,143 @@ public class DashboardBootstrapEndpointTests : IAsyncLifetime
         Assert.Equal("admin", context.AdminUsers.Single().Username);
     }
 
+    /// <summary>
+    /// PHASE 9C.5 (revisão / decisão de scope) — READY com administrador
+    /// existente mas DESACTIVADO. Estado administrativo <b>não suportado</b>:
+    /// o modo é <c>Bootstrap</c> (não há admin activo) mas a criação está
+    /// fechada (existe registo em <c>admin_users</c>), o login humano está
+    /// indisponível e os endpoints normais ficam em 403. Não há recuperação
+    /// in-app (decisão de projecto); uma instalação inconsistente pode ser
+    /// reinicializada de raiz. Teste de caracterização.
+    /// </summary>
+    [Fact]
+    public async Task Ready_with_disabled_admin_is_bootstrap_locked_out()
+    {
+        await SeedReadyWithDisabledAdminAsync();
+
+        var harness = StartHarness();
+
+        var root = await harness.Client.GetAsync("/");
+        Assert.Equal(HttpStatusCode.Found, root.StatusCode);
+        Assert.Equal("/bootstrap", root.Headers.Location?.ToString());
+
+        var status = await harness.Client.GetAsync("/api/bootstrap/status");
+        Assert.Equal(HttpStatusCode.OK, status.StatusCode);
+        using (var doc = JsonDocument.Parse(await status.Content.ReadAsStringAsync()))
+        {
+            Assert.Equal("READY", doc.RootElement.GetProperty("state").GetString());
+            Assert.False(doc.RootElement.GetProperty("hasActiveAdmin").GetBoolean());
+        }
+
+        var created = await harness.Client.PostAsync(
+            "/api/bootstrap/admin",
+            new StringContent(
+                JsonSerializer.Serialize(new { username = "replacement", password = ValidPassword }),
+                Encoding.UTF8, "application/json"));
+        Assert.Equal(HttpStatusCode.Conflict, created.StatusCode);
+        Assert.Contains("AlreadyReady", await created.Content.ReadAsStringAsync());
+
+        var login = await harness.Client.PostAsync(
+            "/api/session",
+            new StringContent(
+                JsonSerializer.Serialize(new { username = "admin", password = ValidPassword }),
+                Encoding.UTF8, "application/json"));
+        Assert.Equal(HttpStatusCode.Conflict, login.StatusCode);
+        Assert.Contains("login-unavailable", await login.Content.ReadAsStringAsync());
+
+        Assert.Equal(HttpStatusCode.Forbidden, (await harness.Client.GetAsync("/api/history")).StatusCode);
+
+        await using var context = _factory.CreateDbContext();
+        Assert.Equal(1, context.AdminUsers.Count());
+        Assert.Equal("admin", context.AdminUsers.Single().Username);
+        Assert.False(context.AdminUsers.Single().IsEnabled);
+    }
+
+    /// <summary>
+    /// PHASE 9C.5 (revisão / decisão de scope) — READY + admin desactivado com
+    /// <c>--web-token</c>: a credencial de máquina continua a autorizar (acesso
+    /// operacional), mas não existe — nem é pretendido — endpoint que reactive
+    /// o administrador ou crie um substituto. O lockout humano é aceite como
+    /// estado não suportado, não como workflow de recuperação.
+    /// </summary>
+    [Fact]
+    public async Task Ready_with_disabled_admin_and_web_token_keeps_machine_access_only()
+    {
+        await SeedReadyWithDisabledAdminAsync();
+
+        const string token = "machine-token-value";
+        var harness = StartHarness(webToken: token);
+
+        var withToken = await harness.Client.SendAsync(WithBearer(HttpMethod.Get, "/api/history", token));
+        Assert.Equal(HttpStatusCode.OK, withToken.StatusCode);
+
+        var created = await harness.Client.SendAsync(WithBearerJson(
+            HttpMethod.Post, "/api/bootstrap/admin", token,
+            JsonSerializer.Serialize(new { username = "replacement", password = ValidPassword })));
+        Assert.Equal(HttpStatusCode.Conflict, created.StatusCode);
+
+        var login = await harness.Client.SendAsync(WithBearerJson(
+            HttpMethod.Post, "/api/session", token,
+            JsonSerializer.Serialize(new { username = "admin", password = ValidPassword })));
+        Assert.Equal(HttpStatusCode.Conflict, login.StatusCode);
+
+        await using var context = _factory.CreateDbContext();
+        Assert.Equal(1, context.AdminUsers.Count());
+        Assert.False(context.AdminUsers.Single().IsEnabled);
+    }
+
+    // === F6 — a resposta de bootstrap-required não mente sobre o estado ===
+
+    [Fact]
+    public async Task Bootstrap_required_reports_not_configured_for_fresh_install()
+    {
+        var harness = StartHarness();
+
+        var response = await harness.Client.GetAsync("/api/history");
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        Assert.Equal("bootstrap-required", doc.RootElement.GetProperty("error").GetString());
+        Assert.Equal("NOT_CONFIGURED", doc.RootElement.GetProperty("state").GetString());
+    }
+
+    [Fact]
+    public async Task Bootstrap_required_reports_ready_when_ready_without_admin()
+    {
+        new ConfigurationLifecycleStore(_storePath).Save(new ConfigurationLifecycleSnapshot(
+            ConfigurationLifecycleState.Ready,
+            AdoptedFromLegacy: true,
+            AdoptedAtUtc: DateTime.UtcNow,
+            LastReason: "legacy-adoption:sources",
+            UpdatedAtUtc: DateTime.UtcNow));
+
+        var harness = StartHarness();
+
+        var response = await harness.Client.GetAsync("/api/history");
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        Assert.Equal("bootstrap-required", doc.RootElement.GetProperty("error").GetString());
+        // O estado real é READY (BOOTSTRAP_REQUIRED), não NOT_CONFIGURED.
+        Assert.Equal("READY", doc.RootElement.GetProperty("state").GetString());
+    }
+
+    private async Task SeedReadyWithDisabledAdminAsync()
+    {
+        new ConfigurationLifecycleStore(_storePath).Save(new ConfigurationLifecycleSnapshot(
+            ConfigurationLifecycleState.Ready,
+            AdoptedFromLegacy: true,
+            AdoptedAtUtc: DateTime.UtcNow,
+            LastReason: "legacy-adoption:sources",
+            UpdatedAtUtc: DateTime.UtcNow));
+
+        var users = new AdminUserStore(_factory);
+        Assert.Equal(CreateAdminResult.Created, await users.CreateFirstAdminAsync("admin", ValidPassword));
+
+        await using var context = _factory.CreateDbContext();
+        var user = context.AdminUsers.Single();
+        user.IsEnabled = false;
+        await context.SaveChangesAsync();
+    }
+
     [Fact]
     public async Task Web_token_remains_required_for_machine_access()
     {

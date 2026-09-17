@@ -3415,6 +3415,8 @@ observar:
 >
 > *Nota de implementação (2026-09-17, PHASE 9C.5): a extensão efectiva do gate `Bootstrap` para `READY` ∧ sem administrador activo foi implementada. `AuthModeResolver` resolve esse caso para `AuthMode.Bootstrap` (em vez de `Legacy`), o `BootstrapService` permite criar o primeiro administrador em `READY` sem descer o estado para `CONFIGURING` e sem reconfigurar nada, e o wizard passa a exigir confirmação da password. O modo `Legacy` fica restrito ao contexto explicitamente standalone/testes. Cobertura em `BootstrapServiceTests`, `DashboardBootstrapEndpointTests` e `AuthPrimitivesTests`; detalhe em `docs/architecture/configuration-lifecycle.md` §"Upgrade de instalações existentes" e §"Fluxo de bootstrap".*
 >
+> *Nota de scope (2026-09-17, simplificação 9C.5): o modelo first-run da 9C destina-se a instalações novas/limpas. Não está prevista migração/recuperação de configuração de administrador de versões anteriores; o bootstrap fecha com **qualquer** registo em `admin_users` (`HasAnyAsync`) e `READY` + administrador desactivado é um estado não suportado, podendo exigir reinicialização do `runtime-data`. A resposta `403 bootstrap-required` passa a reportar o estado de lifecycle real. Ver `docs/architecture/configuration-lifecycle.md` §"Upgrade de instalações existentes".*
+>
 > Esta fase é uma condição de consolidação do produto antes de novas
 > funcionalidades. Não introduz uma segunda arquitectura: fecha o lifecycle
 > operacional sobre o catálogo, políticas, Dashboard e scheduler já existentes.

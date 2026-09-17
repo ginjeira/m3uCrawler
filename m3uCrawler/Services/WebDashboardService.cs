@@ -296,7 +296,8 @@ namespace m3uCrawler.Services
 
             // === PHASE 9C.2 — Authentication / bootstrap ===
             // Gate único, avaliado antes de qualquer rota não pública.
-            var authMode = await ResolveAuthModeAsync();
+            // PHASE 9C.2/9C.5 — modo e estado de lifecycle numa única decisão.
+            var (authMode, lifecycleState) = await ResolveAuthDecisionAsync();
             var sessionId = GetCookieValue(context.Request, SessionCookieName);
             var isRootPath = requestPath.Length == 0 || requestPath == "/";
 
@@ -334,9 +335,11 @@ namespace m3uCrawler.Services
             {
                 if (authMode == AuthMode.Bootstrap && !machineAuthorized)
                 {
+                    // PHASE 9C.5 (F6) — reportar o estado real (pode ser READY
+                    // em BOOTSTRAP_REQUIRED), nunca um valor fixo.
                     await WriteJsonAsync(
                         context.Response,
-                        new { error = "bootstrap-required", state = "NOT_CONFIGURED" },
+                        new { error = "bootstrap-required", state = lifecycleState.ToWireName() },
                         HttpStatusCode.Forbidden);
                     return;
                 }
@@ -6174,7 +6177,13 @@ const rows = Object.entries(inv).map(([k, v]) => {
             public string? Password { get; set; }
         }
 
-        private static async Task<AuthMode> ResolveAuthModeAsync()
+        /// <summary>
+        /// PHASE 9C.5 (F6) — Decide o modo de autorização e devolve também o
+        /// estado de lifecycle efectivo, para que respostas de diagnóstico
+        /// (ex.: <c>403 bootstrap-required</c>) não mintam sobre o estado.
+        /// Numa só leitura, evitando divergência entre modo e estado reportado.
+        /// </summary>
+        private static async Task<(AuthMode Mode, ConfigurationLifecycleState State)> ResolveAuthDecisionAsync()
         {
             if (_configurationLifecycle == null && _authService == null)
             {
@@ -6183,7 +6192,9 @@ const rows = Object.entries(inv).map(([k, v]) => {
                 // Em produção (wiring falhou, p.ex. catálogo indisponível) é
                 // fail-closed: nunca Legacy aberto. UserAuth sem sessão resulta
                 // em 401, mantendo apenas os endpoints públicos de diagnóstico.
-                return _standaloneAuthContext ? AuthMode.Legacy : AuthMode.UserAuth;
+                return (
+                    _standaloneAuthContext ? AuthMode.Legacy : AuthMode.UserAuth,
+                    ConfigurationLifecycleState.NotConfigured);
             }
 
             var state = _configurationLifecycle != null
@@ -6196,13 +6207,15 @@ const rows = Object.entries(inv).map(([k, v]) => {
                 // tratar isto como autorização implícita (Legacy). Em READY
                 // exige autenticação (fail-closed, 401); fora de READY é
                 // bootstrap. Não há mecanismo de fallback novo.
-                return state == ConfigurationLifecycleState.Ready
-                    ? AuthMode.UserAuth
-                    : AuthMode.Bootstrap;
+                return (
+                    state == ConfigurationLifecycleState.Ready
+                        ? AuthMode.UserAuth
+                        : AuthMode.Bootstrap,
+                    state);
             }
 
             var hasAdmin = await _authService.HasActiveAdminAsync();
-            return AuthModeResolver.Resolve(state, hasAdmin);
+            return (AuthModeResolver.Resolve(state, hasAdmin), state);
         }
 
         private static bool IsAlwaysPublicPath(string requestPath)

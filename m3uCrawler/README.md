@@ -673,9 +673,18 @@ READY (sem administrador)
 A configuração existente não é recriada nem reconfigurada (apenas uma linha
 é acrescentada a `admin_users`) e o estado persistido não é alterado. Antes
 da criação, os endpoints administrativos normais ficam bloqueados
-(`403 bootstrap-required`). Depois de existir qualquer administrador, o
+(`403 bootstrap-required`, com o estado de lifecycle real no corpo). Depois
+de existir **qualquer** registo em `admin_users` (activo ou desactivado), o
 bootstrap da criação fecha (`AlreadyReady`). O wizard exige confirmação da
 password no cliente; as regras de validação (mínimo 12 caracteres) mantêm-se.
+
+> **Âmbito (2026-09-17).** O fluxo first-run da 9C destina-se a instalações
+> **novas/limpas**. Migração/recuperação de configuração de administrador de
+> versões anteriores **não** faz parte do ciclo de vida suportado e não existe
+> mecanismo de recuperação/reactivação de administradores. Um estado
+> inconsistente (`READY` com administrador desactivado) resulta em modo
+> `Bootstrap` com criação rejeitada e sem login humano; pode exigir
+> reinicializar a instalação (`runtime-data`) e configurar de raiz.
 
 ### Configuração mínima (L2) exigida para `READY`
 
