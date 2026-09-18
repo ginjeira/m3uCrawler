@@ -3413,7 +3413,7 @@ observar:
 
 # 32.18 — PHASE 9C — First-Run / Configuration Lifecycle / Dashboard Hardening
 
-> **Estado: `[em curso]` — 9C.1–9C.5 implementadas; restantes itens da fase pendentes (redesign do Dashboard, gate de command/endpoints, migração das afinidades, Manual/Ajuda contextual).**
+> **Estado: `[em curso]` (`[parcial]`) — 9C.1–9C.5 implementadas; fase parcialmente concluída. Reconciliação de 2026-09-18 (HEAD `bf04c34`) com evidência de código/testes no bloco abaixo.**
 >
 > *Nota documental (2026-09-16, commit `ad1d3f6`): 9C.3 (canonical country, affinity kind e naming canónico para Dispatcharr) também se encontra implementada. O presente §32.18 será actualizado para reflectir o estado consolidado das três sub-waves numa próxima passagem documental dedicada.*
 >
@@ -3435,9 +3435,15 @@ observar:
 > `GET /api/configuration/lifecycle`. Os requisitos do §5 são **advisory** nesta
 > wave (não bloqueiam `READY`), por compatibilidade com instalações existentes.
 > Detalhe em `docs/architecture/configuration-lifecycle.md`.
-> **Pendente:** wizard 9C.2, redesign do Dashboard, gate de command equivalents e
-> endpoints, migração `CanonicalChannelId` → `CanonicalChannel.Key` e restantes
-> itens da fase.
+> **Reconciliação de estado (2026-09-18, HEAD `bf04c34`) — evidência de código/testes.** A fase continua **parcial**:
+> - **Wizard 9C.2 — parcial:** `BuildBootstrapHtml` (`WebDashboardService.cs:6868-6904`) cobre apenas 3 passos (arrancar bootstrap / criar admin / concluir); os passos dos §6 itens 4–11 (baseline, país, lista de ordenação, fontes, prioridade de fontes, políticas de importação, validação de streams, scheduler) não estão no wizard.
+> - **Gate de command/endpoints — parcial:** o scheduler está gated (`ScheduledJobRunner.cs:105-119`) e os endpoints mutantes respondem `403 bootstrap-required` (`WebDashboardService.cs:334-345`), mas o caminho CLI one-shot `--telegram` sem loop/manutenção não é gated (`Program.cs:297,421-433`).
+> - **Afinidades — parcial (pendência real):** a identidade estável `CanonicalChannelKey` já é armazenada (`CatalogEntities.cs:180`) e a migration `20260916202838_AddCanonicalCountryAndAffinityKind` foi executada e testada (backfill/split/reversibilidade). Porém a resolução continua a depender do FK técnico `CanonicalChannelId` (`CatalogResolver.cs:80-90`; `OnDelete(SetNull)` em `ChannelCatalogDbContext.cs:109-112`), contra o §10 (linhas 3788-3791) e o DoD de afinidades (4161). Não existe teste de sobrevivência a alteração do ID técnico; só existe teste de rename de `DisplayName` (`Phase93AffinityCatalogTests.cs:168-191`).
+> - **Auditoria do Dashboard — pendente:** não existe log de auditoria de acções administrativas (grep `AdminAudit|audit_log|AdminActionLog` sem resultados); `MatchingAuditEntity` é auditoria de matching, não de admin.
+> - **Instalação limpa validada — pendente:** sem teste/script end-to-end contra `runtime-data` vazio; os testes `Fresh_install_*` usam BD in-process.
+> - **Máquina de estados — reduzida:** apenas `NOT_CONFIGURED`/`CONFIGURING`/`READY` (`ConfigurationLifecycleState.cs:12-31`); `RUNNING`/`ERROR` do §1 explicitamente diferidos (`ConfigurationLifecycleState.cs:7-9`).
+> - **Validação de configuração — scoped:** `BootstrapConfigurationValidator` avalia 3 verificações (catálogo, output, Dispatcharr se activo); a lista completa do §5 é **advisory**, não gate (`ConfigurationLifecycleService.EvaluateAdvisoryAsync`).
+> Continua pendente o redesign do Dashboard, o alargamento do wizard, a remoção da dependência runtime de `CanonicalChannelId` nas afinidades e o Manual/Ajuda contextual.
 
 ## 1. Objectivo
 
@@ -4246,6 +4252,8 @@ Além da Definition of Done global:
 - documentação actualizada;
 - commit criado.
 
+> **Reconciliação (2026-09-18).** Cumpridos: lifecycle persistente, bootstrap, adopção legacy testada, criação segura do primeiro administrador, scheduler integrado ao gate, API documentada, testes automatizados, documentação e commit. **Não cumpridos**: wizard funcional completo (apenas admin), discovery gate em *todas* as entradas (CLI one-shot sem gate), auditoria completa do Dashboard, identidade lógica estável na **resolução** das afinidades (não só no armazenamento), instalação limpa validada, e suite Release verde formalizada. Ver bloco de reconciliação em §32.18.
+
 Só depois desta fase se deve iniciar nova evolução funcional de maior dimensão.
 
 ---
@@ -4306,11 +4314,12 @@ Este documento define **como completar a evolução até ao sistema funcional pr
 | PHASE 10 — Dispatcharr | `[concluído]` | `BuildPlanFromCompositionAsync` existe mas sem call site de produção e sem testes (correcção factual 2026-09-17). Ver 32.8 e nota em 32.19. |
 | PHASE 11 — Operations | `[concluído]` | SyncRunStepEntity + API + Dashboard Passos + 4 testes. Ver 32.9. |
 | PHASE 12 — Automation / Scheduler | `[concluído]` | ScheduledJobEntity + CronExpression + Runner + 4 actions concretas (`discoverM3u`, `validatePlaylist`, `generatePlaylist`, `syncDispatcharr`) + arranque em produção via `Program.cs --web` + 19 testes. Ver 32.10 e 32.11. |
-| **PHASE 9C — First-Run / Configuration Lifecycle / Dashboard Hardening** | **`[em curso]`** | 9C.1 (lifecycle persistido `NOT_CONFIGURED/CONFIGURING/READY`, adopção legacy, gate de discovery/scheduler), 9C.2 (wizard de first-run, admin/sessões/CSRF, gate de autorização único), 9C.3 (affinity por país/canal, naming canónico normalizado, migration aditiva `AddCanonicalCountryAndAffinityKind`), 9C.4 (Live Run Monitor: `live_runs`/`live_run_steps`, `RunCoordinator` único, `GET /api/run/status` + `POST /api/run/start`, `--web-allow-trigger`, acções agendadas `telegramRun`/`telegramMaintainRun`, vista "Live Run" com polling) e 9C.5 (first-run/legacy bootstrap: `READY` ∧ sem admin resolve para `AuthMode.Bootstrap` em vez de `Legacy`, criação do primeiro admin sem alterar o estado nem reconfigurar a instalação, confirmação de password no wizard) implementadas. Nota documental 2026-09-17: esta linha descrevia 9C.2 como pendente apesar de já estar implementada; corrigida. Pendente: redesign do Dashboard, gate de command/endpoints, migração das afinidades e Manual/Ajuda contextual. Ver 32.18. |
+| **PHASE 9C — First-Run / Configuration Lifecycle / Dashboard Hardening** | **`[em curso]`** | 9C.1 (lifecycle persistido `NOT_CONFIGURED/CONFIGURING/READY`, adopção legacy, gate de discovery/scheduler), 9C.2 (wizard de first-run, admin/sessões/CSRF, gate de autorização único), 9C.3 (affinity por país/canal, naming canónico normalizado, migration aditiva `AddCanonicalCountryAndAffinityKind`), 9C.4 (Live Run Monitor: `live_runs`/`live_run_steps`, `RunCoordinator` único, `GET /api/run/status` + `POST /api/run/start`, `--web-allow-trigger`, acções agendadas `telegramRun`/`telegramMaintainRun`, vista "Live Run" com polling) e 9C.5 (first-run/legacy bootstrap: `READY` ∧ sem admin resolve para `AuthMode.Bootstrap` em vez de `Legacy`, criação do primeiro admin sem alterar o estado nem reconfigurar a instalação, confirmação de password no wizard) implementadas. Nota documental 2026-09-17: esta linha descrevia 9C.2 como pendente apesar de já estar implementada; corrigida. Pendente (reconciliado 2026-09-18): redesign do Dashboard, gate de command/endpoints (CLI one-shot), remoção da dependência runtime de `CanonicalChannelId` nas afinidades, auditoria administrativa, alargamento do wizard, instalação limpa validada e Manual/Ajuda contextual. Ver 32.18. |
 | PHASE-Bridge — Pipeline → Catálogo | `[concluído]` | `PipelineIngestionService` liga o pipeline real (Telegram/M3U8-search) ao catálogo persistente via `EnsureSourceAsync` + `ResolveAsync` + `RecordChannelSourceAsync` + novo `EnsureCanonicalChannelAsync` (upsert). 9 testes TDD. Ver 32.12. |
+| **PHASE 13 — Dispatcharr Source Selection, Diversity & Source Limits** | **`[em curso]`** (`[parcial]`) | 13-1/13-1a/13-3/13-4 implementadas e publicadas (`94a9c75`, `c1dda71`, `d36b803`, `bf04c34`); 13-2/13-2a/13-2b inexistentes. Gaps: preview/dry-run, Dashboard completo, estabilidade/churn, integração explícita `MatchPlan`/`DispatcharrSyncService`, métricas/auditoria, `ProviderDefinition`, overrides por canal (13-4b). Ver 32.19. |
 # 32.19 — PHASE 13 — Dispatcharr Source Selection, Diversity & Source Limits
 
-> Estado: [em curso] — Waves 13-1, 13-3 e 13-4 implementadas; restante pendente.
+> Estado: `[em curso]` (`[parcial]`) — Waves **13-1, 13-1a, 13-3 e 13-4** implementadas e publicadas (`94a9c75`, `c1dda71`, `d36b803`, `bf04c34`). As sub-waves **13-2/13-2a/13-2b não existem** como artefacto (sem commit, código ou documento). A fase permanece parcial; gaps reais no §17 e no bloco de reconciliação abaixo.
 >
 > Esta fase fecha um problema operacional identificado na publicação para Dispatcharr:
 > actualmente, quando um canal é sincronizado, podem ser associadas ao mesmo canal todas
@@ -4380,6 +4389,17 @@ Este documento define **como completar a evolução até ao sistema funcional pr
 > como `source_priority_policies`. **Reservado e não implementado:** overrides
 > por canal (Wave 13-4b) e auditoria de alterações administrativas. Detalhe em
 > `docs/architecture/phase-13-4-source-selection-policy.md`.
+
+> **Reconciliação de estado (2026-09-18, HEAD `bf04c34`) — evidência de código/testes.** Implementado e verificado: selector puro determinístico com deduplicação e diversidade (`ChannelSourceSelector.cs`), publicação Telegram nos dois pontos (`Program.cs:539-557`, `:1112-1136`) e política global persistida (entidade, migration `AddSourceSelectionPolicies`, resolver, endpoint/UI global). Itens do DoD (§17) ainda **não** implementados, com evidência:
+> - **preview/dry-run** — ausente (sem endpoint/lógica);
+> - **Dashboard completo** — só o cartão global; sem preview, estatísticas, comparação descobertas-vs-seleccionadas ou gestão por canal;
+> - **estabilidade/churn**, `KeepExistingHealthySources`, `RebalanceOnSync`, `MinimumValidatedSources` — ausentes (só mencionados na especificação);
+> - **integração explícita `MatchPlan` + `DispatcharrSourceSelection`** — ausente (`DispatcharrSourceSelection` só existe na especificação, linha 4612); a limitação transitiva do Dispatcharr resulta do fluxo da playlist, não de contrato;
+> - **ownership específico da selecção** e **limpeza selectiva testada** — ausentes; existe apenas o guard genérico pré-existente (`DispatcharrSyncService.cs:281-318`);
+> - **métricas específicas da selecção** — só contagens em `RunReport.SourceSelection`, não expostas no Dashboard; sem auditoria;
+> - **`ProviderDefinition`** completa, **`SelectionPolicy`** (estratégia de ranking separada) e **`MinimumValidatedSources`** — ausentes;
+> - **overrides por canal (13-4b)** — reservados, não implementados.
+> **Não implementado por ausência de artefacto:** sub-waves 13-2/13-2a/13-2b.
 
 > **Nota factual (2026-09-17) — `BuildPlanFromCompositionAsync`.** O método
 > existe em `ChannelMatcher` mas continua **sem call site de produção e sem
@@ -4724,6 +4744,8 @@ Com a política configurada para 10:
 - [ ] documentação actualizada;
 - [ ] build e suite de testes passam;
 - [ ] commit.
+
+> **Reconciliação (2026-09-18).** **Cumpridos:** configuração persistente do limite; valor inicial 10 não hardcoded; deduplicação; ranking determinístico; diversidade de fornecedor; fallback configurável; documentação actualizada; build e suite de testes (Release 0 erros; suite serial 1816/0/1 no commit `bf04c34`); commit. **Parciais:** identificação normalizada de fornecedor (`ProviderIdentity` normaliza host, mas não existe a `ProviderDefinition` completa do §3-§4); "selecção antes do Dispatcharr" e "Dispatcharr recebe apenas o conjunto seleccionado" (garantidos por fluxo de dados antes de `SaveToM3uPlaylist`, sem contrato explícito `MatchPlan`+`DispatcharrSourceSelection`); limpeza segura das associações antigas e ownership (guard genérico pré-existente, não selectivo nem testado nesta fase); métricas (só contagens em `RunReport.SourceSelection`, sem auditoria nem Dashboard); idempotência (garantida para a política, não específica da selecção); testes (faltam cenários de ownership/cleanup/dry-run/Dispatcharr, incluindo "100 fontes descobertas não produzem 100 associações com limite 10"). **Não cumpridos:** preview/dry-run; Dashboard completo.
 
 ## 18. Regra de produto
 
