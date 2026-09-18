@@ -33,12 +33,17 @@ public sealed class SourceSelectionPreviewService
     private const string PolicyScopeDefault = "default";
 
     /// <summary>
-    /// Motivo por-stream para streams sem correspondência inequívoca. A
-    /// ambiguidade é agregada em
-    /// <see cref="SourceSelectionPreviewMetrics.AmbiguousStreamCount"/> — não
-    /// é distinguível neste contrato por-stream.
+    /// Motivo por-stream para streams sem qualquer correspondência no
+    /// catálogo (não-ambíguas). A soma com <see cref="AmbiguousReason"/> está
+    /// em <see cref="SourceSelectionPreviewMetrics.TotalUnmatchedStreamCount"/>.
     /// </summary>
     public const string UnmatchedReason = "unmatched";
+
+    /// <summary>
+    /// Motivo por-stream para streams cuja URL mapeia para mais de um canal
+    /// canónico. Disjunto de <see cref="UnmatchedReason"/>.
+    /// </summary>
+    public const string AmbiguousReason = "ambiguous";
 
     private readonly CatalogResolver _catalog;
 
@@ -92,7 +97,8 @@ public sealed class SourceSelectionPreviewService
                     Source: sourceInfo,
                     Metrics: EmptyMetrics(),
                     Channels: Array.Empty<SourceSelectionPreviewChannel>(),
-                    Unmatched: Array.Empty<SourceSelectionPreviewUnmatched>());
+                    Unmatched: Array.Empty<SourceSelectionPreviewUnmatched>(),
+                    Ambiguous: Array.Empty<SourceSelectionPreviewUnmatched>());
             }
 
             scopedChannels = new[] { channel };
@@ -128,14 +134,30 @@ public sealed class SourceSelectionPreviewService
             .Select(c => ToPreviewChannel(c, displayNames, policies))
             .ToList();
 
+        // Duas listas disjuntas por construção: o stage coloca as streams
+        // ambíguas em Unmatched (pass-through de produção inalterado) e expõe
+        // as mesmas referências em AmbiguousStreams. A exclusão é por
+        // identidade de referência (M3uStream é uma classe sem Equals próprio).
+        var ambiguousStreams = new HashSet<M3uStream>(
+            result.AmbiguousStreams, ReferenceEqualityComparer.Instance);
+
+        var ambiguous = result.AmbiguousStreams
+            .Select(u => new SourceSelectionPreviewUnmatched(
+                StreamUrlSanitized: CredentialSanitizer.SanitizeUrl(u.Url),
+                Title: CredentialSanitizer.SanitizeText(u.Title),
+                Reason: AmbiguousReason))
+            .ToList();
+
         var unmatched = result.Unmatched
+            .Where(u => !ambiguousStreams.Contains(u))
             .Select(u => new SourceSelectionPreviewUnmatched(
                 StreamUrlSanitized: CredentialSanitizer.SanitizeUrl(u.Url),
                 Title: CredentialSanitizer.SanitizeText(u.Title),
                 Reason: UnmatchedReason))
             .ToList();
 
-        var metrics = BuildMetrics(scopedChannels.Count, scopedSources, result);
+        var metrics = BuildMetrics(
+            scopedChannels.Count, scopedSources, result, unmatched.Count, ambiguous.Count);
 
         return new SourceSelectionPreviewResult(
             Applied: result.Applied,
@@ -144,7 +166,8 @@ public sealed class SourceSelectionPreviewService
             Source: sourceInfo,
             Metrics: metrics,
             Channels: previewChannels,
-            Unmatched: unmatched);
+            Unmatched: unmatched,
+            Ambiguous: ambiguous);
     }
 
     private static M3uStream ToStream(ChannelSourceEntity channelSource) => new()
@@ -215,7 +238,9 @@ public sealed class SourceSelectionPreviewService
     private static SourceSelectionPreviewMetrics BuildMetrics(
         int channelsProcessed,
         IReadOnlyList<ChannelSourceEntity> scopedSources,
-        SourceSelectionStageResult result)
+        SourceSelectionStageResult result,
+        int unmatchedStreamCount,
+        int ambiguousStreamCount)
     {
         var sourceChannelIds = new HashSet<long>();
         foreach (var channelSource in scopedSources)
@@ -241,11 +266,11 @@ public sealed class SourceSelectionPreviewService
             }
         }
 
-        var distinctProviderSelections = 0;
+        var diversitySelections = 0;
         var fillSelections = 0;
         foreach (var selection in result.Selected)
         {
-            if (selection.Reason == SelectionReasons.Diversity) distinctProviderSelections++;
+            if (selection.Reason == SelectionReasons.Diversity) diversitySelections++;
             else if (selection.Reason == SelectionReasons.Fill) fillSelections++;
         }
 
@@ -283,12 +308,14 @@ public sealed class SourceSelectionPreviewService
             CandidateStreamCount: candidateStreamCount,
             SelectedStreamCount: result.Selected.Count,
             RejectedStreamCount: result.Rejected.Count,
-            UnmatchedStreamCount: result.Unmatched.Count,
-            AmbiguousStreamCount: result.AmbiguousCount,
+            UnmatchedStreamCount: unmatchedStreamCount,
+            AmbiguousStreamCount: ambiguousStreamCount,
+            TotalUnmatchedStreamCount: unmatchedStreamCount + ambiguousStreamCount,
             ChannelsAtChannelLimit: channelsAtChannelLimit,
             ChannelLimitRejectionCount: CountReason(rejectionCounts, SelectionReasons.LimitReached),
             ProviderLimitRejectionCount: CountReason(rejectionCounts, SelectionReasons.ProviderLimit),
-            DistinctProviderSelectionCount: distinctProviderSelections,
+            DiversitySelectionCount: diversitySelections,
+            DistinctProviderCount: distribution.Count,
             FillSelectionCount: fillSelections,
             FallbackDisabledRejectionCount: CountReason(rejectionCounts, SelectionReasons.FallbackDisabled),
             SourceDisabledRejectionCount: CountReason(rejectionCounts, SourceSelectionStage.SourceDisabledReason),
@@ -307,10 +334,12 @@ public sealed class SourceSelectionPreviewService
         RejectedStreamCount: 0,
         UnmatchedStreamCount: 0,
         AmbiguousStreamCount: 0,
+        TotalUnmatchedStreamCount: 0,
         ChannelsAtChannelLimit: 0,
         ChannelLimitRejectionCount: 0,
         ProviderLimitRejectionCount: 0,
-        DistinctProviderSelectionCount: 0,
+        DiversitySelectionCount: 0,
+        DistinctProviderCount: 0,
         FillSelectionCount: 0,
         FallbackDisabledRejectionCount: 0,
         SourceDisabledRejectionCount: 0,

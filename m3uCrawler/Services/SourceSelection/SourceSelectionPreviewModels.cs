@@ -58,10 +58,9 @@ public sealed record SourceSelectionPreviewChannel(
 
 /// <summary>
 /// PHASE 13 (Wave 13-5) — Stream do input sem correspondência inequívoca no
-/// catálogo. <see cref="Reason"/> é actualmente sempre <c>unmatched</c>; a
-/// ambiguidade é agregada em
-/// <see cref="SourceSelectionPreviewMetrics.AmbiguousStreamCount"/> e não
-/// distinguível por-stream neste contrato.
+/// catálogo. Desde a correcção Wave 13-5, <see cref="Reason"/> distingue
+/// <c>unmatched</c> (sem hit no catálogo) de <c>ambiguous</c> (URL mapeada a
+/// mais de um canal canónico); as duas listas são disjuntas por construção.
 /// </summary>
 public sealed record SourceSelectionPreviewUnmatched(
     string StreamUrlSanitized,
@@ -83,9 +82,11 @@ public sealed record SourceSelectionPreviewProviderStat(
 ///
 /// <para>
 /// <b>FillSelectionCount</b> é o proxy da Fase B / fallback fill do selector
-/// (selecções com <c>SelectionReasons.Fill</c>). <b>AmbiguousStreamCount</b> é
-/// agregado (não por-stream). Todas as contagens derivam do resultado do
-/// <see cref="SourceSelectionStage"/> — o algoritmo não é duplicado.
+/// (selecções com <c>SelectionReasons.Fill</c>).
+/// <b>UnmatchedStreamCount</b> e <b>AmbiguousStreamCount</b> são disjuntos por
+/// construção (respectivamente sem hit e URL ambígua); a soma está em
+/// <b>TotalUnmatchedStreamCount</b>. Todas as contagens derivam do resultado
+/// do <see cref="SourceSelectionStage"/> — o algoritmo não é duplicado.
 /// </para>
 /// </summary>
 public sealed record SourceSelectionPreviewMetrics(
@@ -96,10 +97,12 @@ public sealed record SourceSelectionPreviewMetrics(
     int RejectedStreamCount,
     int UnmatchedStreamCount,
     int AmbiguousStreamCount,
+    int TotalUnmatchedStreamCount,
     int ChannelsAtChannelLimit,
     int ChannelLimitRejectionCount,
     int ProviderLimitRejectionCount,
-    int DistinctProviderSelectionCount,
+    int DiversitySelectionCount,
+    int DistinctProviderCount,
     int FillSelectionCount,
     int FallbackDisabledRejectionCount,
     int SourceDisabledRejectionCount,
@@ -129,4 +132,5 @@ public sealed record SourceSelectionPreviewResult(
     SourceSelectionPreviewSourceInfo Source,
     SourceSelectionPreviewMetrics Metrics,
     IReadOnlyList<SourceSelectionPreviewChannel> Channels,
-    IReadOnlyList<SourceSelectionPreviewUnmatched> Unmatched);
+    IReadOnlyList<SourceSelectionPreviewUnmatched> Unmatched,
+    IReadOnlyList<SourceSelectionPreviewUnmatched> Ambiguous);

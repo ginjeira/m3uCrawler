@@ -69,18 +69,88 @@ public class SourceSelectionPreviewTests : IAsyncLifetime
     private async Task<SourceEntity> NewSourceAsync(string key)
         => await _resolver.EnsureSourceAsync(key, key, SourceKind.Telegram, $"telegram://{key}", 0);
 
-    private async Task RecordAsync(
+    private async Task<ChannelSourceEntity> RecordAsync(
         CanonicalChannelEntity channel,
         SourceEntity source,
         string realUrl,
-        bool isEnabled = true)
+        bool isEnabled = true,
+        AvailabilityState availability = AvailabilityState.Discovered)
         => await _resolver.RecordChannelSourceAsync(
-            channel.Id, source.Id, realUrl, matchMethod: "test", isEnabled: isEnabled);
+            channel.Id, source.Id, realUrl,
+            availability: availability, matchMethod: "test", isEnabled: isEnabled);
 
     private async Task<int> PolicyRowCountAsync()
     {
         await using var context = _factory.CreateDbContext();
         return await context.SourceSelectionPolicies.CountAsync();
+    }
+
+    /// <summary>
+    /// Insere um <see cref="ChannelSourceEntity"/> directamente via
+    /// <see cref="ChannelCatalogDbContext"/>, contornando o
+    /// <c>CatalogResolver</c> (que sanitiza sempre a URL e escreve
+    /// <c>LastResponseTimeMs=0</c>). Usado para provar que o preview
+    /// sanitiza defensivamente o catálogo e propaga o response time.
+    /// </summary>
+    private async Task<ChannelSourceEntity> InsertChannelSourceRawAsync(
+        CanonicalChannelEntity channel,
+        SourceEntity source,
+        string rawUrl,
+        bool isEnabled = true,
+        AvailabilityState availability = AvailabilityState.Discovered,
+        long lastResponseTimeMs = 0)
+    {
+        await using var context = _factory.CreateDbContext();
+        var now = DateTime.UtcNow;
+        var entity = new ChannelSourceEntity
+        {
+            CanonicalChannelId = channel.Id,
+            SourceId = source.Id,
+            StreamUrl = rawUrl,
+            Availability = availability,
+            IsEnabled = isEnabled,
+            MatchMethod = "test-raw",
+            MatchConfidence = 0,
+            FirstSeenAtUtc = now,
+            LastSeenAtUtc = now,
+            LastTestedAtUtc = now,
+            LastResponseTimeMs = lastResponseTimeMs,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+        };
+        context.ChannelSources.Add(entity);
+        await context.SaveChangesAsync();
+        return entity;
+    }
+
+    private async Task SetResponseTimeAsync(long channelSourceId, long responseTimeMs)
+    {
+        await using var context = _factory.CreateDbContext();
+        var entity = await context.ChannelSources.SingleAsync(cs => cs.Id == channelSourceId);
+        entity.LastResponseTimeMs = responseTimeMs;
+        await context.SaveChangesAsync();
+    }
+
+    private static void AssertAllMetricsZero(SourceSelectionPreviewMetrics m)
+    {
+        Assert.Equal(0, m.ChannelsProcessed);
+        Assert.Equal(0, m.ChannelsWithSources);
+        Assert.Equal(0, m.CandidateStreamCount);
+        Assert.Equal(0, m.SelectedStreamCount);
+        Assert.Equal(0, m.RejectedStreamCount);
+        Assert.Equal(0, m.UnmatchedStreamCount);
+        Assert.Equal(0, m.AmbiguousStreamCount);
+        Assert.Equal(0, m.TotalUnmatchedStreamCount);
+        Assert.Equal(0, m.ChannelsAtChannelLimit);
+        Assert.Equal(0, m.ChannelLimitRejectionCount);
+        Assert.Equal(0, m.ProviderLimitRejectionCount);
+        Assert.Equal(0, m.DiversitySelectionCount);
+        Assert.Equal(0, m.DistinctProviderCount);
+        Assert.Equal(0, m.FillSelectionCount);
+        Assert.Equal(0, m.FallbackDisabledRejectionCount);
+        Assert.Equal(0, m.SourceDisabledRejectionCount);
+        Assert.Empty(m.RejectionCounts);
+        Assert.Empty(m.ProviderDistribution);
     }
 
     /// <summary>
@@ -239,8 +309,9 @@ public class SourceSelectionPreviewTests : IAsyncLifetime
         var channel = Assert.Single(preview.Channels);
         Assert.Equal(4, channel.SelectedCount);
         Assert.All(channel.Selected, s => Assert.Equal(SelectionReasons.Diversity, s.Reason));
-        Assert.True(preview.Metrics.DistinctProviderSelectionCount > 0);
-        Assert.Equal(4, preview.Metrics.DistinctProviderSelectionCount);
+        Assert.True(preview.Metrics.DiversitySelectionCount > 0);
+        Assert.Equal(4, preview.Metrics.DiversitySelectionCount);
+        Assert.Equal(4, preview.Metrics.DistinctProviderCount);
     }
 
     [Fact]
@@ -427,5 +498,330 @@ public class SourceSelectionPreviewTests : IAsyncLifetime
         Assert.False(noop.Applied);
         Assert.Empty(noop.Channels);
         Assert.Equal(streams.Count, noop.Published.Count);
+    }
+
+    // ---------------- Wave 13-5 corrections ----------------
+
+    [Fact]
+    public async Task Metrics_are_complete_and_self_consistent()
+    {
+        // Catálogo determinístico: 2 streams do fornecedor metrics-a, 1 do
+        // metrics-b, 1 desactivado, 1 dead e 1 linha raw (inserida
+        // directamente, logo sem hit → unmatched).
+        var a = await NewSourceAsync("preview-metrics-a");
+        await RecordAsync(_channelA, a, "http://metrics-a.example.test/1.ts");
+        await RecordAsync(_channelA, a, "http://metrics-a.example.test/2.ts");
+        var b = await NewSourceAsync("preview-metrics-b");
+        await RecordAsync(_channelA, b, "http://metrics-b.example.test/1.ts");
+        var disabled = await NewSourceAsync("preview-metrics-disabled");
+        await RecordAsync(
+            _channelA, disabled, "http://metrics-disabled.example.test/1.ts", isEnabled: false);
+        var dead = await NewSourceAsync("preview-metrics-dead");
+        await RecordAsync(
+            _channelA, dead, "http://metrics-dead.example.test/1.ts",
+            availability: AvailabilityState.Dead);
+        var raw = await NewSourceAsync("preview-metrics-raw");
+        await InsertChannelSourceRawAsync(
+            _channelA, raw, "http://user:secret@metrics-raw.example.test/live/USER/PASS/1");
+
+        await _resolver.UpsertGlobalSourceSelectionPolicyAsync(3, true, null, true);
+
+        var preview = await Preview().PreviewAsync(_channelA.Key);
+        var m = preview.Metrics;
+
+        Assert.Equal(1, m.ChannelsProcessed);
+        Assert.Equal(1, m.ChannelsWithSources);
+        Assert.Equal(5, m.CandidateStreamCount);
+        Assert.Equal(3, m.SelectedStreamCount);
+        Assert.Equal(2, m.RejectedStreamCount);
+        Assert.Equal(1, m.UnmatchedStreamCount);
+        Assert.Equal(0, m.AmbiguousStreamCount);
+        Assert.Equal(1, m.TotalUnmatchedStreamCount);
+        Assert.Equal(0, m.ChannelsAtChannelLimit);
+        Assert.Equal(0, m.ChannelLimitRejectionCount);
+        Assert.Equal(0, m.ProviderLimitRejectionCount);
+        Assert.Equal(2, m.DiversitySelectionCount);
+        Assert.Equal(2, m.DistinctProviderCount);
+        Assert.Equal(1, m.FillSelectionCount);
+        Assert.Equal(0, m.FallbackDisabledRejectionCount);
+        Assert.Equal(1, m.SourceDisabledRejectionCount);
+
+        Assert.Equal(2, m.RejectionCounts.Count);
+        Assert.Equal(1, m.RejectionCounts[SelectionReasons.NotWorking]);
+        Assert.Equal(1, m.RejectionCounts[SourceSelectionStage.SourceDisabledReason]);
+
+        Assert.Equal(2, m.ProviderDistribution.Count);
+        var providerA = m.ProviderDistribution.Single(p => p.Provider == "metrics-a.example.test");
+        Assert.Equal(2, providerA.SelectedCount);
+        Assert.Equal(1, providerA.ChannelCount);
+        var providerB = m.ProviderDistribution.Single(p => p.Provider == "metrics-b.example.test");
+        Assert.Equal(1, providerB.SelectedCount);
+        Assert.Equal(1, providerB.ChannelCount);
+
+        Assert.Equal(6, preview.InputStreamCount);
+
+        // Invariantes de consistência (frozen contract Wave 13-5).
+        Assert.Equal(m.CandidateStreamCount, m.SelectedStreamCount + m.RejectedStreamCount);
+        Assert.Equal(
+            preview.InputStreamCount,
+            m.CandidateStreamCount + m.UnmatchedStreamCount + m.AmbiguousStreamCount);
+        Assert.Equal(m.TotalUnmatchedStreamCount, m.UnmatchedStreamCount + m.AmbiguousStreamCount);
+    }
+
+    [Fact]
+    public async Task Ambiguous_url_is_reported_as_ambiguous_and_not_unmatched()
+    {
+        // A mesma URL sanitizada mapeada para dois canais canónicos distintos.
+        var sourceA = await NewSourceAsync("preview-ambiguous-1");
+        var sourceB = await NewSourceAsync("preview-ambiguous-2");
+        const string shared = "http://ambiguous.example.test/stream/abc/1.ts";
+        await RecordAsync(_channelA, sourceA, shared);
+        await RecordAsync(_channelB, sourceB, shared);
+
+        // Filtro a um único canal: o preview sintetiza 1 stream para essa
+        // linha, mas o stage continua a ver as duas linhas do catálogo
+        // (A e B) → mapeamento ambíguo. Sem filtro haveria 2 streams (uma
+        // por linha) e AmbiguousStreamCount seria 2.
+        var preview = await Preview().PreviewAsync(_channelA.Key);
+
+        Assert.True(preview.Applied);
+        var ambiguous = Assert.Single(preview.Ambiguous);
+        Assert.Equal(SourceSelectionPreviewService.AmbiguousReason, ambiguous.Reason);
+        Assert.Equal(CredentialSanitizer.SanitizeUrl(shared), ambiguous.StreamUrlSanitized);
+        Assert.Empty(preview.Unmatched);
+        Assert.Empty(preview.Channels);
+        Assert.Equal(1, preview.InputStreamCount);
+        Assert.Equal(0, preview.Metrics.UnmatchedStreamCount);
+        Assert.Equal(1, preview.Metrics.AmbiguousStreamCount);
+        Assert.Equal(1, preview.Metrics.TotalUnmatchedStreamCount);
+
+        // Semântica de produção inalterada: o stage mantém a stream ambígua
+        // em Unmatched (pass-through) e expõe a mesma referência em
+        // AmbiguousStreams.
+        var streams = (await _resolver.ListChannelSourcesAsync())
+            .Where(cs => cs.CanonicalChannelId == _channelA.Id)
+            .Select(ToStream)
+            .ToList();
+        var direct = await new SourceSelectionStage(_resolver)
+            .ApplyAsync(streams, SourceSelectionDefaults.DefaultPolicy);
+
+        Assert.True(direct.Applied);
+        Assert.Equal(1, direct.AmbiguousCount);
+        var ambiguousStream = Assert.Single(direct.AmbiguousStreams);
+        Assert.Contains(direct.Unmatched, u => ReferenceEquals(u, ambiguousStream));
+        Assert.Contains(direct.Published, p => ReferenceEquals(p, ambiguousStream));
+        Assert.Single(direct.Unmatched);
+    }
+
+    [Fact]
+    public async Task Response_time_plumbing_selects_lower_value_and_emits_it_non_zero()
+    {
+        // NOTA: a produção nunca mantém ChannelSourceEntity.LastResponseTimeMs
+        // (CatalogResolver escreve sempre 0); este teste insere valores
+        // não-zero directamente via DbContext para provar que o plumbing
+        // do preview (ChannelSourceEntity → M3uStream → SelectionCandidate →
+        // SourceSelectionPreviewCandidate) propaga o valor quando existe.
+        var source = await NewSourceAsync("preview-response-time");
+        // A URL lexicalmente menor tem o response time PIOR, para que a
+        // selecção só possa ser explicada pelo critério de response time.
+        var slow = await RecordAsync(_channelA, source, "http://rt.example.test/a-slow.ts");
+        var fast = await RecordAsync(_channelA, source, "http://rt.example.test/z-fast.ts");
+        await SetResponseTimeAsync(slow.Id, 500);
+        await SetResponseTimeAsync(fast.Id, 40);
+
+        await _resolver.UpsertGlobalSourceSelectionPolicyAsync(1, true, null, true);
+
+        var preview = await Preview().PreviewAsync(_channelA.Key);
+        var channel = Assert.Single(preview.Channels);
+
+        var selected = Assert.Single(channel.Selected);
+        Assert.Equal("http://rt.example.test/z-fast.ts", selected.StreamUrlSanitized);
+        Assert.Equal(40, selected.LastResponseTimeMs);
+        Assert.Equal(SelectionReasons.Diversity, selected.Reason);
+
+        var rejected = Assert.Single(channel.Rejected);
+        Assert.Equal("http://rt.example.test/a-slow.ts", rejected.StreamUrlSanitized);
+        Assert.Equal(500, rejected.LastResponseTimeMs);
+    }
+
+    [Fact]
+    public async Task Dead_and_disabled_sources_are_rejected_with_exact_reasons()
+    {
+        var unreachable = await NewSourceAsync("preview-unreachable-exact");
+        await RecordAsync(
+            _channelA, unreachable, "http://sel-unreachable.example.test/1.ts",
+            availability: AvailabilityState.Unreachable);
+        var disabled = await NewSourceAsync("preview-disabled-exact");
+        await RecordAsync(
+            _channelA, disabled, "http://sel-disabled-exact.example.test/1.ts", isEnabled: false);
+
+        var preview = await Preview().PreviewAsync(_channelA.Key);
+        var channel = Assert.Single(preview.Channels);
+
+        Assert.Equal(0, channel.SelectedCount);
+        Assert.Equal(2, channel.RejectedCount);
+
+        var unreachableRejected = channel.Rejected.Single(
+            r => r.StreamUrlSanitized.Contains("sel-unreachable", StringComparison.Ordinal));
+        Assert.Equal(SelectionReasons.NotWorking, unreachableRejected.Reason);
+        Assert.Equal("rejected", unreachableRejected.Decision);
+        Assert.Null(unreachableRejected.Rank);
+
+        var disabledRejected = channel.Rejected.Single(
+            r => r.StreamUrlSanitized.Contains("sel-disabled-exact", StringComparison.Ordinal));
+        Assert.Equal(SourceSelectionStage.SourceDisabledReason, disabledRejected.Reason);
+        Assert.Equal("rejected", disabledRejected.Decision);
+        Assert.Null(disabledRejected.Rank);
+
+        Assert.Equal(1, preview.Metrics.SourceDisabledRejectionCount);
+        Assert.Equal(1, preview.Metrics.RejectionCounts[SelectionReasons.NotWorking]);
+        Assert.Equal(1, preview.Metrics.RejectionCounts[SourceSelectionStage.SourceDisabledReason]);
+        Assert.Equal(2, preview.Metrics.CandidateStreamCount);
+        Assert.Equal(0, preview.Metrics.SelectedStreamCount);
+        Assert.Equal(2, preview.Metrics.RejectedStreamCount);
+    }
+
+    [Fact]
+    public async Task Unknown_channel_key_is_not_applied_with_zeroed_metrics_and_empty_lists()
+    {
+        var source = await NewSourceAsync("preview-unknown-key");
+        await RecordAsync(_channelA, source, "http://unknown-key.example.test/1.ts");
+
+        var preview = await Preview().PreviewAsync("does-not-exist");
+
+        Assert.False(preview.Applied);
+        Assert.Equal(0, preview.InputStreamCount);
+        Assert.False(string.IsNullOrEmpty(preview.Source.ChannelKeyFilter));
+        Assert.Equal("does-not-exist", preview.Source.ChannelKeyFilter);
+        Assert.Empty(preview.Channels);
+        Assert.Empty(preview.Unmatched);
+        Assert.Empty(preview.Ambiguous);
+        AssertAllMetricsZero(preview.Metrics);
+
+        // Nada foi mutado pela tentativa falhada.
+        Assert.Equal(0, await PolicyRowCountAsync());
+        Assert.Single(await _resolver.ListChannelSourcesAsync());
+    }
+
+    [Fact]
+    public async Task Raw_catalog_url_is_sanitized_in_unmatched_output()
+    {
+        // O catálogo normal está pré-sanitizado; só uma linha inserida
+        // directamente (com credenciais reais) prova que a sanitização
+        // defensiva do preview é efectivamente aplicada. Se o
+        // CredentialSanitizer fosse removido do caminho unmatched, este
+        // teste falharia com a URL raw no JSON.
+        var source = await NewSourceAsync("preview-raw-sanitize");
+        const string raw = "http://user:secret@raw.example.test/live/USER/PASS/1";
+        await InsertChannelSourceRawAsync(_channelA, source, raw);
+
+        var preview = await Preview().PreviewAsync();
+
+        var unmatched = Assert.Single(preview.Unmatched);
+        Assert.Equal(SourceSelectionPreviewService.UnmatchedReason, unmatched.Reason);
+        Assert.Contains("***", unmatched.StreamUrlSanitized);
+        Assert.Equal(CredentialSanitizer.SanitizeUrl(raw), unmatched.StreamUrlSanitized);
+        Assert.Empty(preview.Ambiguous);
+
+        var json = JsonSerializer.Serialize(preview);
+        Assert.DoesNotContain("secret", json, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("PASS", json, StringComparison.Ordinal);
+        Assert.DoesNotContain("USER", json, StringComparison.Ordinal);
+        Assert.DoesNotContain(raw, json, StringComparison.Ordinal);
+        Assert.Contains("***", json);
+    }
+
+    [Fact]
+    public async Task Preview_decisions_match_hand_computed_expectations_and_direct_stage()
+    {
+        // 3 fontes, 2 fornecedores, max=2, diversidade ligada:
+        // Fase A → a/1 (diversity), b/1 (diversity); a/2 perde por limite.
+        var source = await NewSourceAsync("preview-hand-computed");
+        await RecordAsync(_channelA, source, "http://parity-a.example.test/1.ts");
+        await RecordAsync(_channelA, source, "http://parity-a.example.test/2.ts");
+        await RecordAsync(_channelA, source, "http://parity-b.example.test/1.ts");
+        await _resolver.UpsertGlobalSourceSelectionPolicyAsync(2, true, null, true);
+
+        var preview = await Preview().PreviewAsync(_channelA.Key);
+        var channel = Assert.Single(preview.Channels);
+
+        Assert.Equal(2, channel.SelectedCount);
+        Assert.Equal(1, channel.RejectedCount);
+
+        var selected = channel.Selected
+            .Select(c => (c.Rank!.Value, c.Reason, c.Provider, c.StreamUrlSanitized))
+            .ToArray();
+        Assert.Equal(
+            new[]
+            {
+                (0, SelectionReasons.Diversity, "parity-a.example.test", "http://parity-a.example.test/1.ts"),
+                (1, SelectionReasons.Diversity, "parity-b.example.test", "http://parity-b.example.test/1.ts"),
+            },
+            selected);
+
+        var rejected = Assert.Single(channel.Rejected);
+        Assert.Equal(SelectionReasons.LimitReached, rejected.Reason);
+        Assert.Equal("parity-a.example.test", rejected.Provider);
+        Assert.Equal("http://parity-a.example.test/2.ts", rejected.StreamUrlSanitized);
+        Assert.Null(rejected.Rank);
+        Assert.Equal("rejected", rejected.Decision);
+
+        Assert.Equal(2, preview.Metrics.DiversitySelectionCount);
+        Assert.Equal(0, preview.Metrics.FillSelectionCount);
+        Assert.Equal(2, preview.Metrics.DistinctProviderCount);
+
+        // De-tautologização: além do cálculo à mão, o preview continua a
+        // bater certo com o stage directo sobre os mesmos inputs.
+        var streams = (await _resolver.ListChannelSourcesAsync()).Select(ToStream).ToList();
+        var policies = await new SourceSelectionPolicyResolver(_resolver)
+            .LoadEffectivePoliciesReadOnlyAsync();
+        var direct = await new SourceSelectionStage(_resolver).ApplyAsync(streams, policies);
+        var directGroup = direct.Channels.Single(c => c.CanonicalChannelId == _channelA.Id);
+
+        Assert.Equal(
+            directGroup.Selected.Select(s => (
+                s.Rank,
+                s.Reason,
+                s.Candidate.Provider.Key,
+                CredentialSanitizer.SanitizeUrl(s.Candidate.StreamUrl))),
+            channel.Selected.Select(c => (c.Rank!.Value, c.Reason, c.Provider, c.StreamUrlSanitized)));
+        Assert.Equal(
+            directGroup.Rejected.Select(r => (
+                r.Reason,
+                r.Candidate.Provider.Key,
+                CredentialSanitizer.SanitizeUrl(r.Candidate.StreamUrl))),
+            channel.Rejected.Select(c => (c.Reason, c.Provider, c.StreamUrlSanitized)));
+    }
+
+    [Fact]
+    public async Task Prefer_distinct_providers_false_selects_fill_only_and_zero_diversity()
+    {
+        var source = await NewSourceAsync("preview-no-diversity");
+        await RecordAsync(_channelA, source, "http://nodiv-a.example.test/1.ts");
+        await RecordAsync(_channelA, source, "http://nodiv-a.example.test/2.ts");
+        await RecordAsync(_channelA, source, "http://nodiv-b.example.test/1.ts");
+        await _resolver.UpsertGlobalSourceSelectionPolicyAsync(2, false, null, true);
+
+        var preview = await Preview().PreviewAsync(_channelA.Key);
+        var channel = Assert.Single(preview.Channels);
+
+        Assert.Equal(2, channel.SelectedCount);
+        Assert.Equal(1, channel.RejectedCount);
+        Assert.All(channel.Selected, c => Assert.Equal(SelectionReasons.Fill, c.Reason));
+        Assert.Equal(
+            new[] { "http://nodiv-a.example.test/1.ts", "http://nodiv-a.example.test/2.ts" },
+            channel.Selected.Select(c => c.StreamUrlSanitized).ToArray());
+
+        var rejected = Assert.Single(channel.Rejected);
+        Assert.Equal(SelectionReasons.LimitReached, rejected.Reason);
+        Assert.Equal("http://nodiv-b.example.test/1.ts", rejected.StreamUrlSanitized);
+
+        Assert.Equal(0, preview.Metrics.DiversitySelectionCount);
+        Assert.Equal(2, preview.Metrics.FillSelectionCount);
+        Assert.Equal(1, preview.Metrics.DistinctProviderCount);
+        var provider = Assert.Single(preview.Metrics.ProviderDistribution);
+        Assert.Equal("nodiv-a.example.test", provider.Provider);
+        Assert.Equal(2, provider.SelectedCount);
+        Assert.Equal(1, provider.ChannelCount);
     }
 }

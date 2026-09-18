@@ -327,7 +327,8 @@ canonicalChannelKey = null, CancellationToken = default)`:
 - **não publica**, não escreve `playlist`/JSON, não muta catálogo, ownership nem
   Dispatcharr e **não cria estado persistente**.
 
-A garantia de ausência de escrita assenta no carregamento read-only da política:
+A ausência de escrita é **estrutural** (não existe writer no caminho de preview):
+o carregamento da política é read-only —
 `SourceSelectionPolicyResolver.LoadEffectivePoliciesReadOnlyAsync` lê a política
 global via `CatalogResolver.GetGlobalSourceSelectionPolicyAsync` (que usa
 `AsNoTracking` e **nunca insere**). Se a linha global não existir, usa
@@ -339,13 +340,17 @@ o caminho de produção `LoadEffectivePoliciesAsync`). `HasExplicitGlobal` e
 
 **Endpoint.** `GET /api/catalog/source-selection-policies/preview[?channelKey=<CanonicalChannel.Key>]`.
 
-- **Apenas `GET`** (outros métodos → `405`), sob o gate de autenticação/CSRF
-  existente e o gate de catálogo (→ `503` "Catálogo não inicializado." quando o
-  `CatalogResolver` não está disponível).
-- **Filtro opcional `channelKey`**: match exacto ordinal sobre
-  `CanonicalChannel.Key`, restringindo os canais considerados. Filtro sem
-  correspondência devolve `applied=false` com métricas zeradas, registando o
-  filtro em `source.channelKeyFilter`.
+- **Apenas `GET`** (outros métodos → `405`), sob o gate de autenticação
+  (sessão/token; `GET` não exige CSRF) e o gate de catálogo (→ `503` "Catálogo
+  não inicializado." quando o `CatalogResolver` não está disponível).
+- **Filtro opcional `channelKey`**: match **exacto e case-sensitive** (`Ordinal`)
+  sobre `CanonicalChannel.Key`, restringindo os canais considerados. Uma chave
+  desconhecida devolve **HTTP 200** com `applied=false` e métricas zeradas (não é
+  erro), registando o filtro em `source.channelKeyFilter`; esse campo é
+  sanitizado (`CredentialSanitizer.SanitizeText`) antes da emissão.
+- **Resiliência HTTP:** a rota é envolvida em `try/catch`; uma falha inesperada
+  devolve `500 {"error":"preview-failed"}` e fecha sempre o response, em vez de
+  deixar o cliente pendurado. O comportamento GET-only (`405`) mantém-se.
 - **UI:** cartão "Preview / Dry-Run" no separador de Source Selection do
   Dashboard, com `loadSourceSelectionPreview()`.
 
@@ -353,26 +358,53 @@ o caminho de produção `LoadEffectivePoliciesAsync`). `HasExplicitGlobal` e
 `SourceSelectionStageResult.Channels` + `SourceSelectionChannelResult`. Modelos:
 
 - `SourceSelectionPreviewResult` — `applied`, `generatedAtUtc`,
-  `inputStreamCount`, `source` e `metrics`, `channels`, `unmatched`;
+  `inputStreamCount`, `source` e `metrics`, `channels`, `unmatched` e
+  `ambiguous`;
 - `SourceSelectionPreviewChannel` — id/key/nome canónico, `policyScope`,
   política efectiva, contagens e listas `selected`/`rejected`;
 - `SourceSelectionPreviewCandidate` — candidato projectado com `rank`,
   `decision` (`selected`/`rejected`) e `reason` (vocabulário de
   `SelectionReasons`);
-- `SourceSelectionPreviewUnmatched` — stream sem correspondência inequívoca
-  (motivo `unmatched`);
+- `SourceSelectionPreviewUnmatched` — stream sem correspondência inequívoca,
+  com `reason` `unmatched` (sem hit no catálogo) ou `ambiguous` (URL mapeada a
+  mais de um canal canónico);
 - `SourceSelectionPreviewMetrics`, `SourceSelectionPreviewProviderStat`,
   `SourceSelectionPreviewSourceInfo`, `SourceSelectionPreviewDecisions`
   (`selected`/`rejected`).
 
+O endpoint emite **duas listas top-level disjuntas**: `unmatched[]` (motivo
+`unmatched`) e `ambiguous[]` (motivo `ambiguous`), com a mesma forma. O
+`SourceSelectionStageResult` ganhou uma lista aditiva `AmbiguousStreams`; a
+semântica de produção de `Unmatched` fica **inalterada** (continua a incluir as
+ambíguas, para preservar o pass-through). No preview, as duas listas são
+separadas por identidade de referência (`ReferenceEqualityComparer`).
+
+**Invariantes de contagem (Wave 13-5).** Com as listas disjuntas:
+
+```text
+inputStreamCount == candidateStreamCount + unmatchedStreamCount + ambiguousStreamCount
+candidateStreamCount == selectedStreamCount + rejectedStreamCount
+```
+
+- `unmatchedStreamCount` = streams **não ambíguas** sem hit no catálogo;
+- `ambiguousStreamCount` = streams cuja URL mapeia a mais de um canal canónico;
+- `totalUnmatchedStreamCount = unmatchedStreamCount + ambiguousStreamCount`.
+
 **Métricas agregadas** (`SourceSelectionPreviewMetrics`): `channelsProcessed`,
 `channelsWithSources`, `candidateStreamCount`, `selectedStreamCount`,
 `rejectedStreamCount`, `unmatchedStreamCount`, `ambiguousStreamCount`,
-`channelsAtChannelLimit`, `channelLimitRejectionCount`,
-`providerLimitRejectionCount`, `distinctProviderSelectionCount`,
-`fillSelectionCount`, `fallbackDisabledRejectionCount`,
-`sourceDisabledRejectionCount`, `rejectionCounts` e `providerDistribution`
-(`provider`, `selectedCount`, `channelCount`).
+`totalUnmatchedStreamCount`, `channelsAtChannelLimit`,
+`channelLimitRejectionCount`, `providerLimitRejectionCount`,
+`diversitySelectionCount`, `distinctProviderCount`, `fillSelectionCount`,
+`fallbackDisabledRejectionCount`, `sourceDisabledRejectionCount`,
+`rejectionCounts` e `providerDistribution` (`provider`, `selectedCount`,
+`channelCount`).
+
+- `diversitySelectionCount` (correcção Wave 13-5; substitui o enganador
+  `distinctProviderSelectionCount`) = número de selecções com motivo
+  `diversity`, somadas por canal.
+- `distinctProviderCount` (novo) = número de fornecedores distintos com pelo
+  menos uma selecção (= `providerDistribution.Count`).
 
 **Sanitização.** Todas as URLs emitidas passam por
 `CredentialSanitizer.SanitizeUrl` (defensivo, mesmo que o catálogo já guarde URLs
@@ -386,14 +418,32 @@ origem é o rótulo curto `catalog`, sem caminhos de filesystem nem internals do
 - O input é o **catálogo** (`ChannelSourceEntity`), **não** um conjunto de
   descoberta Telegram ao vivo; a disponibilidade do catálogo é usada como proxy
   do estado de funcionamento (`IsWorking = Availability not Dead/Unreachable`).
-- A ambiguidade é **agregada** (`metrics.ambiguousStreamCount`); as entradas
-  por-stream não correspondidas têm motivo `unmatched` e **não** são rotuladas
-  individualmente como ambíguas.
+- A ambiguidade é exposta em lista própria (`ambiguous[]`); `unmatched` e
+  `ambiguous` são **listas disjuntas** por construção, com
+  `unmatchedStreamCount` a contar apenas as não-ambíguas e
+  `totalUnmatchedStreamCount` a somar ambas.
 - `fillSelectionCount` é o proxy da Fase B do selector (motivo `fill`).
-- Canais sem `ChannelSource` contam em `channelsProcessed`, mas não aparecem em
-  `channels`.
+- `channelsProcessed` é o número de canais canónicos **no âmbito** (após o
+  filtro `channelKey`), **incluindo** os que não têm `ChannelSource`; esses não
+  aparecem em `channels`. A UI rotula o cartão como "Canais no âmbito".
 - Apenas os dois pontos de publicação Telegram aplicam selecção em produção; os
   restantes pontos de publicação permanecem fora de âmbito (pré-existente).
+
+**Limitação de paridade: ResponseTime.** O preview alimenta
+`ResponseTime = ChannelSourceEntity.LastResponseTimeMs`, mas essa coluna só é
+escrita como `0` no insert e nunca é actualizada (`CatalogResolver.cs:1422`;
+ramo de update `:1392-1404`); `ChannelSourceObservationEntity` é append-only,
+não tem flag de sucesso e só é escrito por um POST controlado pelo cliente
+(`WebDashboardService.cs:2133`); o pipeline de ingestão
+(`PipelineIngestionService.cs:250-264`) ignora `stream.ResponseTime`. O valor
+real em produção é o stopwatch ao vivo `DurationMs` da probe exacta
+(`M3uTesterService.cs:550,555`). Por isso o preview **não consegue** reproduzir a
+ordenação de produção por `ResponseTimeKey`
+(`ChannelSourceSelector.cs:128,260-261`) e trata o response time como
+**desconhecido**. É uma limitação documentada, **não** uma garantia: quando os
+candidatos empatam nas primeiras quatro chaves de ranking, a ordem — e portanto
+o conjunto seleccionado — pode diferir da produção. Não se afirma paridade de
+ordenação com a produção.
 
 **Fora de âmbito explícito (13-5).** O contrato `MatchPlan` +
 `DispatcharrSourceSelection`, o ownership/cleanup selectivo, o teste 100→10,

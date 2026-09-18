@@ -604,31 +604,50 @@ produção (não há algoritmo duplicado) e carrega a política global de forma
 read-only (nunca insere a linha default).
 
 - **Filtro opcional:** `?channelKey=<CanonicalChannel.Key>` restringe a um canal
-  canónico (match exacto ordinal). Sem correspondência, devolve `applied=false`
-  com métricas zeradas, registando o filtro em `source.channelKeyFilter`.
+  canónico (match **exacto e case-sensitive**, `Ordinal`). Chave desconhecida
+  devolve **HTTP 200** com `applied=false` e métricas zeradas, registando o
+  filtro (sanitizado) em `source.channelKeyFilter`.
 - **Gate:** GET-only (outros métodos → `405`), sob o mesmo gate de
   autenticação/CSRF dos restantes endpoints do catálogo; `503` "Catálogo não
-  inicializado." quando o catálogo não está disponível.
+  inicializado." quando o catálogo não está disponível. Falhas inesperadas na
+  rota devolvem `500 {"error":"preview-failed"}` com o response sempre fechado
+  (o cliente não fica pendurado).
 - **Resposta:** `applied`, `generatedAtUtc`, `inputStreamCount`, `source`
-  (origem `catalog` + contagens), `metrics` (agregados: canais processados/com
-  fontes, candidatos, seleccionados, rejeitados, não correspondidos, ambíguos,
-  canais no limite, rejeições por limite de canal/fornecedor/fallback/source
-  desactivada, fornecedores distintos, selecções de preenchimento,
-  `rejectionCounts` e `providerDistribution`) e `channels` (por canal:
-  `policyScope` `override`/`global`/`default`, política efectiva, contagens e
-  listas `selected`/`rejected` com `rank`/`decision`/`reason`), além de
-  `unmatched`.
+  (origem `catalog` + contagens), `metrics`, `channels` e as listas top-level
+  **disjuntas** `unmatched[]` e `ambiguous[]` (mesma forma). Métricas agregadas:
+  `channelsProcessed` (canais canónicos no âmbito, incluindo os sem fontes),
+  `channelsWithSources`, candidatos, seleccionados, rejeitados,
+  `unmatchedStreamCount` (sem hit), `ambiguousStreamCount` (URL mapeada a >1
+  canal canónico), `totalUnmatchedStreamCount` (soma das duas), canais no limite,
+  rejeições por limite de canal/fornecedor/fallback/source desactivada,
+  `diversitySelectionCount` (selecções por diversidade), `distinctProviderCount`
+  (fornecedores distintos com ≥1 selecção), `fillSelectionCount`,
+  `rejectionCounts` e `providerDistribution`. Cada canal tem `policyScope`
+  `override`/`global`/`default`, política efectiva, contagens e listas
+  `selected`/`rejected` com `rank`/`decision`/`reason`.
 - **Sanitização:** todas as URLs emitidas passam
   `CredentialSanitizer.SanitizeUrl` (mesmo que o catálogo já guarde URLs
-  sanitizadas) e `unmatched[].title` passa `SanitizeText`; não há credenciais no
-  output.
+  sanitizadas) e `unmatched[].title`/`ambiguous[].title` passam `SanitizeText`;
+  não há credenciais no output.
 - **Limitações:** o input é o catálogo (`ChannelSource`), não a descoberta
   Telegram ao vivo; `IsWorking` usa `Availability not Dead/Unreachable` como
-  proxy; a ambiguidade é agregada em `metrics.ambiguousStreamCount`; `fillSelectionCount`
-  é o proxy da Fase B; canais sem fontes contam em `channelsProcessed` mas não
-  aparecem em `channels`. As métricas ricas são âmbito do preview —
-  `RunReport.SourceSelection` mantém-se só contagens, e o contrato
-  `MatchPlan`/`DispatcharrSourceSelection` (Wave 13-6) permanece fora de âmbito.
+  proxy; `unmatched[]` e `ambiguous[]` são disjuntos por construção
+  (`unmatchedStreamCount` conta só as não-ambíguas, `ambiguousStreamCount` só as
+  ambíguas); `fillSelectionCount` é o proxy da Fase B; canais sem fontes contam
+  em `channelsProcessed` (rotulado na UI "Canais no âmbito") mas não aparecem em
+  `channels`. **Limitação de paridade: `ResponseTime`** — o preview usa
+  `ChannelSourceEntity.LastResponseTimeMs`, mas essa coluna só é escrita como `0`
+  no insert e nunca é actualizada (`CatalogResolver.cs:1422`; update
+  `:1392-1404`), a observação é append-only e sem flag de sucesso
+  (`WebDashboardService.cs:2133`) e o pipeline ignora `stream.ResponseTime`
+  (`PipelineIngestionService.cs:250-264`); o valor real em produção é o stopwatch
+  `DurationMs` da probe exacta (`M3uTesterService.cs:550,555`). O preview trata o
+  response time como desconhecido e **não** reproduz a ordenação por
+  `ResponseTimeKey` (`ChannelSourceSelector.cs:128,260-261`) — em empates nas
+  primeiras quatro chaves, a ordem e o conjunto seleccionado podem diferir da
+  produção. As métricas ricas são âmbito do preview — `RunReport.SourceSelection`
+  mantém-se só contagens, e o contrato `MatchPlan`/`DispatcharrSourceSelection`
+  (Wave 13-6) permanece fora de âmbito.
 
 ### Modelo de segurança do dashboard
 

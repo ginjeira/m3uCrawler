@@ -4593,20 +4593,41 @@ Ambas as waves estão concluídas. A migração completa `Id → Key` do domíni
 > inicializado), mais o cartão "Preview / Dry-Run" e `loadSourceSelectionPreview()`
 > no separador existente. **Sanitização:** todas as URLs emitidas passam
 > `CredentialSanitizer.SanitizeUrl` e `Unmatched.Title` passa `SanitizeText`.
-> **Limitações:** input é o catálogo (não a descoberta Telegram ao vivo),
-> `IsWorking` é proxy, a ambiguidade é agregada (`ambiguousStreamCount`; unmatched
-> por-stream com motivo `unmatched`), `fillSelectionCount` é o proxy da Fase B
-> (`fill`), canais sem sources contam em `channelsProcessed` mas não aparecem em
+> **Métricas (corrigidas):** `distinctProviderSelectionCount` foi renomeado para
+> `diversitySelectionCount` (nº de selecções com motivo `diversity`) e foi
+> acrescentado `distinctProviderCount` (nº de fornecedores distintos com ≥1
+> selecção). **Contrato unmatched/ambiguous (corrigido):** `unmatched` e
+> `ambiguous` são agora disjuntos por construção — `unmatchedStreamCount` conta
+> só as não-ambíguas, `ambiguousStreamCount` só as ambíguas e
+> `totalUnmatchedStreamCount` é a soma; o endpoint emite `ambiguous[]` além de
+> `unmatched[]`, e `SourceSelectionStageResult` ganhou a lista aditiva
+> `AmbiguousStreams` (semântica de produção de `Unmatched` inalterada).
+> **Endpoint (corrigido):** `channelKey` é match exacto/case-sensitive, chave
+> desconhecida devolve `200` com `applied=false` e métricas zeradas, e a rota
+> devolve `500 {"error":"preview-failed"}` (com response fechado) em falha
+> inesperada. **Limitações:** input é o catálogo (não a descoberta Telegram ao
+> vivo), `IsWorking` é proxy, `fillSelectionCount` é o proxy da Fase B (`fill`),
+> `channelsProcessed` são os canais canónicos no âmbito (incluindo os sem
+> sources; na UI "Canais no âmbito") mas os sem sources não aparecem em
 > `channels`, e só os dois pontos de publicação Telegram aplicam selecção em
-> produção. **Fora de âmbito (13-6 e posteriores):** contrato `MatchPlan` +
+> produção. **Limitação de paridade: `ResponseTime`** — o preview usa
+> `ChannelSourceEntity.LastResponseTimeMs`, coluna escrita como `0` no insert e
+> nunca actualizada (`CatalogResolver.cs:1422`; update `:1392-1404`), com
+> observações append-only sem flag de sucesso (`WebDashboardService.cs:2133`) e
+> o pipeline a ignorar `stream.ResponseTime`
+> (`PipelineIngestionService.cs:250-264`); o valor real em produção é o stopwatch
+> `DurationMs` da probe exacta (`M3uTesterService.cs:550,555`). O preview trata o
+> response time como desconhecido e não reproduz a ordenação por
+> `ResponseTimeKey` (`ChannelSourceSelector.cs:128,260-261`); em empates nas
+> primeiras quatro chaves, ordem/conjunto podem diferir da produção — limitação
+> documentada, não garantia. **Fora de âmbito (13-6 e posteriores):** contrato `MatchPlan` +
 > `DispatcharrSourceSelection`, cleanup/ownership selectivo, teste 100→10,
 > `ProviderDefinition`, `SelectionPolicy` separada, `MinimumValidatedSources` e
 > churn/estabilidade. `RunReport.SourceSelection` mantém-se **inalterado** (só
 > contagens); as métricas ricas são âmbito do preview. **A 13-6 não está
 > implementada nem em curso.**
 
-> **Reconciliação de estado (2026-09-18, HEAD `bf04c34` + Waves 13-4b e 13-5) — evidência de código/testes.** Implementado e verificado: selector puro determinístico com deduplicação e diversidade (`ChannelSourceSelector.cs`), publicação Telegram nos dois pontos (`Program.cs:539-557`, `:1112-1136`), política global persistida (entidade, migration `AddSourceSelectionPolicies`, resolver, endpoint/UI global), **overrides por canal (13-4b)** persistidos/resolvidos/expostos por `CanonicalChannel.Key`, com substituição completa e leitura em lote, e **preview/dry-run read-only + métricas (13-5)** sobre o catálogo, a correr o mesmo `SourceSelectionStage`, com endpoint `GET /api/catalog/source-selection-policies/preview` e cartão no Dashboard. Itens do DoD (§17) ainda **não** implementados, com evidência:
-> - **preview/dry-run** — implementado na Wave 13-5 (`SourceSelectionPreviewService`, endpoint + cartão); limitação remanescente: o input é o catálogo, não a descoberta Telegram ao vivo;
+> **Reconciliação de estado (2026-09-18, HEAD `bf04c34` + Waves 13-4b e 13-5) — evidência de código/testes.** Implementado e verificado: selector puro determinístico com deduplicação e diversidade (`ChannelSourceSelector.cs`), publicação Telegram nos dois pontos (`Program.cs:539-557`, `:1112-1136`), política global persistida (entidade, migration `AddSourceSelectionPolicies`, resolver, endpoint/UI global), **overrides por canal (13-4b)** persistidos/resolvidos/expostos por `CanonicalChannel.Key`, com substituição completa e leitura em lote, e **preview/dry-run read-only + métricas (13-5)** sobre o catálogo, a correr o mesmo `SourceSelectionStage`, com endpoint `GET /api/catalog/source-selection-policies/preview` e cartão no Dashboard. O item **preview/dry-run** do DoD (§17) foi entregue na Wave 13-5 (`SourceSelectionPreviewService`, endpoint + cartão); limitação remanescente: o input é o catálogo, não a descoberta Telegram ao vivo. Itens do DoD (§17) ainda **não** implementados, com evidência:
 > - **Dashboard completo** — cartões global, por canal e "Preview / Dry-Run"; continuam ausentes estatísticas/churn e uma comparação dedicada descobertas-vs-seleccionadas (o preview mostra candidatos seleccionados/rejeitados, não o *diff* da descoberta);
 > - **estabilidade/churn**, `KeepExistingHealthySources`, `RebalanceOnSync`, `MinimumValidatedSources` — ausentes (só mencionados na especificação);
 > - **integração explícita `MatchPlan` + `DispatcharrSourceSelection`** — ausente (`DispatcharrSourceSelection` só existe na especificação, linha 4612); a limitação transitiva do Dispatcharr resulta do fluxo da playlist, não de contrato;

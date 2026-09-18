@@ -44,6 +44,17 @@ public sealed record SourceSelectionStageResult(
         Array.Empty<SourceSelectionChannelResult>();
 
     /// <summary>
+    /// PHASE 13 (Wave 13-5) — Subconjunto de <see cref="Unmatched"/> cuja URL
+    /// mapeia para mais de um canal canónico (mapeamento ambíguo). Puramente
+    /// aditivo, <c>init</c>-only e com default vazio: <see cref="Unmatched"/>
+    /// continua a incluir estas streams (pass-through de produção inalterado).
+    /// A identidade das referências é a mesma de <see cref="Unmatched"/>.
+    /// Vazia em <see cref="NoOp"/>.
+    /// </summary>
+    public IReadOnlyList<M3uStream> AmbiguousStreams { get; init; } =
+        Array.Empty<M3uStream>();
+
+    /// <summary>
     /// Resultado no-op: nenhuma selecção aplicada, todas as streams
     /// passam inalteradas (catálogo indisponível, vazio ou falha de leitura).
     /// </summary>

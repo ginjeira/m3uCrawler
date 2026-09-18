@@ -155,6 +155,9 @@ public sealed class SourceSelectionStage : ISourceSelectionStage
 
         var matched = new List<MatchedEntry>();
         var unmatched = new List<M3uStream>();
+        // Wave 13-5: subconjunto ambíguo de unmatched, apenas para preview.
+        // Referências exactas — não altera Unmatched nem a ordem de publicação.
+        var ambiguousStreams = new List<M3uStream>();
         var ambiguousCount = 0;
 
         foreach (var stream in streams)
@@ -172,6 +175,7 @@ public sealed class SourceSelectionStage : ISourceSelectionStage
             {
                 ambiguousCount++;
                 unmatched.Add(stream);
+                ambiguousStreams.Add(stream);
                 continue;
             }
 
@@ -268,6 +272,7 @@ public sealed class SourceSelectionStage : ISourceSelectionStage
             Applied: true)
         {
             Channels = channelResults,
+            AmbiguousStreams = ambiguousStreams,
         };
     }
 

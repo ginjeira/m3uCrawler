@@ -729,7 +729,10 @@ namespace m3uCrawler.Services
             if (_catalogResolver == null)
             {
                 context.Response.StatusCode = (int)HttpStatusCode.ServiceUnavailable;
-                await WriteJsonAsync(context.Response, new { error = "Catálogo não inicializado." });
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = "Catálogo não inicializado." },
+                    HttpStatusCode.ServiceUnavailable);
                 return;
             }
 
@@ -1718,12 +1721,32 @@ namespace m3uCrawler.Services
                     return;
                 }
 
-                var channelKeyFilter = context.Request.QueryString["channelKey"];
-                if (string.IsNullOrWhiteSpace(channelKeyFilter)) channelKeyFilter = null;
+                try
+                {
+                    var channelKeyFilter = context.Request.QueryString["channelKey"];
+                    if (string.IsNullOrWhiteSpace(channelKeyFilter)) channelKeyFilter = null;
 
-                var preview = await new SourceSelectionPreviewService(_catalogResolver)
-                    .PreviewAsync(channelKeyFilter);
-                await WriteJsonAsync(context.Response, SourceSelectionPreviewToJson(preview));
+                    var preview = await new SourceSelectionPreviewService(_catalogResolver)
+                        .PreviewAsync(channelKeyFilter);
+                    await WriteJsonAsync(context.Response, SourceSelectionPreviewToJson(preview));
+                }
+                catch (Exception)
+                {
+                    // O handler é fire-and-forget: uma excepção não pode escapar
+                    // nem deixar o cliente pendurado. Responde 500 e garante que
+                    // o response é sempre fechado.
+                    try
+                    {
+                        await WriteJsonAsync(
+                            context.Response,
+                            new { error = "preview-failed" },
+                            HttpStatusCode.InternalServerError);
+                    }
+                    catch (Exception)
+                    {
+                        try { context.Response.Close(); } catch (Exception) { }
+                    }
+                }
                 return;
             }
 
@@ -3489,7 +3512,9 @@ namespace m3uCrawler.Services
             source = new
             {
                 origin = preview.Source.Origin,
-                channelKeyFilter = preview.Source.ChannelKeyFilter,
+                channelKeyFilter = preview.Source.ChannelKeyFilter is null
+                    ? null
+                    : CredentialSanitizer.SanitizeText(preview.Source.ChannelKeyFilter),
                 catalogChannelSourceCount = preview.Source.CatalogChannelSourceCount,
                 canonicalChannelCount = preview.Source.CanonicalChannelCount,
             },
@@ -3502,10 +3527,12 @@ namespace m3uCrawler.Services
                 rejectedStreamCount = preview.Metrics.RejectedStreamCount,
                 unmatchedStreamCount = preview.Metrics.UnmatchedStreamCount,
                 ambiguousStreamCount = preview.Metrics.AmbiguousStreamCount,
+                totalUnmatchedStreamCount = preview.Metrics.TotalUnmatchedStreamCount,
                 channelsAtChannelLimit = preview.Metrics.ChannelsAtChannelLimit,
                 channelLimitRejectionCount = preview.Metrics.ChannelLimitRejectionCount,
                 providerLimitRejectionCount = preview.Metrics.ProviderLimitRejectionCount,
-                distinctProviderSelectionCount = preview.Metrics.DistinctProviderSelectionCount,
+                diversitySelectionCount = preview.Metrics.DiversitySelectionCount,
+                distinctProviderCount = preview.Metrics.DistinctProviderCount,
                 fillSelectionCount = preview.Metrics.FillSelectionCount,
                 fallbackDisabledRejectionCount = preview.Metrics.FallbackDisabledRejectionCount,
                 sourceDisabledRejectionCount = preview.Metrics.SourceDisabledRejectionCount,
@@ -3540,12 +3567,18 @@ namespace m3uCrawler.Services
                 selected = c.Selected.Select(SourceSelectionPreviewCandidateToJson).ToList(),
                 rejected = c.Rejected.Select(SourceSelectionPreviewCandidateToJson).ToList(),
             }).ToList(),
-            unmatched = preview.Unmatched.Select(u => new
-            {
-                streamUrlSanitized = u.StreamUrlSanitized,
-                title = u.Title,
-                reason = u.Reason,
-            }).ToList(),
+            unmatched = preview.Unmatched.Select(SourceSelectionPreviewUnmatchedToJson).ToList(),
+            ambiguous = preview.Ambiguous.Select(SourceSelectionPreviewUnmatchedToJson).ToList(),
+        };
+    }
+
+    private static object SourceSelectionPreviewUnmatchedToJson(SourceSelectionPreviewUnmatched u)
+    {
+        return new
+        {
+            streamUrlSanitized = u.StreamUrlSanitized,
+            title = u.Title,
+            reason = u.Reason,
         };
     }
 
@@ -5840,10 +5873,10 @@ const rows = Object.entries(inv).map(([k, v]) => {
       }
 
       const cards = [
-        metricCard('Canais processados', nfmt(m.channelsProcessed || 0), nfmt(m.channelsWithSources || 0) + ' com fontes', 'Canais canónicos considerados (após filtro) e quantos têm ChannelSource.'),
+        metricCard('Canais no âmbito', nfmt(m.channelsProcessed || 0), nfmt(m.channelsWithSources || 0) + ' com fontes', 'Canais canónicos no âmbito (após filtro), incluindo os que não têm ChannelSource.'),
         metricCard('Candidatos', nfmt(m.candidateStreamCount || 0), nfmt(m.selectedStreamCount || 0) + ' seleccionados · ' + nfmt(m.rejectedStreamCount || 0) + ' rejeitados', ''),
-        metricCard('Sem correspondência', nfmt(m.unmatchedStreamCount || 0), nfmt(m.ambiguousStreamCount || 0) + ' ambíguos', 'Streams do input sem match inequívoco no catálogo.'),
-        metricCard('Diversidade / Fill', nfmt(m.distinctProviderSelectionCount || 0) + ' / ' + nfmt(m.fillSelectionCount || 0), 'por fornecedor distinto / preenchimento', 'FillSelectionCount é o proxy da Fase B (fallback fill).'),
+        metricCard('Sem correspondência', nfmt(m.unmatchedStreamCount || 0), nfmt(m.ambiguousStreamCount || 0) + ' ambíguos · ' + nfmt(m.totalUnmatchedStreamCount || 0) + ' no total', 'Disjuntos: unmatched (sem hit no catálogo) e ambíguos (URL mapeada a mais de um canal canónico).'),
+        metricCard('Diversidade / Fill', nfmt(m.diversitySelectionCount || 0) + ' / ' + nfmt(m.fillSelectionCount || 0), nfmt(m.distinctProviderCount || 0) + ' fornecedores distintos', 'DiversitySelectionCount = selecções por diversidade; FillSelectionCount é o proxy da Fase B (fallback fill).'),
         metricCard('Limite de canal', nfmt(m.channelLimitRejectionCount || 0), nfmt(m.channelsAtChannelLimit || 0) + ' canais no limite', 'Rejeições limit-reached.'),
         metricCard('Limites de fornecedor', nfmt(m.providerLimitRejectionCount || 0), nfmt(m.fallbackDisabledRejectionCount || 0) + ' fallback-disabled · ' + nfmt(m.sourceDisabledRejectionCount || 0) + ' source-disabled', ''),
       ];
@@ -5873,8 +5906,17 @@ const rows = Object.entries(inv).map(([k, v]) => {
       }).join('');
 
       const unmatchedList = data.unmatched || [];
-      const unmatchedBlock = unmatchedList.length
-        ? `<div style='margin-top:12px;'><h4>Sem correspondência</h4>${unmatchedList.map(u => `<div class='muted' style='font-size:12px;'><span class='badge muted'>${escapeHtml(u.reason || 'unmatched')}</span> ${escapeHtml(u.title || '')} <code>${escapeHtml(u.streamUrlSanitized || '')}</code></div>`).join('')}</div>`
+      const ambiguousList = data.ambiguous || [];
+      const unmatchedLines = (list, ambiguous) => list.map(u => `<div class='muted' style='font-size:12px;'><span class='badge ${ambiguous ? 'err' : 'muted'}'>${escapeHtml(u.reason || (ambiguous ? 'ambiguous' : 'unmatched'))}</span> ${escapeHtml(u.title || '')} <code>${escapeHtml(u.streamUrlSanitized || '')}</code></div>`).join('');
+      const unmatchedBlock = (unmatchedList.length || ambiguousList.length)
+        ? `<div style='margin-top:12px;'><h4>Sem correspondência</h4>`
+          + (unmatchedList.length
+            ? `<div class='muted' style='font-size:12px;'><strong>Sem hit (${nfmt(unmatchedList.length)})</strong></div>${unmatchedLines(unmatchedList, false)}`
+            : '')
+          + (ambiguousList.length
+            ? `<div class='muted' style='font-size:12px;margin-top:6px;'><strong>Ambíguos (${nfmt(ambiguousList.length)})</strong> — URL mapeada a mais de um canal canónico</div>${unmatchedLines(ambiguousList, true)}`
+            : '')
+          + `</div>`
         : '';
 
       out.innerHTML = `<div style='display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));'>${cards.join('')}</div>`

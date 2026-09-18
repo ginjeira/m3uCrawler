@@ -94,6 +94,34 @@ public class SourceSelectionPreviewEndpointTests : IAsyncLifetime
         return _harness;
     }
 
+    /// <summary>
+    /// Arranca o dashboard sem <c>CatalogResolver</c> (equivalente a falha de
+    /// inicialização do catálogo no arranque). O gate de bootstrap/login não
+    /// depende do catálogo, pelo que o fluxo até à sessão autenticada
+    /// continua a funcionar.
+    /// </summary>
+    private DashboardBootstrapEndpointTests.DashboardHarness StartHarnessWithoutCatalog()
+    {
+        _harness = DashboardBootstrapEndpointTests.DashboardHarness.Start(
+            outputDir: _outputDir,
+            resolver: null!,
+            composer: _composer,
+            history: _history,
+            lifecycle: _lifecycle,
+            auth: _auth,
+            bootstrap: _bootstrap,
+            webToken: null);
+        return _harness;
+    }
+
+    private string[] OutputDirSnapshot()
+        => Directory.Exists(_outputDir)
+            ? Directory.GetFileSystemEntries(_outputDir)
+                .Select(p => Path.GetFileName(p)!)
+                .OrderBy(n => n, StringComparer.Ordinal)
+                .ToArray()
+            : Array.Empty<string>();
+
     private static async Task ReachReadyAsync(DashboardBootstrapEndpointTests.DashboardHarness harness)
     {
         var start = await harness.Client.PostAsync("/api/bootstrap/start", EmptyJson());
@@ -178,6 +206,8 @@ public class SourceSelectionPreviewEndpointTests : IAsyncLifetime
         // seria interpretado como evidência legacy e adoptaria READY.
         await SeedChannelSourceAsync("http://preview-ok.example.test/1.ts");
 
+        var outputBefore = OutputDirSnapshot();
+
         var response = await harness.Client.GetAsync(PreviewEndpoint);
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
@@ -189,8 +219,110 @@ public class SourceSelectionPreviewEndpointTests : IAsyncLifetime
         Assert.True(root.TryGetProperty("metrics", out _));
         Assert.True(root.TryGetProperty("channels", out var channels));
         Assert.True(channels.GetArrayLength() >= 1);
+        Assert.True(root.TryGetProperty("unmatched", out var unmatched));
+        Assert.Equal(0, unmatched.GetArrayLength());
+        Assert.True(root.TryGetProperty("ambiguous", out var ambiguous));
+        Assert.Equal(0, ambiguous.GetArrayLength());
 
         Assert.Equal(0, await PolicyRowCountAsync());
+
+        // O preview é read-only também ao nível do filesystem: nenhum
+        // ficheiro novo (playlist/report) é criado no output do dashboard.
+        var outputAfter = OutputDirSnapshot();
+        Assert.Equal(outputBefore, outputAfter);
+        Assert.False(File.Exists(Path.Combine(_outputDir, "playlist.m3u")));
+        Assert.False(File.Exists(Path.Combine(_outputDir, "playlist_temp.m3u")));
+        Assert.False(File.Exists(Path.Combine(_outputDir, "telegram_run_report.json")));
+        Assert.False(File.Exists(Path.Combine(_outputDir, "telegram_maintain_report.json")));
+    }
+
+    [Fact]
+    public async Task Preview_unknown_channel_key_returns_not_applied_with_zeroed_metrics()
+    {
+        var harness = StartHarness();
+        await ReachReadyAsync(harness);
+        await LoginAsync(harness);
+        await SeedChannelSourceAsync("http://preview-unknown.example.test/1.ts");
+
+        var response = await harness.Client.GetAsync(PreviewEndpoint + "?channelKey=does-not-exist");
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        var root = doc.RootElement;
+
+        Assert.False(root.GetProperty("applied").GetBoolean());
+        Assert.Equal(0, root.GetProperty("inputStreamCount").GetInt32());
+        Assert.Equal(0, root.GetProperty("channels").GetArrayLength());
+        Assert.Equal(0, root.GetProperty("unmatched").GetArrayLength());
+        Assert.Equal(0, root.GetProperty("ambiguous").GetArrayLength());
+
+        var source = root.GetProperty("source");
+        Assert.Equal("does-not-exist", source.GetProperty("channelKeyFilter").GetString());
+
+        // Todos os escalares de metrics a zero e colecções vazias.
+        var metrics = root.GetProperty("metrics");
+        foreach (var property in metrics.EnumerateObject())
+        {
+            if (property.Value.ValueKind == JsonValueKind.Number)
+            {
+                Assert.Equal(0, property.Value.GetInt32());
+            }
+            else if (property.Value.ValueKind == JsonValueKind.Array)
+            {
+                Assert.Equal(0, property.Value.GetArrayLength());
+            }
+            else if (property.Value.ValueKind == JsonValueKind.Object)
+            {
+                Assert.Empty(property.Value.EnumerateObject());
+            }
+        }
+
+        // Contrato Wave 13-5: chaves novas presentes e a antiga ausente.
+        Assert.True(metrics.TryGetProperty("diversitySelectionCount", out _));
+        Assert.True(metrics.TryGetProperty("distinctProviderCount", out _));
+        Assert.True(metrics.TryGetProperty("totalUnmatchedStreamCount", out _));
+        Assert.False(metrics.TryGetProperty("distinctProviderSelectionCount", out _));
+    }
+
+    [Fact]
+    public async Task Preview_sanitizes_credential_shaped_channel_key_filter()
+    {
+        var harness = StartHarness();
+        await ReachReadyAsync(harness);
+        await LoginAsync(harness);
+
+        const string rawKey = "http://user:secret@filter.example.test/live/USER/PASS/1";
+        var response = await harness.Client.GetAsync(
+            PreviewEndpoint + "?channelKey=" + Uri.EscapeDataString(rawKey));
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync();
+        Assert.DoesNotContain("secret", body, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("PASS", body, StringComparison.Ordinal);
+        Assert.DoesNotContain("USER", body, StringComparison.Ordinal);
+
+        using var doc = JsonDocument.Parse(body);
+        var root = doc.RootElement;
+        Assert.False(root.GetProperty("applied").GetBoolean());
+        var echoed = root.GetProperty("source").GetProperty("channelKeyFilter").GetString();
+        Assert.False(string.IsNullOrEmpty(echoed));
+        Assert.Equal(CredentialSanitizer.SanitizeText(rawKey), echoed);
+        Assert.Contains("***", echoed);
+    }
+
+    [Fact]
+    public async Task Preview_without_catalog_resolver_returns_503()
+    {
+        var harness = StartHarnessWithoutCatalog();
+        await ReachReadyAsync(harness);
+        await LoginAsync(harness);
+
+        var response = await harness.Client.GetAsync(PreviewEndpoint);
+
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(body);
+        Assert.Equal("Catálogo não inicializado.", doc.RootElement.GetProperty("error").GetString());
     }
 
     [Fact]
