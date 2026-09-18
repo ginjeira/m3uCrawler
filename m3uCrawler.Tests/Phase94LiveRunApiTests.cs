@@ -669,7 +669,18 @@ public class Phase94LiveRunApiTests : IAsyncLifetime
         var html = await page.Content.ReadAsStringAsync();
         var status = await harness.Client.GetAsync("/api/run/status");
         var statusBody = await status.Content.ReadAsStringAsync();
-        var combined = html + "\n" + statusBody;
+
+        // Wave 6 — a vista de Setup nomeia legitimamente o campo de 2FA do
+        // Telegram: atributo type='password' (mascaramento), rota interactiva
+        // /api/telegram/auth/password e a chave do payload JSON. Neutralizamos
+        // apenas essas referências de UI antes da varredura, mantendo o
+        // invariante de que nenhum outro marcador de segredo aparece.
+        var scrubbed = html
+            .Replace("/api/telegram/auth/password", "/api/telegram/auth/2fa", StringComparison.OrdinalIgnoreCase)
+            .Replace("type='password'", "type='2fa'", StringComparison.OrdinalIgnoreCase)
+            .Replace("password:", "2fa:", StringComparison.OrdinalIgnoreCase);
+
+        var combined = scrubbed + "\n" + statusBody;
 
         Assert.DoesNotContain("password", combined, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("api_key", combined, StringComparison.OrdinalIgnoreCase);

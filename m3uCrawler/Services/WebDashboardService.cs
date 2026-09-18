@@ -3002,6 +3002,7 @@ namespace m3uCrawler.Services
         var script =
             "<script>(function(){var t=" + tokenLiteral + ";" +
             "if(!t||typeof window.fetch!=='function'){return;}" +
+            "window.__m3uCrawlerCsrf=t;" +
             "var f=window.fetch.bind(window);" +
             "window.fetch=function(input,init){init=init||{};" +
             "var h=new Headers(init.headers||{});" +
@@ -3781,6 +3782,17 @@ namespace m3uCrawler.Services
     .row-counts { color: var(--muted); font-size: 12px; margin-top: 8px; }
     details { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; margin-top: 8px; }
     summary { cursor: pointer; font-weight: 500; }
+    .setup-banner { display: block; padding: 12px 20px; border-bottom: 1px solid var(--border); }
+    .setup-banner.err { background: rgba(248, 81, 73, 0.12); border-bottom-color: var(--err); }
+    .setup-banner.warn { background: rgba(210, 153, 34, 0.12); border-bottom-color: var(--warn); }
+    .setup-banner.ok { background: rgba(63, 185, 80, 0.10); border-bottom-color: var(--ok); }
+    .setup-banner .title { font-weight: 600; font-size: 15px; margin-bottom: 6px; }
+    .setup-banner .sub { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+    .setup-items { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 6px 0; }
+    .setup-item { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; }
+    .setup-item .k { color: var(--muted); }
+    .setup-item button { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 2px 8px; font: inherit; font-size: 12px; cursor: pointer; }
+    .setup-status { margin-top: 8px; font-size: 13px; }
   </style>
 </head>
 <body>
@@ -3789,7 +3801,10 @@ namespace m3uCrawler.Services
     <span class='meta' id='metaLine'>a carregar…</span>
   </header>
 
+  <div id='setupBanner' class='setup-banner' style='display:none;'></div>
+
     <nav id='nav'>
+    <button data-view='setup' id='navSetupButton'>Setup <span id='setupNavBadge' class='badge err' style='margin-left:4px;padding:1px 6px;border-radius:999px;font-size:10px;display:none;'>!</span></button>
     <button data-view='overview' class='active'>Overview</button>
     <button data-view='executions'>Execuções</button>
     <button data-view='discovery'>Descoberta</button>
@@ -4543,6 +4558,85 @@ namespace m3uCrawler.Services
         <code>StartAtUtc</code>: a UI calcula a expressão cron.
       </div>
       <div id='liveRunScheduled'></div>
+    </section>
+
+    <!-- SETUP (PHASE 9C — Wave 6) -->
+    <section id='view-setup' hidden>
+      <h2 style='font-size:18px;margin-top:0;'>Setup</h2>
+
+      <div class='card' style='margin-bottom:16px;'>
+        <h3>Prontidão</h3>
+        <div id='setupReadiness' class='muted'>a carregar…</div>
+        <div class='toolbar' style='margin-top:12px;'>
+          <button class='secondary' onclick='loadSetupReadiness()'>Reavaliar</button>
+        </div>
+      </div>
+
+      <div class='card' style='margin-bottom:16px;'>
+        <h3>Telegram</h3>
+        <p class='muted'>Sessão Telegram usada pela pipeline. A <code>api_hash</code> nunca é devolvida pelo servidor depois de guardada (mostra <em>configurado</em>).</p>
+        <div style='display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));'>
+          <div>
+            <label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>api_id</label>
+            <input id='setupTelegramApiId' type='text' placeholder='ex: 123456' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+          </div>
+          <div>
+            <label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>api_hash</label>
+            <input id='setupTelegramApiHash' type='password' placeholder='configurado' autocomplete='off' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+          </div>
+          <div>
+            <label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>phone_number</label>
+            <input id='setupTelegramPhone' type='text' placeholder='+351…' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+          </div>
+        </div>
+        <div class='toolbar' style='margin-top:12px;'>
+          <button onclick='saveTelegramConfig()'>Guardar configuração</button>
+          <button class='secondary' onclick='startTelegramAuth()'>Iniciar autenticação</button>
+        </div>
+        <div class='toolbar' style='margin-top:8px;'>
+          <input id='setupTelegramCode' type='text' placeholder='código de verificação' style='background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+          <button onclick='submitTelegramCode()'>Submeter código</button>
+        </div>
+        <div class='toolbar' style='margin-top:8px;'>
+          <input id='setupTelegram2fa' type='password' placeholder='2FA' autocomplete='off' style='background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+          <button onclick='submitTelegram2fa()'>Submeter 2FA</button>
+        </div>
+        <div id='setupTelegramStatus' class='setup-status muted'>a carregar…</div>
+      </div>
+
+      <div class='card'>
+        <h3>Dispatcharr</h3>
+        <p class='muted'>Integração opt-in. A chave da API nunca é devolvida pelo servidor depois de guardada (mostra <em>configurado</em>).</p>
+        <div style='display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));'>
+          <div>
+            <label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>enabled</label>
+            <select id='setupDispatcharrEnabled' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              <option value='false'>não</option>
+              <option value='true'>sim</option>
+            </select>
+          </div>
+          <div>
+            <label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>base_url</label>
+            <input id='setupDispatcharrBaseUrl' type='text' placeholder='http://dispatcharr:8000' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+          </div>
+          <div>
+            <label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Chave API</label>
+            <input id='setupDispatcharrApiKey' type='password' placeholder='configurado' autocomplete='off' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+          </div>
+          <div>
+            <label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>dry_run</label>
+            <select id='setupDispatcharrDryRun' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              <option value='true'>sim</option>
+              <option value='false'>não</option>
+            </select>
+          </div>
+        </div>
+        <div class='toolbar' style='margin-top:12px;'>
+          <button onclick='saveDispatcharrConfig()'>Guardar configuração</button>
+          <button class='secondary' onclick='testDispatcharrConnection()'>Testar ligação</button>
+        </div>
+        <div id='setupDispatcharrStatus' class='setup-status muted'>—</div>
+      </div>
     </section>
   </main>
 
@@ -6654,6 +6748,233 @@ const rows = Object.entries(inv).map(([k, v]) => {
 
     document.querySelectorAll('#catalogTabs button').forEach(b => b.addEventListener('click', () => loadCatalogTab(b.dataset.ctab)));
 
+    // === PHASE 9C (Wave 6) — Setup / prontidão operacional ===
+    var setupSnapshot = null;
+
+    function setupHeaders() {
+      var headers = { 'Content-Type': 'application/json' };
+      // Same-origin CSRF: a página autenticada injecta o cabeçalho
+      // X-CSRF-Token num wrapper de fetch. Quando o token é exposto em
+      // memória (window), enviamo-lo também aqui, sem nunca o persistir.
+      if (window.__m3uCrawlerCsrf) { headers['X-CSRF-Token'] = window.__m3uCrawlerCsrf; }
+      return headers;
+    }
+
+    function setupFetch(path, method, body) {
+      return fetch(path, {
+        method: method,
+        headers: setupHeaders(),
+        body: body === undefined ? undefined : JSON.stringify(body)
+      }).then(function (r) {
+        return r.text().then(function (t) {
+          var j = null;
+          try { j = t ? JSON.parse(t) : null; } catch (e) { j = null; }
+          return { status: r.status, json: j };
+        });
+      });
+    }
+
+    function setupItemLabel(key) {
+      var labels = {
+        bootstrap: 'Bootstrap', admin: 'Administrador', telegram: 'Telegram',
+        dispatcharr: 'Dispatcharr', catalog: 'Catálogo', output: 'Output', sources: 'Fontes'
+      };
+      return labels[key] || key;
+    }
+
+    function setupConfigure(key) {
+      if (key === 'catalog' || key === 'sources') { showView('catalog'); return; }
+      if (key === 'output') { showView('diagnostics'); return; }
+      showView('setup');
+      var ids = { telegram: 'setupTelegramApiId', dispatcharr: 'setupDispatcharrBaseUrl' };
+      var el = ids[key] ? document.getElementById(ids[key]) : null;
+      if (el && el.scrollIntoView) { el.scrollIntoView({ block: 'center' }); }
+    }
+
+    function renderSetupBanner(s) {
+      var banner = document.getElementById('setupBanner');
+      var badge = document.getElementById('setupNavBadge');
+      if (!banner) { return; }
+      if (!s) {
+        banner.style.display = 'none';
+        banner.innerHTML = '';
+        if (badge) { badge.style.display = 'none'; }
+        return;
+      }
+      if (badge) { badge.style.display = s.operationalReady ? 'none' : 'inline-block'; }
+
+      if (!s.setupComplete) {
+        var items = (s.items || []).map(function (it) {
+          var mark = it.satisfied ? '✓' : '❌';
+          var btn = it.satisfied ? '' : " <button onclick='setupConfigure(\"" + it.key + "\")'>Configurar</button>";
+          return "<span class='setup-item'><span>" + mark + "</span><span class='k'>" + setupItemLabel(it.key) + "</span><span class='muted'>" + escapeHtml(it.detail || '') + "</span>" + btn + "</span>";
+        }).join('');
+        banner.className = 'setup-banner err';
+        banner.innerHTML = "<div class='title'>⚠️ SETUP REQUIRED</div>" +
+          "<div class='sub'>Bootstrap: " + (s.bootstrapReady ? 'READY' : 'não READY') +
+          " · Operational: " + (s.operationalReady ? '✓' : '✗') + "</div>" +
+          "<div class='setup-items'>" + items + "</div>";
+        banner.style.display = 'block';
+        return;
+      }
+
+      if (!s.operationalReady) {
+        banner.className = 'setup-banner warn';
+        banner.innerHTML = "<div class='title'>Setup complete — aguarda fontes (sources)</div>" +
+          "<div class='sub'>Bootstrap: READY · Operational: ✗ · fontes ingeridas: " + nfmt(s.sourcesCount || 0) + "</div>";
+        banner.style.display = 'block';
+        return;
+      }
+
+      banner.className = 'setup-banner ok';
+      banner.innerHTML = "<span class='setup-item'><span>✓</span> Operational Ready</span>";
+      banner.style.display = 'block';
+    }
+
+    function renderSetupReadiness(s) {
+      var el = document.getElementById('setupReadiness');
+      if (!el) { return; }
+      if (!s) { el.innerHTML = "<p class='muted'>Estado de prontidão indisponível.</p>"; return; }
+      var rows = (s.items || []).map(function (it) {
+        return "<tr><td>" + (it.satisfied ? '✓' : '❌') + "</td><td>" + setupItemLabel(it.key) +
+          (it.required ? " <span class='badge muted'>obrigatório</span>" : " <span class='badge muted'>opcional</span>") +
+          "</td><td class='muted'>" + escapeHtml(it.detail || '') + "</td></tr>";
+      }).join('');
+      el.innerHTML = "<p><strong>Bootstrap:</strong> " + (s.bootstrapReady ? 'READY' : 'não READY') +
+        " · <strong>Operational:</strong> " + (s.operationalReady ? '✓' : '✗') +
+        " · <strong>Setup completo:</strong> " + (s.setupComplete ? 'sim' : 'não') + "</p>" +
+        (s.adoptedFromLegacy ? "<p class='muted'>Instalação adoptada de configuração legacy.</p>" : '') +
+        "<table><thead><tr><th></th><th>Componente</th><th>Detalhe</th></tr></thead><tbody>" + rows + "</tbody></table>";
+    }
+
+    async function loadSetupReadiness() {
+      var s = await safeFetchJson('/api/configuration/readiness', null);
+      setupSnapshot = (s && !s.error) ? s : null;
+      renderSetupBanner(setupSnapshot);
+      renderSetupReadiness(setupSnapshot);
+      return setupSnapshot;
+    }
+
+    function renderTelegramAuthStatus(s) {
+      var el = document.getElementById('setupTelegramStatus');
+      if (!el) { return; }
+      if (!s) { el.textContent = 'Estado de autenticação indisponível.'; return; }
+      var state = s.state || '—';
+      var cls = state === 'Authenticated' ? 'ok' : (state === 'Error' ? 'err' : 'warn');
+      el.innerHTML = "<span class='badge " + cls + "'>" + escapeHtml(state) + "</span> " +
+        (s.userName ? ("utilizador: " + escapeHtml(s.userName)) : '') +
+        (s.detail ? (" · " + escapeHtml(s.detail)) : '');
+    }
+
+    async function refreshTelegramAuthStatus() {
+      var s = await safeFetchJson('/api/telegram/auth/status', null);
+      renderTelegramAuthStatus(s && !s.error ? s : null);
+    }
+
+    async function loadTelegramSetup() {
+      var s = await safeFetchJson('/api/telegram/config', null);
+      if (s && !s.error) {
+        document.getElementById('setupTelegramApiId').value = s.apiId || '';
+        document.getElementById('setupTelegramPhone').value = s.phoneNumber || '';
+        document.getElementById('setupTelegramApiHash').placeholder = s.hasApiHash ? 'configurado' : 'não configurado';
+      }
+      await refreshTelegramAuthStatus();
+    }
+
+    function telegramFormBody() {
+      var body = {
+        apiId: document.getElementById('setupTelegramApiId').value.trim(),
+        phoneNumber: document.getElementById('setupTelegramPhone').value.trim()
+      };
+      var apiHash = document.getElementById('setupTelegramApiHash').value.trim();
+      if (apiHash) { body.apiHash = apiHash; }
+      return body;
+    }
+
+    async function saveTelegramConfig() {
+      var r = await setupFetch('/api/telegram/config', 'POST', telegramFormBody());
+      if (r.status === 200 && r.json && r.json.hasApiHash) {
+        document.getElementById('setupTelegramApiHash').value = '';
+        document.getElementById('setupTelegramApiHash').placeholder = 'configurado';
+      }
+      await loadSetupReadiness();
+      await refreshTelegramAuthStatus();
+    }
+
+    async function startTelegramAuth() {
+      var r = await setupFetch('/api/telegram/auth/start', 'POST', telegramFormBody());
+      renderTelegramAuthStatus(r.json);
+      await loadSetupReadiness();
+    }
+
+    async function submitTelegramCode() {
+      var code = document.getElementById('setupTelegramCode').value.trim();
+      if (!code) { return; }
+      var r = await setupFetch('/api/telegram/auth/code', 'POST', { code: code });
+      document.getElementById('setupTelegramCode').value = '';
+      renderTelegramAuthStatus(r.json);
+      await loadSetupReadiness();
+    }
+
+    async function submitTelegram2fa() {
+      var code2fa = document.getElementById('setupTelegram2fa').value;
+      if (!code2fa) { return; }
+      var r = await setupFetch('/api/telegram/auth/password', 'POST', { password: code2fa });
+      document.getElementById('setupTelegram2fa').value = '';
+      renderTelegramAuthStatus(r.json);
+      await loadSetupReadiness();
+    }
+
+    async function loadDispatcharrSetup() {
+      var s = await safeFetchJson('/api/dispatcharr/config', null);
+      if (s && !s.error) {
+        document.getElementById('setupDispatcharrEnabled').value = s.enabled ? 'true' : 'false';
+        document.getElementById('setupDispatcharrBaseUrl').value = s.baseUrl || '';
+        document.getElementById('setupDispatcharrDryRun').value = s.dryRun ? 'true' : 'false';
+        document.getElementById('setupDispatcharrApiKey').placeholder = s.hasApiKey ? 'configurado' : 'não configurado';
+      }
+    }
+
+    async function saveDispatcharrConfig() {
+      var body = {
+        enabled: document.getElementById('setupDispatcharrEnabled').value === 'true',
+        baseUrl: document.getElementById('setupDispatcharrBaseUrl').value.trim(),
+        dryRun: document.getElementById('setupDispatcharrDryRun').value === 'true'
+      };
+      var apiKey = document.getElementById('setupDispatcharrApiKey').value.trim();
+      if (apiKey) { body.apiKey = apiKey; }
+      var r = await setupFetch('/api/dispatcharr/config', 'POST', body);
+      if (r.status === 200 && r.json && r.json.hasApiKey) {
+        document.getElementById('setupDispatcharrApiKey').value = '';
+        document.getElementById('setupDispatcharrApiKey').placeholder = 'configurado';
+      }
+      await loadSetupReadiness();
+    }
+
+    function dispatcharrStatusLabel(status) {
+      var map = {
+        Connected: 'CONNECTED', AuthenticationFailed: 'AUTHENTICATION_FAILED',
+        Unreachable: 'UNREACHABLE', InvalidConfiguration: 'INVALID_CONFIGURATION', Error: 'ERROR'
+      };
+      return map[status] || (status || '—');
+    }
+
+    async function testDispatcharrConnection() {
+      var el = document.getElementById('setupDispatcharrStatus');
+      el.textContent = 'a testar…';
+      var r = await setupFetch('/api/dispatcharr/test', 'POST', {});
+      if (!r.json) { el.textContent = 'Erro ao testar (HTTP ' + r.status + ').'; return; }
+      var ok = r.json.status === 'Connected';
+      el.innerHTML = "<span class='badge " + (ok ? 'ok' : 'err') + "'>" + dispatcharrStatusLabel(r.json.status) + "</span> " +
+        (r.json.version ? ("versão " + escapeHtml(r.json.version) + " ") : '') +
+        (r.json.detail ? ("· " + escapeHtml(r.json.detail)) : '');
+      await loadSetupReadiness();
+    }
+
+    async function loadSetup() {
+      await Promise.all([loadSetupReadiness(), loadTelegramSetup(), loadDispatcharrSetup()]);
+    }
+
     function showView(name) {
       console.log('[DEBUG] showView called:', name);
       if (name !== 'liverun') stopLiveRunPolling();
@@ -6673,6 +6994,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
         case 'validation': loadValidationPolicy(); break;
         case 'liverun': loadLiveRun(); startLiveRunPolling(); break;
         case 'diagnostics': loadDiagnostics(); break;
+        case 'setup': loadSetup(); break;
       }
     }
 
@@ -6681,6 +7003,19 @@ const rows = Object.entries(inv).map(([k, v]) => {
     ['discState','discSource','discCountry'].forEach(id => document.getElementById(id).addEventListener('change', renderDiscovery));
 
     showView('overview');
+
+    // Banner de setup é populado no arranque, independentemente da vista.
+    loadSetupReadiness();
+
+    window.loadSetup = loadSetup;
+    window.loadSetupReadiness = loadSetupReadiness;
+    window.setupConfigure = setupConfigure;
+    window.saveTelegramConfig = saveTelegramConfig;
+    window.startTelegramAuth = startTelegramAuth;
+    window.submitTelegramCode = submitTelegramCode;
+    window.submitTelegram2fa = submitTelegram2fa;
+    window.saveDispatcharrConfig = saveDispatcharrConfig;
+    window.testDispatcharrConnection = testDispatcharrConnection;
 
     window.showAddRuleForm = showAddRuleForm;
     window.hideAddRuleForm = hideAddRuleForm;
