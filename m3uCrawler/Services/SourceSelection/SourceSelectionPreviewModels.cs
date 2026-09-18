@@ -1,0 +1,132 @@
+using System;
+using System.Collections.Generic;
+
+namespace m3uCrawler.Services.SourceSelection;
+
+/// <summary>
+/// PHASE 13 (Wave 13-5) — Vocabulário estável das decisões por candidato no
+/// preview. Distinto de <see cref="SelectionReasons"/> (que é o motivo):
+/// aqui apenas se distingue seleccionado de rejeitado.
+/// </summary>
+public static class SourceSelectionPreviewDecisions
+{
+    /// <summary>O candidato foi seleccionado no rank indicado.</summary>
+    public const string Selected = "selected";
+
+    /// <summary>O candidato foi rejeitado; <see cref="SourceSelectionPreviewCandidate.Reason"/> explica porquê.</summary>
+    public const string Rejected = "rejected";
+}
+
+/// <summary>
+/// PHASE 13 (Wave 13-5) — Candidato individual projectado para
+/// preview/dry-run. <see cref="StreamUrlSanitized"/> é sempre o resultado de
+/// <c>CredentialSanitizer.SanitizeUrl</c> (defensivo, mesmo que o catálogo já
+/// guarde URLs sanitizadas). Os enums são achatados via <c>ToString()</c>.
+/// </summary>
+public sealed record SourceSelectionPreviewCandidate(
+    string StreamUrlSanitized,
+    long SourceId,
+    int SourcePriority,
+    string Provider,
+    string? ExternalStreamId,
+    string Quality,
+    string Epg,
+    string Availability,
+    long LastResponseTimeMs,
+    bool IsWorking,
+    int? Rank,
+    string Decision,
+    string Reason);
+
+/// <summary>
+/// PHASE 13 (Wave 13-5) — Resultado de selecção de um canal canónico no
+/// preview. <see cref="Policy"/> é a política efectiva resolvida para o
+/// canal e <see cref="PolicyScope"/> rotula a origem da mesma
+/// (<c>override</c>/<c>global</c>/<c>default</c>).
+/// </summary>
+public sealed record SourceSelectionPreviewChannel(
+    long CanonicalChannelId,
+    string? CanonicalChannelKey,
+    string? DisplayName,
+    string PolicyScope,
+    SourceSelectionPolicy Policy,
+    int CandidateCount,
+    int SelectedCount,
+    int RejectedCount,
+    IReadOnlyList<SourceSelectionPreviewCandidate> Selected,
+    IReadOnlyList<SourceSelectionPreviewCandidate> Rejected);
+
+/// <summary>
+/// PHASE 13 (Wave 13-5) — Stream do input sem correspondência inequívoca no
+/// catálogo. <see cref="Reason"/> é actualmente sempre <c>unmatched</c>; a
+/// ambiguidade é agregada em
+/// <see cref="SourceSelectionPreviewMetrics.AmbiguousStreamCount"/> e não
+/// distinguível por-stream neste contrato.
+/// </summary>
+public sealed record SourceSelectionPreviewUnmatched(
+    string StreamUrlSanitized,
+    string Title,
+    string Reason);
+
+/// <summary>
+/// PHASE 13 (Wave 13-5) — Distribuição de selecções por fornecedor.
+/// <see cref="ChannelCount"/> é o número de canais distintos onde o
+/// fornecedor teve pelo menos uma selecção.
+/// </summary>
+public sealed record SourceSelectionPreviewProviderStat(
+    string Provider,
+    int SelectedCount,
+    int ChannelCount);
+
+/// <summary>
+/// PHASE 13 (Wave 13-5) — Métricas agregadas determinísticas do preview.
+///
+/// <para>
+/// <b>FillSelectionCount</b> é o proxy da Fase B / fallback fill do selector
+/// (selecções com <c>SelectionReasons.Fill</c>). <b>AmbiguousStreamCount</b> é
+/// agregado (não por-stream). Todas as contagens derivam do resultado do
+/// <see cref="SourceSelectionStage"/> — o algoritmo não é duplicado.
+/// </para>
+/// </summary>
+public sealed record SourceSelectionPreviewMetrics(
+    int ChannelsProcessed,
+    int ChannelsWithSources,
+    int CandidateStreamCount,
+    int SelectedStreamCount,
+    int RejectedStreamCount,
+    int UnmatchedStreamCount,
+    int AmbiguousStreamCount,
+    int ChannelsAtChannelLimit,
+    int ChannelLimitRejectionCount,
+    int ProviderLimitRejectionCount,
+    int DistinctProviderSelectionCount,
+    int FillSelectionCount,
+    int FallbackDisabledRejectionCount,
+    int SourceDisabledRejectionCount,
+    IReadOnlyDictionary<string, int> RejectionCounts,
+    IReadOnlyList<SourceSelectionPreviewProviderStat> ProviderDistribution);
+
+/// <summary>
+/// PHASE 13 (Wave 13-5) — Proveniência dos dados do preview. <c>Origin</c> é
+/// um rótulo curto (<c>catalog</c>) e nunca expõe caminhos de filesystem nem
+/// internals do <c>CatalogResolver</c>.
+/// </summary>
+public sealed record SourceSelectionPreviewSourceInfo(
+    string Origin,
+    string? ChannelKeyFilter,
+    int CatalogChannelSourceCount,
+    int CanonicalChannelCount);
+
+/// <summary>
+/// PHASE 13 (Wave 13-5) — Resultado completo do preview/dry-run da selecção
+/// de fontes. <see cref="Applied"/> é <c>false</c> quando o catálogo está
+/// vazio/indisponível ou o filtro não corresponde a nenhum canal.
+/// </summary>
+public sealed record SourceSelectionPreviewResult(
+    bool Applied,
+    DateTime GeneratedAtUtc,
+    int InputStreamCount,
+    SourceSelectionPreviewSourceInfo Source,
+    SourceSelectionPreviewMetrics Metrics,
+    IReadOnlyList<SourceSelectionPreviewChannel> Channels,
+    IReadOnlyList<SourceSelectionPreviewUnmatched> Unmatched);

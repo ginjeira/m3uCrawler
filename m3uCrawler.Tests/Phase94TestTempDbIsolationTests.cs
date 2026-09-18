@@ -14,6 +14,8 @@ namespace m3uCrawler.Tests;
 /// ficheiros que não lhe pertencem.
 /// </para>
 /// </summary>
+[Collection("TestTempDbIsolation")]
+[CollectionDefinition("TestTempDbIsolation", DisableParallelization = true)]
 public class Phase94TestTempDbIsolationTests : IDisposable
 {
     private readonly string _tempRoot = Path.GetTempPath();

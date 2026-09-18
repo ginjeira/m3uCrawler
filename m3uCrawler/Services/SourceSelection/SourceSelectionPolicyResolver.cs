@@ -108,6 +108,45 @@ public sealed class SourceSelectionPolicyResolver
         return new SourceSelectionPolicySet(globalPolicy, overrides);
     }
 
+    /// <summary>
+    /// PHASE 13 (Wave 13-5) — Igual a
+    /// <see cref="LoadEffectivePoliciesAsync"/>, mas <b>estritamente
+    /// read-only</b>: lê a global através de
+    /// <see cref="CatalogResolver.GetGlobalSourceSelectionPolicyAsync"/> e
+    /// nunca cria a linha global. Se a linha não existir, usa
+    /// <see cref="SourceSelectionDefaults.DefaultPolicy"/> e marca o conjunto
+    /// como <c>HasExplicitGlobal = false</c>. Adequado a preview/dry-run.
+    /// </summary>
+    public async Task<SourceSelectionPolicySet> LoadEffectivePoliciesReadOnlyAsync(
+        CancellationToken cancellationToken = default)
+    {
+        var channelEntities = await _catalog
+            .ListChannelSourceSelectionPoliciesAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        var overrides = new Dictionary<string, SourceSelectionPolicy>(StringComparer.Ordinal);
+        foreach (var entity in channelEntities)
+        {
+            var key = entity.CanonicalChannelKey;
+            if (string.IsNullOrEmpty(key)) continue;
+            // Guarda defensiva contra duplicados: mantém o primeiro.
+            if (overrides.ContainsKey(key)) continue;
+            overrides[key] = ToPolicy(entity);
+        }
+
+        var globalEntity = await _catalog
+            .GetGlobalSourceSelectionPolicyAsync(cancellationToken)
+            .ConfigureAwait(false);
+        var globalPolicy = globalEntity is null
+            ? SourceSelectionDefaults.DefaultPolicy
+            : ToPolicy(globalEntity);
+
+        return new SourceSelectionPolicySet(
+            globalPolicy,
+            overrides,
+            hasExplicitGlobal: globalEntity is not null);
+    }
+
     private static SourceSelectionPolicy ToPolicy(SourceSelectionPolicyEntity entity)
         => new(
             MaxSourcesPerChannel: entity.MaxSourcesPerChannel,

@@ -102,8 +102,8 @@ internal static class TestTempDb
         "sched-out-",
         "degradation-", "http-api-tests-", "pipeline-bridge-",
         "matching-audit-", "sync-run-steps-",
-        // Phase 13 (Wave 13-3/13-4) — source selection.
-        "source-selection-stage-", "source-selection-policy-",
+        // Phase 13 (Wave 13-3/13-4/13-5) — source selection.
+        "source-selection-stage-", "source-selection-policy-", "source-selection-preview-",
         // Phase 9C.6 — identidade canónica (Key autoritativa).
         "phase9c6-",
         // Out dir.
@@ -133,8 +133,8 @@ internal static class TestTempDb
         "sched_out-",
         "degradation-", "http_api_tests-", "pipeline_bridge-",
         "matching_audit-", "sync_run_steps-",
-        // Phase 13 (Wave 13-3/13-4) — source selection.
-        "source_selection_stage-", "source_selection_policy-",
+        // Phase 13 (Wave 13-3/13-4/13-5) — source selection.
+        "source_selection_stage-", "source_selection_policy-", "source_selection_preview-",
         // Phase 9C.6 — identidade canónica (Key autoritativa).
         "phase9c6-", "phase9c6_",
         // Auditoria / validação live (timestamped).
@@ -332,9 +332,10 @@ internal static class TestTempDb
 
     private static void TryDeleteDbLockIfKnown(string mainPath)
     {
-        // O nome é "<mainname>.db.lock". Strip do ".db.lock" dá o base.
+        // O ChannelCatalogBootstrapper cria o lock como "<dbpath>.lock".
+        // Só apagamos quando o nome do ficheiro bate um prefixo conhecido.
         var baseName = Path.GetFileName(mainPath);
-        var lockPath = mainPath + DbLockSuffix;
+        var lockPath = mainPath + ".lock";
         if (!File.Exists(lockPath)) return;
         if (AllPrefixes().Any(p => baseName.StartsWith(p, StringComparison.OrdinalIgnoreCase)))
         {

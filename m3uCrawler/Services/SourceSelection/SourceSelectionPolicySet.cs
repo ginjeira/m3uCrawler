@@ -37,9 +37,11 @@ public sealed class SourceSelectionPolicySet : ISourceSelectionPolicyProvider
 
     public SourceSelectionPolicySet(
         SourceSelectionPolicy global,
-        IReadOnlyDictionary<string, SourceSelectionPolicy>? overrides = null)
+        IReadOnlyDictionary<string, SourceSelectionPolicy>? overrides = null,
+        bool hasExplicitGlobal = false)
     {
         Global = global ?? throw new ArgumentNullException(nameof(global));
+        HasExplicitGlobal = hasExplicitGlobal;
 
         if (overrides is null || overrides.Count == 0)
         {
@@ -61,8 +63,23 @@ public sealed class SourceSelectionPolicySet : ISourceSelectionPolicyProvider
     /// <summary>Política global, usada quando não há override para o canal.</summary>
     public SourceSelectionPolicy Global { get; }
 
+    /// <summary>
+    /// PHASE 13 (Wave 13-5) — <c>true</c> quando a política global veio de uma
+    /// linha persistida explícita, <c>false</c> quando é o default do sistema.
+    /// Usado apenas para rotular o âmbito efectivo no preview.
+    /// </summary>
+    public bool HasExplicitGlobal { get; }
+
     /// <summary>Número de overrides por canal carregados neste snapshot.</summary>
     public int OverrideCount => _overrides.Count;
+
+    /// <summary>
+    /// PHASE 13 (Wave 13-5) — Indica se existe override para a chave canónica
+    /// indicada. <c>false</c> para chave nula/vazia.
+    /// </summary>
+    public bool HasOverride(string? canonicalChannelKey)
+        => !string.IsNullOrEmpty(canonicalChannelKey)
+           && _overrides.ContainsKey(canonicalChannelKey);
 
     /// <summary>
     /// Resolve a política efectiva: override por canal quando a chave é

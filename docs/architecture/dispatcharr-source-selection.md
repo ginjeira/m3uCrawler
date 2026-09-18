@@ -1,16 +1,20 @@
 # Dispatcharr Source Selection (PHASE 13)
 
-> Estado: **Waves 13-1, 13-3, 13-4 e 13-4b implementadas.** 13-1: política pura,
+> Estado: **Waves 13-1, 13-3, 13-4, 13-4b e 13-5 implementadas.** 13-1: política pura,
 > determinística, sem I/O. 13-3: aplicação da política ao pipeline Telegram antes
 > da publicação em `output/playlist.m3u` (§10). 13-4: persistência **global** da
 > política na BD do catálogo, resolver e exposição no Dashboard (§10.1;
 > `docs/architecture/phase-13-4-source-selection-policy.md`). 13-4b: **overrides
 > por canal** — política completa chaveada por `CanonicalChannel.Key` que
 > substitui a global, resolvida em lote por execução e gerida no Dashboard
-> (§10.2). **Não** implementados: preview/dry-run, os produtores de Quality/EPG,
-> a correcção do reset de `Source.Priority` e a integração no
-> composer/`MatchPlan`/`DispatcharrSyncService`
-> (ver `docs/IMPLEMENTATION_ROADMAP.md` §32.19).
+> (§10.2). 13-5: **preview/dry-run read-only + métricas** sobre o catálogo, com
+> endpoint `GET` e cartão no Dashboard, a correr o **mesmo** `SourceSelectionStage`
+> da produção, sem publicação nem escrita (§10.3). **Não** implementados: os
+> produtores de Quality/EPG, a correcção do reset de `Source.Priority` e a
+> integração no composer/`MatchPlan`/`DispatcharrSyncService`
+> (ver `docs/IMPLEMENTATION_ROADMAP.md` §32.19). A **Wave 13-6**
+> (`MatchPlan` + `DispatcharrSourceSelection`, cleanup selectivo e teste 100→10)
+> permanece **não implementada e fora de âmbito da 13-5**.
 
 ## 1. Finalidade
 
@@ -296,11 +300,108 @@ Detalhe em `docs/architecture/phase-13-4-source-selection-policy.md`.
   `ListChannelSourceSelectionPoliciesAsync`; os métodos globais mantêm-se
   inalterados.
 
-**Limites explícitos desta wave:** a 13-4b **não** introduz preview/dry-run,
-produtores de Quality/EPG, métricas/auditoria específicas da selecção, churn/
-estabilidade, `ProviderDefinition`, `SelectionPolicy` separada nem integração
-explícita no composer/`MatchPlan`/`DispatcharrSyncService` (ver
+**Limites explícitos desta wave:** a 13-4b **não** introduziu preview/dry-run
+(entregue na Wave 13-5, §10.3), produtores de Quality/EPG, métricas/auditoria
+específicas da selecção, churn/estabilidade, `ProviderDefinition`,
+`SelectionPolicy` separada nem integração explícita no
+composer/`MatchPlan`/`DispatcharrSyncService` (ver
 `docs/IMPLEMENTATION_ROADMAP.md` §32.19).
+
+### 10.3 Preview / Dry-Run + métricas (Wave 13-5)
+
+**Propósito.** Permitir observar *o que a política seleccionaria* — antes de a
+activar em produção — sem publicar, sem escrever ficheiros e sem alterar o
+catálogo. Serve de validação e de diagnóstico da configuração (global, override
+por canal ou default).
+
+**Contrato dry-run.** `SourceSelectionPreviewService.PreviewAsync(string?
+canonicalChannelKey = null, CancellationToken = default)`:
+
+- lê o catálogo (`CatalogResolver.ListCanonicalChannelsAsync` +
+  `ListChannelSourcesAsync`, sempre read-only);
+- sintetiza **uma `M3uStream` por `ChannelSourceEntity`** (`Url` = `StreamUrl`
+  sanitizada já armazenada no catálogo; `IsWorking = Availability not in
+  {Dead, Unreachable}`);
+- resolve as políticas efectivas e corre o **mesmo** `SourceSelectionStage` /
+  `ChannelSourceSelector` usado em produção — **não há algoritmo duplicado**;
+- **não publica**, não escreve `playlist`/JSON, não muta catálogo, ownership nem
+  Dispatcharr e **não cria estado persistente**.
+
+A garantia de ausência de escrita assenta no carregamento read-only da política:
+`SourceSelectionPolicyResolver.LoadEffectivePoliciesReadOnlyAsync` lê a política
+global via `CatalogResolver.GetGlobalSourceSelectionPolicyAsync` (que usa
+`AsNoTracking` e **nunca insere**). Se a linha global não existir, usa
+`SourceSelectionDefaults.DefaultPolicy` e marca o conjunto com
+`SourceSelectionPolicySet.HasExplicitGlobal = false` (em vez de a criar, como faz
+o caminho de produção `LoadEffectivePoliciesAsync`). `HasExplicitGlobal` e
+`HasOverride(key)` rotulam o `policyScope` de cada canal (`override` / `global` /
+`default`).
+
+**Endpoint.** `GET /api/catalog/source-selection-policies/preview[?channelKey=<CanonicalChannel.Key>]`.
+
+- **Apenas `GET`** (outros métodos → `405`), sob o gate de autenticação/CSRF
+  existente e o gate de catálogo (→ `503` "Catálogo não inicializado." quando o
+  `CatalogResolver` não está disponível).
+- **Filtro opcional `channelKey`**: match exacto ordinal sobre
+  `CanonicalChannel.Key`, restringindo os canais considerados. Filtro sem
+  correspondência devolve `applied=false` com métricas zeradas, registando o
+  filtro em `source.channelKeyFilter`.
+- **UI:** cartão "Preview / Dry-Run" no separador de Source Selection do
+  Dashboard, com `loadSourceSelectionPreview()`.
+
+**Saída.** Agrupamento por canal (aditivo):
+`SourceSelectionStageResult.Channels` + `SourceSelectionChannelResult`. Modelos:
+
+- `SourceSelectionPreviewResult` — `applied`, `generatedAtUtc`,
+  `inputStreamCount`, `source` e `metrics`, `channels`, `unmatched`;
+- `SourceSelectionPreviewChannel` — id/key/nome canónico, `policyScope`,
+  política efectiva, contagens e listas `selected`/`rejected`;
+- `SourceSelectionPreviewCandidate` — candidato projectado com `rank`,
+  `decision` (`selected`/`rejected`) e `reason` (vocabulário de
+  `SelectionReasons`);
+- `SourceSelectionPreviewUnmatched` — stream sem correspondência inequívoca
+  (motivo `unmatched`);
+- `SourceSelectionPreviewMetrics`, `SourceSelectionPreviewProviderStat`,
+  `SourceSelectionPreviewSourceInfo`, `SourceSelectionPreviewDecisions`
+  (`selected`/`rejected`).
+
+**Métricas agregadas** (`SourceSelectionPreviewMetrics`): `channelsProcessed`,
+`channelsWithSources`, `candidateStreamCount`, `selectedStreamCount`,
+`rejectedStreamCount`, `unmatchedStreamCount`, `ambiguousStreamCount`,
+`channelsAtChannelLimit`, `channelLimitRejectionCount`,
+`providerLimitRejectionCount`, `distinctProviderSelectionCount`,
+`fillSelectionCount`, `fallbackDisabledRejectionCount`,
+`sourceDisabledRejectionCount`, `rejectionCounts` e `providerDistribution`
+(`provider`, `selectedCount`, `channelCount`).
+
+**Sanitização.** Todas as URLs emitidas passam por
+`CredentialSanitizer.SanitizeUrl` (defensivo, mesmo que o catálogo já guarde URLs
+sanitizadas) e `SourceSelectionPreviewUnmatched.Title` passa por
+`CredentialSanitizer.SanitizeText`. Os enums são achatados via `ToString()`; a
+origem é o rótulo curto `catalog`, sem caminhos de filesystem nem internals do
+`CatalogResolver`. Nenhuma credencial é exposta.
+
+**Limitações (honestas).**
+
+- O input é o **catálogo** (`ChannelSourceEntity`), **não** um conjunto de
+  descoberta Telegram ao vivo; a disponibilidade do catálogo é usada como proxy
+  do estado de funcionamento (`IsWorking = Availability not Dead/Unreachable`).
+- A ambiguidade é **agregada** (`metrics.ambiguousStreamCount`); as entradas
+  por-stream não correspondidas têm motivo `unmatched` e **não** são rotuladas
+  individualmente como ambíguas.
+- `fillSelectionCount` é o proxy da Fase B do selector (motivo `fill`).
+- Canais sem `ChannelSource` contam em `channelsProcessed`, mas não aparecem em
+  `channels`.
+- Apenas os dois pontos de publicação Telegram aplicam selecção em produção; os
+  restantes pontos de publicação permanecem fora de âmbito (pré-existente).
+
+**Fora de âmbito explícito (13-5).** O contrato `MatchPlan` +
+`DispatcharrSourceSelection`, o ownership/cleanup selectivo, o teste 100→10,
+`ProviderDefinition`, uma `SelectionPolicy` de ranking separada,
+`MinimumValidatedSources` e churn/estabilidade pertencem à Wave 13-6 (ou
+posterior) e **não** são implementados aqui. `RunReport.SourceSelection`
+permanece **inalterado** (só contagens); as métricas ricas são âmbito exclusivo do
+preview. A **13-6 permanece não implementada**.
 
 ### Identidade canónica no loader (Wave 9C.6)
 
@@ -345,8 +446,11 @@ Correcção do reset de `Source.Priority`, produtores de Quality/EPG, persistên
 `MatchPlan`/`DispatcharrSyncService`/ownership, `BuildPlanFromCompositionAsync`,
 `ProviderDefinition`, identidade de conta Xtream. Não faz `ProviderDefinition`
 completa. A persistência/Dashboard da política deixou de ser fora de âmbito na
-Wave 13-4 (§10.1) e os **overrides por canal** na Wave 13-4b (§10.2); o
-preview/dry-run continua por implementar.
+Wave 13-4 (§10.1), os **overrides por canal** na Wave 13-4b (§10.2) e o
+**preview/dry-run + métricas** na Wave 13-5 (§10.3). Permanecem fora de âmbito a
+Wave 13-6 (contrato `MatchPlan` + `DispatcharrSourceSelection`, cleanup
+selectivo, teste 100→10, `ProviderDefinition`, `SelectionPolicy` separada,
+`MinimumValidatedSources` e churn/estabilidade) e os restantes itens da §32.19.
 
 ## 11. Testes de referência
 

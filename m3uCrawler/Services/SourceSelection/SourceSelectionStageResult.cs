@@ -34,6 +34,16 @@ public sealed record SourceSelectionStageResult(
     bool Applied)
 {
     /// <summary>
+    /// PHASE 13 (Wave 13-5) — Selecção por canal canónico, na ordem de
+    /// processamento (canal canónico ascendente). Propriedade puramente
+    /// aditiva, <c>init</c>-only e com default vazio: não altera a semântica
+    /// nem a ordem de <see cref="Selected"/> / <see cref="Rejected"/>.
+    /// Vazia em <see cref="NoOp"/>.
+    /// </summary>
+    public IReadOnlyList<SourceSelectionChannelResult> Channels { get; init; } =
+        Array.Empty<SourceSelectionChannelResult>();
+
+    /// <summary>
     /// Resultado no-op: nenhuma selecção aplicada, todas as streams
     /// passam inalteradas (catálogo indisponível, vazio ou falha de leitura).
     /// </summary>

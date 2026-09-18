@@ -184,6 +184,10 @@ public sealed class SourceSelectionStage : ISourceSelectionStage
         var rejected = new List<RejectedSource>();
         var published = new List<M3uStream>();
         var matchedChannelCount = 0;
+        // Wave 13-5: agrupamento por canal apenas para diagnóstico/preview.
+        // Puramente aditivo — a ordem e o conteúdo de selected/rejected/
+        // published mantêm-se exactamente como antes.
+        var channelResults = new List<SourceSelectionChannelResult>();
 
         foreach (var group in matched
                      .GroupBy(m => m.ChannelSource.CanonicalChannelId)
@@ -199,38 +203,53 @@ public sealed class SourceSelectionStage : ISourceSelectionStage
                 .FirstOrDefault(k => !string.IsNullOrEmpty(k));
             var groupPolicy = policies.Resolve(canonicalKey);
 
+            var groupSelected = new List<SelectedSource>();
+            var groupRejected = new List<RejectedSource>();
+
             var enabled = new List<MatchedEntry>();
             foreach (var entry in group)
             {
                 if (!entry.ChannelSource.IsEnabled)
                 {
                     // Excluída da publicação e não entra no selector (Wave 13-3).
-                    rejected.Add(new RejectedSource(entry.Candidate, SourceDisabledReason));
+                    var disabled = new RejectedSource(entry.Candidate, SourceDisabledReason);
+                    rejected.Add(disabled);
+                    groupRejected.Add(disabled);
                     continue;
                 }
                 enabled.Add(entry);
             }
 
-            if (enabled.Count == 0) continue;
-
-            var candidates = enabled.Select(e => e.Candidate).ToList();
-            var byCandidate = new Dictionary<SelectionCandidate, MatchedEntry>(ReferenceEqualityComparer.Instance);
-            foreach (var entry in enabled)
+            if (enabled.Count > 0)
             {
-                byCandidate[entry.Candidate] = entry;
+                var candidates = enabled.Select(e => e.Candidate).ToList();
+                var byCandidate = new Dictionary<SelectionCandidate, MatchedEntry>(ReferenceEqualityComparer.Instance);
+                foreach (var entry in enabled)
+                {
+                    byCandidate[entry.Candidate] = entry;
+                }
+
+                var result = _selector.Select(candidates, groupPolicy);
+
+                foreach (var sel in result.Selected)
+                {
+                    selected.Add(sel);
+                    groupSelected.Add(sel);
+                    published.Add(byCandidate[sel.Candidate].Stream);
+                }
+                foreach (var rej in result.Rejected)
+                {
+                    rejected.Add(rej);
+                    groupRejected.Add(rej);
+                }
             }
 
-            var result = _selector.Select(candidates, groupPolicy);
-
-            foreach (var sel in result.Selected)
-            {
-                selected.Add(sel);
-                published.Add(byCandidate[sel.Candidate].Stream);
-            }
-            foreach (var rej in result.Rejected)
-            {
-                rejected.Add(rej);
-            }
+            channelResults.Add(new SourceSelectionChannelResult(
+                CanonicalChannelId: group.Key,
+                CanonicalChannelKey: canonicalKey,
+                Policy: groupPolicy,
+                Selected: groupSelected,
+                Rejected: groupRejected));
         }
 
         // Streams sem correspondência inequívoca: pass-through na ordem de entrada.
@@ -246,7 +265,10 @@ public sealed class SourceSelectionStage : ISourceSelectionStage
             Unmatched: unmatched,
             MatchedChannelCount: matchedChannelCount,
             AmbiguousCount: ambiguousCount,
-            Applied: true);
+            Applied: true)
+        {
+            Channels = channelResults,
+        };
     }
 
     /// <summary>

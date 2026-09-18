@@ -462,6 +462,7 @@ O dashboard (`Services/WebDashboardService.cs`, `HttpListener`) serve a UI em `h
 | `/api/catalog/source-selection-policies` (GET/POST) | Política **global** de selecção de fontes por canal (ver secção seguinte). |
 | `/api/catalog/source-selection-policies/channels` (GET/POST) | Overrides **por canal** da política de selecção de fontes (identidade = chave canónica; ver secção seguinte). |
 | `/api/catalog/source-selection-policies/channels/{key}` (GET/DELETE) | Lê/elimina o override do canal canónico `{key}`. |
+| `/api/catalog/source-selection-policies/preview` (GET) | **Preview/dry-run read-only** da selecção de fontes: corre a mesma lógica da produção sobre o catálogo, sem publicar nem escrever. Ver secção seguinte. |
 
 ### Navegação do Dashboard
 
@@ -550,7 +551,7 @@ Quando um stream tem indicadores de país (e.g. "PT" no título ou group-title) 
   antiga, **aborta** com erro explícito sem apagar dados; só conclui a remoção
   da proveniência e do schema novo quando o rollback é possível.
 
-### Política de selecção de fontes (Waves 13-4 / 13-4b)
+### Política de selecção de fontes (Waves 13-4 / 13-4b / 13-5)
 
 O endpoint `GET/POST /api/catalog/source-selection-policies` gere a política
 **global** que limita quantas fontes (streams) de um canal são publicadas.
@@ -592,6 +593,42 @@ overrides **por canal**, sob o mesmo gate de autenticação/CSRF:
   upsert; `GET .../channels/{key}` devolve o override do canal; `DELETE
   .../channels/{key}` elimina-o. O dashboard inclui a gestão de overrides na
   área Catálogo, ao lado do cartão global.
+
+#### Preview / Dry-Run (Wave 13-5)
+
+`GET /api/catalog/source-selection-policies/preview` corre a selecção de fontes
+em modo **read-only** sobre o catálogo actual e devolve o que seria seleccionado,
+sem publicar, sem escrever ficheiros, sem mutar o catálogo/ownership/Dispatcharr
+e sem criar a linha global da política. Usa o **mesmo** `SourceSelectionStage` da
+produção (não há algoritmo duplicado) e carrega a política global de forma
+read-only (nunca insere a linha default).
+
+- **Filtro opcional:** `?channelKey=<CanonicalChannel.Key>` restringe a um canal
+  canónico (match exacto ordinal). Sem correspondência, devolve `applied=false`
+  com métricas zeradas, registando o filtro em `source.channelKeyFilter`.
+- **Gate:** GET-only (outros métodos → `405`), sob o mesmo gate de
+  autenticação/CSRF dos restantes endpoints do catálogo; `503` "Catálogo não
+  inicializado." quando o catálogo não está disponível.
+- **Resposta:** `applied`, `generatedAtUtc`, `inputStreamCount`, `source`
+  (origem `catalog` + contagens), `metrics` (agregados: canais processados/com
+  fontes, candidatos, seleccionados, rejeitados, não correspondidos, ambíguos,
+  canais no limite, rejeições por limite de canal/fornecedor/fallback/source
+  desactivada, fornecedores distintos, selecções de preenchimento,
+  `rejectionCounts` e `providerDistribution`) e `channels` (por canal:
+  `policyScope` `override`/`global`/`default`, política efectiva, contagens e
+  listas `selected`/`rejected` com `rank`/`decision`/`reason`), além de
+  `unmatched`.
+- **Sanitização:** todas as URLs emitidas passam
+  `CredentialSanitizer.SanitizeUrl` (mesmo que o catálogo já guarde URLs
+  sanitizadas) e `unmatched[].title` passa `SanitizeText`; não há credenciais no
+  output.
+- **Limitações:** o input é o catálogo (`ChannelSource`), não a descoberta
+  Telegram ao vivo; `IsWorking` usa `Availability not Dead/Unreachable` como
+  proxy; a ambiguidade é agregada em `metrics.ambiguousStreamCount`; `fillSelectionCount`
+  é o proxy da Fase B; canais sem fontes contam em `channelsProcessed` mas não
+  aparecem em `channels`. As métricas ricas são âmbito do preview —
+  `RunReport.SourceSelection` mantém-se só contagens, e o contrato
+  `MatchPlan`/`DispatcharrSourceSelection` (Wave 13-6) permanece fora de âmbito.
 
 ### Modelo de segurança do dashboard
 

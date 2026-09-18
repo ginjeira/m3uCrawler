@@ -1829,6 +1829,22 @@ public sealed class CatalogResolver
         return existing;
     }
 
+    /// <summary>
+    /// PHASE 13 (Wave 13-5) — Devolve a política global de selecção de fontes
+    /// <b>sem a criar</b>, ou <c>null</c> se não existir. Estritamente
+    /// read-only (<see cref="EntityFrameworkQueryableExtensions.AsNoTracking{TEntity}(IQueryable{TEntity})"/>),
+    /// usada pelo preview/dry-run para nunca mutar o catálogo.
+    /// </summary>
+    public async Task<SourceSelectionPolicyEntity?> GetGlobalSourceSelectionPolicyAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.SourceSelectionPolicies
+            .AsNoTracking()
+            .FirstOrDefaultAsync(
+                p => p.ScopeKey == SourceSelectionPolicyScopes.Global, cancellationToken);
+    }
+
     public async Task<SourceSelectionPolicyEntity> UpsertGlobalSourceSelectionPolicyAsync(
         int maxSourcesPerChannel,
         bool preferDistinctProviders,

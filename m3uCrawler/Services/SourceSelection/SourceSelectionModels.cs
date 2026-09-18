@@ -120,6 +120,38 @@ public sealed record SelectedSource(SelectionCandidate Candidate, int Rank, stri
 public sealed record RejectedSource(SelectionCandidate Candidate, string Reason);
 
 /// <summary>
+/// PHASE 13 (Wave 13-5) — Resultado da selecção para um canal canónico
+/// individual, usado para preview/dry-run e métricas agregadas.
+///
+/// <para>
+/// Puramente aditivo: não altera a semântica nem a ordem de
+/// <see cref="SourceSelectionResult"/> /
+/// <see cref="SourceSelectionStageResult.Selected"/> /
+/// <see cref="SourceSelectionStageResult.Rejected"/>. É registado um
+/// resultado por grupo de canal canónico processado, incluindo grupos cujas
+/// fontes estão todas desactivadas (<see cref="Selected"/> vazio e
+/// <see cref="Rejected"/> com entradas <c>source-disabled</c>).
+/// </para>
+///
+/// <para>
+/// <b>Sensível:</b> <see cref="Selected"/> e <see cref="Rejected"/> contêm
+/// <see cref="SelectionCandidate.StreamUrl"/> com a URL real (credenciais
+/// incluídas) apenas em memória. Nunca devem ser serializados, persistidos
+/// ou logados; o preview projeta para tipos sanitizados.
+/// </para>
+/// </summary>
+public sealed record SourceSelectionChannelResult(
+    long CanonicalChannelId,
+    string? CanonicalChannelKey,
+    SourceSelectionPolicy Policy,
+    IReadOnlyList<SelectedSource> Selected,
+    IReadOnlyList<RejectedSource> Rejected)
+{
+    /// <summary>Total de candidatos considerados neste canal.</summary>
+    public int CandidateCount => Selected.Count + Rejected.Count;
+}
+
+/// <summary>
 /// Resultado determinístico da selecção. <see cref="Selected"/> está na
 /// ordem final (Rank = índice); <see cref="Rejected"/> cobre todos os
 /// restantes candidatos com motivo observável (preview/auditoria).

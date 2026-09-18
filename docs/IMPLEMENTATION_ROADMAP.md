@@ -4318,7 +4318,9 @@ Este documento define **como completar a evolução até ao sistema funcional pr
 | PHASE 12 — Automation / Scheduler | `[concluído]` | ScheduledJobEntity + CronExpression + Runner + 4 actions concretas (`discoverM3u`, `validatePlaylist`, `generatePlaylist`, `syncDispatcharr`) + arranque em produção via `Program.cs --web` + 19 testes. Ver 32.10 e 32.11. |
 | **PHASE 9C — First-Run / Configuration Lifecycle / Dashboard Hardening** | **`[em curso]`** | 9C.1 (lifecycle persistido `NOT_CONFIGURED/CONFIGURING/READY`, adopção legacy, gate de discovery/scheduler), 9C.2 (wizard de first-run, admin/sessões/CSRF, gate de autorização único), 9C.3 (affinity por país/canal, naming canónico normalizado, migration aditiva `AddCanonicalCountryAndAffinityKind`), 9C.4 (Live Run Monitor: `live_runs`/`live_run_steps`, `RunCoordinator` único, `GET /api/run/status` + `POST /api/run/start`, `--web-allow-trigger`, acções agendadas `telegramRun`/`telegramMaintainRun`, vista "Live Run" com polling) e 9C.5 (first-run/legacy bootstrap: `READY` ∧ sem admin resolve para `AuthMode.Bootstrap` em vez de `Legacy`, criação do primeiro admin sem alterar o estado nem reconfigurar a instalação, confirmação de password no wizard) e 9C.6 (identidade canónica em runtime: resolução de afinidades Key-autoritativa, com Key autoritativa sobre o `CanonicalChannelId` obsoleto e sobrevivência a delete/recreate com a mesma Key; `CanonicalChannel.Key` exposta no loader de selecção de fontes) implementadas. Nota documental 2026-09-17: esta linha descrevia 9C.2 como pendente apesar de já estar implementada; corrigida. Pendente (reconciliado 2026-09-18; 9C.6 acrescentada em 2026-09-18): redesign do Dashboard, gate de command/endpoints (CLI one-shot), dependências de `Id` remanescentes da identidade canónica (FKs de `channel_aliases`/`channel_sources`/`ordering_items`, `source_priority_policies` por canal, ownership, `matching_audits`, `MatchPlan`, agrupamento do `SourceSelectionStage`), auditoria administrativa, alargamento do wizard, instalação limpa validada e Manual/Ajuda contextual. Ver 32.18. |
 | PHASE-Bridge — Pipeline → Catálogo | `[concluído]` | `PipelineIngestionService` liga o pipeline real (Telegram/M3U8-search) ao catálogo persistente via `EnsureSourceAsync` + `ResolveAsync` + `RecordChannelSourceAsync` + novo `EnsureCanonicalChannelAsync` (upsert). 9 testes TDD. Ver 32.12. |
-| **PHASE 13 — Dispatcharr Source Selection, Diversity & Source Limits** | **`[em curso]`** (`[parcial]`) | 13-1/13-1a/13-3/13-4/13-4b implementadas e publicadas (`94a9c75`, `c1dda71`, `d36b803`, `bf04c34`; 13-4b nesta wave); 13-2/13-2a/13-2b inexistentes. Gaps: preview/dry-run, Dashboard completo, estabilidade/churn, integração explícita `MatchPlan`/`DispatcharrSyncService`, ownership/limpeza selectiva testados, métricas/auditoria, `ProviderDefinition`, `SelectionPolicy`, `MinimumValidatedSources`, teste 100→10. Ver 32.19. |
+| **PHASE 13 — Dispatcharr Source Selection, Diversity & Source Limits** | **`[em curso]`** (`[parcial]`) | 13-1/13-1a/13-3/13-4/13-4b/13-5 implementadas (`94a9c75`, `c1dda71`, `d36b803`, `bf04c34`, `637bddd` para a 13-4b; 13-5 nesta iteração, ainda sem hash referenciável); 13-2/13-2a/13-2b e 13-6 inexistentes/não implementadas. Gaps: Dashboard completo (estatísticas/churn), estabilidade/churn, integração explícita `MatchPlan`/`DispatcharrSyncService`, ownership/limpeza selectiva testados, auditoria (métricas ricas entregues na 13-5 a nível de preview), `ProviderDefinition`, `SelectionPolicy`, `MinimumValidatedSources`, teste 100→10. Ver 32.19. |
+
+
 # Implementation Wave Map — visão executiva
 
 > Secção exclusivamente documental (2026-09-18). Não altera requisitos, Definition of Done, código nem estado funcional. Construída a partir da documentação do projecto e do histórico Git local.
@@ -4353,7 +4355,7 @@ PHASE 13 — Dispatcharr Source Selection, Diversity & Source Limits     [em cur
 ├── 13-3   [CONCLUÍDA]
 ├── 13-4   [CONCLUÍDA]
 ├── 13-4b  [CONCLUÍDA]   (local, não empurrada)
-├── 13-5   [PROPOSTA]
+├── 13-5   [CONCLUÍDA]   (commit desta iteração)
 └── 13-6   [PROPOSTA]
 ```
 
@@ -4382,7 +4384,7 @@ PHASE 13 — Dispatcharr Source Selection, Diversity & Source Limits     [em cur
 | 13-3 | CONCLUÍDA | `d36b803` | Aplicação da política ao pipeline Telegram antes de `SaveToM3uPlaylist` (`SourceSelectionStage`) |
 | 13-4 | CONCLUÍDA | `bf04c34` | Persistência da política global (`source_selection_policies`), resolver, endpoint/UI |
 | 13-4b | CONCLUÍDA | `637bddd` | Overrides por canal por `CanonicalChannel.Key`; **commit local, não empurrado** |
-| 13-5 | PROPOSTA | — | Preview/dry-run + métricas (auditoria; não consta de documento do repositório) |
+| 13-5 | CONCLUÍDA | — | Preview/dry-run read-only + métricas sobre o catálogo, a correr o mesmo `SourceSelectionStage`; o commit dedicado da Wave 13-5 é o desta iteração (sem hash referenciável à data desta edição) |
 | 13-6 | PROPOSTA | — | Integração `MatchPlan` + `DispatcharrSourceSelection`, cleanup e teste 100→10 (auditoria) |
 
 > A auditoria de dependências apontava a **13-4b como próxima wave**. Entretanto a implementação foi realizada e commitada localmente em `637bddd` (`feat(13): add per-channel source selection policies`), pelo que o mapa a classifica como **CONCLUÍDA**. O commit `637bddd` **não foi empurrado**; o upstream da branch é `4562489`.
@@ -4391,7 +4393,15 @@ PHASE 13 — Dispatcharr Source Selection, Diversity & Source Limits     [em cur
 
 ## Próxima wave
 
-Não existe, à data, uma wave **formalmente estabelecida** como próxima. A primeira candidata por ordem de execução sugerida pela auditoria de dependências é a **13-5 (PROPOSTA)** — preview/dry-run + métricas —, seguida da **13-6 (PROPOSTA)**. Ambas permanecem **não formalizadas**: não constam de `docs/IMPLEMENTATION_ROADMAP.md`, `CHANGELOG.md`, `m3uCrawler/README.md` nem de `docs/architecture/*`.
+A Wave **13-5** (preview/dry-run + métricas) foi implementada nesta iteração e o
+mapa classifica-a como **CONCLUÍDA**; o seu commit dedicado é o desta iteração.
+Continua a **não** existir uma wave **formalmente estabelecida** como próxima. A
+candidata por ordem de execução sugerida pela auditoria de dependências é agora a
+**13-6 (PROPOSTA)** — integração `MatchPlan` + `DispatcharrSourceSelection`,
+cleanup e teste 100→10 —, que permanece **não formalizada**: não consta de
+`docs/IMPLEMENTATION_ROADMAP.md`, `CHANGELOG.md`, `m3uCrawler/README.md` nem de
+`docs/architecture/*` como execução. A **13-6 não está implementada nem em
+curso**.
 
 ```text
 NENHUMA wave com o estado [FORMALMENTE PLANEADA] foi identificada para a PHASE 9C ou a PHASE 13.
@@ -4426,10 +4436,9 @@ Requisitos de DoD sem wave atribuída (classificados `[NÃO DECOMPOSTA]`, sem cr
 
 **PHASE 13 (§17):**
 
-- preview/dry-run;
-- Dashboard completo;
+- Dashboard completo (estatísticas/churn; o preview/dry-run foi entregue na Wave 13-5, mas o Dashboard da fase não está completo);
 - limpeza segura das associações antigas e ownership selectivo, testados;
-- métricas e auditoria;
+- auditoria (as métricas ricas de selecção foram entregues na Wave 13-5 a nível de **preview**; `RunReport.SourceSelection` mantém-se só contagens);
 - contrato explícito `MatchPlan` + `DispatcharrSourceSelection`;
 - `ProviderDefinition` completa;
 - `SelectionPolicy` (estratégia de ranking separada) — explicitamente fora de âmbito remanescente;
@@ -4453,7 +4462,7 @@ Ambas as waves estão concluídas. A migração completa `Id → Key` do domíni
 
 # 32.19 — PHASE 13 — Dispatcharr Source Selection, Diversity & Source Limits
 
-> Estado: `[em curso]` (`[parcial]`) — Waves **13-1, 13-1a, 13-3, 13-4 e 13-4b** implementadas e publicadas (`94a9c75`, `c1dda71`, `d36b803`, `bf04c34`). As sub-waves **13-2/13-2a/13-2b não existem** como artefacto (sem commit, código ou documento). A fase permanece parcial; gaps reais no §17 e no bloco de reconciliação abaixo.
+> Estado: `[em curso]` (`[parcial]`) — Waves **13-1, 13-1a, 13-3, 13-4, 13-4b e 13-5** implementadas (`94a9c75`, `c1dda71`, `d36b803`, `bf04c34`, `637bddd` para a 13-4b; a 13-5 é o commit desta iteração, ainda sem hash referenciável). A **13-6** permanece **não implementada**. As sub-waves **13-2/13-2a/13-2b não existem** como artefacto (sem commit, código ou documento). A fase permanece parcial; gaps reais no §17 e no bloco de reconciliação abaixo.
 >
 > Esta fase fecha um problema operacional identificado na publicação para Dispatcharr:
 > actualmente, quando um canal é sincronizado, podem ser associadas ao mesmo canal todas
@@ -4559,16 +4568,53 @@ Ambas as waves estão concluídas. A migração completa `Id → Key` do domíni
 > `docs/architecture/dispatcharr-source-selection.md` §10.2 e
 > `docs/architecture/phase-13-4-source-selection-policy.md` §0.1.
 
-> **Reconciliação de estado (2026-09-18, HEAD `bf04c34` + Wave 13-4b) — evidência de código/testes.** Implementado e verificado: selector puro determinístico com deduplicação e diversidade (`ChannelSourceSelector.cs`), publicação Telegram nos dois pontos (`Program.cs:539-557`, `:1112-1136`), política global persistida (entidade, migration `AddSourceSelectionPolicies`, resolver, endpoint/UI global) e **overrides por canal (13-4b)** persistidos/resolvidos/expostos por `CanonicalChannel.Key`, com substituição completa e leitura em lote. Itens do DoD (§17) ainda **não** implementados, com evidência:
-> - **preview/dry-run** — ausente (sem endpoint/lógica);
-> - **Dashboard completo** — cartões global e por canal; sem preview, estatísticas, comparação descobertas-vs-seleccionadas ou churn;
+> **Nota factual (Wave 13-5, 2026-09-18).** Foi implementado o **preview/dry-run
+> read-only + métricas** da selecção de fontes. Novo
+> `SourceSelectionPreviewService.PreviewAsync(string? canonicalChannelKey = null,
+> CancellationToken = default)`: lê o catálogo (`ListCanonicalChannelsAsync` +
+> `ListChannelSourcesAsync`), sintetiza **uma `M3uStream` por `ChannelSourceEntity`**
+> (`Url` = `StreamUrl` sanitizada já armazenada; `IsWorking = Availability not in
+> {Dead, Unreachable}`) e corre o **mesmo** `SourceSelectionStage` /
+> `ChannelSourceSelector` da produção — sem algoritmo duplicado, sem publicação,
+> sem escrita de ficheiros, sem mutação de catálogo/ownership/Dispatcharr e sem
+> estado persistente. A ausência de escrita é garantida pelo carregamento
+> read-only da política: novo `CatalogResolver.GetGlobalSourceSelectionPolicyAsync`
+> (nunca insere; `AsNoTracking`) + `SourceSelectionPolicyResolver.LoadEffectivePoliciesReadOnlyAsync`;
+> `SourceSelectionPolicySet.HasExplicitGlobal`/`HasOverride` rotulam o âmbito
+> efectivo (`override`/`global`/`default`). `SourceSelectionStageResult` ganhou
+> `Channels` (agrupamento por canal, aditivo) + `SourceSelectionChannelResult`.
+> Modelos: `SourceSelectionPreviewResult`, `SourceSelectionPreviewChannel`,
+> `SourceSelectionPreviewCandidate`, `SourceSelectionPreviewUnmatched`,
+> `SourceSelectionPreviewMetrics`, `SourceSelectionPreviewProviderStat`,
+> `SourceSelectionPreviewSourceInfo` e `SourceSelectionPreviewDecisions`
+> (`selected`/`rejected`). Endpoint
+> `GET /api/catalog/source-selection-policies/preview[?channelKey=<CanonicalChannel.Key>]`
+> (GET-only, sob o gate de auth/CSRF e o gate de catálogo — `503` quando não
+> inicializado), mais o cartão "Preview / Dry-Run" e `loadSourceSelectionPreview()`
+> no separador existente. **Sanitização:** todas as URLs emitidas passam
+> `CredentialSanitizer.SanitizeUrl` e `Unmatched.Title` passa `SanitizeText`.
+> **Limitações:** input é o catálogo (não a descoberta Telegram ao vivo),
+> `IsWorking` é proxy, a ambiguidade é agregada (`ambiguousStreamCount`; unmatched
+> por-stream com motivo `unmatched`), `fillSelectionCount` é o proxy da Fase B
+> (`fill`), canais sem sources contam em `channelsProcessed` mas não aparecem em
+> `channels`, e só os dois pontos de publicação Telegram aplicam selecção em
+> produção. **Fora de âmbito (13-6 e posteriores):** contrato `MatchPlan` +
+> `DispatcharrSourceSelection`, cleanup/ownership selectivo, teste 100→10,
+> `ProviderDefinition`, `SelectionPolicy` separada, `MinimumValidatedSources` e
+> churn/estabilidade. `RunReport.SourceSelection` mantém-se **inalterado** (só
+> contagens); as métricas ricas são âmbito do preview. **A 13-6 não está
+> implementada nem em curso.**
+
+> **Reconciliação de estado (2026-09-18, HEAD `bf04c34` + Waves 13-4b e 13-5) — evidência de código/testes.** Implementado e verificado: selector puro determinístico com deduplicação e diversidade (`ChannelSourceSelector.cs`), publicação Telegram nos dois pontos (`Program.cs:539-557`, `:1112-1136`), política global persistida (entidade, migration `AddSourceSelectionPolicies`, resolver, endpoint/UI global), **overrides por canal (13-4b)** persistidos/resolvidos/expostos por `CanonicalChannel.Key`, com substituição completa e leitura em lote, e **preview/dry-run read-only + métricas (13-5)** sobre o catálogo, a correr o mesmo `SourceSelectionStage`, com endpoint `GET /api/catalog/source-selection-policies/preview` e cartão no Dashboard. Itens do DoD (§17) ainda **não** implementados, com evidência:
+> - **preview/dry-run** — implementado na Wave 13-5 (`SourceSelectionPreviewService`, endpoint + cartão); limitação remanescente: o input é o catálogo, não a descoberta Telegram ao vivo;
+> - **Dashboard completo** — cartões global, por canal e "Preview / Dry-Run"; continuam ausentes estatísticas/churn e uma comparação dedicada descobertas-vs-seleccionadas (o preview mostra candidatos seleccionados/rejeitados, não o *diff* da descoberta);
 > - **estabilidade/churn**, `KeepExistingHealthySources`, `RebalanceOnSync`, `MinimumValidatedSources` — ausentes (só mencionados na especificação);
 > - **integração explícita `MatchPlan` + `DispatcharrSourceSelection`** — ausente (`DispatcharrSourceSelection` só existe na especificação, linha 4612); a limitação transitiva do Dispatcharr resulta do fluxo da playlist, não de contrato;
 > - **ownership específico da selecção** e **limpeza selectiva testada** — ausentes; existe apenas o guard genérico pré-existente (`DispatcharrSyncService.cs:281-318`);
-> - **métricas específicas da selecção** — só contagens em `RunReport.SourceSelection`, não expostas no Dashboard; sem auditoria;
+> - **métricas específicas da selecção** — entregues a nível de **preview** (`SourceSelectionPreviewMetrics`); `RunReport.SourceSelection` mantém-se só contagens; **sem auditoria**;
 > - **`ProviderDefinition`** completa e **`SelectionPolicy`** (estratégia de ranking separada) — ausentes;
 > - **teste "100 fontes descobertas não produzem 100 associações com limite 10"** — ausente.
-> **Não implementado por ausência de artefacto:** sub-waves 13-2/13-2a/13-2b.
+> **Não implementado por ausência de artefacto:** sub-waves 13-2/13-2a/13-2b e a Wave 13-6.
 
 > **Nota factual (2026-09-17) — `BuildPlanFromCompositionAsync`.** O método
 > existe em `ChannelMatcher` mas continua **sem call site de produção e sem
@@ -4914,7 +4960,7 @@ Com a política configurada para 10:
 - [ ] build e suite de testes passam;
 - [ ] commit.
 
-> **Reconciliação (2026-09-18; actualizada com a Wave 13-4b).** **Cumpridos:** configuração persistente do limite (global **e** override por canal, 13-4b, com identidade por `CanonicalChannel.Key` e substituição completa); valor inicial 10 não hardcoded; deduplicação; ranking determinístico; diversidade de fornecedor; fallback configurável; documentação actualizada; build e suite de testes (Release 0 erros; suite serial 1845/0/1 após a 13-4b); commit. **Parciais:** identificação normalizada de fornecedor (`ProviderIdentity` normaliza host, mas não existe a `ProviderDefinition` completa do §3-§4); "selecção antes do Dispatcharr" e "Dispatcharr recebe apenas o conjunto seleccionado" (garantidos por fluxo de dados antes de `SaveToM3uPlaylist`, sem contrato explícito `MatchPlan`+`DispatcharrSourceSelection`); limpeza segura das associações antigas e ownership (guard genérico pré-existente, não selectivo nem testado nesta fase); métricas (só contagens em `RunReport.SourceSelection`, sem auditoria nem Dashboard); idempotência (garantida para a política, não específica da selecção); testes (faltam cenários de ownership/cleanup/dry-run/Dispatcharr, incluindo "100 fontes descobertas não produzem 100 associações com limite 10"). **Não cumpridos:** preview/dry-run; Dashboard completo. **Fora de âmbito remanescente:** `SelectionPolicy` (estratégia de ranking separada) e `MinimumValidatedSources`.
+> **Reconciliação (2026-09-18; actualizada com as Waves 13-4b e 13-5).** **Cumpridos:** configuração persistente do limite (global **e** override por canal, 13-4b, com identidade por `CanonicalChannel.Key` e substituição completa); valor inicial 10 não hardcoded; deduplicação; ranking determinístico; diversidade de fornecedor; fallback configurável; **preview/dry-run** (Wave 13-5: `SourceSelectionPreviewService` estritamente read-only sobre o catálogo + endpoint `GET /api/catalog/source-selection-policies/preview` + cartão no Dashboard, a correr o **mesmo** `SourceSelectionStage` da produção, sem publicação nem escrita); documentação actualizada; build e suite de testes (Release 0 erros; suite serial 1845/0/1 após a 13-4b); commit. **Parciais:** identificação normalizada de fornecedor (`ProviderIdentity` normaliza host, mas não existe a `ProviderDefinition` completa do §3-§4); "selecção antes do Dispatcharr" e "Dispatcharr recebe apenas o conjunto seleccionado" (garantidos por fluxo de dados antes de `SaveToM3uPlaylist`, sem contrato explícito `MatchPlan`+`DispatcharrSourceSelection`); limpeza segura das associações antigas e ownership (guard genérico pré-existente, não selectivo nem testado nesta fase); métricas (entregues a nível de **preview** na Wave 13-5 — `SourceSelectionPreviewMetrics`; `RunReport.SourceSelection` mantém-se só contagens; sem auditoria); idempotência (garantida para a política, não específica da selecção); testes (faltam cenários de ownership/cleanup/Dispatcharr, incluindo "100 fontes descobertas não produzem 100 associações com limite 10"). **Não cumpridos:** Dashboard completo. **Fora de âmbito remanescente:** contrato `MatchPlan` + `DispatcharrSourceSelection` (Wave 13-6), `SelectionPolicy` (estratégia de ranking separada) e `MinimumValidatedSources`.
 
 ## 18. Regra de produto
 

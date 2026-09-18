@@ -5,6 +5,7 @@ using m3uCrawler.Services.Automation;
 using m3uCrawler.Services.Catalog;
 using m3uCrawler.Services.Configuration;
 using m3uCrawler.Services.LiveRun;
+using m3uCrawler.Services.SourceSelection;
 using m3uCrawler.Services.Sync;
 using m3uCrawler.Services.Validation;
 using System.IO;
@@ -1699,6 +1700,30 @@ namespace m3uCrawler.Services
                     return;
                 }
                 context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
+                return;
+            }
+
+            // === PHASE 13 (Wave 13-5) — Source Selection Preview / Dry-Run ===
+            // GET /api/catalog/source-selection-policies/preview?channelKey={key}
+            //
+            // Read-only: não publica, não persiste, não muta o catálogo.
+            if (requestPath.Equals("/api/catalog/source-selection-policies/preview", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
+                    // Flush/close o response: sem isto o HttpClient fica à espera
+                    // indefinidamente (o HttpListener não envia a resposta).
+                    context.Response.Close();
+                    return;
+                }
+
+                var channelKeyFilter = context.Request.QueryString["channelKey"];
+                if (string.IsNullOrWhiteSpace(channelKeyFilter)) channelKeyFilter = null;
+
+                var preview = await new SourceSelectionPreviewService(_catalogResolver)
+                    .PreviewAsync(channelKeyFilter);
+                await WriteJsonAsync(context.Response, SourceSelectionPreviewToJson(preview));
                 return;
             }
 
@@ -3448,6 +3473,102 @@ namespace m3uCrawler.Services
         };
     }
 
+    // === PHASE 13 (Wave 13-5) — Source Selection Preview / Dry-Run JSON ===
+    //
+    // Projecção sanitizada: todas as URLs do output passam por
+    // SourceSelectionPreviewService (CredentialSanitizer.SanitizeUrl), pelo
+    // que este helper nunca expõe credenciais. Não expõe internals do
+    // CatalogResolver nem caminhos de filesystem (Origin é um rótulo curto).
+    private static object SourceSelectionPreviewToJson(SourceSelectionPreviewResult preview)
+    {
+        return new
+        {
+            applied = preview.Applied,
+            generatedAtUtc = preview.GeneratedAtUtc.ToString("o"),
+            inputStreamCount = preview.InputStreamCount,
+            source = new
+            {
+                origin = preview.Source.Origin,
+                channelKeyFilter = preview.Source.ChannelKeyFilter,
+                catalogChannelSourceCount = preview.Source.CatalogChannelSourceCount,
+                canonicalChannelCount = preview.Source.CanonicalChannelCount,
+            },
+            metrics = new
+            {
+                channelsProcessed = preview.Metrics.ChannelsProcessed,
+                channelsWithSources = preview.Metrics.ChannelsWithSources,
+                candidateStreamCount = preview.Metrics.CandidateStreamCount,
+                selectedStreamCount = preview.Metrics.SelectedStreamCount,
+                rejectedStreamCount = preview.Metrics.RejectedStreamCount,
+                unmatchedStreamCount = preview.Metrics.UnmatchedStreamCount,
+                ambiguousStreamCount = preview.Metrics.AmbiguousStreamCount,
+                channelsAtChannelLimit = preview.Metrics.ChannelsAtChannelLimit,
+                channelLimitRejectionCount = preview.Metrics.ChannelLimitRejectionCount,
+                providerLimitRejectionCount = preview.Metrics.ProviderLimitRejectionCount,
+                distinctProviderSelectionCount = preview.Metrics.DistinctProviderSelectionCount,
+                fillSelectionCount = preview.Metrics.FillSelectionCount,
+                fallbackDisabledRejectionCount = preview.Metrics.FallbackDisabledRejectionCount,
+                sourceDisabledRejectionCount = preview.Metrics.SourceDisabledRejectionCount,
+                // SortedDictionary (ordinal) construído pelo preview: ordem
+                // determinística das chaves sem re-ordenar aqui.
+                rejectionCounts = preview.Metrics.RejectionCounts,
+                providerDistribution = preview.Metrics.ProviderDistribution
+                    .Select(p => new
+                    {
+                        provider = p.Provider,
+                        selectedCount = p.SelectedCount,
+                        channelCount = p.ChannelCount,
+                    })
+                    .ToList(),
+            },
+            channels = preview.Channels.Select(c => new
+            {
+                canonicalChannelId = c.CanonicalChannelId,
+                canonicalChannelKey = c.CanonicalChannelKey,
+                displayName = c.DisplayName,
+                policyScope = c.PolicyScope,
+                policy = new
+                {
+                    maxSourcesPerChannel = c.Policy.MaxSourcesPerChannel,
+                    preferDistinctProviders = c.Policy.PreferDistinctProviders,
+                    maxSourcesPerProvider = c.Policy.MaxSourcesPerProvider,
+                    allowFallbackToSameProvider = c.Policy.AllowFallbackToSameProvider,
+                },
+                candidateCount = c.CandidateCount,
+                selectedCount = c.SelectedCount,
+                rejectedCount = c.RejectedCount,
+                selected = c.Selected.Select(SourceSelectionPreviewCandidateToJson).ToList(),
+                rejected = c.Rejected.Select(SourceSelectionPreviewCandidateToJson).ToList(),
+            }).ToList(),
+            unmatched = preview.Unmatched.Select(u => new
+            {
+                streamUrlSanitized = u.StreamUrlSanitized,
+                title = u.Title,
+                reason = u.Reason,
+            }).ToList(),
+        };
+    }
+
+    private static object SourceSelectionPreviewCandidateToJson(SourceSelectionPreviewCandidate c)
+    {
+        return new
+        {
+            streamUrlSanitized = c.StreamUrlSanitized,
+            sourceId = c.SourceId,
+            sourcePriority = c.SourcePriority,
+            provider = c.Provider,
+            externalStreamId = c.ExternalStreamId,
+            quality = c.Quality,
+            epg = c.Epg,
+            availability = c.Availability,
+            lastResponseTimeMs = c.LastResponseTimeMs,
+            isWorking = c.IsWorking,
+            rank = c.Rank,
+            decision = c.Decision,
+            reason = c.Reason,
+        };
+    }
+
     // === PHASE 7 — Playlist Composer JSON ===
     private static object PlaylistCompositionToJson(PlaylistComposition c)
     {
@@ -4059,6 +4180,17 @@ namespace m3uCrawler.Services
           </div>
           <div id='channelSourceSelectionPolicyStatus' class='muted' style='margin-top:8px;'></div>
           <div id='channelSourceSelectionPoliciesTable' style='margin-top:12px;'></div>
+        </div>
+
+        <!-- PHASE 13 (Wave 13-5) — Preview / Dry-Run -->
+        <div class='card' style='margin-top:16px;'>
+          <h3>Preview / Dry-Run</h3>
+          <p class='muted'>Corre a selecção de fontes em modo <strong>read-only</strong> sobre o catálogo actual: não publica, não escreve ficheiros, não cria a política global. Mostra as métricas agregadas e a decisão por candidato. Filtro opcional por chave canónica (aplica-se só aos canais considerados).</p>
+          <div style='display:flex;gap:8px;align-items:center;flex-wrap:wrap;'>
+            <input id='sourceSelectionPreviewChannelKey' list='cssp_channelKeyList' placeholder='filtro opcional: chave canónica (ex: sic-pt)' style='background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+            <button onclick='loadSourceSelectionPreview()'>Executar preview</button>
+          </div>
+          <div id='sourceSelectionPreviewResult' style='margin-top:12px;'></div>
         </div>
       </div>
 
@@ -5669,6 +5801,90 @@ const rows = Object.entries(inv).map(([k, v]) => {
       }
     }
 
+    // === PHASE 13 (Wave 13-5) — Source Selection Preview / Dry-Run ===
+    function sourceSelectionPreviewCandidateLine(c, decision) {
+      const badge = decision === 'selected' ? 'ok' : 'muted';
+      const rank = (c.rank === null || c.rank === undefined) ? '—' : c.rank;
+      return `<div class='muted' style='font-size:12px;margin:2px 0;'>` +
+        `<span class='badge ${badge}'>${escapeHtml(decision)}</span> ` +
+        `#${escapeHtml(String(rank))} · ${escapeHtml(c.provider || '—')} · ${escapeHtml(c.availability || '—')} · ${escapeHtml(c.quality || '—')} · ${escapeHtml(c.reason || '')} ` +
+        `<code>${escapeHtml(c.streamUrlSanitized || '')}</code></div>`;
+    }
+
+    async function loadSourceSelectionPreview() {
+      const out = document.getElementById('sourceSelectionPreviewResult');
+      if (!out) return;
+      out.innerHTML = '<p class="muted">A executar preview…</p>';
+      const filterEl = document.getElementById('sourceSelectionPreviewChannelKey');
+      const filter = filterEl ? filterEl.value.trim() : '';
+      const url = '/api/catalog/source-selection-policies/preview'
+        + (filter ? ('?channelKey=' + encodeURIComponent(filter)) : '');
+      const data = await safeFetchJson(url, null);
+      if (!data || data.error) {
+        out.innerHTML = '<p class="muted">Erro ao executar preview.</p>';
+        return;
+      }
+
+      const m = data.metrics || {};
+      const src = data.source || {};
+      const header = `<p class='muted'>Origem: ${escapeHtml(src.origin || 'catalog')}` +
+        ` · canais no catálogo: ${nfmt(src.canonicalChannelCount || 0)}` +
+        ` · channel sources: ${nfmt(src.catalogChannelSourceCount || 0)}` +
+        (src.channelKeyFilter ? ` · filtro: <code>${escapeHtml(src.channelKeyFilter)}</code>` : '') +
+        ` · streams de entrada: ${nfmt(data.inputStreamCount || 0)}` +
+        ` · gerado: ${escapeHtml(tsLocal(data.generatedAtUtc))}</p>`;
+
+      if (!data.applied) {
+        out.innerHTML = header + `<p class='muted'>Preview não aplicado (catálogo vazio/indisponível ou filtro sem correspondência).</p>`;
+        return;
+      }
+
+      const cards = [
+        metricCard('Canais processados', nfmt(m.channelsProcessed || 0), nfmt(m.channelsWithSources || 0) + ' com fontes', 'Canais canónicos considerados (após filtro) e quantos têm ChannelSource.'),
+        metricCard('Candidatos', nfmt(m.candidateStreamCount || 0), nfmt(m.selectedStreamCount || 0) + ' seleccionados · ' + nfmt(m.rejectedStreamCount || 0) + ' rejeitados', ''),
+        metricCard('Sem correspondência', nfmt(m.unmatchedStreamCount || 0), nfmt(m.ambiguousStreamCount || 0) + ' ambíguos', 'Streams do input sem match inequívoco no catálogo.'),
+        metricCard('Diversidade / Fill', nfmt(m.distinctProviderSelectionCount || 0) + ' / ' + nfmt(m.fillSelectionCount || 0), 'por fornecedor distinto / preenchimento', 'FillSelectionCount é o proxy da Fase B (fallback fill).'),
+        metricCard('Limite de canal', nfmt(m.channelLimitRejectionCount || 0), nfmt(m.channelsAtChannelLimit || 0) + ' canais no limite', 'Rejeições limit-reached.'),
+        metricCard('Limites de fornecedor', nfmt(m.providerLimitRejectionCount || 0), nfmt(m.fallbackDisabledRejectionCount || 0) + ' fallback-disabled · ' + nfmt(m.sourceDisabledRejectionCount || 0) + ' source-disabled', ''),
+      ];
+
+      const rejectionCounts = m.rejectionCounts || {};
+      const rejectionKeys = Object.keys(rejectionCounts);
+      const rejectionLine = rejectionKeys.length
+        ? rejectionKeys.map(k => `<code>${escapeHtml(k)}</code>: ${nfmt(rejectionCounts[k])}`).join(' · ')
+        : '<span class="muted">—</span>';
+
+      const distribution = m.providerDistribution || [];
+      const distributionTable = distribution.length
+        ? `<div style='margin-top:12px;'><h4>Distribuição por fornecedor</h4><table><thead><tr><th>Fornecedor</th><th>Seleccionados</th><th>Canais</th></tr></thead><tbody>${distribution.map(p => `<tr><td><code>${escapeHtml(p.provider)}</code></td><td>${nfmt(p.selectedCount)}</td><td>${nfmt(p.channelCount)}</td></tr>`).join('')}</tbody></table></div>`
+        : '';
+
+      const channelBlocks = (data.channels || []).map(c => {
+        const selected = (c.selected || []).map(x => sourceSelectionPreviewCandidateLine(x, 'selected')).join('');
+        const rejected = (c.rejected || []).map(x => sourceSelectionPreviewCandidateLine(x, 'rejected')).join('');
+        const name = escapeHtml(c.displayName || '') || '<span class="muted">(sem nome)</span>';
+        const key = c.canonicalChannelKey ? ` <code>${escapeHtml(c.canonicalChannelKey)}</code>` : '';
+        return `<div class='card' style='margin-top:12px;'>
+          <div><strong>#${c.canonicalChannelId}</strong> ${name}${key} · âmbito: <strong>${escapeHtml(c.policyScope || '')}</strong> · ${nfmt(c.selectedCount)}/${nfmt(c.candidateCount)} seleccionados (${nfmt(c.rejectedCount)} rejeitados)</div>
+          <div class='muted' style='font-size:12px;margin-top:4px;'>Política: max/canal=${c.policy.maxSourcesPerChannel} · distintos=${c.policy.preferDistinctProviders ? 'sim' : 'não'} · max/fornecedor=${c.policy.maxSourcesPerProvider ?? '—'} · fallback=${c.policy.allowFallbackToSameProvider ? 'sim' : 'não'}</div>
+          ${selected ? `<div style='margin-top:6px;'><div class='muted'><strong>Seleccionadas</strong></div>${selected}</div>` : ''}
+          ${rejected ? `<div style='margin-top:6px;'><div class='muted'><strong>Rejeitadas</strong></div>${rejected}</div>` : ''}
+        </div>`;
+      }).join('');
+
+      const unmatchedList = data.unmatched || [];
+      const unmatchedBlock = unmatchedList.length
+        ? `<div style='margin-top:12px;'><h4>Sem correspondência</h4>${unmatchedList.map(u => `<div class='muted' style='font-size:12px;'><span class='badge muted'>${escapeHtml(u.reason || 'unmatched')}</span> ${escapeHtml(u.title || '')} <code>${escapeHtml(u.streamUrlSanitized || '')}</code></div>`).join('')}</div>`
+        : '';
+
+      out.innerHTML = `<div style='display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));'>${cards.join('')}</div>`
+        + header
+        + `<p class='muted' style='margin-top:8px;'>Rejeições por motivo: ${rejectionLine}</p>`
+        + distributionTable
+        + (channelBlocks || '<p class="muted" style="margin-top:12px;">Nenhum canal processado.</p>')
+        + unmatchedBlock;
+    }
+
     async function loadImportPolicies() {
       const list = await safeFetchJson('/api/catalog/import-policies', []);
       if (!Array.isArray(list)) { document.getElementById('importPoliciesTable').innerHTML = '<p class="muted">Erro.</p>'; return; }
@@ -6360,6 +6576,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
     window.editChannelSourceSelectionPolicy = editChannelSourceSelectionPolicy;
     window.saveChannelSourceSelectionPolicy = saveChannelSourceSelectionPolicy;
     window.deleteChannelSourceSelectionPolicy = deleteChannelSourceSelectionPolicy;
+    window.loadSourceSelectionPreview = loadSourceSelectionPreview;
 
     // === PHASE 9C.4 — Live Run (polling leve; sem SSE/WebSocket, sem tail de logs) ===
     var liveRunTimer = null;
