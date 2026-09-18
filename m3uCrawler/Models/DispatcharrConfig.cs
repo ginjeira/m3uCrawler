@@ -19,9 +19,16 @@ namespace m3uCrawler.Models
 
     public static class DispatcharrConfigLoader
     {
-        public static DispatcharrConfig Load()
+        public static DispatcharrConfig Load() => Parse(WtelegramConfigFile.Read());
+
+        /// <summary>
+        /// Interpreta um dicionário chave/valor de <c>wtelegram.config</c>.
+        /// Extraído de <see cref="Load"/> para permitir releitura a partir de
+        /// um store injetado sem duplicar o contrato de parsing.
+        /// </summary>
+        public static DispatcharrConfig Parse(IReadOnlyDictionary<string, string> values)
         {
-            var values = WtelegramConfigFile.Read();
+            if (values is null) throw new ArgumentNullException(nameof(values));
             bool enabled = values.TryGetValue("dispatcharr_enabled", out var enRaw)
                            && ParseBool(enRaw);
 
