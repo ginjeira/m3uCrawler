@@ -7,6 +7,14 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Unreleased]
 
+### 🔧 Alterado
+- **Wave W3s — país: leituras puras, prontidão e afinidades com escopo (2026-09-18).**
+  - **Leituras não escrevem:** `CountryChannelListService.GetAllCountries`/`GetCountry` (GET `/api/countries`, `/api/country`) deixam de auto-criar `countries/<code>.json`; sem ficheiro devolvem resultado vazio. A persistência só ocorre no arranque (`CountryConfigProvisioner`) ou via `SaveCountry` (POST `/api/country/save`). O construtor deixa de criar o directório; a leitura tolera JSON com campos em qualquer caixa.
+  - **Prontidão `countryData`:** novo item obrigatório `countryData` em `OperationalReadinessService` (`countryDataOk` no snapshot e em `GET /api/configuration/readiness`; mostrado no painel Setup). Satisfeito quando existe ficheiro de país com canais ou a baseline embutida (PT); ausente entra em `missingRequired`. Legacy adoptado continua grandfathered.
+  - **Afinidades com escopo de instância:** `CountryChannelValidator.SetAffinityMembersStatic` e o dicionário estático global foram removidos; os membros `Kind=Country` são injectados na construção do validador por `Program.cs`, `WebDashboardService` e `TelegramScraperService`. Sem estado mutável global; `Kind=Country` permanece classificação (não cria identidade) e a resolução `Kind=Channel` não muda.
+  - **Removido caminho legacy:** `CountryChannelValidator.ValidatePlaylist` (falsos positivos por `Contains` bruto) e os seus testes.
+  - **Nota/ADR:** o import da baseline mantém `Country`; canais do seed programático ficam com `Country=null` (comportamento fixado por teste, sem migration). A propriedade/schema dos dados de país continua um **ADR em aberto** (`docs/Reestructure/24-DECISIONS.md`); é documentado em `docs/architecture/configuration-lifecycle.md` (Wave W3s) que esta wave não a escolheu.
+
 ### 📋 Decisões
 - **PHASE 9C.4 — fecho (2026-09-17): decisões sobre upgrade de instalações existentes (bootstrap).**
   - **1. Instalação nova** (sem configuração persistente): arranca em `NOT_CONFIGURED`; Dashboard disponível em modo `Bootstrap`; primeiro acesso conduz ao First-Run / Setup Wizard; o wizard cria o primeiro administrador e valida o mínimo (L2) para atingir `READY`; **não** reconfigura elementos já correctamente configurados.

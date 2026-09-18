@@ -169,6 +169,9 @@ namespace m3uCrawler
                         () => telegramAuth.IsAuthenticated,
                         dispatcharrService.Get,
                         ct => HasCanonicalChannelsAsync(webCatalogResolver, ct),
+                        ct => Task.FromResult(CountryConfigProvisioner.IsCountryDataAvailable(
+                            Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries"),
+                            countryCode)),
                         () => IsOutputWritable(dashboardOutputDir),
                         ct => CountChannelSourcesAsync(webCatalogResolver, ct));
 
@@ -276,11 +279,14 @@ namespace m3uCrawler
                 await scraper.LoginAsync();
 
                 var catalogDbPath = ResolveCatalogDbPath(args);
+                IReadOnlyDictionary<string, IEnumerable<string>> countryAffinityMembers =
+                    new Dictionary<string, IEnumerable<string>>(StringComparer.OrdinalIgnoreCase);
                 CatalogResolver? catalogForAffinity = null;
                 try
                 {
                     catalogForAffinity = await InitializeCatalogAsync(catalogDbPath, CancellationToken.None);
-                    await InjectAffinityMembersToValidatorAsync(catalogForAffinity);
+                    countryAffinityMembers = await LoadCountryAffinityMembersAsync(catalogForAffinity);
+                    scraper.SetCountryAffinityMembers(countryAffinityMembers);
                 }
                 catch (Exception ex)
                 {
@@ -360,7 +366,9 @@ namespace m3uCrawler
                 var outputDir = GetOptionValue(args, "--output-dir") ?? "output";
                 telegramPlaylistManager.CreateOutputDirectory(outputDir);
                 var importHistoryService = new ImportHistoryService(outputDir);
-                var countryChannelValidator = new CountryChannelValidator(Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries"));
+                var countryChannelValidator = new CountryChannelValidator(
+                    Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries"),
+                    countryAffinityMembers);
                 Console.WriteLine($"📂 Pasta de saída das playlists: {Path.GetFullPath(outputDir)}");
 
                 // PHASE-Bridge — Inicializar o ingestor de catálogo para o pipeline
@@ -1359,8 +1367,16 @@ namespace m3uCrawler
             Console.WriteLine($"   • Relatório de execução: {Path.Combine(outputDir, "telegram_run_report.json")}");
         }
 
-        static async Task InjectAffinityMembersToValidatorAsync(CatalogResolver catalog)
+        /// <summary>
+        /// Carrega os membros de afinidade <c>Kind=Country</c> do catálogo
+        /// como um mapa país→aliases. São injectados na construção de cada
+        /// <see cref="CountryChannelValidator"/>; não existe estado estático
+        /// partilhado. Estes membros são classificadores de país e não criam
+        /// identidade de canal.
+        /// </summary>
+        static async Task<IReadOnlyDictionary<string, IEnumerable<string>>> LoadCountryAffinityMembersAsync(CatalogResolver catalog)
         {
+            var result = new Dictionary<string, IEnumerable<string>>(StringComparer.OrdinalIgnoreCase);
             var groups = await catalog.ListAffinityGroupsAsync();
             var byCountry = groups
                 .Where(g => g.Kind == AffinityKind.Country
@@ -1375,10 +1391,12 @@ namespace m3uCrawler
                     .ToList();
                 if (members.Count > 0)
                 {
-                    CountryChannelValidator.SetAffinityMembersStatic(group.Key, members);
+                    result[group.Key] = members;
                     Console.WriteLine($"  [{group.Key}] {members.Count} membro(s) de afinidade injetados");
                 }
             }
+
+            return result;
         }
 
         /// <summary>

@@ -53,6 +53,7 @@ public sealed class OperationalReadinessServiceTests : IDisposable
         bool telegramAuthenticated = true,
         DispatcharrConfig? dispatcharr = null,
         bool catalogOk = true,
+        bool countryDataOk = true,
         bool outputOk = true,
         int sources = 1)
         => new(
@@ -61,6 +62,7 @@ public sealed class OperationalReadinessServiceTests : IDisposable
             () => telegramAuthenticated,
             () => dispatcharr ?? DispatcharrConfig.Disabled(),
             _ => Task.FromResult(catalogOk),
+            _ => Task.FromResult(countryDataOk),
             () => outputOk,
             _ => Task.FromResult(sources));
 
@@ -75,12 +77,13 @@ public sealed class OperationalReadinessServiceTests : IDisposable
         Assert.False(snapshot.DispatcharrEnabled);
         Assert.True(snapshot.DispatcharrValid);
         Assert.True(snapshot.CatalogOk);
+        Assert.True(snapshot.CountryDataOk);
         Assert.True(snapshot.OutputOk);
         Assert.Equal(1, snapshot.SourcesCount);
         Assert.True(snapshot.SetupComplete);
         Assert.True(snapshot.OperationalReady);
         Assert.Empty(snapshot.MissingRequired);
-        Assert.Equal(7, snapshot.Items.Count);
+        Assert.Equal(8, snapshot.Items.Count);
     }
 
     [Fact]
@@ -208,6 +211,50 @@ public sealed class OperationalReadinessServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task Country_data_present_is_satisfied()
+    {
+        var snapshot = await Build(NewLifecycle(), countryDataOk: true).EvaluateAsync();
+
+        Assert.True(snapshot.CountryDataOk);
+        Assert.True(snapshot.SetupComplete);
+
+        var item = snapshot.Items.Single(i => i.Key == OperationalReadinessService.KeyCountryData);
+        Assert.True(item.Required);
+        Assert.True(item.Satisfied);
+        Assert.DoesNotContain("countryData", snapshot.MissingRequired);
+    }
+
+    [Fact]
+    public async Task Country_data_absent_blocks_setup_and_appears_in_missing_required()
+    {
+        var snapshot = await Build(NewLifecycle(), countryDataOk: false).EvaluateAsync();
+
+        Assert.False(snapshot.CountryDataOk);
+        Assert.False(snapshot.SetupComplete);
+        Assert.Contains("countryData", snapshot.MissingRequired);
+
+        var item = snapshot.Items.Single(i => i.Key == OperationalReadinessService.KeyCountryData);
+        Assert.True(item.Required);
+        Assert.False(item.Satisfied);
+    }
+
+    [Fact]
+    public async Task Country_data_absent_is_grandfathered_for_legacy_adoption()
+    {
+        var snapshot = await Build(
+            NewLifecycle(ConfigurationLifecycleState.Ready, adopted: true),
+            countryDataOk: false).EvaluateAsync();
+
+        Assert.True(snapshot.AdoptedFromLegacy);
+        Assert.False(snapshot.CountryDataOk);
+        Assert.True(snapshot.SetupComplete);
+        Assert.True(snapshot.OperationalReady);
+
+        // Obrigatório em falta continua a ser reportado (informativo).
+        Assert.Contains("countryData", snapshot.MissingRequired);
+    }
+
+    [Fact]
     public async Task Output_unavailable_blocks_setup()
     {
         var snapshot = await Build(NewLifecycle(), outputOk: false).EvaluateAsync();
@@ -258,6 +305,7 @@ public sealed class OperationalReadinessServiceTests : IDisposable
             () => throw new InvalidOperationException("telegram"),
             () => throw new InvalidOperationException("dispatcharr"),
             _ => throw new InvalidOperationException("catalog"),
+            _ => throw new InvalidOperationException("countryData"),
             () => throw new InvalidOperationException("output"),
             _ => throw new InvalidOperationException("sources"));
 
@@ -266,6 +314,7 @@ public sealed class OperationalReadinessServiceTests : IDisposable
         Assert.False(snapshot.HasAdmin);
         Assert.False(snapshot.TelegramAuthenticated);
         Assert.False(snapshot.CatalogOk);
+        Assert.False(snapshot.CountryDataOk);
         Assert.False(snapshot.OutputOk);
         Assert.Equal(0, snapshot.SourcesCount);
         Assert.False(snapshot.SetupComplete);

@@ -48,7 +48,8 @@ public sealed record OperationalReadinessItem(string Key, bool Required, bool Sa
 ///   READY (<see cref="BootstrapReady"/>) E <see cref="HasAdmin"/> E
 ///   <see cref="TelegramAuthenticated"/> E (<see cref="DispatcharrValid"/>
 ///   apenas quando <see cref="DispatcharrEnabled"/>) E
-///   <see cref="CatalogOk"/> E <see cref="OutputOk"/>.</item>
+///   <see cref="CatalogOk"/> E <see cref="CountryDataOk"/> E
+///   <see cref="OutputOk"/>.</item>
 ///   <item><b>Sources</b>: <see cref="SourcesCount"/> conta as
 ///   <c>channel_sources</c> realmente ingeridas. <b>Não</b> faz parte de
 ///   <see cref="SetupComplete"/> — caso contrário o scheduler de descoberta
@@ -71,6 +72,7 @@ public sealed record OperationalReadinessSnapshot(
     bool DispatcharrEnabled,
     bool DispatcharrValid,
     bool CatalogOk,
+    bool CountryDataOk,
     bool OutputOk,
     int SourcesCount,
     bool SetupComplete,
@@ -100,6 +102,7 @@ public sealed class OperationalReadinessService : IOperationalReadinessGate
     public const string KeyTelegram = "telegram";
     public const string KeyDispatcharr = "dispatcharr";
     public const string KeyCatalog = "catalog";
+    public const string KeyCountryData = "countryData";
     public const string KeyOutput = "output";
     public const string KeySources = "sources";
 
@@ -108,6 +111,7 @@ public sealed class OperationalReadinessService : IOperationalReadinessGate
     private readonly Func<bool> _telegramAuthenticated;
     private readonly Func<DispatcharrConfig> _dispatcharrConfig;
     private readonly Func<CancellationToken, Task<bool>> _catalogHasCanonicalChannels;
+    private readonly Func<CancellationToken, Task<bool>> _countryDataAvailable;
     private readonly Func<bool> _outputWritable;
     private readonly Func<CancellationToken, Task<int>> _channelSourceCount;
 
@@ -117,6 +121,7 @@ public sealed class OperationalReadinessService : IOperationalReadinessGate
         Func<bool> telegramAuthenticated,
         Func<DispatcharrConfig> dispatcharrConfig,
         Func<CancellationToken, Task<bool>> catalogHasCanonicalChannels,
+        Func<CancellationToken, Task<bool>> countryDataAvailable,
         Func<bool> outputWritable,
         Func<CancellationToken, Task<int>> channelSourceCount)
     {
@@ -126,6 +131,8 @@ public sealed class OperationalReadinessService : IOperationalReadinessGate
         _dispatcharrConfig = dispatcharrConfig ?? throw new ArgumentNullException(nameof(dispatcharrConfig));
         _catalogHasCanonicalChannels = catalogHasCanonicalChannels
             ?? throw new ArgumentNullException(nameof(catalogHasCanonicalChannels));
+        _countryDataAvailable = countryDataAvailable
+            ?? throw new ArgumentNullException(nameof(countryDataAvailable));
         _outputWritable = outputWritable ?? throw new ArgumentNullException(nameof(outputWritable));
         _channelSourceCount = channelSourceCount ?? throw new ArgumentNullException(nameof(channelSourceCount));
     }
@@ -150,6 +157,7 @@ public sealed class OperationalReadinessService : IOperationalReadinessGate
         var telegramAuthenticated = SafeBool(_telegramAuthenticated);
         var dispatcharr = SafeDispatcharr(_dispatcharrConfig);
         var catalogOk = await SafeBoolAsync(_catalogHasCanonicalChannels, ct).ConfigureAwait(false);
+        var countryDataOk = await SafeBoolAsync(_countryDataAvailable, ct).ConfigureAwait(false);
         var outputOk = SafeBool(_outputWritable);
         var sourcesCount = await SafeCountAsync(_channelSourceCount, ct).ConfigureAwait(false);
 
@@ -184,6 +192,13 @@ public sealed class OperationalReadinessService : IOperationalReadinessGate
                 Satisfied: catalogOk,
                 Detail: catalogOk ? "catálogo canónico com canais." : "catálogo canónico vazio ou indisponível."),
             new(
+                KeyCountryData,
+                Required: true,
+                Satisfied: countryDataOk,
+                Detail: countryDataOk
+                    ? "dados de país disponíveis."
+                    : "dados de país em falta para o país configurado."),
+            new(
                 KeyOutput,
                 Required: true,
                 Satisfied: outputOk,
@@ -207,6 +222,7 @@ public sealed class OperationalReadinessService : IOperationalReadinessGate
             && telegramAuthenticated
             && dispatcharrValid
             && catalogOk
+            && countryDataOk
             && outputOk;
 
         // Legacy grandfathering: uma instalação adoptada como já operacional
@@ -223,6 +239,7 @@ public sealed class OperationalReadinessService : IOperationalReadinessGate
             DispatcharrEnabled: dispatcharrEnabled,
             DispatcharrValid: dispatcharrValid,
             CatalogOk: catalogOk,
+            CountryDataOk: countryDataOk,
             OutputOk: outputOk,
             SourcesCount: sourcesCount,
             SetupComplete: setupComplete,

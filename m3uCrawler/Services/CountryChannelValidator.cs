@@ -43,7 +43,6 @@ namespace m3uCrawler.Services
     {
         private readonly string _rootDirectory;
         private readonly Dictionary<string, List<string>> _cache = new(StringComparer.OrdinalIgnoreCase);
-        private static readonly Dictionary<string, List<string>> _globalAffinityMembers = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, List<string>> _affinityMembers = new(StringComparer.OrdinalIgnoreCase);
 
         /// <summary>
@@ -100,21 +99,49 @@ namespace m3uCrawler.Services
                 "zmb","zwe",
             };
 
-        public CountryChannelValidator(string? rootDirectory = null)
+        /// <summary>
+        /// Constrói um validador de país.
+        /// </summary>
+        /// <param name="rootDirectory">
+        /// Pasta com os ficheiros <c>&lt;country&gt;.json</c>. Por defeito,
+        /// <c>runtime-data/countries</c> junto do binário.
+        /// </param>
+        /// <param name="affinityMembers">
+        /// Membros de afinidade <b>por país</b> a fundir com os aliases
+        /// carregados dos ficheiros JSON (ver <see cref="LoadCountryAliases"/>).
+        /// A injecção é feita na construção — não existe estado estático
+        /// partilhado entre validadores. Membros de afinidade
+        /// <c>AffinityKind.Country</c> são apenas classificadores de
+        /// país: não criam identidade de canal.
+        /// </param>
+        public CountryChannelValidator(
+            string? rootDirectory = null,
+            IReadOnlyDictionary<string, IEnumerable<string>>? affinityMembers = null)
         {
             _rootDirectory = string.IsNullOrWhiteSpace(rootDirectory)
                 ? Path.Combine(AppContext.BaseDirectory, "runtime-data", "countries")
                 : rootDirectory;
 
-            Directory.CreateDirectory(_rootDirectory);
+            if (affinityMembers is not null)
+            {
+                foreach (var pair in affinityMembers)
+                {
+                    if (string.IsNullOrWhiteSpace(pair.Key))
+                        continue;
+
+                    _affinityMembers[pair.Key] = (pair.Value ?? Enumerable.Empty<string>())
+                        .Where(m => !string.IsNullOrWhiteSpace(m))
+                        .ToList();
+                }
+            }
         }
 
         /// <summary>
         /// Injeta membros de grupos de afinidade como aliases adicionais
-        /// para um país. Os membros são fundidos com os aliases carregados
-        /// dos ficheiros JSON em <see cref="LoadCountryAliases"/>.
-        /// O cache do país é invalidado para que os novos membros sejam
-        /// visíveis na próxima chamada.
+        /// para um país, <b>nesta instância</b>. Os membros são fundidos com
+        /// os aliases carregados dos ficheiros JSON em
+        /// <see cref="LoadCountryAliases"/>. O cache do país é invalidado
+        /// para que os novos membros sejam visíveis na próxima chamada.
         /// </summary>
         /// <param name="countryCode">Código ISO do país (e.g. "pt").</param>
         /// <param name="members">Lista de membros já normalizados.</param>
@@ -123,91 +150,29 @@ namespace m3uCrawler.Services
             if (string.IsNullOrWhiteSpace(countryCode)) return;
             var list = members?.ToList() ?? new List<string>();
             _affinityMembers[countryCode] = list;
-            lock (_globalAffinityMembers)
-            {
-                _globalAffinityMembers[countryCode] = list;
-            }
             _cache.Remove(countryCode);
         }
 
         /// <summary>
-        /// Estático: define membros de afinidade para todos os CountryChannelValidator
-        /// futuros (incluindo os criados dentro do TelegramScraperService).
-        /// </summary>
-        public static void SetAffinityMembersStatic(string countryCode, IEnumerable<string> members)
-        {
-            if (string.IsNullOrWhiteSpace(countryCode)) return;
-            var list = members?.ToList() ?? new List<string>();
-            lock (_globalAffinityMembers)
-            {
-                _globalAffinityMembers[countryCode] = list;
-            }
-        }
-
-        /// <summary>
-        /// Remove todos os membros de afinidade injetados e limpa o cache
-        /// do país, revertendo para os aliases dos ficheiros JSON.
+        /// Remove todos os membros de afinidade injetados nesta instância e
+        /// limpa o cache do país, revertendo para os aliases dos ficheiros
+        /// JSON.
         /// </summary>
         public void ClearAffinityMembers(string countryCode)
         {
             if (string.IsNullOrWhiteSpace(countryCode)) return;
             _affinityMembers.Remove(countryCode);
-            lock (_globalAffinityMembers)
-            {
-                _globalAffinityMembers.Remove(countryCode);
-            }
             _cache.Remove(countryCode);
         }
 
         /// <summary>
-        /// Limpa todo o cache (aliases e afinidades) forçando o recarregamento
-        /// na próxima chamada.
+        /// Limpa todo o cache (aliases e afinidades) desta instância,
+        /// forçando o recarregamento na próxima chamada.
         /// </summary>
         public void ClearCache()
         {
             _cache.Clear();
             _affinityMembers.Clear();
-            lock (_globalAffinityMembers)
-            {
-                _globalAffinityMembers.Clear();
-            }
-        }
-
-        public CountryChannelValidationResult ValidatePlaylist(string playlistContent, string countryCode)
-        {
-            var aliases = LoadCountryAliases(countryCode);
-            if (aliases.Count == 0)
-            {
-                return new CountryChannelValidationResult
-                {
-                    IsMatch = false,
-                    Country = countryCode,
-                    MatchedAliases = new List<string>(),
-                    RawContent = playlistContent
-                };
-            }
-
-            var normalized = NormalizeText(playlistContent);
-            var matches = new List<string>();
-
-            foreach (var alias in aliases)
-            {
-                var candidate = NormalizeText(alias);
-                if (!string.IsNullOrWhiteSpace(candidate) && normalized.Contains(candidate, StringComparison.OrdinalIgnoreCase))
-                {
-                    matches.Add(alias);
-                }
-            }
-
-            var result = new CountryChannelValidationResult
-            {
-                IsMatch = matches.Count > 0,
-                Country = countryCode,
-                MatchedAliases = matches.Distinct(StringComparer.OrdinalIgnoreCase).ToList(),
-                RawContent = playlistContent
-            };
-
-            return result;
         }
 
         /// <summary>
@@ -438,19 +403,12 @@ namespace m3uCrawler.Services
                 aliases = combined;
             }
 
-            // Faz merge dos membros de afinidade (injetados por SetAffinityMembers).
-            // Esses membros são fundidos tanto do cache de instância (_affinityMembers)
-            // como do cache estático (_globalAffinityMembers), que é partilhado por
-            // todos os CountryChannelValidator (incluindo os criados dentro do
-            // TelegramScraperService).
+            // Faz merge dos membros de afinidade desta instância (injetados
+            // na construção ou via SetAffinityMembers). Só existem neste
+            // validador: não há cache estático partilhado.
             var affinityMembers = new List<string>();
             if (_affinityMembers.TryGetValue(countryCode, out var inst) && inst.Count > 0)
                 affinityMembers.AddRange(inst);
-            lock (_globalAffinityMembers)
-            {
-                if (_globalAffinityMembers.TryGetValue(countryCode, out var global) && global.Count > 0)
-                    affinityMembers.AddRange(global);
-            }
             if (affinityMembers.Count > 0)
             {
                 var combined = new List<string>(aliases);

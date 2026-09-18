@@ -327,6 +327,7 @@ public class WaveW2PublicationTests : IAsyncLifetime
             DispatcharrEnabled: false,
             DispatcharrValid: true,
             CatalogOk: catalogOk,
+            CountryDataOk: true,
             OutputOk: outputOk,
             SourcesCount: 1,
             SetupComplete: false,

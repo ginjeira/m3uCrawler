@@ -318,17 +318,21 @@ precisa estão funcionais?".
 | Conceito | Condição | Reportado em |
 |---|---|---|
 | **Bootstrap Ready** | lifecycle `READY` (administrador activo + L2 válida, ver §"Configuração mínima (L2) para READY") | `bootstrapReady` em `GET /api/configuration/readiness`; `GET /api/configuration/lifecycle` |
-| **Setup Complete** | Bootstrap Ready **e** administrador activo **e** sessão Telegram autenticada **e** Dispatcharr válido (apenas se activado) **e** catálogo canónico com canais **e** output gravável | `setupComplete` |
+| **Setup Complete** | Bootstrap Ready **e** administrador activo **e** sessão Telegram autenticada **e** Dispatcharr válido (apenas se activado) **e** catálogo canónico com canais **e** dados de país disponíveis **e** output gravável | `setupComplete` |
 | **Operational Ready** | `Setup Complete` **e** `sourcesCount >= 1` | `operationalReady` |
 
 ### Componentes obrigatórios
 
 `OperationalReadinessService` avalia itens com chave estável (`bootstrap`,
-`admin`, `telegram`, `dispatcharr`, `catalog`, `output`, `sources`):
+`admin`, `telegram`, `dispatcharr`, `catalog`, `countryData`, `output`,
+`sources`):
 
 - **Obrigatórios para `SetupComplete`**: `bootstrap`, `admin`, `telegram`,
-  `catalog`, `output` e `dispatcharr` **apenas quando** `Dispatcharr.Enabled`
-  (exige então `BaseUrl` e ApiKey **ou** user/pass).
+  `catalog`, `countryData`, `output` e `dispatcharr` **apenas quando**
+  `Dispatcharr.Enabled` (exige então `BaseUrl` e ApiKey **ou** user/pass).
+- `countryData` fica satisfeito quando existem dados de país para o país
+  configurado: `runtime-data/countries/<code>.json` com pelo menos um canal
+  ou a baseline embutida (PT), ver `CountryConfigProvisioner.IsCountryDataAvailable`.
 - **Informacional**: `sources` conta as `channel_sources` ingeridas. **Não**
   faz parte de `SetupComplete` — se fizesse, o scheduler de descoberta ficaria
   bloqueado por nunca existirem fontes antes de a primeira descoberta correr
@@ -363,7 +367,7 @@ operacional antes da introdução do lifecycle não fica bloqueada.
 
 | Endpoint | Descrição |
 |---|---|
-| `GET /api/configuration/readiness` | Snapshot: `bootstrapReady`, `hasAdmin`, `telegramAuthenticated`, `dispatcharrEnabled`, `dispatcharrValid`, `catalogOk`, `outputOk`, `sourcesCount`, `setupComplete`, `operationalReady`, `adoptedFromLegacy`, `items[]`, `missingRequired[]`. Read-only. |
+| `GET /api/configuration/readiness` | Snapshot: `bootstrapReady`, `hasAdmin`, `telegramAuthenticated`, `dispatcharrEnabled`, `dispatcharrValid`, `catalogOk`, `countryDataOk`, `outputOk`, `sourcesCount`, `setupComplete`, `operationalReady`, `adoptedFromLegacy`, `items[]`, `missingRequired[]`. Read-only. |
 | `GET/POST /api/telegram/config` | Lê/grava `api_id`, `phone_number`, `session_pathname`; `api_hash` **nunca** é devolvido (`hasApiHash` indica existência). |
 | `POST /api/telegram/auth/start` | Inicia o login Telegram por passos com a configuração guardada. |
 | `POST /api/telegram/auth/code` | Submete o código de verificação. |
@@ -397,11 +401,53 @@ PT embutida, **nunca sobrepondo** ficheiros existentes, com escrita atómica.
 > e a baseline C# é a fonte efectiva. Alinhar o tracking do ficheiro (ou
 > remover o EmbeddedResource) é dívida a tratar.
 
+### Wave W3s — reads puros, prontidão de país e afinidades com escopo
+
+- **Leituras de país não escrevem.** `CountryChannelListService.GetAllCountries`
+  e `GetCountry` (GET `/api/countries` e `/api/country`) deixam de auto-criar
+  `countries/<code>.json`. Sem ficheiro devolvem um resultado vazio; a
+  persistência só acontece no arranque (`CountryConfigProvisioner`) ou via
+  `SaveCountry` (POST `/api/country/save`). O construtor deixou de criar o
+  directório.
+- **Prontidão inclui `countryDataOk`.** `OperationalReadinessService` passa a
+  avaliar um requisito obrigatório `countryData`, satisfeito quando existem
+  dados de país utilizáveis para o país configurado: um ficheiro
+  `runtime-data/countries/<code>.json` com pelo menos um canal, ou a baseline
+  embutida (`CountryConfigProvisioner.IsCountryDataAvailable`). Em falta,
+  aparece em `missingRequired`; uma instalação adoptada como legacy continua
+  grandfathered. Exposto em `GET /api/configuration/readiness` (`countryDataOk`)
+  e no painel **Setup** do dashboard.
+- **Afinidades são escopo de instância.** `CountryChannelValidator` recebe os
+  membros de afinidade de país na construção (ou via `SetAffinityMembers`).
+  `SetAffinityMembersStatic` e o dicionário estático global foram removidos:
+  não resta estado mutável global. `TelegramScraperService` e o dashboard
+  injectam os membros `Kind=Country` do catálogo. Afinidade `Kind=Country` é
+  apenas classificação de país — não cria identidade de canal; a resolução de
+  afinidade `Kind=Channel` (no `CatalogResolver`) mantém-se inalterada.
+- **Caminho legacy removido.** `CountryChannelValidator.ValidatePlaylist`
+  (match bruto `Contains` sobre a playlist, com falsos positivos de fronteira
+  de palavra) foi removido, com os testes que o exercitavam.
+- **Atributo `Country`.** O import da baseline continua a definir `Country`
+  nos canais que cria. Canais do seed programático ficam com `Country = null`
+  — comportamento actual fixado por teste, sem migration.
+
+> **ADR em aberto (W4).** A propriedade e o schema dos dados de país
+> (ownership, versionamento, formato, quem os pode escrever) são um ADR
+> pendente identificado em `docs/Reestructure/24-DECISIONS.md` (item
+> "country data ownership"). Esta wave (W3s) implementou apenas as partes
+> seguras, dependentes do ADR: **não** escolheu uma interpretação para
+> ownership/schema, não introduziu migration para canais semeados e não
+> alterou o contrato persistido de `countries/*.json`. Qualquer decisão de
+> ownership terá de ser tomada explicitamente por ADR antes de novas waves
+> sobre esta matéria.
+
 Testes de referência: `OperationalReadinessServiceTests`,
 `ConfigurationGateSchedulerTests`, `TelegramAuthServiceTests`,
 `DispatcharrConfigurationServiceTests`, `DispatcharrConnectionTesterTests`,
 `WtelegramConfigStoreTests`, `CountryConfigProvisionerTests`,
-`SetupConfigEndpointTests`, `WebDashboardSetupHtmlTests`.
+`SetupConfigEndpointTests`, `WebDashboardSetupHtmlTests`,
+`CountryChannelListServiceReadsTests`, `CountryChannelValidatorAffinityScopeTests`,
+`CountryAttributeConsistencyTests`.
 
 ## Modos de autorização
 

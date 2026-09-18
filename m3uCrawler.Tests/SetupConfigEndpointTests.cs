@@ -128,6 +128,7 @@ public class SetupConfigEndpointTests : IAsyncLifetime
         bool hasAdmin = true,
         bool telegramAuthenticated = true,
         bool catalogOk = true,
+        bool countryDataOk = true,
         bool outputOk = true,
         int sources = 1,
         DispatcharrConfig? dispatcharr = null)
@@ -137,6 +138,7 @@ public class SetupConfigEndpointTests : IAsyncLifetime
             () => telegramAuthenticated,
             () => dispatcharr ?? DispatcharrConfig.Disabled(),
             _ => Task.FromResult(catalogOk),
+            _ => Task.FromResult(countryDataOk),
             () => outputOk,
             _ => Task.FromResult(sources));
 
@@ -410,7 +412,8 @@ public class SetupConfigEndpointTests : IAsyncLifetime
         Assert.False(root.GetProperty("setupComplete").GetBoolean());
         Assert.False(root.GetProperty("operationalReady").GetBoolean());
         Assert.Equal(0, root.GetProperty("sourcesCount").GetInt32());
-        Assert.Equal(7, root.GetProperty("items").GetArrayLength());
+        Assert.True(root.GetProperty("countryDataOk").GetBoolean());
+        Assert.Equal(8, root.GetProperty("items").GetArrayLength());
 
         var missing = root.GetProperty("missingRequired").EnumerateArray()
             .Select(e => e.GetString()).ToList();
@@ -436,7 +439,7 @@ public class SetupConfigEndpointTests : IAsyncLifetime
         Assert.True(root.GetProperty("operationalReady").GetBoolean());
         Assert.Equal(1, root.GetProperty("sourcesCount").GetInt32());
         Assert.Equal(0, root.GetProperty("missingRequired").GetArrayLength());
-        Assert.Equal(7, root.GetProperty("items").GetArrayLength());
+        Assert.Equal(8, root.GetProperty("items").GetArrayLength());
     }
 
     [Fact]

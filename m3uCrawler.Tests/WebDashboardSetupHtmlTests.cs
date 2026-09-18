@@ -25,6 +25,8 @@ public class WebDashboardSetupHtmlTests
         Assert.Contains("/api/configuration/readiness", html);
         Assert.Contains("/api/telegram/auth/start", html);
         Assert.Contains("/api/dispatcharr/test", html);
+        // Wave W3s — item de prontidão de dados de país no painel Setup.
+        Assert.Contains("countryData", html);
     }
 
     [Fact]

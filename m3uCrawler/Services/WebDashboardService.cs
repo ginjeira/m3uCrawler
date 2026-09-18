@@ -551,7 +551,10 @@ namespace m3uCrawler.Services
             {
                 var countryCode = context.Request.QueryString["country"] ?? "pt";
                 var countryList = new CountryChannelListService(Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries"));
-                var validator = new CountryChannelValidator(Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries"));
+                var affinityMembers = await LoadCountryAffinityMembersAsync();
+                var validator = new CountryChannelValidator(
+                    Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries"),
+                    affinityMembers);
                 var playlistPath = Path.Combine(outputDir, "playlist.m3u");
                 var playlistText = File.Exists(playlistPath) ? await File.ReadAllTextAsync(playlistPath, Encoding.UTF8) : string.Empty;
 
@@ -6910,13 +6913,15 @@ const rows = Object.entries(inv).map(([k, v]) => {
     function setupItemLabel(key) {
       var labels = {
         bootstrap: 'Bootstrap', admin: 'Administrador', telegram: 'Telegram',
-        dispatcharr: 'Dispatcharr', catalog: 'Catálogo', output: 'Output', sources: 'Fontes'
+        dispatcharr: 'Dispatcharr', catalog: 'Catálogo',
+        countryData: 'Dados de país', output: 'Output', sources: 'Fontes'
       };
       return labels[key] || key;
     }
 
     function setupConfigure(key) {
       if (key === 'catalog' || key === 'sources') { showView('catalog'); return; }
+      if (key === 'countryData') { showView('catalog'); return; }
       if (key === 'output') { showView('diagnostics'); return; }
       showView('setup');
       var ids = { telegram: 'setupTelegramApiId', dispatcharr: 'setupDispatcharrBaseUrl' };
@@ -8552,6 +8557,7 @@ fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
                     dispatcharrEnabled = snapshot.DispatcharrEnabled,
                     dispatcharrValid = snapshot.DispatcharrValid,
                     catalogOk = snapshot.CatalogOk,
+                    countryDataOk = snapshot.CountryDataOk,
                     outputOk = snapshot.OutputOk,
                     sourcesCount = snapshot.SourcesCount,
                     setupComplete = snapshot.SetupComplete,
@@ -8570,6 +8576,48 @@ fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
             }
 
             await WriteJsonAsync(context.Response, new { error = "not-found" }, HttpStatusCode.NotFound);
+        }
+
+        /// <summary>
+        /// Carrega os membros de afinidade <c>Kind=Country</c> do catálogo
+        /// como mapa país→aliases para injectar na construção de um
+        /// <see cref="CountryChannelValidator"/>. Leitura pura e best-effort:
+        /// sem catálogo (ou em erro) devolve um mapa vazio. Estes membros são
+        /// classificadores de país e não criam identidade de canal.
+        /// </summary>
+        private static async Task<IReadOnlyDictionary<string, IEnumerable<string>>> LoadCountryAffinityMembersAsync()
+        {
+            var resolver = _catalogResolver;
+            if (resolver is null)
+            {
+                return new Dictionary<string, IEnumerable<string>>(StringComparer.OrdinalIgnoreCase);
+            }
+
+            try
+            {
+                var groups = await resolver.ListAffinityGroupsAsync();
+                var result = new Dictionary<string, IEnumerable<string>>(StringComparer.OrdinalIgnoreCase);
+                foreach (var group in groups
+                    .Where(g => g.Kind == AffinityKind.Country && !string.IsNullOrWhiteSpace(g.CountryCode))
+                    .GroupBy(g => g.CountryCode!.ToLowerInvariant()))
+                {
+                    var members = group
+                        .SelectMany(g => g.Members)
+                        .Select(m => m.NormalizedMember)
+                        .Distinct(StringComparer.OrdinalIgnoreCase)
+                        .ToList();
+                    if (members.Count > 0)
+                    {
+                        result[group.Key] = members;
+                    }
+                }
+
+                return result;
+            }
+            catch
+            {
+                return new Dictionary<string, IEnumerable<string>>(StringComparer.OrdinalIgnoreCase);
+            }
         }
 
         private static object TelegramConfigDisplayToJson(TelegramConfigDisplay display)

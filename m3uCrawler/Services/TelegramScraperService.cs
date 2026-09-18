@@ -26,6 +26,14 @@ namespace m3uCrawler.Services
         // comportamento dos testes que instanciam directamente.
         private m3uCrawler.Services.Validation.ITraceSink _trace = m3uCrawler.Services.Validation.NullTraceSink.Instance;
 
+        // Membros de afinidade Kind=Country (classificação de país), por
+        // código ISO. Injectados na construção do CountryChannelValidator
+        // deste scraper. Escopo de instância: não existe estado estático
+        // partilhado entre processos/serviços. Country affinity NÃO cria
+        // identidade de canal.
+        private IReadOnlyDictionary<string, IEnumerable<string>> _countryAffinityMembers =
+            new Dictionary<string, IEnumerable<string>>(StringComparer.OrdinalIgnoreCase);
+
         public RunReport? LastRunReport { get; private set; }
 
         // PHASE-OBSERVABILITY (2026-09-15): associa um sink de tracing
@@ -35,6 +43,19 @@ namespace m3uCrawler.Services
         public void SetTrace(m3uCrawler.Services.Validation.ITraceSink trace)
         {
             _trace = trace ?? m3uCrawler.Services.Validation.NullTraceSink.Instance;
+        }
+
+        /// <summary>
+        /// Define os membros de afinidade <c>Kind=Country</c> usados pelo
+        /// <see cref="CountryChannelValidator"/> criado em cada run. Chamado
+        /// pela composição (Program.cs) após o catálogo estar disponível.
+        /// Passar <c>null</c> repõe o estado vazio.
+        /// </summary>
+        public void SetCountryAffinityMembers(
+            IReadOnlyDictionary<string, IEnumerable<string>>? members)
+        {
+            _countryAffinityMembers = members
+                ?? new Dictionary<string, IEnumerable<string>>(StringComparer.OrdinalIgnoreCase);
         }
 
         /// <summary>
@@ -231,7 +252,7 @@ namespace m3uCrawler.Services
 
             var countriesRoot = countriesDir
                 ?? Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries");
-            var validator = new CountryChannelValidator(countriesRoot);
+            var validator = new CountryChannelValidator(countriesRoot, _countryAffinityMembers);
             var parser = new M3uParserService();
             // 9A-PROD-WIRING: tester criado via factory. Quando existe
             // um stream_validation_policy.json no runtime-data, este

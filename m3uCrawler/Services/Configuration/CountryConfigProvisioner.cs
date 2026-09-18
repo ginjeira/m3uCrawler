@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Text.Json;
 
 namespace m3uCrawler.Services.Configuration;
 
@@ -82,6 +83,76 @@ public static class CountryConfigProvisioner
 
         ProvisionEmbeddedResources(countriesDirectory);
         ProvisionBuiltInBaselines(countriesDirectory);
+    }
+
+    /// <summary>
+    /// Indica se existem dados de país utilizáveis para
+    /// <paramref name="countryCode"/>: um ficheiro
+    /// <c>&lt;code&gt;.json</c> já provisionado com pelo menos um canal, ou a
+    /// baseline embutida (PT). É uma <b>leitura pura</b>: nunca cria nem
+    /// altera ficheiros. Usada pela prontidão operacional
+    /// (<c>countryDataOk</c>).
+    /// </summary>
+    public static bool IsCountryDataAvailable(string? countriesDirectory, string? countryCode)
+    {
+        var normalized = (countryCode ?? string.Empty).Trim().ToLowerInvariant();
+        if (normalized.Length == 0)
+            return false;
+
+        if (!string.IsNullOrWhiteSpace(countriesDirectory))
+        {
+            var path = Path.Combine(countriesDirectory, $"{normalized}{JsonSuffix}");
+            if (File.Exists(path) && FileHasChannels(path))
+                return true;
+        }
+
+        return HasBuiltInBaseline(normalized);
+    }
+
+    /// <summary>
+    /// <c>true</c> quando existe uma baseline embutida no assembly para o
+    /// país indicado (actualmente apenas PT).
+    /// </summary>
+    public static bool HasBuiltInBaseline(string? countryCode)
+        => string.Equals(
+            (countryCode ?? string.Empty).Trim(),
+            "pt",
+            StringComparison.OrdinalIgnoreCase);
+
+    private static bool FileHasChannels(string path)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(File.ReadAllText(path));
+            if (doc.RootElement.ValueKind != JsonValueKind.Object)
+                return false;
+
+            foreach (var property in doc.RootElement.EnumerateObject())
+            {
+                if (!string.Equals(property.Name, "channels", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                if (property.Value.ValueKind != JsonValueKind.Array)
+                    return false;
+
+                foreach (var item in property.Value.EnumerateArray())
+                {
+                    if (item.ValueKind == JsonValueKind.String
+                        && !string.IsNullOrWhiteSpace(item.GetString()))
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+        }
+        catch
+        {
+            // Ficheiro ilegível/inválido não conta como dado disponível.
+        }
+
+        return false;
     }
 
     private static void ProvisionEmbeddedResources(string countriesDirectory)

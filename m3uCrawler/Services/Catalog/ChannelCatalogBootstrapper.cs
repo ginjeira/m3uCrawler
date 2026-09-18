@@ -350,6 +350,13 @@ public sealed class ChannelCatalogBootstrapper
 
             if (!existingChannelKeySet.Contains(ch.Key))
             {
+                // TODO/ADR (Wave W3s): canais do seed programático ficam com
+                // Country = null (o record CanonicalChannelSeed não tem
+                // país). Não se introduz migration para os preencher: a
+                // propriedade/ownership dos dados de país é um ADR em aberto
+                // (docs/Reestructure/24-DECISIONS.md, "country data
+                // ownership"). Country é apenas classificação, não
+                // identidade. Fixado por CountryAttributeConsistencyTests.
                 var entity = new CanonicalChannelEntity
                 {
                     Key = ch.Key,
