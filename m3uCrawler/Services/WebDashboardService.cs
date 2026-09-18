@@ -4,9 +4,11 @@ using m3uCrawler.Services.Auth;
 using m3uCrawler.Services.Automation;
 using m3uCrawler.Services.Catalog;
 using m3uCrawler.Services.Configuration;
+using m3uCrawler.Services.Dispatcharr;
 using m3uCrawler.Services.LiveRun;
 using m3uCrawler.Services.SourceSelection;
 using m3uCrawler.Services.Sync;
+using m3uCrawler.Services.Telegram;
 using m3uCrawler.Services.Validation;
 using System.IO;
 using System.Net;
@@ -26,6 +28,14 @@ namespace m3uCrawler.Services
         private static BootstrapService? _bootstrapService;
         private static LiveRunHost? _liveRunHost;
         private static bool _webAllowTrigger;
+
+        // Wave 5 (PHASE 9C) — Serviços de setup/configuração expostos pela
+        // API. Todos opcionais: quando ausentes, os respectivos endpoints
+        // respondem 503 <serviço>-unavailable (nunca fail-open).
+        private static TelegramAuthService? _telegramAuthService;
+        private static DispatcharrConfigurationService? _dispatcharrConfigurationService;
+        private static DispatcharrConnectionTester? _dispatcharrConnectionTester;
+        private static OperationalReadinessService? _operationalReadinessService;
 
         /// <summary>
         /// PHASE 9C.2 (S1-E) — Indica que o Dashboard corre num contexto
@@ -103,6 +113,24 @@ namespace m3uCrawler.Services
             _webAllowTrigger = allow;
         }
 
+        /// <summary>
+        /// Wave 5 (PHASE 9C) — Regista os serviços de setup/configuração
+        /// (Telegram, Dispatcharr e prontidão operacional). Todos os
+        /// parâmetros são opcionais; passar <c>null</c> repõe o estado
+        /// "não ligado" (os endpoints respondem 503).
+        /// </summary>
+        public static void SetSetupServices(
+            TelegramAuthService? telegramAuth,
+            DispatcharrConfigurationService? dispatcharrConfig,
+            DispatcharrConnectionTester? dispatcharrTester,
+            OperationalReadinessService? readiness)
+        {
+            _telegramAuthService = telegramAuth;
+            _dispatcharrConfigurationService = dispatcharrConfig;
+            _dispatcharrConnectionTester = dispatcharrTester;
+            _operationalReadinessService = readiness;
+        }
+
         public static async Task RunDashboardAsync(string outputDir, int port, ImportHistoryService historyService, string? webToken = null, CancellationToken cancellationToken = default)
         {
             var listener = new HttpListener();
@@ -176,11 +204,55 @@ namespace m3uCrawler.Services
             ConfigurationLifecycleService? lifecycle,
             AuthService? authService,
             BootstrapService? bootstrapService,
-            string? webToken = null)
+            string? webToken = null,
+            TelegramAuthService? telegramAuth = null,
+            DispatcharrConfigurationService? dispatcharrConfig = null,
+            DispatcharrConnectionTester? dispatcharrTester = null,
+            OperationalReadinessService? readiness = null)
         {
             using var scope = new StaticResolverScope(resolver);
             using var authScope = new StaticAuthScope(lifecycle, authService, bootstrapService);
+            using var setupScope = new StaticSetupScope(
+                telegramAuth, dispatcharrConfig, dispatcharrTester, readiness);
             await HandleRequestAsync(context, outputDir, historyService, webToken);
+        }
+
+        /// <summary>
+        /// Wave 5 (PHASE 9C) — Scope testável para os serviços de
+        /// setup/configuração. Restaura o estado anterior em
+        /// <see cref="Dispose"/>, isolando testes paralelos.
+        /// </summary>
+        public sealed class StaticSetupScope : IDisposable
+        {
+            private readonly TelegramAuthService? _previousTelegram;
+            private readonly DispatcharrConfigurationService? _previousDispatcharrConfig;
+            private readonly DispatcharrConnectionTester? _previousDispatcharrTester;
+            private readonly OperationalReadinessService? _previousReadiness;
+
+            public StaticSetupScope(
+                TelegramAuthService? telegramAuth,
+                DispatcharrConfigurationService? dispatcharrConfig,
+                DispatcharrConnectionTester? dispatcharrTester,
+                OperationalReadinessService? readiness)
+            {
+                _previousTelegram = _telegramAuthService;
+                _previousDispatcharrConfig = _dispatcharrConfigurationService;
+                _previousDispatcharrTester = _dispatcharrConnectionTester;
+                _previousReadiness = _operationalReadinessService;
+
+                _telegramAuthService = telegramAuth;
+                _dispatcharrConfigurationService = dispatcharrConfig;
+                _dispatcharrConnectionTester = dispatcharrTester;
+                _operationalReadinessService = readiness;
+            }
+
+            public void Dispose()
+            {
+                _telegramAuthService = _previousTelegram;
+                _dispatcharrConfigurationService = _previousDispatcharrConfig;
+                _dispatcharrConnectionTester = _previousDispatcharrTester;
+                _operationalReadinessService = _previousReadiness;
+            }
         }
 
         private sealed class StaticAuthScope : IDisposable
@@ -399,6 +471,16 @@ namespace m3uCrawler.Services
             if (requestPath.Equals("/api/configuration/lifecycle", StringComparison.OrdinalIgnoreCase))
             {
                 await WriteJsonAsync(context.Response, await BuildLifecyclePayloadAsync(_configurationLifecycle));
+                return;
+            }
+
+            // Wave 5 (PHASE 9C) — API de setup: configuração Telegram,
+            // login interactivo, configuração/teste Dispatcharr e
+            // prontidão operacional. Todas atrás do gate único acima
+            // (sessão + CSRF para métodos mutantes). Método errado → 405.
+            if (IsSetupPath(requestPath))
+            {
+                await HandleSetupEndpointAsync(context, requestPath);
                 return;
             }
 
@@ -7518,6 +7600,344 @@ fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
             var ab = Encoding.UTF8.GetBytes(a);
             var bb = Encoding.UTF8.GetBytes(b);
             return CryptographicOperations.FixedTimeEquals(ab, bb);
+        }
+
+        // ================= Wave 5 (PHASE 9C) — Setup endpoints =================
+
+        private sealed class TelegramConfigWritePayload
+        {
+            public string? ApiId { get; set; }
+            public string? ApiHash { get; set; }
+            public string? PhoneNumber { get; set; }
+            public string? SessionPath { get; set; }
+        }
+
+        private sealed class TelegramStartPayload
+        {
+            public string? ApiId { get; set; }
+            public string? ApiHash { get; set; }
+            public string? PhoneNumber { get; set; }
+        }
+
+        private sealed class TelegramCodePayload
+        {
+            public string? Code { get; set; }
+        }
+
+        private sealed class TelegramPasswordPayload
+        {
+            public string? Password { get; set; }
+        }
+
+        private sealed class DispatcharrConfigWritePayload
+        {
+            public bool Enabled { get; set; }
+            public string? BaseUrl { get; set; }
+            public bool DryRun { get; set; }
+            public string? ApiKey { get; set; }
+            public string? Username { get; set; }
+            public string? Password { get; set; }
+        }
+
+        private static bool IsSetupPath(string requestPath)
+        {
+            return requestPath.Equals("/api/telegram/config", StringComparison.OrdinalIgnoreCase)
+                || requestPath.Equals("/api/telegram/auth/start", StringComparison.OrdinalIgnoreCase)
+                || requestPath.Equals("/api/telegram/auth/code", StringComparison.OrdinalIgnoreCase)
+                || requestPath.Equals("/api/telegram/auth/password", StringComparison.OrdinalIgnoreCase)
+                || requestPath.Equals("/api/telegram/auth/status", StringComparison.OrdinalIgnoreCase)
+                || requestPath.Equals("/api/dispatcharr/config", StringComparison.OrdinalIgnoreCase)
+                || requestPath.Equals("/api/dispatcharr/test", StringComparison.OrdinalIgnoreCase)
+                || requestPath.Equals("/api/configuration/readiness", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static async Task HandleSetupEndpointAsync(
+            HttpListenerContext context,
+            string requestPath)
+        {
+            var method = context.Request.HttpMethod;
+
+            if (requestPath.Equals("/api/telegram/config", StringComparison.OrdinalIgnoreCase))
+            {
+                if (method.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (_telegramAuthService == null)
+                    {
+                        await WriteServiceUnavailableAsync(context.Response, "telegram-unavailable");
+                        return;
+                    }
+
+                    var display = _telegramAuthService.GetConfigForDisplay();
+                    await WriteJsonAsync(context.Response, new
+                    {
+                        apiId = display.ApiId,
+                        phoneNumber = display.PhoneNumber,
+                        hasApiHash = display.HasApiHash,
+                        sessionPath = display.SessionPath,
+                    });
+                    return;
+                }
+
+                if (method.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (_telegramAuthService == null)
+                    {
+                        await WriteServiceUnavailableAsync(context.Response, "telegram-unavailable");
+                        return;
+                    }
+
+                    var payload = await TryReadJsonAsync<TelegramConfigWritePayload>(context.Request);
+                    if (payload == null)
+                    {
+                        await WriteJsonAsync(context.Response, new { error = "invalid-payload" }, HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var display = _telegramAuthService.SaveConfig(
+                        payload.ApiId, payload.ApiHash, payload.PhoneNumber, payload.SessionPath);
+                    await WriteJsonAsync(context.Response, TelegramConfigDisplayToJson(display));
+                    return;
+                }
+
+                await WriteMethodNotAllowedAsync(context.Response);
+                return;
+            }
+
+            if (requestPath.StartsWith("/api/telegram/auth/", StringComparison.OrdinalIgnoreCase))
+            {
+                if (_telegramAuthService == null)
+                {
+                    await WriteServiceUnavailableAsync(context.Response, "telegram-unavailable");
+                    return;
+                }
+
+                if (requestPath.Equals("/api/telegram/auth/status", StringComparison.OrdinalIgnoreCase)
+                    && method.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    var status = await _telegramAuthService.GetStatusAsync();
+                    await WriteJsonAsync(context.Response, TelegramAuthStatusToJson(status));
+                    return;
+                }
+
+                if (requestPath.Equals("/api/telegram/auth/start", StringComparison.OrdinalIgnoreCase)
+                    && method.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Corpo opcional: os campos fornecidos são persistidos e
+                    // os em falta são preenchidos a partir da configuração
+                    // guardada (nunca exposta ao chamador).
+                    var payload = await TryReadJsonAsync<TelegramStartPayload>(context.Request);
+                    if (payload != null)
+                    {
+                        _telegramAuthService.SaveConfig(
+                            payload.ApiId, payload.ApiHash, payload.PhoneNumber, sessionPath: null);
+                    }
+
+                    var status = await _telegramAuthService.StartFromSavedAsync();
+                    await WriteJsonAsync(context.Response, TelegramAuthStatusToJson(status));
+                    return;
+                }
+
+                if (requestPath.Equals("/api/telegram/auth/code", StringComparison.OrdinalIgnoreCase)
+                    && method.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    var payload = await TryReadJsonAsync<TelegramCodePayload>(context.Request);
+                    if (payload?.Code is null)
+                    {
+                        await WriteJsonAsync(context.Response, new { error = "invalid-payload" }, HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var status = await _telegramAuthService.SubmitCodeAsync(payload.Code);
+                    await WriteJsonAsync(context.Response, TelegramAuthStatusToJson(status));
+                    return;
+                }
+
+                if (requestPath.Equals("/api/telegram/auth/password", StringComparison.OrdinalIgnoreCase)
+                    && method.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    var payload = await TryReadJsonAsync<TelegramPasswordPayload>(context.Request);
+                    if (payload?.Password is null)
+                    {
+                        await WriteJsonAsync(context.Response, new { error = "invalid-payload" }, HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var status = await _telegramAuthService.SubmitPasswordAsync(payload.Password);
+                    await WriteJsonAsync(context.Response, TelegramAuthStatusToJson(status));
+                    return;
+                }
+
+                await WriteMethodNotAllowedAsync(context.Response);
+                return;
+            }
+
+            if (requestPath.Equals("/api/dispatcharr/config", StringComparison.OrdinalIgnoreCase))
+            {
+                if (_dispatcharrConfigurationService == null)
+                {
+                    await WriteServiceUnavailableAsync(context.Response, "dispatcharr-unavailable");
+                    return;
+                }
+
+                if (method.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteJsonAsync(
+                        context.Response,
+                        DispatcharrConfigDisplayToJson(_dispatcharrConfigurationService.GetForDisplay()));
+                    return;
+                }
+
+                if (method.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    var payload = await TryReadJsonAsync<DispatcharrConfigWritePayload>(context.Request);
+                    if (payload == null)
+                    {
+                        await WriteJsonAsync(context.Response, new { error = "invalid-payload" }, HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    _dispatcharrConfigurationService.Save(new DispatcharrConfigurationWrite(
+                        payload.Enabled,
+                        payload.BaseUrl ?? string.Empty,
+                        payload.DryRun,
+                        payload.ApiKey,
+                        payload.Username,
+                        payload.Password));
+
+                    await WriteJsonAsync(
+                        context.Response,
+                        DispatcharrConfigDisplayToJson(_dispatcharrConfigurationService.GetForDisplay()));
+                    return;
+                }
+
+                await WriteMethodNotAllowedAsync(context.Response);
+                return;
+            }
+
+            if (requestPath.Equals("/api/dispatcharr/test", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!method.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteMethodNotAllowedAsync(context.Response);
+                    return;
+                }
+
+                if (_dispatcharrConnectionTester == null || _dispatcharrConfigurationService == null)
+                {
+                    await WriteServiceUnavailableAsync(context.Response, "dispatcharr-unavailable");
+                    return;
+                }
+
+                var result = await _dispatcharrConnectionTester.TestAsync(
+                    _dispatcharrConfigurationService.Get());
+                await WriteJsonAsync(context.Response, new
+                {
+                    status = result.Status.ToString(),
+                    version = result.Version,
+                    httpStatusCode = result.HttpStatusCode,
+                    detail = result.SanitizedDetail,
+                });
+                return;
+            }
+
+            if (requestPath.Equals("/api/configuration/readiness", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!method.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteMethodNotAllowedAsync(context.Response);
+                    return;
+                }
+
+                if (_operationalReadinessService == null)
+                {
+                    await WriteServiceUnavailableAsync(context.Response, "readiness-unavailable");
+                    return;
+                }
+
+                var snapshot = await _operationalReadinessService.EvaluateAsync();
+                await WriteJsonAsync(context.Response, new
+                {
+                    bootstrapReady = snapshot.BootstrapReady,
+                    hasAdmin = snapshot.HasAdmin,
+                    telegramAuthenticated = snapshot.TelegramAuthenticated,
+                    dispatcharrEnabled = snapshot.DispatcharrEnabled,
+                    dispatcharrValid = snapshot.DispatcharrValid,
+                    catalogOk = snapshot.CatalogOk,
+                    outputOk = snapshot.OutputOk,
+                    sourcesCount = snapshot.SourcesCount,
+                    setupComplete = snapshot.SetupComplete,
+                    operationalReady = snapshot.OperationalReady,
+                    adoptedFromLegacy = snapshot.AdoptedFromLegacy,
+                    items = snapshot.Items.Select(i => new
+                    {
+                        key = i.Key,
+                        required = i.Required,
+                        satisfied = i.Satisfied,
+                        detail = i.Detail,
+                    }),
+                    missingRequired = snapshot.MissingRequired,
+                });
+                return;
+            }
+
+            await WriteJsonAsync(context.Response, new { error = "not-found" }, HttpStatusCode.NotFound);
+        }
+
+        private static object TelegramConfigDisplayToJson(TelegramConfigDisplay display)
+            => new
+            {
+                apiId = display.ApiId,
+                phoneNumber = display.PhoneNumber,
+                hasApiHash = display.HasApiHash,
+                sessionPath = display.SessionPath,
+            };
+
+        private static object TelegramAuthStatusToJson(TelegramAuthStatus status)
+            => new
+            {
+                state = status.State.ToString(),
+                userName = status.UserName,
+                detail = status.Detail,
+                configured = status.Configured,
+            };
+
+        private static object DispatcharrConfigDisplayToJson(DispatcharrConfigDisplay display)
+            => new
+            {
+                enabled = display.Enabled,
+                baseUrl = display.BaseUrl,
+                dryRun = display.DryRun,
+                hasApiKey = display.HasApiKey,
+                hasUsername = display.HasUsername,
+                matchThreshold = display.MatchThreshold,
+                targetGroupName = display.TargetGroupName,
+            };
+
+        private static async Task<T?> TryReadJsonAsync<T>(HttpListenerRequest request) where T : class
+        {
+            try
+            {
+                var body = await ReadJsonBodyAsync(request);
+                return string.IsNullOrWhiteSpace(body)
+                    ? null
+                    : JsonSerializer.Deserialize<T>(body, JsonOptions);
+            }
+            catch (JsonException)
+            {
+                return null;
+            }
+        }
+
+        private static Task WriteServiceUnavailableAsync(HttpListenerResponse response, string error)
+            => WriteJsonAsync(response, new { error }, HttpStatusCode.ServiceUnavailable);
+
+        private static async Task WriteMethodNotAllowedAsync(HttpListenerResponse response)
+        {
+            response.Headers["Allow"] = "GET, POST";
+            await WriteJsonAsync(
+                response,
+                new { error = "method-not-allowed" },
+                HttpStatusCode.MethodNotAllowed);
         }
 
         private static async Task WriteUnauthorizedAsync(HttpListenerResponse response)

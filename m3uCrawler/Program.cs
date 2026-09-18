@@ -4,6 +4,7 @@ using m3uCrawler.Services.Auth;
 using m3uCrawler.Services.Automation;
 using m3uCrawler.Services.Catalog;
 using m3uCrawler.Services.Configuration;
+using m3uCrawler.Services.Dispatcharr;
 using m3uCrawler.Services.LiveRun;
 using m3uCrawler.Services.Matching;
 using m3uCrawler.Services.SourceOrdering;
@@ -123,6 +124,28 @@ namespace m3uCrawler
                     var wtelegramStore = new WtelegramConfigStore();
                     var telegramAuth = new TelegramAuthService(wtelegramStore);
                     var dispatcharrService = new DispatcharrConfigurationService(wtelegramStore);
+
+                    // Wave 5 (PHASE 9C) — Hidratação da sessão Telegram em
+                    // background: um session.dat persistido válido deve marcar
+                    // o processo como autenticado logo após restart, sem
+                    // bloquear o arranque do dashboard nem exigir rede. Falha
+                    // e timeout são não-fatais (a prontidão fica false).
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            var status = await telegramAuth
+                                .GetStatusAsync(CancellationToken.None)
+                                .WaitAsync(TimeSpan.FromSeconds(10));
+                            Console.WriteLine(
+                                $"🔐 Telegram auth: state={status.State} configured={status.Configured}");
+                        }
+                        catch (Exception hydrateEx)
+                        {
+                            Console.WriteLine(
+                                $"⚠️ Hidratação da sessão Telegram falhou: {hydrateEx.GetType().Name}");
+                        }
+                    });
                     var operationalReadiness = new OperationalReadinessService(
                         lifecycle,
                         adminUsers.HasActiveAdminAsync,
@@ -131,6 +154,16 @@ namespace m3uCrawler
                         ct => HasCanonicalChannelsAsync(webCatalogResolver, ct),
                         () => IsOutputWritable(dashboardOutputDir),
                         ct => CountChannelSourcesAsync(webCatalogResolver, ct));
+
+                    // Wave 5 (PHASE 9C) — Expor os serviços de setup/config
+                    // à API do dashboard (Telegram config/login, Dispatcharr
+                    // config/teste, prontidão). Sem estes serviços os
+                    // endpoints respondem 503 <serviço>-unavailable.
+                    WebDashboardService.SetSetupServices(
+                        telegramAuth,
+                        dispatcharrService,
+                        new DispatcharrConnectionTester(),
+                        operationalReadiness);
 
                     try
                     {

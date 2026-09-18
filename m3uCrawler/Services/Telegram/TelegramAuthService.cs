@@ -169,6 +169,59 @@ public sealed class TelegramAuthService
     }
 
     /// <summary>
+    /// Persiste (upsert) apenas os valores fornecidos, preservando todas as
+    /// restantes chaves através do <see cref="IWtelegramConfigStore"/>.
+    /// Valores <c>null</c> mantêm o valor existente; string vazia limpa o
+    /// campo. <paramref name="sessionPath"/> nulo/vazio resolve para o
+    /// caminho já persistido ou <see cref="DefaultSessionPath"/>.
+    ///
+    /// <para>
+    /// Nunca devolve nem regista segredos: a projecção devolvida é a de
+    /// <see cref="GetConfigForDisplay"/>. Não arranca login nem toca na
+    /// sessão persistida.
+    /// </para>
+    /// </summary>
+    public TelegramConfigDisplay SaveConfig(
+        string? apiId,
+        string? apiHash,
+        string? phoneNumber,
+        string? sessionPath = null)
+    {
+        var cfg = _store.Read();
+
+        var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (apiId is not null)
+            values["api_id"] = apiId.Trim();
+        if (apiHash is not null)
+            values["api_hash"] = apiHash.Trim();
+        if (phoneNumber is not null)
+            values["phone_number"] = phoneNumber.Trim();
+
+        values["session_pathname"] = string.IsNullOrWhiteSpace(sessionPath)
+            ? ResolveSessionPath(cfg)
+            : sessionPath.Trim();
+
+        _store.Upsert(values);
+        InvalidateResumeCache();
+        return GetConfigForDisplay();
+    }
+
+    /// <summary>
+    /// Arranca o login com as credenciais persistidas. Lê os segredos
+    /// internamente e delega em <see cref="StartAsync"/>, pelo que o
+    /// chamador nunca precisa (nem recebe) o api_hash.
+    /// </summary>
+    public Task<TelegramAuthStatus> StartFromSavedAsync(CancellationToken ct = default)
+    {
+        var cfg = _store.Read();
+        return StartAsync(
+            ReadValue(cfg, "api_id") ?? string.Empty,
+            ReadValue(cfg, "api_hash") ?? string.Empty,
+            ReadValue(cfg, "phone_number") ?? string.Empty,
+            ct);
+    }
+
+    /// <summary>
     /// Descarta o estado em memória (backend, login em curso, cache de
     /// resume). Não altera o ficheiro de configuração nem a sessão.
     /// </summary>
