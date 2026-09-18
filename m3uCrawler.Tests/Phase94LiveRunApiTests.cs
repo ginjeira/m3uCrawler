@@ -406,6 +406,38 @@ public class Phase94LiveRunApiTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Post_start_overrides_reach_the_pipeline_request()
+    {
+        // Wave C — overrides explícitos do dashboard devem chegar ao
+        // request entregue à pipeline (o executor resolve-os sobre a
+        // configuração persistida).
+        LiveRunRequest? captured = null;
+        var pipeline = new Phase94RunApiHarness.DelegatePipeline(r => captured = r);
+        var host = await BuildHostAsync(executor: _ => pipeline);
+        var harness = StartHarness(host, webAllowTrigger: true, standalone: true);
+
+        var response = await harness.Client.PostAsync(
+            "/api/run/start",
+            JsonBody(JsonSerializer.Serialize(new
+            {
+                keyword = "override-term",
+                historyHours = 48,
+                maxStreams = 123,
+            })));
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+
+        for (var i = 0; i < 100 && captured is null; i++)
+        {
+            await Task.Delay(25);
+        }
+
+        Assert.NotNull(captured);
+        Assert.Equal("override-term", captured!.Keyword);
+        Assert.Equal(48, captured.HistoryHours);
+        Assert.Equal(123, captured.MaxStreams);
+    }
+
+    [Fact]
     public async Task Status_during_run_reports_running_then_completed()
     {
         var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);

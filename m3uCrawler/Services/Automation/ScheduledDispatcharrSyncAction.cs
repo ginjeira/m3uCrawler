@@ -61,6 +61,7 @@ public sealed class ScheduledDispatcharrSyncAction : IScheduledAction
     internal const string FunctionalPlaylistFileName = "playlist.m3u";
 
     private readonly DispatcharrConfig _config;
+    private readonly Func<DispatcharrConfig>? _configLoader;
     private readonly string _outputDir;
     private readonly CatalogResolver? _catalog;
     private readonly HttpMessageHandler? _transport;
@@ -83,25 +84,34 @@ public sealed class ScheduledDispatcharrSyncAction : IScheduledAction
     /// <summary>
     /// Seam interno de teste: permite injectar o transporte HTTP para
     /// exercitar o pipeline real (matcher + ownership + apply) sem
-    /// tocar a rede. Não exposto em DI.
+    /// tocar a rede. Não exposto em DI. <paramref name="configLoader"/>
+    /// permite injectar a releitura de config sem tocar em
+    /// <c>wtelegram.config</c>.
     /// </summary>
     internal ScheduledDispatcharrSyncAction(
         DispatcharrConfig config,
         ScheduledActionOptions options,
         CatalogResolver? catalog,
-        HttpMessageHandler? transport)
+        HttpMessageHandler? transport,
+        Func<DispatcharrConfig>? configLoader = null)
     {
         _config = config;
         _outputDir = options.OutputDir;
         _catalog = catalog;
         _transport = transport;
+        _configLoader = configLoader;
     }
 
     public string Name => ActionName;
 
     public async Task<string> ExecuteAsync(CancellationToken cancellationToken)
     {
-        if (!_config.Enabled)
+        // Wave C — Releitura da config por execução (paridade com o
+        // caminho CLI, que faz DispatcharrConfigLoader.Load() em cada
+        // sync). Sem loader explícito mantém-se o snapshot injectado,
+        // usado por testes que constroem a acção directamente.
+        var config = _configLoader?.Invoke() ?? _config;
+        if (!config.Enabled)
         {
             return "dispatcharr-disabled";
         }
@@ -112,17 +122,17 @@ public sealed class ScheduledDispatcharrSyncAction : IScheduledAction
             return "no-playlist";
         }
 
-        var aliases = AliasResolver.FromFile(_config.AliasFile);
-        var ordering = new StreamOrderingPolicy(_config.ProviderPriority);
+        var aliases = AliasResolver.FromFile(config.AliasFile);
+        var ordering = new StreamOrderingPolicy(config.ProviderPriority);
         var matcher = new ChannelMatcher(aliases, null, _catalog);
 
         DispatcharrSyncService sync;
         if (_transport != null)
         {
             var built = DispatcharrClientFactory.BuildWithTransport(
-                _config.BaseUrl, _config.ApiKey, _config.Username, _config.Password, _transport);
+                config.BaseUrl, config.ApiKey, config.Username, config.Password, _transport);
             sync = new DispatcharrSyncService(
-                _config, _outputDir,
+                config, _outputDir,
                 aliases: aliases,
                 ordering: ordering,
                 matcher: matcher,
@@ -137,7 +147,7 @@ public sealed class ScheduledDispatcharrSyncAction : IScheduledAction
         else
         {
             sync = new DispatcharrSyncService(
-                _config, _outputDir,
+                config, _outputDir,
                 aliases: aliases,
                 ordering: ordering,
                 matcher: matcher,

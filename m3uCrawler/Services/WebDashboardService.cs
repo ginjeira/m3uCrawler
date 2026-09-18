@@ -29,6 +29,11 @@ namespace m3uCrawler.Services
         private static LiveRunHost? _liveRunHost;
         private static bool _webAllowTrigger;
 
+        // Wave C — Override do directório de runtime-data para testes
+        // isolados (sem tocar no runtime-data real). Produção usa sempre
+        // <c><cwd>/runtime-data</c>. Restaurado por StaticRuntimeDataDirScope.
+        private static string? _runtimeDataDirOverride;
+
         // Wave 5 (PHASE 9C) — Serviços de setup/configuração expostos pela
         // API. Todos opcionais: quando ausentes, os respectivos endpoints
         // respondem 503 <serviço>-unavailable (nunca fail-open).
@@ -114,7 +119,7 @@ namespace m3uCrawler.Services
         }
 
         /// <summary>
-        /// Wave 5 (PHASE 9C) — Regista os serviços de setup/configuração
+        /// Wave C — Regista os serviços de setup/configuração
         /// (Telegram, Dispatcharr e prontidão operacional). Todos os
         /// parâmetros são opcionais; passar <c>null</c> repõe o estado
         /// "não ligado" (os endpoints respondem 503).
@@ -130,6 +135,17 @@ namespace m3uCrawler.Services
             _dispatcharrConnectionTester = dispatcharrTester;
             _operationalReadinessService = readiness;
         }
+
+        /// <summary>
+        /// Wave C — Directório de runtime-data usado pelos endpoints de
+        /// configuração operacional. Produção: <c><cwd>/runtime-data</c>.
+        /// Testes podem sobrepor via <see cref="StaticRuntimeDataDirScope"/>
+        /// para isolar o ficheiro <c>app_settings.json</c>.
+        /// </summary>
+        private static string ResolveRuntimeDataDir() =>
+            string.IsNullOrWhiteSpace(_runtimeDataDirOverride)
+                ? Path.Combine(Directory.GetCurrentDirectory(), "runtime-data")
+                : _runtimeDataDirOverride!;
 
         public static async Task RunDashboardAsync(string outputDir, int port, ImportHistoryService historyService, string? webToken = null, CancellationToken cancellationToken = default)
         {
@@ -305,6 +321,27 @@ namespace m3uCrawler.Services
             {
                 _liveRunHost = _previousHost;
                 _webAllowTrigger = _previousAllow;
+            }
+        }
+
+        /// <summary>
+        /// Wave C — Scope testável para o directório de runtime-data,
+        /// usado pelos endpoints de settings de discovery. Restaura o
+        /// valor anterior em <see cref="Dispose"/>.
+        /// </summary>
+        public sealed class StaticRuntimeDataDirScope : IDisposable
+        {
+            private readonly string? _previous;
+
+            public StaticRuntimeDataDirScope(string? runtimeDataDir)
+            {
+                _previous = _runtimeDataDirOverride;
+                _runtimeDataDirOverride = runtimeDataDir;
+            }
+
+            public void Dispose()
+            {
+                _runtimeDataDirOverride = _previous;
             }
         }
 
@@ -671,6 +708,16 @@ namespace m3uCrawler.Services
                     duplicatesCollapsed = raw.Count - dedup.Count,
                     items = dedup,
                 });
+                return;
+            }
+
+            // Wave C — Configuração operacional de discovery (fonte de verdade
+            // única). GET devolve os valores persistidos; POST valida e
+            // persiste no mesmo app_settings.json (o gate 9C.2 exige sessão +
+            // CSRF para este método mutante).
+            if (requestPath.Equals("/api/discovery/settings", StringComparison.OrdinalIgnoreCase))
+            {
+                await HandleDiscoverySettingsEndpointAsync(context);
                 return;
             }
 
@@ -3094,6 +3141,23 @@ namespace m3uCrawler.Services
     {
         [JsonPropertyName("affinityVariantDelimiter")]
         public string? AffinityVariantDelimiter { get; set; }
+    }
+
+    /// <summary>
+    /// Wave C — Payload de <c>POST /api/discovery/settings</c>. Campos
+    /// opcionais: apenas os fornecidos são aplicados sobre os valores
+    /// persistidos (patch semantics).
+    /// </summary>
+    private sealed class DiscoverySettingsPayload
+    {
+        [JsonPropertyName("historyHours")]
+        public int? HistoryHours { get; set; }
+
+        [JsonPropertyName("maxStreams")]
+        public int? MaxStreams { get; set; }
+
+        [JsonPropertyName("keyword")]
+        public string? Keyword { get; set; }
     }
 
     /// <summary>
@@ -8035,6 +8099,75 @@ const rows = Object.entries(inv).map(([k, v]) => {
                     LiveRunApiMappings.ToAlreadyRunningPayload(current),
                     HttpStatusCode.Conflict);
             }
+        }
+
+        /// <summary>
+        /// Wave C — <c>GET/POST /api/discovery/settings</c>. Fonte de
+        /// verdade única dos parâmetros de discovery, persistida no mesmo
+        /// <c>runtime-data/app_settings.json</c> (secção <c>discovery</c>).
+        /// O POST é mutante e por isso já passou pelo gate 9C.2
+        /// (sessão humana + CSRF) ou por credencial de máquina.
+        /// </summary>
+        private static async Task HandleDiscoverySettingsEndpointAsync(HttpListenerContext context)
+        {
+            var store = new AppSettingsStore(ResolveRuntimeDataDir());
+
+            if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+            {
+                await WriteJsonAsync(context.Response, store.Load().Discovery);
+                return;
+            }
+
+            if (context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+            {
+                DiscoverySettingsPayload? payload;
+                try
+                {
+                    var body = await ReadJsonBodyAsync(context.Request);
+                    payload = string.IsNullOrWhiteSpace(body)
+                        ? new DiscoverySettingsPayload()
+                        : JsonSerializer.Deserialize<DiscoverySettingsPayload>(body, JsonOptions);
+                }
+                catch
+                {
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = "invalid payload" },
+                        HttpStatusCode.BadRequest);
+                    return;
+                }
+
+                if (payload is null)
+                {
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = "invalid payload" },
+                        HttpStatusCode.BadRequest);
+                    return;
+                }
+
+                var current = store.Load();
+                var candidate = current.Discovery.Clone();
+                if (payload.HistoryHours.HasValue) candidate.HistoryHours = payload.HistoryHours.Value;
+                if (payload.MaxStreams.HasValue) candidate.MaxStreams = payload.MaxStreams.Value;
+                if (payload.Keyword is not null) candidate.Keyword = payload.Keyword;
+
+                if (!candidate.TryValidate(out var error))
+                {
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error },
+                        HttpStatusCode.BadRequest);
+                    return;
+                }
+
+                current.Discovery = candidate;
+                var saved = store.Save(current);
+                await WriteJsonAsync(context.Response, saved.Discovery);
+                return;
+            }
+
+            await WriteMethodNotAllowedAsync(context.Response);
         }
 
         private static async Task<CredentialsPayload?> TryReadCredentialsAsync(HttpListenerRequest request)

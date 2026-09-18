@@ -21,8 +21,17 @@ public sealed class AppSettings
     public string AffinityVariantDelimiter { get; set; } = ",";
 
     /// <summary>
+    /// Wave C — Parâmetros operacionais de discovery. Persistidos no
+    /// mesmo ficheiro (<c>runtime-data/app_settings.json</c>), sob a
+    /// chave <c>discovery</c>. Nunca existe um segundo ficheiro de
+    /// settings.
+    /// </summary>
+    public DiscoverySettings Discovery { get; set; } = new();
+
+    /// <summary>
     /// Normaliza o delimiter: trim, vazio/inválido → default. Aceita
-    /// apenas 1..3 caracteres sem quebras de linha.
+    /// apenas 1..3 caracteres sem quebras de linha. Normaliza também
+    /// os parâmetros de discovery.
     /// </summary>
     public void Sanitize()
     {
@@ -36,6 +45,12 @@ public sealed class AppSettings
             value = ",";
         }
         AffinityVariantDelimiter = value;
+
+        if (Discovery is null)
+        {
+            Discovery = new DiscoverySettings();
+        }
+        Discovery.Sanitize();
     }
 }
 

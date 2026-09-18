@@ -3,6 +3,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using m3uCrawler.Services;
 using m3uCrawler.Services.Catalog;
+using m3uCrawler.Services.Validation;
 
 namespace m3uCrawler.Services.Automation;
 
@@ -30,23 +31,35 @@ public sealed class ScheduledM3uDiscoveryAction : IScheduledAction
     private readonly M3uTesterService _tester;
     private readonly PlaylistManagerService _playlistWriter;
     private readonly ScheduledActionOptions _options;
+    private readonly StreamValidationState? _validationState;
 
     public ScheduledM3uDiscoveryAction(
         M3uCrawlerService crawler,
         M3uTesterService tester,
         PlaylistManagerService playlistWriter,
-        ScheduledActionOptions options)
+        ScheduledActionOptions options,
+        StreamValidationState? validationState = null)
     {
         _crawler = crawler;
         _tester = tester;
         _playlistWriter = playlistWriter;
         _options = options;
+        _validationState = validationState;
     }
 
     public string Name => ActionName;
 
     public async Task<string> ExecuteAsync(CancellationToken cancellationToken)
     {
+        // Wave C — Recarregar a policy de validação a cada execução (o
+        // tester injectado capturou as options no build do DI).
+        var tester = _tester;
+        if (_validationState is not null)
+        {
+            _validationState.ReloadPolicy();
+            tester = StreamValidationTesterFactory.CreateTester(_validationState);
+        }
+
         var term = _options.DefaultDiscoveryTerm;
         var maxStreams = _options.MaxDiscoveryStreams;
 
@@ -58,7 +71,7 @@ public sealed class ScheduledM3uDiscoveryAction : IScheduledAction
             return "no-streams-found";
         }
 
-        var tested = await _tester.TestMultipleStreams(found, maxConcurrency: 10);
+        var tested = await tester.TestMultipleStreams(found, maxConcurrency: 10);
         cancellationToken.ThrowIfCancellationRequested();
 
         var working = tested.FindAll(s => s.IsWorking);

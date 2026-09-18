@@ -1,6 +1,7 @@
 using System;
 using System.Threading;
 using System.Threading.Tasks;
+using m3uCrawler.Services.Configuration;
 using m3uCrawler.Services.LiveRun;
 
 namespace m3uCrawler.Services.Automation;
@@ -52,11 +53,16 @@ public sealed class ScheduledTelegramRunAction : IScheduledAction
 
     private readonly LiveRunHost? _host;
     private readonly LiveRunMode _mode;
+    private readonly DiscoverySettingsProvider? _discoverySettings;
 
-    public ScheduledTelegramRunAction(LiveRunHost? host, LiveRunMode mode)
+    public ScheduledTelegramRunAction(
+        LiveRunHost? host,
+        LiveRunMode mode,
+        DiscoverySettingsProvider? discoverySettings = null)
     {
         _host = host;
         _mode = mode;
+        _discoverySettings = discoverySettings;
     }
 
     public string Name => _mode == LiveRunMode.TelegramMaintain
@@ -71,12 +77,20 @@ public sealed class ScheduledTelegramRunAction : IScheduledAction
             return NotConfiguredResult;
         }
 
+        // Wave C — O scheduler não usa um snapshot do arranque: lê os
+        // parâmetros de discovery persistidos neste instante, para que uma
+        // edição no dashboard se aplique à execução agendada seguinte.
+        var discovery = _discoverySettings?.Load() ?? new DiscoverySettings();
+
         var request = new LiveRunRequest
         {
             Mode = _mode,
             // A origem identifica inequivocamente o scheduler. Este é o
             // único ponto que produz Source=Scheduler para uma LiveRun.
             Source = LiveRunSource.Scheduler,
+            Keyword = discovery.Keyword,
+            HistoryHours = discovery.HistoryHours,
+            MaxStreams = discovery.MaxStreams,
         };
 
         LiveRunOutcome outcome;

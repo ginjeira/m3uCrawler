@@ -48,6 +48,13 @@ namespace m3uCrawler
             }
             Console.WriteLine($"🇵🇹 País em validação: {countryCode}");
 
+            // Wave C — Store único de settings operacionais, partilhado por
+            // CLI, dashboard e scheduler. Fonte de verdade em
+            // runtime-data/app_settings.json (secção "discovery").
+            var appSettingsRuntimeDataDir = Path.Combine(Directory.GetCurrentDirectory(), "runtime-data");
+            var appSettingsStore = new AppSettingsStore(appSettingsRuntimeDataDir);
+            var discoverySettingsProvider = new DiscoverySettingsProvider(appSettingsStore);
+
             // Dashboard web: parsing e arranque no top-level para que --web
             // funcione standalone (sem --telegram). A pipeline Telegram
             // continua condicionada a args.Contains("--telegram") mais abaixo.
@@ -205,7 +212,9 @@ namespace m3uCrawler
                         dashboardOutputDir,
                         dispatcharrConfig,
                         gate: new ConfigurationGate(lifecycle, operationalReadiness),
-                        liveRunHost: liveRunHost);
+                        liveRunHost: liveRunHost,
+                        dispatcharrConfigLoader: DispatcharrConfigLoader.Load,
+                        discoverySettings: discoverySettingsProvider);
                     WebDashboardService.SetScheduledActions(automationHost.RegisteredActions);
                     automationHost.Start();
                     Console.WriteLine(
@@ -276,59 +285,65 @@ namespace m3uCrawler
                     Console.WriteLine($"⚠️ Catálogo não disponível para injeção de afinidades: {ex.Message}");
                 }
 
-                // Get search term from arguments or prompt user
-                string term = "";
-                
-                // Find the index of --telegram and get the next argument as search term
+                // === Wave C — Discovery settings (fonte de verdade única) ===
+                // Os parâmetros de discovery vivem em runtime-data/app_settings.json
+                // (secção "discovery"). Um override explícito de CLI é persistido,
+                // para que a próxima execução (CLI, dashboard ou scheduler) leia o
+                // mesmo valor. Sem override, lê-se o valor persistido (default PT).
+                // Termo explícito: argumentos após --telegram até à próxima opção.
+                string? cliTerm = null;
                 int telegramIndex = Array.IndexOf(args, "--telegram");
                 if (telegramIndex >= 0 && telegramIndex < args.Length - 1)
                 {
-                    // Get arguments after --telegram until the next option
                     var remainingArgs = new List<string>();
                     for (int i = telegramIndex + 1; i < args.Length; i++)
                     {
                         if (args[i].StartsWith("--")) break;
                         remainingArgs.Add(args[i]);
                     }
-                    
+
                     if (remainingArgs.Any())
                     {
-                        term = string.Join(" ", remainingArgs);
+                        cliTerm = string.Join(" ", remainingArgs).Trim();
                     }
                 }
-                
-                // If no term provided via arguments, prompt the user
-                if (string.IsNullOrWhiteSpace(term))
-                {
-                    Console.Write("Termo a procurar no Telegram: ");
-                    term = Console.ReadLine() ?? "";
-                }
 
-                if (string.IsNullOrWhiteSpace(term))
-                {
-                    Console.WriteLine("Termo de pesquisa não pode estar vazio!");
-                    return;
-                }
-
-                int telegramMaxStreams = 500;
+                int? cliMaxStreams = null;
                 var telegramMaxArg = GetOptionValue(args, "--max-streams");
                 if (int.TryParse(telegramMaxArg, out int telegramParsedMax) && telegramParsedMax > 0)
                 {
-                    telegramMaxStreams = Math.Min(telegramParsedMax, 5000);
+                    cliMaxStreams = Math.Min(telegramParsedMax, DiscoverySettings.OverrideMaxStreamsCeiling);
                 }
 
-                // Janela de pesquisa Telegram: 24h por defeito.
-                // 24h cobre ciclos diários sem aumentar desnecessariamente
-                // o volume (mensagens analisadas, downloads HTTP, validação).
-                // Confirmado em produção: resultados relevantes continuam
-                // a aparecer dentro de 24h (ex: 2026-09-11 — m3u@…-HITS_DI_…html).
-                int telegramHistoryHours = 24;
+                int? cliHistoryHours = null;
                 var historyArg = GetOptionValue(args, "--history-hours");
-                if (int.TryParse(historyArg, out int parsedHistoryHours) && parsedHistoryHours > 0)
+                if (int.TryParse(historyArg, out int parsedHistoryHours)
+                    && parsedHistoryHours >= DiscoverySettings.MinHistoryHours)
                 {
-                    telegramHistoryHours = Math.Min(parsedHistoryHours, 24 * 30);
+                    cliHistoryHours = Math.Min(parsedHistoryHours, DiscoverySettings.MaxHistoryHours);
                 }
+
+                // CLI alimenta a mesma configuração: só persiste o que foi
+                // explicitamente indicado; os restantes campos mantêm-se.
+                if (!string.IsNullOrWhiteSpace(cliTerm) || cliMaxStreams.HasValue || cliHistoryHours.HasValue)
+                {
+                    var persistedForWrite = appSettingsStore.Load();
+                    if (!string.IsNullOrWhiteSpace(cliTerm)) persistedForWrite.Discovery.Keyword = cliTerm!;
+                    if (cliHistoryHours.HasValue) persistedForWrite.Discovery.HistoryHours = cliHistoryHours.Value;
+                    if (cliMaxStreams.HasValue) persistedForWrite.Discovery.MaxStreams = cliMaxStreams.Value;
+                    appSettingsStore.Save(persistedForWrite);
+                }
+
+                // Sem override explícito, o valor vem do store persistido
+                // (nunca de um snapshot em memória capturado no arranque).
+                var resolvedDiscovery = discoverySettingsProvider.Load();
+                string term = resolvedDiscovery.Keyword;
+                int telegramMaxStreams = resolvedDiscovery.MaxStreams;
+                int telegramHistoryHours = resolvedDiscovery.HistoryHours;
+                Console.WriteLine($"🔎 Termo de pesquisa Telegram: {term}");
                 Console.WriteLine($"🕒 Janela de pesquisa Telegram: últimas {telegramHistoryHours}h");
+                Console.WriteLine($"🎯 Limite de streams Telegram: {telegramMaxStreams}");
+
 
                 bool maintenanceMode = args.Contains("--telegram-maintain");
 
@@ -421,17 +436,22 @@ namespace m3uCrawler
                             liveRunException = null;
                             try
                             {
+                                // Wave C — Overrides do run (CLI/dashboard) têm
+                                // prioridade; na sua ausência lê-se o store
+                                // persistido neste instante (sem snapshot de arranque).
+                                var effectiveDiscovery = discoverySettingsProvider.Resolve(
+                                    request.Keyword, request.HistoryHours, request.MaxStreams);
                                 if (request.Mode == LiveRunMode.TelegramMaintain)
                                 {
                                     await RunTelegramMaintenanceCycle(
                                         scraper,
                                         telegramPlaylistManager,
                                         importHistoryService,
-                                        term,
+                                        effectiveDiscovery.Keyword,
                                         outputDir,
-                                        telegramMaxStreams,
+                                        effectiveDiscovery.MaxStreams,
                                         domainFilter,
-                                        telegramHistoryHours,
+                                        effectiveDiscovery.HistoryHours,
                                         args,
                                         pipelineIngestor,
                                         catalogForIngestion,
@@ -443,15 +463,15 @@ namespace m3uCrawler
                                 else
                                 {
                                     var (streams, report) = await scraper.SearchAndTestM3UInTelegramAsync(
-                                        term,
+                                        effectiveDiscovery.Keyword,
                                         limit: 200,
                                         maxConcurrency: 5,
-                                        maxUrlsToTest: telegramMaxStreams,
-                                        historyHours: telegramHistoryHours,
+                                        maxUrlsToTest: effectiveDiscovery.MaxStreams,
+                                        historyHours: effectiveDiscovery.HistoryHours,
                                         countryCode: countryCode,
                                         countriesDir: countriesDirectory,
                                         pipelineIngestor: pipelineIngestor,
-                                        pipelineSourceKey: $"telegram-{Slugify(term)}",
+                                        pipelineSourceKey: $"telegram-{Slugify(effectiveDiscovery.Keyword)}",
                                         liveRunProgress: progress,
                                         cancellationToken: ct);
                                     liveRunStreams = streams;
@@ -518,6 +538,11 @@ namespace m3uCrawler
                         continue;
                     }
 
+                    // Wave C — Recarregar a configuração de discovery a cada
+                    // iteração: uma edição no dashboard aplica-se ao ciclo
+                    // seguinte sem reiniciar o processo.
+                    var cycleDiscovery = discoverySettingsProvider.Load();
+
                     if (maintenanceMode)
                     {
                         if (liveRunCoordinator is not null)
@@ -526,9 +551,9 @@ namespace m3uCrawler
                             {
                                 Mode = LiveRunMode.TelegramMaintain,
                                 Source = LiveRunSource.Cli,
-                                Keyword = term,
-                                HistoryHours = telegramHistoryHours,
-                                MaxStreams = telegramMaxStreams,
+                                Keyword = cycleDiscovery.Keyword,
+                                HistoryHours = cycleDiscovery.HistoryHours,
+                                MaxStreams = cycleDiscovery.MaxStreams,
                             }, CancellationToken.None);
 
                             if (liveRunException is not null)
@@ -543,11 +568,11 @@ namespace m3uCrawler
                                 scraper,
                                 telegramPlaylistManager,
                                 importHistoryService,
-                                term,
+                                cycleDiscovery.Keyword,
                                 outputDir,
-                                telegramMaxStreams,
+                                cycleDiscovery.MaxStreams,
                                 domainFilter,
-                                telegramHistoryHours,
+                                cycleDiscovery.HistoryHours,
                                 args,
                                 pipelineIngestor,
                                 catalogForIngestion,
@@ -567,9 +592,9 @@ namespace m3uCrawler
                             {
                                 Mode = LiveRunMode.Telegram,
                                 Source = LiveRunSource.Cli,
-                                Keyword = term,
-                                HistoryHours = telegramHistoryHours,
-                                MaxStreams = telegramMaxStreams,
+                                Keyword = cycleDiscovery.Keyword,
+                                HistoryHours = cycleDiscovery.HistoryHours,
+                                MaxStreams = cycleDiscovery.MaxStreams,
                             }, CancellationToken.None);
 
                             if (liveRunException is not null)
@@ -584,15 +609,15 @@ namespace m3uCrawler
                         else
                         {
                             (workingStreams, runReport) = await scraper.SearchAndTestM3UInTelegramAsync(
-                                term,
+                                cycleDiscovery.Keyword,
                                 limit: 200,
                                 maxConcurrency: 5,
-                                maxUrlsToTest: telegramMaxStreams,
-                                historyHours: telegramHistoryHours,
+                                maxUrlsToTest: cycleDiscovery.MaxStreams,
+                                historyHours: cycleDiscovery.HistoryHours,
                                 countryCode: countryCode,
                                 countriesDir: countriesDirectory,
                                 pipelineIngestor: pipelineIngestor,
-                                pipelineSourceKey: $"telegram-{Slugify(term)}");
+                                pipelineSourceKey: $"telegram-{Slugify(cycleDiscovery.Keyword)}");
                         }
 
                         if (!string.IsNullOrWhiteSpace(domainFilter))
@@ -668,9 +693,9 @@ namespace m3uCrawler
                         {
                             Timestamp = DateTime.UtcNow,
                             Mode = "TelegramSearch",
-                            SearchTerm = term,
-                            HistoryHours = telegramHistoryHours,
-                            MaxStreams = telegramMaxStreams,
+                            SearchTerm = cycleDiscovery.Keyword,
+                            HistoryHours = cycleDiscovery.HistoryHours,
+                            MaxStreams = cycleDiscovery.MaxStreams,
                             NewFunctionalCount = workingStreams.Count,
                             MessagesAnalyzed = runReport.MessagesAnalyzed,
                             CandidatesFound = runReport.CandidatesFound,
