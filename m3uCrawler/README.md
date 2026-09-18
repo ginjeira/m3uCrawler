@@ -605,16 +605,28 @@ read-only (nunca insere a linha default).
 
 - **Filtro opcional:** `?channelKey=<CanonicalChannel.Key>` restringe a um canal
   canónico (match **exacto e case-sensitive**, `Ordinal`). Chave desconhecida
-  devolve **HTTP 200** com `applied=false` e métricas zeradas, registando o
-  filtro (sanitizado) em `source.channelKeyFilter`.
-- **Gate:** GET-only (outros métodos → `405`), sob o mesmo gate de
-  autenticação/CSRF dos restantes endpoints do catálogo; `503` "Catálogo não
-  inicializado." quando o catálogo não está disponível. Falhas inesperadas na
-  rota devolvem `500 {"error":"preview-failed"}` com o response sempre fechado
-  (o cliente não fica pendurado).
-- **Resposta:** `applied`, `generatedAtUtc`, `inputStreamCount`, `source`
-  (origem `catalog` + contagens), `metrics`, `channels` e as listas top-level
-  **disjuntas** `unmatched[]` e `ambiguous[]` (mesma forma). Métricas agregadas:
+  devolve **HTTP 200** com `applied=false`, `status="channel-not-found"` e
+  `channelsProcessed=0`, registando o filtro (sanitizado) em
+  `source.channelKeyFilter`.
+- **Gate:** GET-only (outros métodos → `405`), sob o gate de autenticação;
+  `GET` não exige CSRF. `503` "Catálogo não inicializado." quando o catálogo não
+  está disponível. Falhas inesperadas na rota devolvem
+  `500 {"error":"preview-failed"}` com o response sempre fechado (o cliente não
+  fica pendurado). O helper partilhado `WriteJsonAsync` **não** foi alterado: os
+  estados HTTP vêm do status passado pela própria rota.
+- **`status`:** campo top-level (`SourceSelectionPreviewStatuses`) que
+  desambigua os casos antes colapsados em `applied=false`. Valores e
+  precedência: `channel-not-found` (o filtro `channelKey` não corresponde a
+  nenhum canal canónico; `applied=false`, `channelsProcessed=0`); senão
+  `no-channels` (o catálogo não tem canais canónicos); senão `no-input` (há
+  canais no âmbito mas nenhum tem `ChannelSource`; `applied=false` com
+  `channelsProcessed>0` é válido e esperado); senão `applied` (a selecção
+  correu). `channelsProcessed` mantém-se "canais canónicos no âmbito" e não foi
+  zerado; `applied` não foi redefinido.
+- **Resposta:** `applied`, `status`, `generatedAtUtc`, `inputStreamCount`,
+  `source` (origem `catalog` + contagens), `metrics`, `channels` e as listas
+  top-level **disjuntas** `unmatched[]` e `ambiguous[]` (mesma forma). Métricas
+  agregadas:
   `channelsProcessed` (canais canónicos no âmbito, incluindo os sem fontes),
   `channelsWithSources`, candidatos, seleccionados, rejeitados,
   `unmatchedStreamCount` (sem hit), `ambiguousStreamCount` (URL mapeada a >1
@@ -635,17 +647,20 @@ read-only (nunca insere a linha default).
   (`unmatchedStreamCount` conta só as não-ambíguas, `ambiguousStreamCount` só as
   ambíguas); `fillSelectionCount` é o proxy da Fase B; canais sem fontes contam
   em `channelsProcessed` (rotulado na UI "Canais no âmbito") mas não aparecem em
-  `channels`. **Limitação de paridade: `ResponseTime`** — o preview usa
-  `ChannelSourceEntity.LastResponseTimeMs`, mas essa coluna só é escrita como `0`
-  no insert e nunca é actualizada (`CatalogResolver.cs:1422`; update
-  `:1392-1404`), a observação é append-only e sem flag de sucesso
-  (`WebDashboardService.cs:2133`) e o pipeline ignora `stream.ResponseTime`
+  `channels`. **Limitação de paridade: `ResponseTime`** — o preview usa o valor
+  **persistido** `ChannelSourceEntity.LastResponseTimeMs` quando presente; na
+  prática essa coluna só é escrita como `0` no insert e nunca é actualizada
+  (`CatalogResolver.cs:1422`; update `:1392-1404`), pelo que está normalmente a
+  `0`/indisponível e **não** representa o `DurationMs` da probe ao vivo; a
+  observação é append-only e sem flag de sucesso
+  (`WebDashboardService.cs:2156`) e o pipeline ignora `stream.ResponseTime`
   (`PipelineIngestionService.cs:250-264`); o valor real em produção é o stopwatch
-  `DurationMs` da probe exacta (`M3uTesterService.cs:550,555`). O preview trata o
-  response time como desconhecido e **não** reproduz a ordenação por
-  `ResponseTimeKey` (`ChannelSourceSelector.cs:128,260-261`) — em empates nas
-  primeiras quatro chaves, a ordem e o conjunto seleccionado podem diferir da
-  produção. As métricas ricas são âmbito do preview — `RunReport.SourceSelection`
+  `DurationMs` da probe exacta (`M3uTesterService.cs:550,555`). Por isso o
+  preview **não** reproduz a ordenação por `ResponseTimeKey`
+  (`ChannelSourceSelector.cs:128,260-261`) e a sua ordenação por response time
+  **pode divergir** da produção — em empates nas primeiras quatro chaves, a
+  ordem e o conjunto seleccionado podem diferir da produção. As métricas ricas
+  são âmbito do preview — `RunReport.SourceSelection`
   mantém-se só contagens, e o contrato `MatchPlan`/`DispatcharrSourceSelection`
   (Wave 13-6) permanece fora de âmbito.
 

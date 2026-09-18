@@ -121,12 +121,48 @@ public sealed record SourceSelectionPreviewSourceInfo(
     int CanonicalChannelCount);
 
 /// <summary>
-/// PHASE 13 (Wave 13-5) — Resultado completo do preview/dry-run da selecção
-/// de fontes. <see cref="Applied"/> é <c>false</c> quando o catálogo está
-/// vazio/indisponível ou o filtro não corresponde a nenhum canal.
+/// PHASE 13 (Wave 13-5, MAJOR-1) — Vocabulário estável das razões de nível
+/// superior pelas quais o preview foi ou não aplicado. Distinto de
+/// <see cref="SourceSelectionPreviewDecisions"/> (decisão por candidato) e de
+/// <see cref="SelectionReasons"/> (motivo da rejeição).
+/// </summary>
+public static class SourceSelectionPreviewStatuses
+{
+    /// <summary>O estágio correu e aplicou a selecção (<see cref="SourceSelectionPreviewResult.Applied"/> é <c>true</c>).</summary>
+    public const string Applied = "applied";
+
+    /// <summary>Um <c>channelKey</c> não vazio não corresponde a nenhum canal canónico.</summary>
+    public const string ChannelNotFound = "channel-not-found";
+
+    /// <summary>Sem filtro (ou filtro correspondido) mas o catálogo não tem canais canónicos.</summary>
+    public const string NoChannels = "no-channels";
+
+    /// <summary>Há canais no âmbito mas nenhum tem <c>ChannelSource</c>, logo zero streams de entrada.</summary>
+    public const string NoInput = "no-input";
+}
+
+/// <summary>
+/// PHASE 13 (Wave 13-5, MAJOR-1) — Resultado completo do preview/dry-run da
+/// selecção de fontes.
+///
+/// <para>
+/// <see cref="Status"/> desambigua os quatro casos distintos que antes
+/// colapsavam em <see cref="Applied"/>: <c>applied</c>,
+/// <c>channel-not-found</c>, <c>no-channels</c> e <c>no-input</c>.
+/// <see cref="Applied"/> é <c>true</c> apenas no caso <c>applied</c>.
+/// </para>
+///
+/// <para>
+/// <b>Importante:</b> <c>Applied=false</c> com <c>Status="no-input"</c> e
+/// <c>channelsProcessed &gt; 0</c> é um estado válido e esperado — significa
+/// que existem canais canónicos no âmbito mas nenhum tem fontes. As quatro
+/// categorias de <see cref="Status"/> são mutuamente distintas e não devem
+/// ser confundidas com "catálogo vazio".
+/// </para>
 /// </summary>
 public sealed record SourceSelectionPreviewResult(
     bool Applied,
+    string Status,
     DateTime GeneratedAtUtc,
     int InputStreamCount,
     SourceSelectionPreviewSourceInfo Source,

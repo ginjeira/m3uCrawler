@@ -132,8 +132,17 @@ public class SourceSelectionPreviewTests : IAsyncLifetime
     }
 
     private static void AssertAllMetricsZero(SourceSelectionPreviewMetrics m)
+        => AssertAllMetricsZeroExceptChannelsProcessed(m, expectedChannelsProcessed: 0);
+
+    /// <summary>
+    /// Invariante de <c>no-input</c>: todos os escalares a zero EXCEPTO
+    /// <c>ChannelsProcessed</c>, que reflecte os canais canónicos no âmbito
+    /// (não é zerado; ver contrato Wave 13-5 / MAJOR-1).
+    /// </summary>
+    private static void AssertAllMetricsZeroExceptChannelsProcessed(
+        SourceSelectionPreviewMetrics m, int expectedChannelsProcessed)
     {
-        Assert.Equal(0, m.ChannelsProcessed);
+        Assert.Equal(expectedChannelsProcessed, m.ChannelsProcessed);
         Assert.Equal(0, m.ChannelsWithSources);
         Assert.Equal(0, m.CandidateStreamCount);
         Assert.Equal(0, m.SelectedStreamCount);
@@ -823,5 +832,202 @@ public class SourceSelectionPreviewTests : IAsyncLifetime
         Assert.Equal("nodiv-a.example.test", provider.Provider);
         Assert.Equal(2, provider.SelectedCount);
         Assert.Equal(1, provider.ChannelCount);
+    }
+
+    // ---------------- Wave 13-5 final hardening — MAJOR-1 status precedence ----------------
+
+    [Fact]
+    public async Task Preview_matched_channel_without_sources_reports_no_input()
+    {
+        // A tem fontes; B (filtro) não tem nenhuma ChannelSource. O filtro
+        // corresponde a um canal canónico, logo não é `channel-not-found`;
+        // o âmbito tem 1 canal mas 0 streams → `no-input`.
+        var source = await NewSourceAsync("preview-no-input-filter");
+        await RecordAsync(_channelA, source, "http://no-input-a.example.test/1.ts");
+
+        var preview = await Preview().PreviewAsync(_channelB.Key);
+
+        Assert.False(preview.Applied);
+        Assert.Equal(SourceSelectionPreviewStatuses.NoInput, preview.Status);
+        Assert.Equal(_channelB.Key, preview.Source.ChannelKeyFilter);
+        Assert.Equal(1, preview.Metrics.ChannelsProcessed);
+        Assert.Equal(0, preview.InputStreamCount);
+        AssertAllMetricsZeroExceptChannelsProcessed(preview.Metrics, expectedChannelsProcessed: 1);
+        Assert.Empty(preview.Channels);
+        Assert.Empty(preview.Unmatched);
+        Assert.Empty(preview.Ambiguous);
+    }
+
+    [Fact]
+    public async Task Preview_catalog_without_channel_sources_reports_no_input()
+    {
+        // Catálogo com canais canónicos (seed) mas zero ChannelSources: é o
+        // caso global de `no-input`, distinto de `no-channels`.
+        Assert.True((await _resolver.ListCanonicalChannelsAsync()).Count >= 1);
+        Assert.Empty(await _resolver.ListChannelSourcesAsync());
+
+        var preview = await Preview().PreviewAsync();
+
+        Assert.False(preview.Applied);
+        Assert.Equal(SourceSelectionPreviewStatuses.NoInput, preview.Status);
+        Assert.True(preview.Metrics.ChannelsProcessed >= 1);
+        Assert.True(preview.Source.CanonicalChannelCount >= 1);
+        Assert.Equal(0, preview.Source.CatalogChannelSourceCount);
+        Assert.Equal(0, preview.InputStreamCount);
+        AssertAllMetricsZeroExceptChannelsProcessed(
+            preview.Metrics, expectedChannelsProcessed: preview.Metrics.ChannelsProcessed);
+        Assert.Empty(preview.Channels);
+        Assert.Empty(preview.Unmatched);
+        Assert.Empty(preview.Ambiguous);
+    }
+
+    [Fact]
+    public async Task Preview_no_channels_reports_no_channels()
+    {
+        // Migra a BD para zero canais canónicos removendo os canais do seed.
+        var seeded = await _resolver.ListCanonicalChannelsAsync();
+        Assert.True(seeded.Count >= 1);
+        foreach (var channel in seeded)
+        {
+            Assert.True(await _resolver.DeleteCanonicalChannelAsync(channel.Id));
+        }
+        Assert.Empty(await _resolver.ListCanonicalChannelsAsync());
+
+        var preview = await Preview().PreviewAsync();
+
+        Assert.False(preview.Applied);
+        Assert.Equal(SourceSelectionPreviewStatuses.NoChannels, preview.Status);
+        Assert.Equal(0, preview.Source.CanonicalChannelCount);
+        Assert.Equal(0, preview.Metrics.ChannelsProcessed);
+        Assert.Equal(0, preview.InputStreamCount);
+        AssertAllMetricsZero(preview.Metrics);
+        Assert.Empty(preview.Channels);
+        Assert.Empty(preview.Unmatched);
+        Assert.Empty(preview.Ambiguous);
+    }
+
+    [Fact]
+    public async Task Preview_unknown_channel_reports_channel_not_found()
+    {
+        var source = await NewSourceAsync("preview-channel-not-found");
+        await RecordAsync(_channelA, source, "http://channel-not-found.example.test/1.ts");
+
+        var unknown = await Preview().PreviewAsync("does-not-exist");
+
+        Assert.False(unknown.Applied);
+        Assert.Equal(SourceSelectionPreviewStatuses.ChannelNotFound, unknown.Status);
+        Assert.Equal("does-not-exist", unknown.Source.ChannelKeyFilter);
+        Assert.Equal(0, unknown.Metrics.ChannelsProcessed);
+        Assert.Equal(0, unknown.InputStreamCount);
+        AssertAllMetricsZero(unknown.Metrics);
+        Assert.Empty(unknown.Channels);
+        Assert.Empty(unknown.Unmatched);
+        Assert.Empty(unknown.Ambiguous);
+
+        // Distinção semântica face a `no-input` (filtro correspondido a um
+        // canal sem fontes): mesma forma zerada, status diferente. Não é
+        // possível confundir os dois casos pelo JSON.
+        var noInput = await Preview().PreviewAsync(_channelB.Key);
+        Assert.Equal(SourceSelectionPreviewStatuses.NoInput, noInput.Status);
+        Assert.False(noInput.Applied);
+        Assert.Equal(0, noInput.InputStreamCount);
+        Assert.Equal(unknown.InputStreamCount, noInput.InputStreamCount);
+        Assert.NotEqual(unknown.Status, noInput.Status);
+    }
+
+    // ---------------- Wave 13-5 final hardening — MINOR partitions / case ----------------
+
+    [Fact]
+    public async Task Preview_partitions_unmatched_and_ambiguous_in_one_run()
+    {
+        // 1 URL ambígua (mesma URL sanitizada em A e B) + 1 linha raw sem
+        // hit no catálogo (credenciais guardadas cruas → a chave sanitizada
+        // da stream sintetizada nunca coincide com a chave armazenada).
+        var ambA = await NewSourceAsync("preview-partition-amb-a");
+        var ambB = await NewSourceAsync("preview-partition-amb-b");
+        const string shared = "http://partition-ambiguous.example.test/stream/1.ts";
+        await RecordAsync(_channelA, ambA, shared);
+        await RecordAsync(_channelB, ambB, shared);
+
+        var rawSource = await NewSourceAsync("preview-partition-raw");
+        const string raw = "http://user:secret@partition-raw.example.test/live/USER/PASS/1";
+        await InsertChannelSourceRawAsync(_channelA, rawSource, raw);
+
+        var preview = await Preview().PreviewAsync();
+
+        Assert.True(preview.Applied);
+        Assert.NotEmpty(preview.Unmatched);
+        Assert.NotEmpty(preview.Ambiguous);
+
+        // Sem filtro, cada linha do catálogo sintetiza uma stream: as duas
+        // linhas da URL partilhada são ambíguas (2) e a linha raw é
+        // unmatched (1).
+        Assert.Equal(1, preview.Metrics.UnmatchedStreamCount);
+        Assert.Equal(2, preview.Metrics.AmbiguousStreamCount);
+        Assert.Equal(3, preview.Metrics.TotalUnmatchedStreamCount);
+        Assert.Equal(3, preview.InputStreamCount);
+        Assert.Equal(
+            preview.Metrics.TotalUnmatchedStreamCount,
+            preview.Metrics.UnmatchedStreamCount + preview.Metrics.AmbiguousStreamCount);
+
+        // Cada lista usa um motivo exclusivo; a partição é disjunta.
+        Assert.All(preview.Unmatched, u =>
+            Assert.Equal(SourceSelectionPreviewService.UnmatchedReason, u.Reason));
+        Assert.All(preview.Ambiguous, a =>
+            Assert.Equal(SourceSelectionPreviewService.AmbiguousReason, a.Reason));
+
+        var unmatchedKeys = preview.Unmatched
+            .Select(u => (u.StreamUrlSanitized, u.Reason))
+            .ToHashSet();
+        var ambiguousKeys = preview.Ambiguous
+            .Select(a => (a.StreamUrlSanitized, a.Reason))
+            .ToHashSet();
+        Assert.Empty(unmatchedKeys.Intersect(ambiguousKeys));
+
+        // A URL ambígua não aparece em Unmatched e a raw não aparece em
+        // Ambiguous; nenhuma referência é partilhada entre as duas listas.
+        Assert.DoesNotContain(
+            preview.Unmatched,
+            u => u.StreamUrlSanitized == CredentialSanitizer.SanitizeUrl(shared));
+        Assert.DoesNotContain(
+            preview.Ambiguous,
+            a => a.StreamUrlSanitized == CredentialSanitizer.SanitizeUrl(raw));
+        Assert.DoesNotContain(
+            preview.Unmatched,
+            u => preview.Ambiguous.Any(a => ReferenceEquals(a, u)));
+    }
+
+    [Fact]
+    public async Task Preview_channel_key_is_case_sensitive()
+    {
+        var channel = await _resolver.CreateCanonicalChannelAsync(
+            "preview-case-sensitive",
+            "Preview Case Sensitive",
+            EditorialCategory.Live,
+            CanonicalEditorialGroup.PortugalLive,
+            PublicationPolicy.CreateEligible,
+            isEnabled: true,
+            normalizedAliases: Array.Empty<string>());
+        var source = await NewSourceAsync("preview-case-sensitive-source");
+        await RecordAsync(channel, source, "http://case-sensitive.example.test/1.ts");
+
+        var exact = await Preview().PreviewAsync(channel.Key);
+        Assert.True(exact.Applied);
+        Assert.Equal(SourceSelectionPreviewStatuses.Applied, exact.Status);
+        Assert.Equal(1, exact.Metrics.ChannelsProcessed);
+
+        var upper = channel.Key.ToUpperInvariant();
+        Assert.NotEqual(channel.Key, upper);
+
+        var upperResult = await Preview().PreviewAsync(upper);
+        Assert.False(upperResult.Applied);
+        Assert.Equal(SourceSelectionPreviewStatuses.ChannelNotFound, upperResult.Status);
+        Assert.Equal(upper, upperResult.Source.ChannelKeyFilter);
+        Assert.Equal(0, upperResult.Metrics.ChannelsProcessed);
+        Assert.Equal(0, upperResult.InputStreamCount);
+        AssertAllMetricsZero(upperResult.Metrics);
+        Assert.Empty(upperResult.Channels);
+        Assert.Empty(upperResult.Unmatched);
+        Assert.Empty(upperResult.Ambiguous);
     }
 }

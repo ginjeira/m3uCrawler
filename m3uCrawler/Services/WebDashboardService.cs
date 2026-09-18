@@ -3507,6 +3507,7 @@ namespace m3uCrawler.Services
         return new
         {
             applied = preview.Applied,
+            status = preview.Status,
             generatedAtUtc = preview.GeneratedAtUtc.ToString("o"),
             inputStreamCount = preview.InputStreamCount,
             source = new
@@ -5868,7 +5869,13 @@ const rows = Object.entries(inv).map(([k, v]) => {
         ` · gerado: ${escapeHtml(tsLocal(data.generatedAtUtc))}</p>`;
 
       if (!data.applied) {
-        out.innerHTML = header + `<p class='muted'>Preview não aplicado (catálogo vazio/indisponível ou filtro sem correspondência).</p>`;
+        const nonAppliedMessages = {
+          'channel-not-found': 'channelKey não corresponde a nenhum canal canónico.',
+          'no-channels': 'O catálogo não tem canais canónicos.',
+          'no-input': 'Sem streams candidatas no âmbito (canais sem fontes).',
+        };
+        const msg = nonAppliedMessages[data.status] || 'Preview não aplicado.';
+        out.innerHTML = header + `<p class='muted'>${escapeHtml(msg)}</p>`;
         return;
       }
 

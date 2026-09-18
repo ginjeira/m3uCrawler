@@ -4589,9 +4589,21 @@ Ambas as waves estão concluídas. A migração completa `Id → Key` do domíni
 > `SourceSelectionPreviewSourceInfo` e `SourceSelectionPreviewDecisions`
 > (`selected`/`rejected`). Endpoint
 > `GET /api/catalog/source-selection-policies/preview[?channelKey=<CanonicalChannel.Key>]`
-> (GET-only, sob o gate de auth/CSRF e o gate de catálogo — `503` quando não
-> inicializado), mais o cartão "Preview / Dry-Run" e `loadSourceSelectionPreview()`
-> no separador existente. **Sanitização:** todas as URLs emitidas passam
+> (GET-only, sob o gate de autenticação — `GET` não exige CSRF — e o gate de
+> catálogo — `503` quando não inicializado), mais o cartão "Preview / Dry-Run" e
+> `loadSourceSelectionPreview()` no separador existente. O endpoint emite o
+> campo top-level `status` (`SourceSelectionPreviewStatuses`) que desambigua os
+> casos antes colapsados em `applied=false`: `channel-not-found` (o filtro
+> `channelKey` não corresponde a nenhum canal canónico; `applied=false`,
+> `channelsProcessed=0`), `no-channels` (o catálogo não tem canais canónicos),
+> `no-input` (há canais no âmbito mas nenhum tem `ChannelSource`; `applied=false`
+> com `channelsProcessed>0` é válido e esperado) e `applied`; precedência
+> `channel-not-found` → `no-channels` → `no-input` → `applied`. `channelsProcessed`
+> mantém-se "canais canónicos no âmbito" (não zerado) e `applied` não foi
+> redefinido. **Nota de âmbito (MAJOR-2):** `WebDashboardService.WriteJsonAsync`
+> **não** foi alterado; a rota de preview passa o HTTP status explicitamente
+> (`503`/`500`) e o default pré-existente do helper é dívida transversal **fora
+> de âmbito** da 13-5, não corrigida estruturalmente. **Sanitização:** todas as URLs emitidas passam
 > `CredentialSanitizer.SanitizeUrl` e `Unmatched.Title` passa `SanitizeText`.
 > **Métricas (corrigidas):** `distinctProviderSelectionCount` foi renomeado para
 > `diversitySelectionCount` (nº de selecções com motivo `diversity`) e foi
@@ -4610,17 +4622,20 @@ Ambas as waves estão concluídas. A migração completa `Id → Key` do domíni
 > `channelsProcessed` são os canais canónicos no âmbito (incluindo os sem
 > sources; na UI "Canais no âmbito") mas os sem sources não aparecem em
 > `channels`, e só os dois pontos de publicação Telegram aplicam selecção em
-> produção. **Limitação de paridade: `ResponseTime`** — o preview usa
-> `ChannelSourceEntity.LastResponseTimeMs`, coluna escrita como `0` no insert e
-> nunca actualizada (`CatalogResolver.cs:1422`; update `:1392-1404`), com
-> observações append-only sem flag de sucesso (`WebDashboardService.cs:2133`) e
+> produção. **Limitação de paridade: `ResponseTime`** — o preview usa o valor
+> **persistido** `ChannelSourceEntity.LastResponseTimeMs` quando presente; na
+> prática a coluna é escrita como `0` no insert e nunca actualizada
+> (`CatalogResolver.cs:1422`; update `:1392-1404`), pelo que está normalmente a
+> `0`/indisponível e **não** representa o `DurationMs` da probe ao vivo, com
+> observações append-only sem flag de sucesso (`WebDashboardService.cs:2156`) e
 > o pipeline a ignorar `stream.ResponseTime`
 > (`PipelineIngestionService.cs:250-264`); o valor real em produção é o stopwatch
-> `DurationMs` da probe exacta (`M3uTesterService.cs:550,555`). O preview trata o
-> response time como desconhecido e não reproduz a ordenação por
-> `ResponseTimeKey` (`ChannelSourceSelector.cs:128,260-261`); em empates nas
-> primeiras quatro chaves, ordem/conjunto podem diferir da produção — limitação
-> documentada, não garantia. **Fora de âmbito (13-6 e posteriores):** contrato `MatchPlan` +
+> `DurationMs` da probe exacta (`M3uTesterService.cs:550,555`). O preview **não**
+> reproduz a ordenação por `ResponseTimeKey`
+> (`ChannelSourceSelector.cs:128,260-261`) e a sua ordenação por response time
+> **pode divergir** da produção; em empates nas primeiras quatro chaves,
+> ordem/conjunto podem diferir da produção — limitação documentada, não
+> garantia. **Fora de âmbito (13-6 e posteriores):** contrato `MatchPlan` +
 > `DispatcharrSourceSelection`, cleanup/ownership selectivo, teste 100→10,
 > `ProviderDefinition`, `SelectionPolicy` separada, `MinimumValidatedSources` e
 > churn/estabilidade. `RunReport.SourceSelection` mantém-se **inalterado** (só

@@ -5,11 +5,13 @@ using System.Net;
 using System.Net.Http;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 using m3uCrawler.Services;
 using m3uCrawler.Services.Auth;
 using m3uCrawler.Services.Catalog;
 using m3uCrawler.Services.Configuration;
+using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Xunit;
 
@@ -176,6 +178,36 @@ public class SourceSelectionPreviewEndpointTests : IAsyncLifetime
         var channels = await _resolver.ListCanonicalChannelsAsync();
         await _resolver.RecordChannelSourceAsync(
             channels[0].Id, source.Id, url, matchMethod: "test");
+    }
+
+    /// <summary>
+    /// Insere um <see cref="ChannelSourceEntity"/> directamente via
+    /// <see cref="ChannelCatalogDbContext"/>, contornando o
+    /// <c>CatalogResolver</c> (que sanitiza sempre a URL). Uma URL com
+    /// credenciais cruas nunca coincide com a chave sanitizada da stream
+    /// sintetizada pelo preview → prova o caminho <c>unmatched</c> real.
+    /// </summary>
+    private async Task SeedRawChannelSourceAsync(long canonicalChannelId, long sourceId, string rawUrl)
+    {
+        await using var context = _factory.CreateDbContext();
+        var now = DateTime.UtcNow;
+        context.ChannelSources.Add(new ChannelSourceEntity
+        {
+            CanonicalChannelId = canonicalChannelId,
+            SourceId = sourceId,
+            StreamUrl = rawUrl,
+            Availability = AvailabilityState.Discovered,
+            IsEnabled = true,
+            MatchMethod = "test-raw",
+            MatchConfidence = 0,
+            FirstSeenAtUtc = now,
+            LastSeenAtUtc = now,
+            LastTestedAtUtc = now,
+            LastResponseTimeMs = 0,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+        });
+        await context.SaveChangesAsync();
     }
 
     private async Task<int> PolicyRowCountAsync()
@@ -355,5 +387,134 @@ public class SourceSelectionPreviewEndpointTests : IAsyncLifetime
             PostJson(PreviewEndpoint, "{}", csrf));
 
         Assert.Equal(HttpStatusCode.MethodNotAllowed, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Preview_serializes_non_empty_arrays_with_camel_case()
+    {
+        var harness = StartHarness();
+        await ReachReadyAsync(harness);
+        await LoginAsync(harness);
+
+        var channels = await _resolver.ListCanonicalChannelsAsync();
+        Assert.True(channels.Count >= 2);
+
+        var source = await _resolver.EnsureSourceAsync(
+            "preview-shape", "preview-shape", SourceKind.Telegram, "telegram://preview-shape", 0);
+
+        // channel[0]: 2 linhas regulares; limite global 1 → 1 seleccionada,
+        // 1 rejeitada. Hosts diferentes para haver dois fornecedores distintos.
+        await _resolver.RecordChannelSourceAsync(
+            channels[0].Id, source.Id, "http://shape-selected.example.test/1.ts", matchMethod: "test");
+        await _resolver.RecordChannelSourceAsync(
+            channels[0].Id, source.Id, "http://shape-rejected.example.test/1.ts", matchMethod: "test");
+
+        // URL ambígua: a mesma URL sanitizada em dois canais canónicos.
+        const string shared = "http://shape-ambiguous.example.test/1.ts";
+        await _resolver.RecordChannelSourceAsync(
+            channels[0].Id, source.Id, shared, matchMethod: "test");
+        await _resolver.RecordChannelSourceAsync(
+            channels[1].Id, source.Id, shared, matchMethod: "test");
+
+        // Linha raw sem hit → unmatched.
+        await SeedRawChannelSourceAsync(
+            channels[0].Id, source.Id,
+            "http://user:secret@shape-raw.example.test/live/USER/PASS/1");
+
+        await _resolver.UpsertGlobalSourceSelectionPolicyAsync(1, true, null, true);
+
+        var response = await harness.Client.GetAsync(PreviewEndpoint);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(body);
+        var root = doc.RootElement;
+
+        Assert.True(root.GetProperty("applied").GetBoolean());
+        Assert.Equal("applied", root.GetProperty("status").GetString());
+
+        var channelsJson = root.GetProperty("channels");
+        Assert.True(channelsJson.GetArrayLength() >= 1);
+        var matchedChannel = channelsJson.EnumerateArray()
+            .Single(c => c.GetProperty("canonicalChannelId").GetInt64() == channels[0].Id);
+
+        var selected = matchedChannel.GetProperty("selected");
+        Assert.True(selected.GetArrayLength() >= 1);
+        AssertCandidateShape(selected[0], expectedDecision: "selected");
+
+        var rejected = matchedChannel.GetProperty("rejected");
+        Assert.True(rejected.GetArrayLength() >= 1);
+        AssertCandidateShape(rejected[0], expectedDecision: "rejected");
+
+        var unmatched = root.GetProperty("unmatched");
+        Assert.True(unmatched.GetArrayLength() >= 1);
+        AssertUnmatchedShape(unmatched[0], expectedReason: "unmatched");
+
+        var ambiguous = root.GetProperty("ambiguous");
+        Assert.True(ambiguous.GetArrayLength() >= 1);
+        AssertUnmatchedShape(ambiguous[0], expectedReason: "ambiguous");
+
+        // camelCase: as chaves novas estão presentes e não há fugas PascalCase.
+        Assert.True(root.TryGetProperty("inputStreamCount", out _));
+        Assert.True(root.TryGetProperty("status", out _));
+        Assert.True(root.GetProperty("metrics").TryGetProperty("totalUnmatchedStreamCount", out _));
+        Assert.DoesNotContain("\"StreamUrlSanitized\"", body);
+        Assert.DoesNotContain("\"TotalUnmatchedStreamCount\"", body);
+        Assert.DoesNotContain("\"CanonicalChannelId\"", body);
+        Assert.DoesNotContain("\"InputStreamCount\"", body);
+        Assert.DoesNotContain("\"SelectedCount\"", body);
+        Assert.DoesNotContain("\"GeneratedAtUtc\"", body);
+    }
+
+    [Fact]
+    public async Task Preview_returns_500_preview_failed_when_selection_throws()
+    {
+        var harness = StartHarness();
+        await ReachReadyAsync(harness);
+        await LoginAsync(harness);
+
+        // Falha determinística da leitura do preview: apaga a primeira tabela
+        // que o serviço lê. Sem isto o endpoint devolveria 200 com o catálogo
+        // normal. Limpa o pool para que a alteração de schema seja visível.
+        SqliteConnection.ClearAllPools();
+        await using (var context = _factory.CreateDbContext())
+        {
+            await context.Database.ExecuteSqlRawAsync("DROP TABLE canonical_channels;");
+        }
+        SqliteConnection.ClearAllPools();
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        var response = await harness.Client.GetAsync(PreviewEndpoint, cts.Token);
+
+        Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync(cts.Token);
+        using var doc = JsonDocument.Parse(body);
+        Assert.Equal("preview-failed", doc.RootElement.GetProperty("error").GetString());
+    }
+
+    private static void AssertCandidateShape(JsonElement candidate, string expectedDecision)
+    {
+        Assert.True(candidate.TryGetProperty("streamUrlSanitized", out var url));
+        Assert.Equal(JsonValueKind.String, url.ValueKind);
+        Assert.True(candidate.TryGetProperty("provider", out var provider));
+        Assert.Equal(JsonValueKind.String, provider.ValueKind);
+        Assert.True(candidate.TryGetProperty("rank", out _));
+        Assert.True(candidate.TryGetProperty("decision", out var decision));
+        Assert.Equal(expectedDecision, decision.GetString());
+        Assert.True(candidate.TryGetProperty("reason", out var reason));
+        Assert.Equal(JsonValueKind.String, reason.ValueKind);
+        Assert.True(candidate.TryGetProperty("quality", out var quality));
+        Assert.Equal(JsonValueKind.String, quality.ValueKind);
+        Assert.True(candidate.TryGetProperty("availability", out var availability));
+        Assert.Equal(JsonValueKind.String, availability.ValueKind);
+    }
+
+    private static void AssertUnmatchedShape(JsonElement entry, string expectedReason)
+    {
+        Assert.True(entry.TryGetProperty("streamUrlSanitized", out var url));
+        Assert.Equal(JsonValueKind.String, url.ValueKind);
+        Assert.True(entry.TryGetProperty("title", out var title));
+        Assert.Equal(JsonValueKind.String, title.ValueKind);
+        Assert.True(entry.TryGetProperty("reason", out var reason));
+        Assert.Equal(expectedReason, reason.GetString());
     }
 }

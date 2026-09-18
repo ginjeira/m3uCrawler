@@ -345,21 +345,58 @@ o caminho de produção `LoadEffectivePoliciesAsync`). `HasExplicitGlobal` e
   não inicializado." quando o `CatalogResolver` não está disponível).
 - **Filtro opcional `channelKey`**: match **exacto e case-sensitive** (`Ordinal`)
   sobre `CanonicalChannel.Key`, restringindo os canais considerados. Uma chave
-  desconhecida devolve **HTTP 200** com `applied=false` e métricas zeradas (não é
-  erro), registando o filtro em `source.channelKeyFilter`; esse campo é
-  sanitizado (`CredentialSanitizer.SanitizeText`) antes da emissão.
+  desconhecida devolve **HTTP 200** com `applied=false`, `status="channel-not-found"`
+  e `channelsProcessed=0` (não é erro), registando o filtro em
+  `source.channelKeyFilter`; esse campo é sanitizado
+  (`CredentialSanitizer.SanitizeText`) antes da emissão.
 - **Resiliência HTTP:** a rota é envolvida em `try/catch`; uma falha inesperada
   devolve `500 {"error":"preview-failed"}` e fecha sempre o response, em vez de
   deixar o cliente pendurado. O comportamento GET-only (`405`) mantém-se.
 - **UI:** cartão "Preview / Dry-Run" no separador de Source Selection do
   Dashboard, com `loadSourceSelectionPreview()`.
 
+**Contrato de `status` (Wave 13-5, MAJOR-1).** O endpoint emite um campo
+top-level `status` (`SourceSelectionPreviewStatuses`), estável, distinto do
+booleano `applied`, que desambigua os quatro casos antes colapsados num único
+`applied=false`:
+
+| `status` | Condição | `applied` | `channelsProcessed` |
+|---|---|---|---|
+| `channel-not-found` | `channelKey` não vazio sem correspondência canónica | `false` | `0` |
+| `no-channels` | âmbito sem canais canónicos | `false` | `0` |
+| `no-input` | há canais canónicos no âmbito mas nenhum tem `ChannelSource` | `false` | `> 0` (válido e esperado) |
+| `applied` | o estágio correu | `true` | (do estágio) |
+
+Precedência determinística: (1) `channelKey` não vazio sem match →
+`channel-not-found`; (2) caso contrário, zero canais canónicos no âmbito →
+`no-channels`; (3) caso contrário, canais no âmbito mas zero `ChannelSource`
+(logo zero streams de entrada) → `no-input`; (4) caso contrário → `applied`.
+
+Cada valor distingue um caso operacional diferente: (1) o **filtro não
+encontrou** o canal; (2) o **catálogo não tem canais canónicos**; (3) existem
+**canais no âmbito mas nenhum tem `ChannelSource`** — `applied=false` com
+`channelsProcessed>0` é um estado **válido e esperado**, que não significa
+"catálogo vazio"; (4) a **selecção correu**. `channelsProcessed` mantém-se como
+o número de canais canónicos no âmbito e **não** foi zerado em `no-input`;
+`applied` **não** foi redefinido (continua `true` apenas no caso `applied`).
+
+**Nota de âmbito (MAJOR-2): `WriteJsonAsync` não foi alterado.** A rota de
+preview passa o HTTP status explicitamente (`503` sem catálogo, `500` no
+`catch`) e fecha sempre o response. O helper partilhado
+`WebDashboardService.WriteJsonAsync` **não** foi modificado: o seu default
+pré-existente — escrever `StatusCode = OK` quando nenhum status explícito é
+passado — é dívida transversal **pré-existente**, explicitamente **fora de
+âmbito** da Wave 13-5, e **não** foi estruturalmente corrigido. Os estados HTTP
+do preview resultam do status passado pela própria rota, não de uma correcção
+global do helper; nenhuma afirmação de que o helper foi corrigido é válida.
+
 **Saída.** Agrupamento por canal (aditivo):
 `SourceSelectionStageResult.Channels` + `SourceSelectionChannelResult`. Modelos:
 
-- `SourceSelectionPreviewResult` — `applied`, `generatedAtUtc`,
+- `SourceSelectionPreviewResult` — `applied`, `status`, `generatedAtUtc`,
   `inputStreamCount`, `source` e `metrics`, `channels`, `unmatched` e
-  `ambiguous`;
+  `ambiguous`; `status` é emitido também como campo top-level no JSON do
+  endpoint (ver contrato acima);
 - `SourceSelectionPreviewChannel` — id/key/nome canónico, `policyScope`,
   política efectiva, contagens e listas `selected`/`rejected`;
 - `SourceSelectionPreviewCandidate` — candidato projectado com `rank`,
@@ -430,20 +467,22 @@ origem é o rótulo curto `catalog`, sem caminhos de filesystem nem internals do
   restantes pontos de publicação permanecem fora de âmbito (pré-existente).
 
 **Limitação de paridade: ResponseTime.** O preview alimenta
-`ResponseTime = ChannelSourceEntity.LastResponseTimeMs`, mas essa coluna só é
-escrita como `0` no insert e nunca é actualizada (`CatalogResolver.cs:1422`;
-ramo de update `:1392-1404`); `ChannelSourceObservationEntity` é append-only,
-não tem flag de sucesso e só é escrito por um POST controlado pelo cliente
-(`WebDashboardService.cs:2133`); o pipeline de ingestão
+`ResponseTime = ChannelSourceEntity.LastResponseTimeMs`, isto é, usa o valor
+**persistido** quando presente. Na prática essa coluna é escrita como `0` no
+insert e nunca é actualizada (`CatalogResolver.cs:1422`; ramo de update
+`:1392-1404`), pelo que o valor está normalmente a `0`/indisponível e **não**
+representa o `DurationMs` da probe ao vivo. `ChannelSourceObservationEntity` é
+append-only, não tem flag de sucesso e só é escrito por um POST controlado pelo
+cliente (`WebDashboardService.cs:2156`); o pipeline de ingestão
 (`PipelineIngestionService.cs:250-264`) ignora `stream.ResponseTime`. O valor
 real em produção é o stopwatch ao vivo `DurationMs` da probe exacta
 (`M3uTesterService.cs:550,555`). Por isso o preview **não consegue** reproduzir a
 ordenação de produção por `ResponseTimeKey`
-(`ChannelSourceSelector.cs:128,260-261`) e trata o response time como
-**desconhecido**. É uma limitação documentada, **não** uma garantia: quando os
-candidatos empatam nas primeiras quatro chaves de ranking, a ordem — e portanto
-o conjunto seleccionado — pode diferir da produção. Não se afirma paridade de
-ordenação com a produção.
+(`ChannelSourceSelector.cs:128,260-261`): como o campo persistido é normalmente
+`0`/indisponível, a ordenação do preview **pode divergir** da produção. É uma
+limitação documentada, **não** uma garantia: quando os candidatos empatam nas
+primeiras quatro chaves de ranking, a ordem — e portanto o conjunto seleccionado
+— pode diferir da produção. Não se afirma paridade de ordenação com a produção.
 
 **Fora de âmbito explícito (13-5).** O contrato `MatchPlan` +
 `DispatcharrSourceSelection`, o ownership/cleanup selectivo, o teste 100→10,

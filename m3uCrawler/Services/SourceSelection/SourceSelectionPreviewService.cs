@@ -92,6 +92,7 @@ public sealed class SourceSelectionPreviewService
             {
                 return new SourceSelectionPreviewResult(
                     Applied: false,
+                    Status: SourceSelectionPreviewStatuses.ChannelNotFound,
                     GeneratedAtUtc: generatedAt,
                     InputStreamCount: 0,
                     Source: sourceInfo,
@@ -115,6 +116,20 @@ public sealed class SourceSelectionPreviewService
         // Uma stream sintética por ChannelSource (incluindo desactivados, para
         // que as decisões `source-disabled` sejam visíveis).
         var streams = scopedSources.Select(ToStream).ToList();
+
+        // MAJOR-1 — precedência dos estados (o filtro sem correspondência já
+        // regressou acima como `channel-not-found`):
+        //   1. `no-channels` — o âmbito não tem canais canónicos;
+        //   2. `no-input`    — há canais no âmbito mas nenhum tem ChannelSource
+        //                      (streams.Count == 0), pelo que o estágio é NoOp;
+        //   3. `applied`     — o estágio correu.
+        // `channelsProcessed` mantém-se como o número de canais canónicos no
+        // âmbito; NÃO é zerado em `no-input`.
+        var status = scopedChannels.Count == 0
+            ? SourceSelectionPreviewStatuses.NoChannels
+            : streams.Count == 0
+                ? SourceSelectionPreviewStatuses.NoInput
+                : SourceSelectionPreviewStatuses.Applied;
 
         var policies = await new SourceSelectionPolicyResolver(_catalog)
             .LoadEffectivePoliciesReadOnlyAsync(cancellationToken)
@@ -161,6 +176,7 @@ public sealed class SourceSelectionPreviewService
 
         return new SourceSelectionPreviewResult(
             Applied: result.Applied,
+            Status: status,
             GeneratedAtUtc: generatedAt,
             InputStreamCount: streams.Count,
             Source: sourceInfo,
