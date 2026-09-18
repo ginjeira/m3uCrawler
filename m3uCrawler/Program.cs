@@ -27,6 +27,15 @@ namespace m3uCrawler
                 return;
             }
 
+            // W10a — Recuperação de password do administrador (host-only).
+            // Tratado antes do banner/dashboard/telegram para que este caminho
+            // imprima apenas mensagens funcionais e saia de seguida.
+            if (args.Contains("--admin-reset-password"))
+            {
+                Environment.ExitCode = await RunAdminResetPasswordAsync(args);
+                return;
+            }
+
             Console.WriteLine("=== m3uCrawler - Pesquisador de Streams M3U8 ===");
             Console.WriteLine(BuildInfo.Current.ToCliLine());
             Console.WriteLine();
@@ -1006,6 +1015,7 @@ namespace m3uCrawler
             Console.WriteLine("  --high-performance Mesmo que --fast");
             Console.WriteLine("  --dispatcharr-sync  Sincroniza uma playlist M3U já existente com Dispatcharr (sem Telegram)");
             Console.WriteLine("  --playlist PATH    Caminho da playlist a sincronizar (default: <output-dir>/playlist.m3u)");
+            Console.WriteLine("  --admin-reset-password USERNAME  Recupera a password do administrador (host-only; password lida do stdin, nunca de argv)");
             Console.WriteLine("  --help, -h        Mostra esta ajuda");
             Console.WriteLine("  --version, -V     Mostra versão (SemVer + commit SHA + build number + data) e sai");
             Console.WriteLine();
@@ -1033,6 +1043,130 @@ namespace m3uCrawler
             }
 
             return null;
+        }
+
+        /// <summary>
+        /// W10a — Recuperação de password do administrador via host (CLI).
+        ///
+        /// <para>
+        /// A password NUNCA é um argumento de linha de comandos (ficaria no
+        /// histórico do shell e na lista de processos). Só o username é lido de
+        /// <c>argv</c>; a nova password e a confirmação são lidas do stdin.
+        /// </para>
+        /// <para>
+        /// Leitura: se <see cref="Console.IsInputRedirected"/> for verdadeiro
+        /// (input canalizado/automação) usa-se <c>Console.ReadLine()</c>; caso
+        /// contrário usa-se <c>Console.ReadKey(intercept:true)</c> com eco
+        /// mascarado (<c>*</c>), para a password não aparecer no terminal.
+        /// Nota/limitação: em alguns contentores sem TTY reconhecido pelo .NET,
+        /// <c>IsInputRedirected</c> é <c>true</c> mesmo com <c>docker run -it</c>,
+        /// caindo-se no caminho <c>ReadLine</c> onde o eco canónico do terminal
+        /// mostra os caracteres; a máscara não é garantida nesse cenário.
+        /// </para>
+        /// </summary>
+        static async Task<int> RunAdminResetPasswordAsync(string[] args)
+        {
+            var username = GetOptionValue(args, "--admin-reset-password");
+            if (string.IsNullOrWhiteSpace(username))
+            {
+                Console.Error.WriteLine("Uso: m3uCrawler --admin-reset-password <username>");
+                return 1;
+            }
+
+            CatalogResolver catalog;
+            try
+            {
+                catalog = await InitializeCatalogAsync(
+                    ResolveCatalogDbPath(args), CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                // Mensagem de erro sem qualquer valor de password/hash.
+                Console.Error.WriteLine($"❌ Catálogo não disponível: {ex.Message}");
+                return 1;
+            }
+
+            var users = new AdminUserStore(catalog.GetFactory());
+            var service = new AdminPasswordResetService(users);
+
+            var promptIndex = 0;
+            Func<string> passwordReader = () =>
+            {
+                Console.Write(promptIndex++ == 0
+                    ? "Nova password: "
+                    : "Confirmar nova password: ");
+
+                if (Console.IsInputRedirected)
+                {
+                    return Console.ReadLine() ?? string.Empty;
+                }
+
+                var masked = ReadMaskedPassword();
+                Console.WriteLine();
+                return masked;
+            };
+
+            AdminPasswordResetOutcome outcome;
+            try
+            {
+                outcome = await service.ResetAsync(username, passwordReader, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                // Nunca imprimir valores da password; apenas tipo/mensagem.
+                Console.Error.WriteLine($"❌ Falha ao alterar a password: {ex.GetType().Name}");
+                return 1;
+            }
+
+            switch (outcome)
+            {
+                case AdminPasswordResetOutcome.Changed:
+                    Console.WriteLine("password alterada");
+                    return 0;
+                case AdminPasswordResetOutcome.UserNotFound:
+                    Console.WriteLine("utilizador não encontrado");
+                    return 2;
+                case AdminPasswordResetOutcome.InvalidPassword:
+                    Console.WriteLine("password inválida");
+                    return 3;
+                default:
+                    Console.WriteLine("passwords não coincidem");
+                    return 4;
+            }
+        }
+
+        /// <summary>
+        /// Lê uma linha sem eco, escrevendo <c>*</c> por cada carácter. Suporta
+        /// backspace. Usado apenas em terminais interactivos (quando
+        /// <see cref="Console.IsInputRedirected"/> é falso).
+        /// </summary>
+        static string ReadMaskedPassword()
+        {
+            var buffer = new StringBuilder();
+            while (true)
+            {
+                var key = Console.ReadKey(intercept: true);
+                if (key.Key == ConsoleKey.Enter)
+                {
+                    return buffer.ToString();
+                }
+
+                if (key.Key == ConsoleKey.Backspace)
+                {
+                    if (buffer.Length > 0)
+                    {
+                        buffer.Length--;
+                        Console.Write("\b \b");
+                    }
+                    continue;
+                }
+
+                if (key.KeyChar != '\0')
+                {
+                    buffer.Append(key.KeyChar);
+                    Console.Write('*');
+                }
+            }
         }
 
         static bool UrlMatchesDomain(string url, string domainFilter)

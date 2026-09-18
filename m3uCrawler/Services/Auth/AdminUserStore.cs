@@ -13,6 +13,16 @@ public enum CreateAdminResult
 }
 
 /// <summary>
+/// W10a — Resultado de uma alteração de password de administrador.
+/// </summary>
+public enum ChangePasswordResult
+{
+    Changed = 0,
+    UserNotFound = 1,
+    InvalidPassword = 2,
+}
+
+/// <summary>
 /// PHASE 9C.2 — Acesso a administradores no catálogo SQLite.
 ///
 /// <para>
@@ -127,5 +137,75 @@ public sealed class AdminUserStore
         user.LastLoginAtUtc = atUtc;
         user.UpdatedAtUtc = atUtc;
         await context.SaveChangesAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// W10a — Altera a password de um administrador pelo <c>Id</c>. A nova
+    /// password é validada por <see cref="CredentialPolicy.ValidatePassword"/>
+    /// antes de qualquer acesso à BD; se for inválida devolve
+    /// <see cref="ChangePasswordResult.InvalidPassword"/> sem tocar no
+    /// repositório. A actualização do hash e a revogação de todas as sessões
+    /// do utilizador acontecem na mesma transacção (rollback em falha).
+    /// Nunca registar a password nem o hash.
+    /// </summary>
+    public Task<ChangePasswordResult> ChangePasswordAsync(
+        int userId,
+        string newPassword,
+        CancellationToken cancellationToken = default)
+        => ChangePasswordCoreAsync(
+            context => context.AdminUsers.FirstOrDefaultAsync(u => u.Id == userId, cancellationToken),
+            newPassword,
+            cancellationToken);
+
+    /// <summary>
+    /// W10a — Altera a password de um administrador pelo <c>Username</c>
+    /// (case-sensitive, como persistido). Mesma semântica transaccional de
+    /// <see cref="ChangePasswordAsync(int, string, CancellationToken)"/>.
+    /// </summary>
+    public Task<ChangePasswordResult> ChangePasswordByUsernameAsync(
+        string username,
+        string newPassword,
+        CancellationToken cancellationToken = default)
+        => ChangePasswordCoreAsync(
+            context => context.AdminUsers.FirstOrDefaultAsync(u => u.Username == username, cancellationToken),
+            newPassword,
+            cancellationToken);
+
+    private async Task<ChangePasswordResult> ChangePasswordCoreAsync(
+        Func<ChannelCatalogDbContext, Task<AdminUserEntity?>> findUser,
+        string newPassword,
+        CancellationToken cancellationToken)
+    {
+        // Política de password centralizada (não duplicar regras). Inválida
+        // nunca chega a tocar na BD.
+        if (CredentialPolicy.ValidatePassword(newPassword) != null)
+        {
+            return ChangePasswordResult.InvalidPassword;
+        }
+
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        await using var transaction = await context.Database.BeginTransactionAsync(cancellationToken);
+
+        var user = await findUser(context);
+        if (user == null)
+        {
+            await transaction.RollbackAsync(cancellationToken);
+            return ChangePasswordResult.UserNotFound;
+        }
+
+        var now = DateTime.UtcNow;
+        user.PasswordHash = PasswordHasher.Hash(newPassword);
+        user.UpdatedAtUtc = now;
+
+        // Revogação: todas as sessões do utilizador caem na mesma
+        // transacção que a mudança de password (defesa em profundidade —
+        // uma password alterada não deve manter sessões antigas vivas).
+        await context.AdminSessions
+            .Where(s => s.AdminUserId == user.Id)
+            .ExecuteDeleteAsync(cancellationToken);
+
+        await context.SaveChangesAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+        return ChangePasswordResult.Changed;
     }
 }
