@@ -537,8 +537,13 @@ namespace m3uCrawler
                         var reportPath = Path.Combine(outputDir, $"telegram_report_{timestamp}.json");
 
                         // PHASE 13 (Wave 13-3) — selecção de fontes antes da publicação.
+                        // PHASE 13 (Wave 13-4) — política global resolvida do catálogo.
+                        var singleCyclePolicy = catalogForIngestion is null
+                            ? SourceSelectionDefaults.DefaultPolicy
+                            : await new SourceSelectionPolicyResolver(catalogForIngestion)
+                                .ResolveGlobalAsync(CancellationToken.None);
                         var singleCycleSelection = await new SourceSelectionStage(catalogForIngestion)
-                            .ApplyAsync(workingStreams, SourceSelectionDefaults.DefaultPolicy, CancellationToken.None);
+                            .ApplyAsync(workingStreams, singleCyclePolicy, CancellationToken.None);
                         runReport.SourceSelection = singleCycleSelection.ToReport();
                         if (singleCycleSelection.Applied)
                         {
@@ -1105,8 +1110,13 @@ namespace m3uCrawler
             var finalStreams = TelegramScraperService.MergeStreams(stillWorkingMain, freshStreams);
 
             // PHASE 13 (Wave 13-3) — selecção de fontes sobre a playlist final.
+            // PHASE 13 (Wave 13-4) — política global resolvida do catálogo.
+            var maintenancePolicy = catalog is null
+                ? SourceSelectionDefaults.DefaultPolicy
+                : await new SourceSelectionPolicyResolver(catalog)
+                    .ResolveGlobalAsync(cancellationToken);
             var maintenanceSelection = await new SourceSelectionStage(catalog)
-                .ApplyAsync(finalStreams, SourceSelectionDefaults.DefaultPolicy, cancellationToken);
+                .ApplyAsync(finalStreams, maintenancePolicy, cancellationToken);
             runReport.SourceSelection = maintenanceSelection.ToReport();
             if (maintenanceSelection.Applied)
             {

@@ -102,10 +102,10 @@ public sealed class ChannelSourceSelector : IChannelSourceSelector
     {
         ArgumentNullException.ThrowIfNull(candidates);
         ArgumentNullException.ThrowIfNull(policy);
-        if (policy.MaxSourcesPerChannel < 1)
+        if (policy.MaxSourcesPerChannel < 0)
         {
             throw new ArgumentOutOfRangeException(
-                nameof(policy), "MaxSourcesPerChannel deve ser >= 1.");
+                nameof(policy), "MaxSourcesPerChannel deve ser >= 0.");
         }
         if (policy.MaxSourcesPerProvider is <= 0)
         {

@@ -102,6 +102,8 @@ internal static class TestTempDb
         "sched-out-",
         "degradation-", "http-api-tests-", "pipeline-bridge-",
         "matching-audit-", "sync-run-steps-",
+        // Phase 13 (Wave 13-3/13-4) — source selection.
+        "source-selection-stage-", "source-selection-policy-",
         // Out dir.
         "out_",
     };
@@ -129,6 +131,8 @@ internal static class TestTempDb
         "sched_out-",
         "degradation-", "http_api_tests-", "pipeline_bridge-",
         "matching_audit-", "sync_run_steps-",
+        // Phase 13 (Wave 13-3/13-4) — source selection.
+        "source_selection_stage-", "source_selection_policy-",
         // Auditoria / validação live (timestamped).
         "bundle_guard_validation_", "content_type_distribution_",
         "country_opcao_c_live_validation_", "country_opcao_c_validation_",

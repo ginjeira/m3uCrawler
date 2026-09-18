@@ -1776,6 +1776,74 @@ public sealed class CatalogResolver
     }
 
     // ============================================================================
+    // PHASE 13 (Wave 13-4) — Source Selection Policy
+    // ============================================================================
+
+    public async Task<SourceSelectionPolicyEntity> GetOrCreateGlobalSourceSelectionPolicyAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var existing = await context.SourceSelectionPolicies
+            .FirstOrDefaultAsync(p => p.ScopeKey == "global", cancellationToken);
+        if (existing != null) return existing;
+
+        var now = DateTime.UtcNow;
+        existing = new SourceSelectionPolicyEntity
+        {
+            ScopeKey = "global",
+            CanonicalChannelKey = null,
+            MaxSourcesPerChannel = 10,
+            PreferDistinctProviders = true,
+            MaxSourcesPerProvider = null,
+            AllowFallbackToSameProvider = true,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+        };
+        context.SourceSelectionPolicies.Add(existing);
+        await context.SaveChangesAsync(cancellationToken);
+        return existing;
+    }
+
+    public async Task<SourceSelectionPolicyEntity> UpsertGlobalSourceSelectionPolicyAsync(
+        int maxSourcesPerChannel,
+        bool preferDistinctProviders,
+        int? maxSourcesPerProvider,
+        bool allowFallbackToSameProvider,
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var now = DateTime.UtcNow;
+        var existing = await context.SourceSelectionPolicies
+            .FirstOrDefaultAsync(p => p.ScopeKey == "global", cancellationToken);
+
+        if (existing != null)
+        {
+            existing.MaxSourcesPerChannel = maxSourcesPerChannel;
+            existing.PreferDistinctProviders = preferDistinctProviders;
+            existing.MaxSourcesPerProvider = maxSourcesPerProvider;
+            existing.AllowFallbackToSameProvider = allowFallbackToSameProvider;
+            existing.UpdatedAtUtc = now;
+            await context.SaveChangesAsync(cancellationToken);
+            return existing;
+        }
+
+        existing = new SourceSelectionPolicyEntity
+        {
+            ScopeKey = "global",
+            CanonicalChannelKey = null,
+            MaxSourcesPerChannel = maxSourcesPerChannel,
+            PreferDistinctProviders = preferDistinctProviders,
+            MaxSourcesPerProvider = maxSourcesPerProvider,
+            AllowFallbackToSameProvider = allowFallbackToSameProvider,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+        };
+        context.SourceSelectionPolicies.Add(existing);
+        await context.SaveChangesAsync(cancellationToken);
+        return existing;
+    }
+
+    // ============================================================================
     // PHASE 8 — TV/Radio/VOD/Groups + Import Policies
     // ============================================================================
 

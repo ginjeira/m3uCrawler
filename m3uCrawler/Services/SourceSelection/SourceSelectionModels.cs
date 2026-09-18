@@ -90,6 +90,8 @@ public sealed record SelectionCandidate(
 /// </summary>
 /// <param name="MaxSourcesPerChannel">
 /// Número máximo de fontes seleccionadas por canal. Nunca ultrapassado.
+/// <c>0</c> é válido e significa que nenhuma fonte é seleccionada
+/// ("não publicar"); valores negativos são inválidos.
 /// </param>
 /// <param name="PreferDistinctProviders">
 /// Quando <c>true</c>, a Fase A favorece um representante por fornecedor

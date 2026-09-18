@@ -1499,6 +1499,79 @@ namespace m3uCrawler.Services
                 return;
             }
 
+            // === PHASE 13 (Wave 13-4) — Global Source Selection Policy API ===
+            // GET  /api/catalog/source-selection-policies
+            // POST /api/catalog/source-selection-policies
+            if (requestPath.Equals("/api/catalog/source-selection-policies", StringComparison.OrdinalIgnoreCase))
+            {
+                if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    var global = await _catalogResolver.GetOrCreateGlobalSourceSelectionPolicyAsync();
+                    await WriteJsonAsync(context.Response, SourceSelectionPolicyToJson(global));
+                    return;
+                }
+                if (context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
+                        var body = await reader.ReadToEndAsync();
+                        var payload = JsonSerializer.Deserialize<SourceSelectionPolicyPayload>(body, JsonOptions);
+                        if (payload == null)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "Payload inválido." }, HttpStatusCode.BadRequest);
+                            return;
+                        }
+                        if (payload.MaxSourcesPerChannel is null)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "maxSourcesPerChannel é obrigatório." }, HttpStatusCode.BadRequest);
+                            return;
+                        }
+                        if (payload.MaxSourcesPerChannel.Value < 0)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "maxSourcesPerChannel não pode ser negativo." }, HttpStatusCode.BadRequest);
+                            return;
+                        }
+                        if (payload.PreferDistinctProviders is null)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "preferDistinctProviders é obrigatório." }, HttpStatusCode.BadRequest);
+                            return;
+                        }
+                        if (payload.AllowFallbackToSameProvider is null)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "allowFallbackToSameProvider é obrigatório." }, HttpStatusCode.BadRequest);
+                            return;
+                        }
+                        if (payload.MaxSourcesPerProvider is <= 0)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "maxSourcesPerProvider deve ser >= 1 ou ausente/null para sem limite." }, HttpStatusCode.BadRequest);
+                            return;
+                        }
+                        var saved = await _catalogResolver.UpsertGlobalSourceSelectionPolicyAsync(
+                            payload.MaxSourcesPerChannel.Value,
+                            payload.PreferDistinctProviders.Value,
+                            payload.MaxSourcesPerProvider,
+                            payload.AllowFallbackToSameProvider.Value);
+                        await WriteJsonAsync(context.Response, SourceSelectionPolicyToJson(saved));
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                        await WriteJsonAsync(context.Response, new { error = ex.Message }, HttpStatusCode.BadRequest);
+                        return;
+                    }
+                }
+                context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
+                return;
+            }
+
             // === PHASE 9 — Stream degradation dashboard ===
             // GET /api/catalog/degradation/recent?lookbackMinutes={n}&limit={n}
             // GET /api/catalog/degradation/stats?lookbackMinutes={n}
@@ -2971,6 +3044,15 @@ namespace m3uCrawler.Services
         [JsonPropertyName("allowFallback")] public bool AllowFallback { get; set; } = true;
     }
 
+    // === PHASE 13 (Wave 13-4) — Source Selection Policy payload ===
+    private sealed class SourceSelectionPolicyPayload
+    {
+        [JsonPropertyName("maxSourcesPerChannel")] public int? MaxSourcesPerChannel { get; set; }
+        [JsonPropertyName("preferDistinctProviders")] public bool? PreferDistinctProviders { get; set; }
+        [JsonPropertyName("maxSourcesPerProvider")] public int? MaxSourcesPerProvider { get; set; }
+        [JsonPropertyName("allowFallbackToSameProvider")] public bool? AllowFallbackToSameProvider { get; set; }
+    }
+
     // === PHASE 8 — payloads ===
     private sealed class ImportPolicyPayload
     {
@@ -3195,6 +3277,22 @@ namespace m3uCrawler.Services
         };
     }
 
+    private static object SourceSelectionPolicyToJson(SourceSelectionPolicyEntity p)
+    {
+        return new
+        {
+            id = p.Id,
+            scopeKey = p.ScopeKey,
+            canonicalChannelKey = p.CanonicalChannelKey,
+            maxSourcesPerChannel = p.MaxSourcesPerChannel,
+            preferDistinctProviders = p.PreferDistinctProviders,
+            maxSourcesPerProvider = p.MaxSourcesPerProvider,
+            allowFallbackToSameProvider = p.AllowFallbackToSameProvider,
+            createdAtUtc = p.CreatedAtUtc.ToString("o"),
+            updatedAtUtc = p.UpdatedAtUtc.ToString("o"),
+        };
+    }
+
     // === PHASE 7 — Playlist Composer JSON ===
     private static object PlaylistCompositionToJson(PlaylistComposition c)
     {
@@ -3408,6 +3506,7 @@ namespace m3uCrawler.Services
         <button data-ctab='sources' style='padding:8px 14px;'>Sources</button>
         <button data-ctab='ordering' style='padding:8px 14px;'>Ordering</button>
         <button data-ctab='priority' style='padding:8px 14px;'>Source Priority</button>
+        <button data-ctab='sourceselection' style='padding:8px 14px;'>Source Selection</button>
         <button data-ctab='matching' style='padding:8px 14px;'>Matching</button>
         <button data-ctab='degradation' style='padding:8px 14px;'>Degradação</button>
         <button data-ctab='scheduled' style='padding:8px 14px;'>Scheduled Jobs</button>
@@ -3757,6 +3856,20 @@ namespace m3uCrawler.Services
           <div style='margin-top:10px;display:flex;gap:8px;'>
             <button onclick='saveChannelPriority()'>Guardar override</button>
           </div>
+        </div>
+      </div>
+
+      <!-- TAB: Source Selection (PHASE 13, Wave 13-4) -->
+      <div id='ctab-sourceselection' hidden>
+        <div class='card' style='margin-top:16px;'>
+          <h3>Política global de selecção de fontes</h3>
+          <p class='muted'>Aplica-se por defeito a todos os canais quando não há override por canal. <strong>MaxSourcesPerChannel = 0</strong> é uma definição deliberada e válida: nenhuma fonte seleccionada é publicada para os canais. Não são aceites valores negativos. MaxSourcesPerProvider em branco significa sem limite.</p>
+          <div id='sourceSelectionPolicyForm' style='display:grid;gap:8px;grid-template-columns:1fr 1fr;'></div>
+          <div style='margin-top:10px;display:flex;gap:8px;'>
+            <button onclick='saveSourceSelectionPolicy()'>Guardar política</button>
+            <button class='secondary' onclick='loadSourceSelectionPolicy()'>Recarregar</button>
+          </div>
+          <div id='sourceSelectionPolicyStatus' class='muted' style='margin-top:8px;'></div>
         </div>
       </div>
 
@@ -4442,6 +4555,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
       else if (tab === 'sources') { loadSources(); loadChannelSources(); }
       else if (tab === 'ordering') loadOrderingLists();
       else if (tab === 'priority') loadGlobalPriority();
+      else if (tab === 'sourceselection') loadSourceSelectionPolicy();
       else if (tab === 'matching') loadMatchingAudits();
       else if (tab === 'degradation') loadDegradation();
       else if (tab === 'scheduled') { loadScheduledActions(); loadScheduledJobs(); }
@@ -5231,6 +5345,52 @@ const rows = Object.entries(inv).map(([k, v]) => {
       else { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
     }
 
+    // === PHASE 13 (Wave 13-4) — Global Source Selection Policy ===
+    async function loadSourceSelectionPolicy() {
+      const p = await safeFetchJson('/api/catalog/source-selection-policies', null);
+      const form = document.getElementById('sourceSelectionPolicyForm');
+      const status = document.getElementById('sourceSelectionPolicyStatus');
+      if (!p) { form.innerHTML = '<p class="muted">Erro ao carregar política.</p>'; return; }
+      form.innerHTML = `
+        <div><label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Max sources per channel (0 = não publicar nenhuma)</label>
+          <input id='ssp_maxSourcesPerChannel' type='number' min='0' value='${p.maxSourcesPerChannel}' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+        </div>
+        <div><label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Max sources per provider (vazio = sem limite)</label>
+          <input id='ssp_maxSourcesPerProvider' type='number' min='1' value='${p.maxSourcesPerProvider ?? ''}' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+        </div>
+        <div><label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Prefer distinct providers</label>
+          <select id='ssp_preferDistinctProviders'><option value='true' ${p.preferDistinctProviders?'selected':''}>sim</option><option value='false' ${!p.preferDistinctProviders?'selected':''}>não</option></select>
+        </div>
+        <div><label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Allow fallback to same provider</label>
+          <select id='ssp_allowFallbackToSameProvider'><option value='true' ${p.allowFallbackToSameProvider?'selected':''}>sim</option><option value='false' ${!p.allowFallbackToSameProvider?'selected':''}>não</option></select>
+        </div>
+      `;
+      status.textContent = 'Política carregada.';
+    }
+
+    async function saveSourceSelectionPolicy() {
+      const status = document.getElementById('sourceSelectionPolicyStatus');
+      const maxChannelRaw = document.getElementById('ssp_maxSourcesPerChannel').value.trim();
+      const maxProviderRaw = document.getElementById('ssp_maxSourcesPerProvider').value.trim();
+      const payload = {
+        maxSourcesPerChannel: maxChannelRaw === '' ? null : parseInt(maxChannelRaw, 10),
+        maxSourcesPerProvider: maxProviderRaw === '' ? null : parseInt(maxProviderRaw, 10),
+        preferDistinctProviders: document.getElementById('ssp_preferDistinctProviders').value === 'true',
+        allowFallbackToSameProvider: document.getElementById('ssp_allowFallbackToSameProvider').value === 'true',
+      };
+      const r = await fetch('/api/catalog/source-selection-policies', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (r.ok) {
+        status.textContent = 'Política guardada.';
+      } else {
+        const err = await r.json();
+        status.textContent = 'Erro: ' + (err.error || r.status);
+      }
+    }
+
     async function loadImportPolicies() {
       const list = await safeFetchJson('/api/catalog/import-policies', []);
       if (!Array.isArray(list)) { document.getElementById('importPoliciesTable').innerHTML = '<p class="muted">Erro.</p>'; return; }
@@ -5915,6 +6075,8 @@ const rows = Object.entries(inv).map(([k, v]) => {
     window.cancelAffinityEdit = cancelAffinityEdit;
     window.onAffinityKindChange = onAffinityKindChange;
     window.saveAffinityDelimiter = saveAffinityDelimiter;
+    window.loadSourceSelectionPolicy = loadSourceSelectionPolicy;
+    window.saveSourceSelectionPolicy = saveSourceSelectionPolicy;
 
     // === PHASE 9C.4 — Live Run (polling leve; sem SSE/WebSocket, sem tail de logs) ===
     var liveRunTimer = null;

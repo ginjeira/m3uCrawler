@@ -54,6 +54,13 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
   - Documentação alinhada (`docs/architecture/configuration-lifecycle.md`, `m3uCrawler/README.md`).
 
 ### ✨ Adicionado
+- **PHASE 13 — Wave 13-4 (2026-09-18): política global de selecção de fontes persistida + Dashboard.**
+  - **Persistência:** nova entidade `SourceSelectionPolicyEntity` → tabela `source_selection_policies` na BD do catálogo (`channel-catalog.db`), por migration **aditiva** `AddSourceSelectionPolicies` (índice único em `ScopeKey`, sem FK, identidade por `CanonicalChannelKey` — nunca `CanonicalChannelId`). Linha global (`ScopeKey="global"`, `CanonicalChannelKey=null`) criada lazily por `CatalogResolver.GetOrCreateGlobalSourceSelectionPolicyAsync`, com os defaults da 13-3 (`MaxSourcesPerChannel=10`, `PreferDistinctProviders=true`, `MaxSourcesPerProvider=null`, `AllowFallbackToSameProvider=true`). Tabela excluída do `LegacyConfigurationEvidenceEvaluator`, como `source_priority_policies`.
+  - **Resolução:** novo `SourceSelectionPolicyResolver` resolve a política global efectiva; `SourceSelectionStage` mantém-se sem persistência e recebe a `SourceSelectionPolicy` explícita. Os dois pontos de publicação Telegram (`Program.cs:540-541`, `:1108-1109`) passam a resolver via resolver.
+  - **Dashboard:** `GET/POST /api/catalog/source-selection-policies` + cartão *data-driven* na área Catálogo (apenas global), sob o gate de autenticação/CSRF existente.
+  - **Contrato ratificado (alteração semântica deliberada):** `ChannelSourceSelector` aceita `MaxSourcesPerChannel >= 0`, com `0` **válido** (selecciona zero fontes) e negativos inválidos; `MaxSourcesPerProvider` mantém `null` = sem limite, com `0`/negativos inválidos.
+  - **Fora de âmbito:** overrides por canal reservados à Wave 13-4b; sem auditoria de alterações administrativas. Documentado em `docs/architecture/phase-13-4-source-selection-policy.md` e `docs/architecture/dispatcharr-source-selection.md` §10.
+
 - **PHASE 13 — Wave 13-3 (2026-09-17): selecção de fontes aplicada à publicação Telegram.**
   - Nova `SourceSelectionStage` (`m3uCrawler/Services/SourceSelection/`): junta as streams do pipeline (URL real, só em memória) aos `ChannelSource` do catálogo pela chave `CredentialSanitizer.SanitizeUrl(realUrl)` — a mesma chave de unicidade do catálogo — projecta `SelectionCandidate`, aplica `IChannelSourceSelector` por canal canónico e devolve a lista publicável. Catálogo apenas lido; não escreve ficheiros.
   - Projection: `Provider` = host normalizado (`Uri.Host`, lowercase, sem `www.`/ponto final/porta); `Availability` = runtime `IsWorking`; `LastResponseTimeMs` = runtime; `Quality`/`Epg` = `Unknown`; `SourcePriority` do catálogo (actualmente 0).

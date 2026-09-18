@@ -720,7 +720,7 @@ public class DashboardBootstrapEndpointTests : IAsyncLifetime
         Assert.Equal(HttpStatusCode.OK, (await harness.Client.GetAsync("/api/history")).StatusCode);
     }
 
-    private sealed class DashboardHarness : IAsyncDisposable
+    internal sealed class DashboardHarness : IAsyncDisposable
     {
         private readonly HttpListener _listener;
         private readonly CancellationTokenSource _cts = new();

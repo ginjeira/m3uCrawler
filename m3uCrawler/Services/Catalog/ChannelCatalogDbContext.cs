@@ -26,6 +26,7 @@ public sealed class ChannelCatalogDbContext : DbContext
     public DbSet<OrderingListEntity> OrderingLists => Set<OrderingListEntity>();
     public DbSet<OrderingItemEntity> OrderingItems => Set<OrderingItemEntity>();
     public DbSet<SourcePriorityPolicyEntity> SourcePriorityPolicies => Set<SourcePriorityPolicyEntity>();
+    public DbSet<SourceSelectionPolicyEntity> SourceSelectionPolicies => Set<SourceSelectionPolicyEntity>();
     public DbSet<ImportPolicyEntity> ImportPolicies => Set<ImportPolicyEntity>();
     public DbSet<CanonicalGroupEntity> CanonicalGroups => Set<CanonicalGroupEntity>();
     public DbSet<GroupMappingEntity> GroupMappings => Set<GroupMappingEntity>();
@@ -335,6 +336,23 @@ public sealed class ChannelCatalogDbContext : DbContext
             e.Property(x => x.CreatedAtUtc).IsRequired();
             e.Property(x => x.UpdatedAtUtc).IsRequired();
             e.HasIndex(x => x.Scope).IsUnique();
+        });
+
+        // PHASE 13 (Wave 13-4) — SourceSelectionPolicy
+        modelBuilder.Entity<SourceSelectionPolicyEntity>(e =>
+        {
+            e.ToTable("source_selection_policies");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Id).ValueGeneratedOnAdd();
+            e.Property(x => x.ScopeKey).IsRequired().HasMaxLength(160);
+            e.Property(x => x.CanonicalChannelKey).HasMaxLength(120);
+            e.Property(x => x.MaxSourcesPerChannel).IsRequired();
+            e.Property(x => x.PreferDistinctProviders).IsRequired();
+            e.Property(x => x.MaxSourcesPerProvider);
+            e.Property(x => x.AllowFallbackToSameProvider).IsRequired();
+            e.Property(x => x.CreatedAtUtc).IsRequired();
+            e.Property(x => x.UpdatedAtUtc).IsRequired();
+            e.HasIndex(x => x.ScopeKey).IsUnique();
         });
 
         // PHASE 8 — ImportPolicy

@@ -4310,7 +4310,7 @@ Este documento define **como completar a evolução até ao sistema funcional pr
 | PHASE-Bridge — Pipeline → Catálogo | `[concluído]` | `PipelineIngestionService` liga o pipeline real (Telegram/M3U8-search) ao catálogo persistente via `EnsureSourceAsync` + `ResolveAsync` + `RecordChannelSourceAsync` + novo `EnsureCanonicalChannelAsync` (upsert). 9 testes TDD. Ver 32.12. |
 # 32.19 — PHASE 13 — Dispatcharr Source Selection, Diversity & Source Limits
 
-> Estado: [pendente] — proposta de implementação.
+> Estado: [em curso] — Waves 13-1, 13-3 e 13-4 implementadas; restante pendente.
 >
 > Esta fase fecha um problema operacional identificado na publicação para Dispatcharr:
 > actualmente, quando um canal é sincronizado, podem ser associadas ao mesmo canal todas
@@ -4321,7 +4321,8 @@ Este documento define **como completar a evolução até ao sistema funcional pr
 > A solução proposta é introduzir uma etapa explícita de **selecção/ranking de fontes por
 > canal**, imediatamente antes da sincronização para Dispatcharr.
 
-> **Nota factual (Wave 10-0, 2026-09-17).** Esta fase permanece `[pendente]`.
+> **Nota factual (Wave 10-0, 2026-09-17).** Nesse momento a fase permanecia
+> `[pendente]`.
 > Antes de a iniciar, o caminho agendado `syncDispatcharr` foi consolidado:
 > passou a injectar o `CatalogResolver` (catálogo canónico + ownership) no
 > `ChannelMatcher` e no `DispatcharrSyncService`, eliminando o modo legacy
@@ -4355,10 +4356,30 @@ Este documento define **como completar a evolução até ao sistema funcional pr
 > de publicação Telegram. `source-disabled` exclui; não correspondidas/ambíguas fazem
 > pass-through; catálogo ausente/vazio ⇒ no-op. Sem persistência nova, sem migration,
 > sem alterações ao Dispatcharr/`MatchPlan`/ownership. Diagnóstico agregado em
-> `RunReport.SourceSelection` (só contagens). Continuam pendentes: persistência/
-> Dashboard da política, produtores de Quality/EPG, correcção do reset de
-> `Source.Priority`, integração no composer/discovery. Detalhe em
+> `RunReport.SourceSelection` (só contagens). Continuam pendentes: produtores de
+> Quality/EPG, correcção do reset de `Source.Priority`, integração no
+> composer/discovery. Detalhe em
 > `docs/architecture/dispatcharr-source-selection.md` §10.
+
+> **Nota factual (Wave 13-4, 2026-09-18).** A política global de selecção de
+> fontes passou a ser **persistida** na BD do catálogo: nova entidade
+> `SourceSelectionPolicyEntity` → tabela `source_selection_policies`, por
+> migration aditiva `AddSourceSelectionPolicies` (índice único em `ScopeKey`,
+> sem FK, identidade por `CanonicalChannelKey`, nunca `CanonicalChannelId`). A
+> linha global (`ScopeKey="global"`, `CanonicalChannelKey=null`) é criada
+> lazily por `CatalogResolver.GetOrCreateGlobalSourceSelectionPolicyAsync` com
+> os defaults da 13-3 (`10/true/null/true`). Novo `SourceSelectionPolicyResolver`
+> resolve a política efectiva nos dois pontos de publicação Telegram
+> (`Program.cs:540-541`, `:1108-1109`); `SourceSelectionStage` permanece sem
+> persistência. Dashboard: `GET/POST /api/catalog/source-selection-policies` +
+> cartão na área Catálogo (apenas global), sob o gate de auth/CSRF existente.
+> **Contrato (alteração deliberada e ratificada):** `MaxSourcesPerChannel >= 0`,
+> com `0` **válido** (selecciona zero fontes) e negativos inválidos;
+> `MaxSourcesPerProvider` mantém `null` = sem limite, com `0`/negativos
+> inválidos. A tabela é excluída do `LegacyConfigurationEvidenceEvaluator`,
+> como `source_priority_policies`. **Reservado e não implementado:** overrides
+> por canal (Wave 13-4b) e auditoria de alterações administrativas. Detalhe em
+> `docs/architecture/phase-13-4-source-selection-policy.md`.
 
 > **Nota factual (2026-09-17) — `BuildPlanFromCompositionAsync`.** O método
 > existe em `ChannelMatcher` mas continua **sem call site de produção e sem

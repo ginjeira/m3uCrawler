@@ -953,6 +953,40 @@ public sealed class ChannelSourceObservationEntity
     public DateTime ObservedAtUtc { get; set; }
 }
 
+/// <summary>
+/// PHASE 13 (Wave 13-4) — Política de selecção de fontes persistida no
+/// catálogo. Contém apenas valores inteiros/booleanos — nunca URLs nem
+/// credenciais. <see cref="ScopeKey"/> distingue a política global
+/// (<c>"global"</c>) de overrides por canal (<c>"channel:{key}"</c>,
+/// reservados para 13-4b). Não tem FK: o âmbito por canal é resolvido
+/// pela chave canónica.
+/// </summary>
+public sealed class SourceSelectionPolicyEntity
+{
+    public long Id { get; set; }
+
+    /// <summary>"global" para a política por defeito do sistema; "channel:{key}" para override por canal.</summary>
+    public string ScopeKey { get; set; } = "global";
+
+    /// <summary>Chave do canal canónico para overrides por canal; <c>null</c> para a política global.</summary>
+    public string? CanonicalChannelKey { get; set; }
+
+    /// <summary>Número máximo de fontes por canal. <c>0</c> = não publicar nenhuma; negativo é inválido.</summary>
+    public int MaxSourcesPerChannel { get; set; }
+
+    /// <summary>Se true, favorece um representante por fornecedor distinto.</summary>
+    public bool PreferDistinctProviders { get; set; }
+
+    /// <summary>Limite opcional por fornecedor. <c>null</c> = sem limite.</summary>
+    public int? MaxSourcesPerProvider { get; set; }
+
+    /// <summary>Se true, a Fase B pode preencher lugares restantes com fornecedores já representados.</summary>
+    public bool AllowFallbackToSameProvider { get; set; }
+
+    public DateTime CreatedAtUtc { get; set; }
+    public DateTime UpdatedAtUtc { get; set; }
+}
+
 public sealed class SourcePriorityPolicyEntity
 {
     public long Id { get; set; }

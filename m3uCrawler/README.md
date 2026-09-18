@@ -459,6 +459,7 @@ O dashboard (`Services/WebDashboardService.cs`, `HttpListener`) serve a UI em `h
 | `/api/playlist/preview` / `/api/playlist_temp/preview` | **Diagnóstico**: mesmo conteúdo com URLs sanitizadas (`CredentialSanitizer.SanitizeM3uContent`). Usado pela pré-visualização HTML para nunca expor credenciais. |
 | `/api/run-report` | `RunReport` da última execução (sanitizado). |
 | `/api/discovered-playlists` | Lista de playlists descobertas na última execução (sanitizado). |
+| `/api/catalog/source-selection-policies` (GET/POST) | Política global de selecção de fontes por canal (ver secção seguinte). |
 
 ### Navegação do Dashboard
 
@@ -546,6 +547,27 @@ Quando um stream tem indicadores de país (e.g. "PT" no título ou group-title) 
   tiver `NormalizedMember` duplicados que impeçam restaurar a unicidade global
   antiga, **aborta** com erro explícito sem apagar dados; só conclui a remoção
   da proveniência e do schema novo quando o rollback é possível.
+
+### Política global de selecção de fontes (Wave 13-4)
+
+O endpoint `GET/POST /api/catalog/source-selection-policies` gere a política
+**global** que limita quantas fontes (streams) de um canal são publicadas.
+`GET` devolve a política global (criando a default na primeira chamada); `POST`
+faz upsert com os campos:
+
+| Campo | Tipo | Default | Validação |
+|---|---|---|---|
+| `maxSourcesPerChannel` | int (obrigatório) | `10` | `>= 0`. `0` é válido e significa que nenhuma fonte do canal é publicada; valores negativos são rejeitados com `400`. |
+| `preferDistinctProviders` | bool (obrigatório) | `true` | — |
+| `maxSourcesPerProvider` | int ou `null` | `null` | `null` = sem limite; caso contrário `>= 1` (`0` e negativos rejeitados com `400`). |
+| `allowFallbackToSameProvider` | bool (obrigatório) | `true` | — |
+
+Payloads inválidos (campo obrigatório ausente, `maxSourcesPerChannel` negativo
+ou `maxSourcesPerProvider` `<= 0`) devolvem `400 Bad Request` com
+`{ "error": "..." }`. O sucesso devolve a política gravada (campos `id`,
+`scopeKey`, `canonicalChannelKey`, `createdAtUtc`, `updatedAtUtc`). Overrides
+por canal estão reservados para a Wave 13-4b — este endpoint expõe apenas a
+política global.
 
 ### Modelo de segurança do dashboard
 

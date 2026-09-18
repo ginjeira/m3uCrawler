@@ -1,11 +1,14 @@
 # Dispatcharr Source Selection (PHASE 13)
 
-> Estado: **Wave 13-1 implementada** (política pura, determinística, sem I/O) e
-> **Wave 13-3 implementada** (aplicação da política ao pipeline Telegram antes da
-> publicação em `output/playlist.m3u`, §10). A persistência da política, o
-> Dashboard/preview, os produtores de Quality/EPG, a correcção do reset de
-> `Source.Priority` e a integração no composer/`MatchPlan`/`DispatcharrSyncService`
-> **não** estão implementados (ver `docs/IMPLEMENTATION_ROADMAP.md` §32.19).
+> Estado: **Waves 13-1, 13-3 e 13-4 implementadas.** 13-1: política pura,
+> determinística, sem I/O. 13-3: aplicação da política ao pipeline Telegram antes
+> da publicação em `output/playlist.m3u` (§10). 13-4: persistência **global** da
+> política na BD do catálogo, resolver e exposição no Dashboard (§10.1;
+> `docs/architecture/phase-13-4-source-selection-policy.md`). **Não**
+> implementados: overrides por canal (reservados à Wave 13-4b), preview/dry-run,
+> os produtores de Quality/EPG, a correcção do reset de `Source.Priority` e a
+> integração no composer/`MatchPlan`/`DispatcharrSyncService`
+> (ver `docs/IMPLEMENTATION_ROADMAP.md` §32.19).
 
 ## 1. Finalidade
 
@@ -35,9 +38,11 @@ publicação — não limita o canal canónico nem o catálogo interno.
   `SourcePriority`, `Quality`, `Epg`, `Availability`, `LastResponseTimeMs`,
   `ExternalStreamId`, `Provider` (`ProviderIdentity`), `IsWorking`.
   Reutiliza os enums de domínio `StreamQuality`, `EpgState` e `AvailabilityState`.
-- `SourceSelectionPolicy` — `MaxSourcesPerChannel`, `PreferDistinctProviders`,
-  `MaxSourcesPerProvider` (opcional), `AllowFallbackToSameProvider`. **Sem
-  limites hardcoded**; o chamador fornece os valores (ex.: 10 nos testes).
+- `SourceSelectionPolicy` — `MaxSourcesPerChannel` (`>= 0`; `0` é válido e não
+  selecciona nenhuma fonte, negativos inválidos), `PreferDistinctProviders`,
+  `MaxSourcesPerProvider` (opcional; `null` = sem limite, `0`/negativos
+  inválidos), `AllowFallbackToSameProvider`. **Sem limites hardcoded**; o
+  chamador fornece os valores (ex.: 10 nos testes).
 - `IChannelSourceSelector` / `ChannelSourceSelector` — a política.
 - `SourceSelectionResult` — `Selected` (candidato + `Rank` + motivo),
   `Rejected` (candidato + motivo) e `TotalCandidates`.
@@ -115,7 +120,9 @@ fornecedor já representado só é elegível se `AllowFallbackToSameProvider`
 (→ `fallback-disabled` caso contrário).
 
 `MaxSourcesPerChannel` é o tecto absoluto; `MaxSourcesPerProvider` aplica-se em
-ambas as fases.
+ambas as fases. Desde a Wave 13-4, `MaxSourcesPerChannel=0` é **válido** e
+selecciona zero fontes (a guarda foi relaxada de `>= 1` para `>= 0`); valores
+negativos são inválidos.
 
 ## 7. Provider desconhecido
 
@@ -161,7 +168,7 @@ Coberto por testes que comparam a assinatura completa (Selected/rank/motivo e
 Rejected/motivo) em múltiplas permutações e num dataset com empates
 deliberados.
 
-## 10. Integração no pipeline Telegram (Wave 13-3)
+## 10. Integração no pipeline Telegram (Waves 13-3 e 13-4)
 
 ### Boundary
 
@@ -217,11 +224,34 @@ IPv4/IPv6 distintos. Sem resolução de aliases/CDN/proxy.
   (não entra no selector) — alteração funcional deliberada.
 - Stream sem correspondência inequívoca → pass-through.
 
-### Defaults (13-3)
+### Defaults (13-3 → persistidos na 13-4)
 
 `MaxSourcesPerChannel = 10`, `MaxSourcesPerProvider = null`,
 `PreferDistinctProviders = true`, `AllowFallbackToSameProvider = true`
-(`SourceSelectionDefaults.DefaultPolicy`). Injectáveis pelo caller; sem persistência.
+(`SourceSelectionDefaults.DefaultPolicy`). Deixaram de ser apenas in-memory: a
+Wave 13-4 persiste-os como linha global e continua a usá-los como *fallback*
+final quando não existe linha (§10.1).
+
+### 10.1 Política global persistida (Wave 13-4)
+
+- **Schema:** `SourceSelectionPolicyEntity` → tabela `source_selection_policies`
+  na BD do catálogo, por migration **aditiva** `AddSourceSelectionPolicies`;
+  índice único em `ScopeKey`, sem FK, identidade por `CanonicalChannelKey`.
+- **Linha global:** `ScopeKey="global"` / `CanonicalChannelKey=null`, criada
+  **lazy** por `CatalogResolver.GetOrCreateGlobalSourceSelectionPolicyAsync`.
+- **Resolver:** `SourceSelectionPolicyResolver` resolve a política global
+  efectiva; `SourceSelectionStage` mantém-se **sem persistência** e recebe a
+  política explicitamente. Os dois pontos de publicação Telegram
+  (`Program.cs:540-541`, `:1108-1109`) resolvem via resolver.
+- **Dashboard:** `GET/POST /api/catalog/source-selection-policies` (apenas
+  global), sob o gate de autenticação/CSRF existente.
+- **Semântica:** `MaxSourcesPerChannel >= 0`, com `0` válido (zero selecções) e
+  negativos inválidos; `MaxSourcesPerProvider` `null` = sem limite, com
+  `0`/negativos inválidos.
+- **Legacy adoption:** a tabela é excluída do
+  `LegacyConfigurationEvidenceEvaluator`, tal como `source_priority_policies`.
+
+Detalhe em `docs/architecture/phase-13-4-source-selection-policy.md`.
 
 ### Pontos de publicação integrados
 
@@ -244,10 +274,12 @@ por contagens (sem URL) — não há novo artefacto persistente com credenciais.
 ### Fora de âmbito (13-3)
 
 Correcção do reset de `Source.Priority`, produtores de Quality/EPG, persistência de
-`LastResponseTimeMs`, persistência/Dashboard da política, migrations, integração no
-composer/discovery/validation, alterações ao `MatchPlan`/`DispatcharrSyncService`/
-ownership, `BuildPlanFromCompositionAsync`, `ProviderDefinition`, identidade de conta
-Xtream. Não faz `ProviderDefinition` completa.
+`LastResponseTimeMs`, integração no composer/discovery/validation, alterações ao
+`MatchPlan`/`DispatcharrSyncService`/ownership, `BuildPlanFromCompositionAsync`,
+`ProviderDefinition`, identidade de conta Xtream. Não faz `ProviderDefinition`
+completa. A persistência/Dashboard da política deixou de ser fora de âmbito na
+Wave 13-4 (§10.1); overrides por canal permanecem fora (reservados à 13-4b) e o
+preview/dry-run continua por implementar.
 
 ## 11. Testes de referência
 

@@ -815,9 +815,22 @@ public class ChannelSourceSelectorTests
     [Fact]
     public void Invalid_policy_is_rejected()
     {
+        // Wave 13-4 — 0 é um contrato válido (não publicar); só negativos são inválidos.
         Assert.Throws<ArgumentOutOfRangeException>(() =>
-            _selector.Select(Array.Empty<SelectionCandidate>(), Policy(max: 0)));
+            _selector.Select(Array.Empty<SelectionCandidate>(), Policy(max: -1)));
         Assert.Throws<ArgumentOutOfRangeException>(() =>
             _selector.Select(Array.Empty<SelectionCandidate>(), Policy(max: 10, maxPerProvider: 0)));
+    }
+
+    [Fact]
+    public void Zero_max_sources_selects_none()
+    {
+        var candidates = Many(5, 2);
+
+        var result = _selector.Select(candidates, Policy(max: 0));
+
+        Assert.Empty(result.Selected);
+        Assert.Equal(candidates.Count, result.Rejected.Count);
+        Assert.All(result.Rejected, r => Assert.Equal(SelectionReasons.LimitReached, r.Reason));
     }
 }

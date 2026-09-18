@@ -33,8 +33,9 @@ public sealed record LegacyEvidenceResult(bool HasEvidence, IReadOnlyList<string
 ///     matching audits, pending country approvals, affinity groups,
 ///     ownership Dispatcharr e identity rules.
 ///     <b>Excluídos</b> <c>CanonicalChannels</c>, <c>ChannelAliases</c>
-///     (criados pelo seed/baseline) e <c>SourcePriorityPolicies</c>
-///     (default global criado lazily).
+///     (criados pelo seed/baseline), <c>SourcePriorityPolicies</c> e
+///     <c>SourceSelectionPolicies</c> (defaults globais criados
+///     lazily e, por isso, sem valor probatório de adopção legacy).
 ///   </item>
 ///   <item>
 ///     Artefactos de output produzidos por execuções reais:
