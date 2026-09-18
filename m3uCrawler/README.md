@@ -95,6 +95,7 @@ As opções abaixo são as efectivamente reconhecidas pelo `Program.cs`. Opçõe
 | `--web-port PORTA` | Porta do dashboard (padrão: 5000). |
 | `--web-token TOKEN` | Token partilhado para proteger o dashboard (ver secção "Modelo de segurança do dashboard"). Opcional. |
 | `--web-allow-trigger` | Opt-in: permite `POST /api/run/start` (trigger manual) no dashboard. Default: desactivado ⇒ `503 web-allow-trigger-disabled`. |
+| `--admin-reset-password USERNAME` | Recuperação **host-only** da password de administrador: a password é lida interactivamente do stdin, **nunca** de argv. Ver secção "Alterar/recuperar password de administrador". |
 | `--output-dir DIR` | Directório de saída (padrão: `output`). |
 | `--bot` | Modo bot Telegram. |
 | `--fast` / `--high-performance` | Aumenta a concorrência (modo de pesquisa web). |
@@ -899,6 +900,37 @@ Telegram, sources, ordering, import policies, grupos, source priority e schedule
 - **CSRF**: token por sessão exigido no header `X-CSRF-Token` em métodos mutantes.
 - Password e hash nunca aparecem em logs, respostas ou erros; utilizador
   inexistente usa hash dummy (tempo uniforme) e erro genérico.
+
+### Alterar/recuperar password de administrador
+
+**Pelo Dashboard (autenticado).** Área "Alterar password"
+(actual/nova/confirmar) que faz `POST /api/session/password` (CSRF
+obrigatório) com `{currentPassword, newPassword}`. Em sucesso devolve
+`200 {message:"password-changed", reloginRequired:true}` e a UI mostra
+`password alterada — faça login novamente`, redireccionando para o login.
+A alteração **revoga todas as sessões do utilizador na mesma transacção**
+(`AdminUserStore.ChangePasswordAsync`), pelo que é necessário voltar a
+autenticar. Erros: `400 invalid-current-password`,
+`400 invalid-new-password`, `401 authentication-required`,
+`403 csrf-invalid`; apenas `POST` (`405` com `Allow: POST` nos restantes).
+Nunca devolve nem registra passwords/hashes.
+
+**Recuperação host-only (CLI).** Numa máquina com acesso ao catálogo:
+
+```bash
+m3uCrawler --admin-reset-password <username>
+```
+
+A password é pedida interactivamente (`Nova password:` /
+`Confirmar nova password:`) e **nunca** é passada como argumento. Exit
+codes: `0` alterada, `2` utilizador não encontrado, `3` password inválida,
+`4` passwords não coincidem, `1` erro de uso/setup. Não verifica a password
+actual (recuperação host-only) e não arranca web/Telegram/discovery/sync.
+**Não existe endpoint HTTP não autenticado de reset**; o bootstrap
+(`BOOTSTRAP_REQUIRED`) não é afectado. Contrato completo e limitação de
+máscara de input em contentores: ver
+`docs/architecture/configuration-lifecycle.md` §"Gestão da password de
+administrador".
 
 ### Modos de autorização
 

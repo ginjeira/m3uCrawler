@@ -247,6 +247,54 @@ READY (sem administrador)
   instalação pode ser reinicializada de raiz (ver §"Upgrade de instalações
   existentes").
 
+## Gestão da password de administrador
+
+A alteração/recuperação da password de administrador **não reabre o
+bootstrap**: o estado de lifecycle e a semântica de `BOOTSTRAP_REQUIRED`
+(§"Fluxo de bootstrap"/§"Caminho `BOOTSTRAP_REQUIRED`") permanecem inalterados.
+Não existe endpoint HTTP **não autenticado** de reset; a recuperação é
+estritamente host-only (CLI).
+
+### Alteração pelo Dashboard (autenticada)
+
+- `POST /api/session/password` (`UserAuth`; **apenas `POST`**; CSRF
+  obrigatório): body `{currentPassword, newPassword}`; verifica a password
+  actual, valida a nova por `CredentialPolicy` e grava o hash por
+  `PasswordHasher`. Respostas: `200
+  {message:"password-changed", reloginRequired:true}` em sucesso;
+  `401 authentication-required`; `403 csrf-invalid`; `405` com `Allow: POST`
+  (métodos não-`POST`); `400 invalid-current-password` /
+  `400 invalid-new-password`. Nunca devolve nem registra passwords ou hashes.
+- `AdminUserStore.ChangePasswordAsync(userId, newPassword)` /
+  `ChangePasswordByUsernameAsync(username, newPassword)` devolvem
+  `ChangePasswordResult { Changed, UserNotFound, InvalidPassword }` e, em
+  sucesso, **revogam todas as sessões do utilizador na mesma transacção** do
+  update do hash — daí `reloginRequired:true`.
+- Dashboard: área autenticada "Alterar password" (actual/nova/confirmar);
+  no sucesso apresenta `password alterada — faça login novamente` e
+  redirecciona para o login. A password nunca é escrita em URL, `localStorage`
+  ou logs.
+
+### Recuperação host-only (CLI)
+
+```
+m3uCrawler --admin-reset-password <username>
+```
+
+- O **username** pode ser argumento; a **password nunca é argumento** —
+  é lida interactivamente do stdin, com prompts `Nova password:` e
+  `Confirmar nova password:`.
+- Por desenho **não** verifica a password actual: é um caminho de recuperação
+  exclusivo do host (requer acesso ao filesystem/BD do catálogo).
+- Exit codes: `0` alterada, `2` utilizador não encontrado, `3` password
+  inválida (viola a política), `4` passwords não coincidem, `1` erro de
+  uso/setup.
+- Não arranca web/Telegram/discovery/sync e nunca imprime password ou hash.
+- **Limitação conhecida:** em alguns contentores, ou com stdin redireccionado,
+  `Console.IsInputRedirected` é `true` e a leitura cai em `Console.ReadLine()`
+  (máscara não garantida); com input piped/automação o comportamento é
+  determinístico.
+
 ## Configuração mínima (L2) para READY
 
 | Item | Obrigatório |
@@ -404,7 +452,8 @@ administrativo anónimo por falha de wiring.
 
 Testes de referência: `AuthPrimitivesTests`, `AdminSessionStoreTests`,
 `BootstrapServiceTests`, `BootstrapConfigurationValidatorTests`,
-`DashboardBootstrapEndpointTests`.
+`DashboardBootstrapEndpointTests`, `AdminUserStoreChangePasswordTests`,
+`AdminPasswordResetServiceTests`, `DashboardPasswordChangeEndpointTests`.
 
 ---
 
@@ -628,6 +677,7 @@ implementação envolvidos nas decisões acima são:
 - `m3uCrawler/Services/Configuration/LegacyConfigurationEvidenceEvaluator.cs`
 - `m3uCrawler/Services/Configuration/ConfigurationGate.cs`
 - `m3uCrawler/Services/Auth/AuthService.cs`
+- `m3uCrawler/Services/Auth/AdminPasswordResetService.cs`
 - `m3uCrawler/Services/Auth/AuthMode.cs`
 - `m3uCrawler/Services/Configuration/BootstrapService.cs`
 - `m3uCrawler/Services/Configuration/BootstrapConfigurationValidator.cs`
