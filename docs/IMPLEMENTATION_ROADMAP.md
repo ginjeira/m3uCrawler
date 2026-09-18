@@ -3425,6 +3425,8 @@ observar:
 >
 > *Nota de implementação (2026-09-18, HEAD `69aeb98`, PHASE 9C.6 — identidade canónica em runtime): a resolução de afinidades de canal passou a ser **Key-autoritativa**. `CatalogResolver.ResolveAsync` resolve o canal por `AffinityGroup.CanonicalChannelKey` (encontrado e habilitado) quando a Key existe; se a Key existe mas não resolve (inexistente ou desactivada), **não** recua para o `CanonicalChannelId` obsoleto; linhas legadas com Key nula/vazia mantêm o fallback por FK/navegação. `CatalogResolver.ListChannelSourcesAsync` inclui agora `CanonicalChannel`, expondo a Key ao caminho de selecção de fontes. Sem alteração de schema, migration, coluna ou FK — `CanonicalChannelId` permanece coluna de transição. Cobertura em `m3uCrawler.Tests/Phase9C6CanonicalIdentityTests.cs` (6 testes). Permanecem dependentes de `Id`: FKs de `channel_aliases`/`channel_sources`/`ordering_items`, `source_priority_policies` por canal, `dispatcharr_channel_ownerships`, `matching_audits`, `MatchPlan` e o agrupamento do `SourceSelectionStage`. Overrides por canal (13-4b) **implementados** entretanto com identidade por `CanonicalChannel.Key` (sem migração completa `Id → Key` do domínio).*
 >
+> *Nota de implementação (2026-09-18, onboarding/setup): a onda de onboarding pós-bootstrap entregou o serviço de prontidão operacional (`OperationalReadinessService`/`IOperationalReadinessGate`), a autenticação Telegram interactiva (`TelegramAuthService`), a configuração/teste Dispatcharr (`DispatcharrConfigurationService`, `DispatcharrConnectionTester`), os endpoints de setup e readiness, a vista `Setup` + banner `⚠️ SETUP REQUIRED` no Dashboard e o provisionamento de configuração de país no arranque (`CountryConfigProvisioner`). O gate do scheduler passa a exigir `READY` **e** `SetupComplete`; `adoptedFromLegacy` fica grandfathered e `sources` é informacional (não bloqueia `SetupComplete`, evitando deadlock do discovery). Detalhe normativo em `docs/architecture/configuration-lifecycle.md` §"Operational Readiness (pós-bootstrap)"; commits `39383fc`…`fcd5e32`. Permanece por decidir/implementar: embeber Telegram/Dispatcharr no wizard de first-run propriamente dito (a UI de Setup é uma vista separada, não o wizard 9C.2) e versionar/trackear `m3uCrawler/runtime-data/countries/pt.json` (dívida: EmbeddedResource inerte em CI/Docker).*
+>
 > Esta fase é uma condição de consolidação do produto antes de novas
 > funcionalidades. Não introduz uma segunda arquitectura: fecha o lifecycle
 > operacional sobre o catálogo, políticas, Dashboard e scheduler já existentes.
@@ -3438,7 +3440,7 @@ observar:
 > wave (não bloqueiam `READY`), por compatibilidade com instalações existentes.
 > Detalhe em `docs/architecture/configuration-lifecycle.md`.
 > **Reconciliação de estado (2026-09-18, HEAD `bf04c34`) — evidência de código/testes.** A fase continua **parcial**:
-> - **Wizard 9C.2 — parcial:** `BuildBootstrapHtml` (`WebDashboardService.cs:6868-6904`) cobre apenas 3 passos (arrancar bootstrap / criar admin / concluir); os passos dos §6 itens 4–11 (baseline, país, lista de ordenação, fontes, prioridade de fontes, políticas de importação, validação de streams, scheduler) não estão no wizard.
+> - **Wizard 9C.2 / onboarding — parcial:** `BuildBootstrapHtml` cobre apenas 3 passos (arrancar bootstrap / criar admin / concluir) e os passos dos §6 itens 4–11 (baseline canónico, lista de ordenação, fontes, prioridade de fontes, políticas de importação, validação de streams, scheduler) não estão no wizard. A onda de onboarding acrescentou uma vista **Setup** separada (não o wizard) com config/autenticação Telegram, config/teste Dispatcharr, prontidão operacional e banner `⚠️ SETUP REQUIRED`; embeber Telegram/Dispatcharr no próprio wizard de first-run permanece em aberto.
 > - **Gate de command/endpoints — parcial:** o scheduler está gated (`ScheduledJobRunner.cs:105-119`) e os endpoints mutantes respondem `403 bootstrap-required` (`WebDashboardService.cs:334-345`), mas o caminho CLI one-shot `--telegram` sem loop/manutenção não é gated (`Program.cs:297,421-433`).
 > - **Afinidades — resolução runtime corrigida (Wave 9C.6); dependências de `Id` remanescentes:** a identidade estável `CanonicalChannelKey` já era armazenada (`CatalogEntities.cs:180`) e a migration `20260916202838_AddCanonicalCountryAndAffinityKind` foi executada e testada (backfill/split/reversibilidade). A partir da Wave 9C.6 (HEAD `69aeb98`), `CatalogResolver.ResolveAsync` é **Key-autoritativo**: resolve por `Key` quando presente (encontrada e habilitada) e, se a `Key` existir mas não resolver, **não** recua para o `CanonicalChannelId` obsoleto; a Key nula/vazia mantém o fallback legado por FK/navegação. A sobrevivência a apagar/recriar o canal com a mesma `Key` está coberta por `m3uCrawler.Tests/Phase9C6CanonicalIdentityTests.cs`, contra o §10 (linhas 3788-3791) e o DoD de afinidades (4165-4177). Permanecem dependentes de `Id` (não migrados): FKs de `channel_aliases`, `channel_sources` e `ordering_items`, `source_priority_policies` por canal, `dispatcharr_channel_ownerships`, `matching_audits`, `MatchPlan` e o agrupamento do `SourceSelectionStage` — não é uma migração completa `Id → Key` (`OnDelete(SetNull)` do FK transitório mantém-se; `ChannelCatalogDbContext.cs:109-112`).
 > - **Auditoria do Dashboard — pendente:** não existe log de auditoria de acções administrativas (grep `AdminAudit|audit_log|AdminActionLog` sem resultados); `MatchingAuditEntity` é auditoria de matching, não de admin.
@@ -4254,7 +4256,7 @@ Além da Definition of Done global:
 - documentação actualizada;
 - commit criado.
 
-> **Reconciliação (2026-09-18; actualizada com a Wave 9C.6).** Cumpridos: lifecycle persistente, bootstrap, adopção legacy testada, criação segura do primeiro administrador, scheduler integrado ao gate, API documentada, testes automatizados, identidade lógica estável na **resolução** das afinidades (Key-autoritativa desde a Wave 9C.6, não só no armazenamento), documentação e commit. **Não cumpridos**: wizard funcional completo (apenas admin), discovery gate em *todas* as entradas (CLI one-shot sem gate), auditoria completa do Dashboard, instalação limpa validada, e suite Release verde formalizada. Ver bloco de reconciliação em §32.18.
+> **Reconciliação (2026-09-18; actualizada com a Wave 9C.6 e com a onda de onboarding/setup).** Cumpridos: lifecycle persistente, bootstrap, adopção legacy testada, criação segura do primeiro administrador, scheduler integrado ao gate (agora `READY` **e** `SetupComplete`), prontidão operacional (`/api/configuration/readiness`), autenticação Telegram interactiva, config/teste Dispatcharr, vista Setup + banner `SETUP REQUIRED`, provisionamento de país no arranque, API documentada, testes automatizados e documentação. **Não cumpridos**: wizard funcional completo — a vista Setup cobre Telegram/Dispatcharr/readiness, mas os §6 itens 4–11 continuam fora (embedding no wizard 9C.2 por decidir); discovery gate em *todas* as entradas (CLI one-shot sem gate), auditoria completa do Dashboard, auditoria administrativa, instalação limpa validada, suite Release verde formalizada e tracking do baseline `runtime-data/countries/pt.json`. Ver bloco de reconciliação em §32.18.
 
 Só depois desta fase se deve iniciar nova evolução funcional de maior dimensão.
 
@@ -4369,6 +4371,7 @@ PHASE 13 — Dispatcharr Source Selection, Diversity & Source Limits     [em cur
 | 9C.4 | CONCLUÍDA | série `e6d4be3`…`fc0440e` (+ fecho `394061e`) | Live Run Monitor (`live_runs`/`live_run_steps`, `RunCoordinator`, `GET /api/run/status`, `POST /api/run/start`) |
 | 9C.5 | CONCLUÍDA | `6fc2fa3` | `READY` sem administrador activo resolve para `AuthMode.Bootstrap`; primeiro admin sem reconfigurar |
 | 9C.6 | CONCLUÍDA | `4562489` | Identidade canónica em runtime: resolução de afinidades Key-autoritativa; `CanonicalChannel.Key` exposta ao loader de selecção |
+| Onboarding / Setup (pós-9C.6) | CONCLUÍDA | `39383fc`…`fcd5e32` | Prontidão operacional, autenticação Telegram interactiva, config/teste Dispatcharr, endpoints setup/readiness, vista Setup + banner `SETUP REQUIRED`, provisionamento de país; gate `READY` + `SetupComplete` (não é uma sub-wave 9C numerada) |
 
 > A definição normativa de 9C.1–9C.6 vive em `docs/architecture/configuration-lifecycle.md`, `docs/architecture/run-observability-and-manual-trigger.md` (§18) e `docs/architecture/channel-catalog-and-ownership.md` (§12 e "Identidade canónica em runtime"). Apenas 9C.3 (`ad1d3f6`), o fecho 9C.2/9C.3/9C.4 (`394061e`) e o estado de 9C.6 têm hashes referidos na documentação; os restantes hashes são evidência do histórico Git.
 
@@ -4427,12 +4430,13 @@ Requisitos de DoD sem wave atribuída (classificados `[NÃO DECOMPOSTA]`, sem cr
 
 **PHASE 9C (§15):**
 
-- wizard funcional completo (apenas admin; §6 itens 4–11 fora do wizard);
+- wizard funcional completo (admin + vista Setup de Telegram/Dispatcharr/readiness; §6 itens 4–11 continuam fora do wizard — embedding no wizard 9C.2 por decidir);
 - discovery gate em *todas* as entradas relevantes (CLI one-shot `--telegram` sem gate);
 - auditoria completa do Dashboard;
 - auditoria administrativa (log de mutações) — lacuna transversal;
 - instalação limpa validada;
 - suite Release verde formalizada;
+- versionamento/tracking do baseline `m3uCrawler/runtime-data/countries/pt.json` (dívida: EmbeddedResource inerte em CI/Docker);
 - dependências remanescentes de `CanonicalChannelId` (FKs de `channel_aliases`/`channel_sources`/`ordering_items`, `source_priority_policies` por canal, `dispatcharr_channel_ownerships`, `matching_audits`, `MatchPlan`, agrupamento do `SourceSelectionStage`);
 - Manual/Ajuda contextual.
 

@@ -475,6 +475,7 @@ O dashboard tem os seguintes separadores principais:
 - **Playlist**: visualização da playlist actual com links para download funcional.
 - **Dispatcharr**: estado da última sincronização e detalhes do plano/report.
 - **Catálogo**: gestão completa do catálogo de canais (ver secção abaixo).
+- **Setup**: onboarding pós-bootstrap — banner `⚠️ SETUP REQUIRED`, prontidão por componente, config/autenticação Telegram e config/teste Dispatcharr (ver secção "Onboarding / Setup operacional").
 - **Diagnóstico**: inventário de ficheiros, RunReport completo e glossário de métricas.
 
 ### Catálogo de Canais
@@ -927,6 +928,62 @@ silenciosamente para o modo legacy.
 O dashboard serve HTTP. Sem TLS não é possível garantir `Secure` nem proteger
 credenciais em trânsito; uma exposição fora de rede confiável deve usar reverse
 proxy/TLS.
+
+## Onboarding / Setup operacional (pós-bootstrap)
+
+`READY` (bootstrap) **não** significa operacional. O Dashboard expõe uma vista
+**Setup** e um banner superior `⚠️ SETUP REQUIRED` que distingue
+`Bootstrap: READY` de `Operational`, mostrando cada componente com ✓/❌ e o
+respectivo formulário. Fluxo de onboarding:
+
+```
+Bootstrap → Admin → Setup Required → Telegram → Dispatcharr → Sources → Operational Ready
+```
+
+| Endpoint | Método | Descrição |
+|---|---|---|
+| `/api/configuration/readiness` | GET | Snapshot de prontidão (`bootstrapReady`, `setupComplete`, `operationalReady`, `sourcesCount`, `items[]`, `missingRequired[]`). |
+| `/api/telegram/config` | GET/POST | Lê/grava `api_id`, `phone_number`, `session_pathname`; `api_hash` nunca é devolvido (`hasApiHash`). |
+| `/api/telegram/auth/start` | POST | Inicia o login Telegram por passos. |
+| `/api/telegram/auth/code` | POST | Submete o código de verificação. |
+| `/api/telegram/auth/password` | POST | Submete a password 2FA. |
+| `/api/telegram/auth/status` | GET | Estado do login (`state`, `userName`, `detail`, `configured`). |
+| `/api/dispatcharr/config` | GET/POST | Lê/grava `enabled`, `base_url`, `dry_run` e credenciais (nunca devolvidas). |
+| `/api/dispatcharr/test` | POST | Teste de ligação read-only (`GET /api/core/version/`). |
+
+Todos os `POST` são métodos mutantes e, em `UserAuth`, exigem `X-CSRF-Token`.
+
+### Autenticação Telegram interactiva
+
+`TelegramAuthService` corre `WTelegram.Client.Login` por passos
+(`start` → `code` → opcional `password`), sem `Console.ReadLine` no fluxo web.
+A sessão é persistida em `session.dat` via `session_pathname`. O `api_hash`
+nunca é devolvido nem registado e o `detail` de estado é sanitizado.
+
+### Dispatcharr (config + teste)
+
+`DispatcharrConfigurationService` grava a configuração em `wtelegram.config`
+por um writer atómico que preserva chaves desconhecidas e aplica permissões
+restritivas (600). O teste de ligação é **read-only** e distingue `CONNECTED`,
+`AUTHENTICATION_FAILED`, `UNREACHABLE`, `INVALID_CONFIGURATION` e `ERROR`;
+nunca faz escrita nem sincronização.
+
+### Bootstrap Ready vs Operational Ready
+
+- **Bootstrap Ready**: lifecycle `READY` (administrador + L2).
+- **Operational Ready**: administrador + Telegram autenticado + Dispatcharr
+  válido (se activado) + catálogo + output, e `sources >= 1`.
+- `sources` **não** entra em `SetupComplete` (evita bloquear o scheduler por
+  nunca haver fontes); só afecta `operationalReady`.
+- O scheduler/discovery exige `READY` **e** `SetupComplete`; jobs bloqueados
+  mantêm `NextRunAtUtc` inalterado e são registados.
+- Instalações adoptadas como legacy (`adoptedFromLegacy`) ficam grandfathered.
+- O provisionamento inicial de país (`runtime-data/countries/*.json`, nunca
+  sobreposto) corre no arranque em `--web` e `--telegram`.
+
+Regras completas, componentes obrigatórios e a dívida do baseline de país em
+`docs/architecture/configuration-lifecycle.md` §"Operational Readiness
+(pós-bootstrap)".
 
 ## Live Run Monitor (PHASE 9C.4)
 

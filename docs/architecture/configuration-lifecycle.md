@@ -260,6 +260,101 @@ READY (sem administrador)
 Nota: o loader existente normaliza `dispatcharr_enabled=true` sem
 `dispatcharr_base_url` para "desactivado"; esse caso não bloqueia `READY`.
 
+## Operational Readiness (pós-bootstrap)
+
+`READY` (bootstrap) **não** é o mesmo que uma instalação **operacional**. A
+primeira responde "o bootstrap está fechado e existe configuração mínima?"; a
+segunda responde "os componentes concretos de que o funcionamento automático
+precisa estão funcionais?".
+
+| Conceito | Condição | Reportado em |
+|---|---|---|
+| **Bootstrap Ready** | lifecycle `READY` (administrador activo + L2 válida, ver §"Configuração mínima (L2) para READY") | `bootstrapReady` em `GET /api/configuration/readiness`; `GET /api/configuration/lifecycle` |
+| **Setup Complete** | Bootstrap Ready **e** administrador activo **e** sessão Telegram autenticada **e** Dispatcharr válido (apenas se activado) **e** catálogo canónico com canais **e** output gravável | `setupComplete` |
+| **Operational Ready** | `Setup Complete` **e** `sourcesCount >= 1` | `operationalReady` |
+
+### Componentes obrigatórios
+
+`OperationalReadinessService` avalia itens com chave estável (`bootstrap`,
+`admin`, `telegram`, `dispatcharr`, `catalog`, `output`, `sources`):
+
+- **Obrigatórios para `SetupComplete`**: `bootstrap`, `admin`, `telegram`,
+  `catalog`, `output` e `dispatcharr` **apenas quando** `Dispatcharr.Enabled`
+  (exige então `BaseUrl` e ApiKey **ou** user/pass).
+- **Informacional**: `sources` conta as `channel_sources` ingeridas. **Não**
+  faz parte de `SetupComplete` — se fizesse, o scheduler de descoberta ficaria
+  bloqueado por nunca existirem fontes antes de a primeira descoberta correr
+  (deadlock). Só `OperationalReady` exige `sourcesCount >= 1`.
+
+A avaliação é fail-safe (excepção/dado em falta ⇒ `false`) e nenhum `Detail`
+inclui URLs, API keys, passwords ou telefones.
+
+### Gate do scheduler / discovery
+
+`ConfigurationGate` passa a poder ser composto com `IOperationalReadinessGate`.
+Quando presente, `IConfigurationGate.IsReadyAsync` exige **as duas** condições:
+lifecycle `READY` **e** `SetupComplete`.
+
+- Jobs vencidos ficam com `LastResult = "blocked:not-configured"`, **sem**
+  `LastRunAtUtc` e **sem** avanço de `NextRunAtUtc` — continuam vencidos para
+  correr assim que a instalação fique pronta. O bloqueio é registado uma vez
+  (`⛔ scheduler blocked: not configured (state=…)`).
+- Sem readiness gate (ex.: caminho CLI one-shot), o comportamento mantém-se o
+  anterior (apenas lifecycle), por retrocompatibilidade.
+
+### Legacy grandfathering
+
+Quando o lifecycle tem `AdoptedFromLegacy == true`, `SetupComplete` e
+`OperationalReady` são ambos `true`, mesmo que itens individuais apareçam
+insatisfeitos (ex.: sessão Telegram não confirmada no processo). Os itens
+continuam a ser reportados para diagnóstico e `MissingRequired` continua a
+listar os obrigatórios em falta (meramente informativo). Uma instalação já
+operacional antes da introdução do lifecycle não fica bloqueada.
+
+### Endpoints (UserAuth; POST ⇒ CSRF)
+
+| Endpoint | Descrição |
+|---|---|
+| `GET /api/configuration/readiness` | Snapshot: `bootstrapReady`, `hasAdmin`, `telegramAuthenticated`, `dispatcharrEnabled`, `dispatcharrValid`, `catalogOk`, `outputOk`, `sourcesCount`, `setupComplete`, `operationalReady`, `adoptedFromLegacy`, `items[]`, `missingRequired[]`. Read-only. |
+| `GET/POST /api/telegram/config` | Lê/grava `api_id`, `phone_number`, `session_pathname`; `api_hash` **nunca** é devolvido (`hasApiHash` indica existência). |
+| `POST /api/telegram/auth/start` | Inicia o login Telegram por passos com a configuração guardada. |
+| `POST /api/telegram/auth/code` | Submete o código de verificação. |
+| `POST /api/telegram/auth/password` | Submete a password 2FA. |
+| `GET /api/telegram/auth/status` | Estado (`state`, `userName`, `detail` sanitizado, `configured`). |
+| `GET/POST /api/dispatcharr/config` | Lê/grava `enabled`, `base_url`, `dry_run` e credenciais (nunca devolvidas; `hasApiKey`/`hasUsername`). |
+| `POST /api/dispatcharr/test` | Teste de ligação **read-only** (`GET /api/core/version/`) com `CONNECTED`/`AUTHENTICATION_FAILED`/`UNREACHABLE`/`INVALID_CONFIGURATION`/`ERROR`. |
+
+Os endpoints respondem `503 <serviço>-unavailable` quando o serviço não está
+composto no processo.
+
+### Escrita segura de `wtelegram.config`
+
+`WtelegramConfigStore.Upsert` (usado pela config Telegram e Dispatcharr)
+preserva comentários, chaves desconhecidas e a ordem das linhas, acrescenta
+chaves novas no fim e escreve de forma atómica (temp + move). Em Unix aplica
+`UserRead|UserWrite` (600). `api_hash`, passwords e API keys nunca são
+devolvidos, registados nem incluídos em `Detail`.
+
+### Config de país no arranque
+
+`CountryConfigProvisioner.EnsureProvisioned` corre no arranque, em ambos os
+caminhos (`--web` e `--telegram`), a partir de `InitializeCatalogAsync`: semeia
+`runtime-data/countries/*.json` a partir de EmbeddedResources e de uma baseline
+PT embutida, **nunca sobrepondo** ficheiros existentes, com escrita atómica.
+
+> **Dívida conhecida.** `m3uCrawler/runtime-data/countries/pt.json` não está
+> versionado (`.gitignore` ignora `m3uCrawler/runtime-data/*` excepto
+> `.gitkeep`/`channel-indicators.json`) e `.dockerignore` exclui
+> `runtime-data/`, pelo que o EmbeddedResource compilado é inerte em CI/Docker
+> e a baseline C# é a fonte efectiva. Alinhar o tracking do ficheiro (ou
+> remover o EmbeddedResource) é dívida a tratar.
+
+Testes de referência: `OperationalReadinessServiceTests`,
+`ConfigurationGateSchedulerTests`, `TelegramAuthServiceTests`,
+`DispatcharrConfigurationServiceTests`, `DispatcharrConnectionTesterTests`,
+`WtelegramConfigStoreTests`, `CountryConfigProvisionerTests`,
+`SetupConfigEndpointTests`, `WebDashboardSetupHtmlTests`.
+
 ## Modos de autorização
 
 | Modo | Condição | Comportamento |
