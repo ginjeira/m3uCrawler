@@ -96,6 +96,7 @@ internal static class TestTempDb
         // Catálogo / matching / scheduler / dispatcharr.
         "channel-catalog-", "channel-catalog-tests-", "channel-catalog-ownership-guard-",
         "catalog-admin-", "catalog-admin-tests-", "catalog-baseline-", "catalog-baseline-test-",
+        "catalog-normalization-",
         "ordering-", "ordering-tests-",
         "sources-", "sources-tests-",
         "policies-groups-", "scheduled-actions-", "scheduled-jobs-", "sched-e2e-",
@@ -127,6 +128,7 @@ internal static class TestTempDb
         "auth_store-", "bootstrap-", "l2-",
         "channel_catalog-", "channel_catalog_tests-", "channel_catalog_ownership_guard-",
         "catalog_admin-", "catalog_admin_tests-", "catalog_baseline-", "catalog_baseline_test-",
+        "catalog_normalization-",
         "ordering-", "ordering_tests-",
         "sources-", "sources_tests-",
         "policies_groups-", "scheduled_actions-", "scheduled_jobs-", "sched_e2e-",

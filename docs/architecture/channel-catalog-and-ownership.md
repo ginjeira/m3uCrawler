@@ -30,6 +30,31 @@ permanece apenas como **compatibilidade de categoria editorial**
   alias, categoria editorial, política de publicação, ownership,
   fingerprint de revisão e contadores de SyncRun.
 
+### Invariante de identidade (Wave B)
+
+`CanonicalChannel (Key)` + `ChannelAlias` é a **única** fonte de
+identidade de canal. Consequências normativas:
+
+- A ingestão (`PipelineIngestionService`) **não cria** canais
+  canónicos a partir de títulos desconhecidos. Se
+  `CatalogResolver.ResolveAsync` (IdentityRule → Affinity(Channel) →
+  ChannelAlias) não devolver um canal canónico real, o stream não é
+  ligado ao catálogo: não há `CanonicalChannel` inventado nem
+  `ChannelSource` sob identidade fabricada. O desconhecido fica
+  visível como `MatchingAudit` (sem canal) e como `ReviewItem`
+  idempotente.
+- Todos os aliases persistidos estão na **forma matchable** produzida
+  por `ChannelNormalizer.Normalize` (o que o matcher consulta). Os
+  caminhos de escrita normalizam: `AddAliasAsync`,
+  `RemoveAliasAsync`, `CreateCanonicalChannelAsync`,
+  `EnsureCanonicalChannelAsync`, o seed e os membros de afinidade
+  `Kind = Channel` (membros `Kind = Country` são apenas trim'd).
+- O arranque normaliza in-place aliases legacy de instalações
+  pré-existentes, de forma idempotente e collision-safe: um alias que
+  colida com a forma normalizada de outro canal é deixado intacto
+  (skip determinístico), nunca roubando identidade nem lançando.
+- As `Key` dos canais canónicos não mudam.
+
 ## 2. Modelo de dados
 
 ### `CanonicalChannel`
@@ -164,9 +189,10 @@ de alias entre canais (um alias não pode aparecer em dois canais).
 
 ### Channels curados
 
-`benfica-tv` (Desporto, CreateEligible) com aliases: `btv`,
-`btv hevc pt`, `benficatv`, `benfica tv`, `pt benfica tv`,
-`pt  benfica tv`.
+`benfica-tv` (Desporto, CreateEligible). O alias persistido é a
+forma normalizada: `btv`, `benficatv`, `benfica tv` (as variantes
+`btv hevc pt`, `pt benfica tv`, `pt  benfica tv` colapsam para
+`btv`/`benfica tv` e são deduplicadas).
 
 `sport-tv-1` a `sport-tv-7`, `sport-tv-news` (todos CreateEligible,
 Desporto). Canais PT curados (RTP 1/2/3, RTP Notícias, SIC,
@@ -285,13 +311,14 @@ StreamOwnership = External, Unknown, ou sem registo (com catalog)
 
 ## 7. Política para BTV e Benfica TV
 
-A entrada `BTV HEVC PT` (alias do canal `benfica-tv`) é resolvida
-para `benfica-tv` na BD:
+A entrada `BTV HEVC PT` (título que normaliza para `btv`, alias do
+canal `benfica-tv`) é resolvida para `benfica-tv` na BD:
 
 1. `ContentClassifier.Classify("BTV HEVC PT", ...)` devolve
    `Kind = Channel` (legado: alias match em `ChannelCategoryLookup`).
-2. `CatalogResolver.ResolveAsync("btv hevc pt")` devolve
-   `Canonical benfica-tv, Policy = CreateEligible, Kind = Canonical`.
+2. `CatalogResolver.ResolveAsync("btv")` (forma normalizada)
+   devolve `Canonical benfica-tv, Policy = CreateEligible,
+   Kind = Canonical`.
 3. Bucket tier = `Curated`; bucket identity = `benfica-tv`
    (canonical).
 4. Se já existir um canal `Benfica TV` no Dispatcharr:
@@ -308,8 +335,8 @@ distinto de Sport TV 1..7:
 
 1. `ContentClassifier.Classify("PT: SPORT TV NBA", ...)` →
    `Kind = Channel`.
-2. `CatalogResolver.ResolveAsync("pt sport tv nba")` → encontra
-   `ChannelAlias.NormalizedAlias = "pt sport tv nba"` →
+2. `CatalogResolver.ResolveAsync("sport tv nba")` → encontra
+   `ChannelAlias.NormalizedAlias = "sport tv nba"` →
    `Kind = Canonical, Key = "sport-tv-nba",
    PublicationPolicy = CreateEligible`.
 3. O bucket resolve para `(Curated, "sport-tv-nba")`.
@@ -330,9 +357,13 @@ Aliases canónicos suportados (na forma produzida por
 | Raw                      | Normalizado               |
 |--------------------------|---------------------------|
 | `SPORT TV NBA`           | `sport tv nba`            |
-| `PT: SPORT TV NBA`       | `pt sport tv nba`         |
-| `PT SPORT TV NBA`        | `pt sport tv nba`         |
-| `SPORT TV NBA HEVC PT`   | `sport tv nba hevc pt`    |
+| `PT: SPORT TV NBA`       | `sport tv nba`            |
+| `PT SPORT TV NBA`        | `sport tv nba`            |
+| `SPORT TV NBA HEVC PT`   | `sport tv nba`            |
+
+Os tokens de país (`PT`) e de qualidade (`HEVC`) são removidos pelo
+`ChannelNormalizer`, pelo que todas as variantes colapsam para o
+**único** alias persistido `sport tv nba`.
 
 (Não há mais `IdentityRule ReviewOnly` para NBA — a entrada foi
 removida quando o canal subiu para `Canonical CreateEligible`.)

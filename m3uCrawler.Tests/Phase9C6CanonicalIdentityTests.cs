@@ -48,6 +48,14 @@ public class Phase9C6CanonicalIdentityTests : IAsyncLifetime
 
     public Task DisposeAsync() => Task.CompletedTask;
 
+    /// <summary>
+    /// Forma matchable de um membro de afinidade. As Channel
+    /// affinities normalizam os membros na escrita (Wave B), pelo
+    /// que as queries têm de usar a mesma forma.
+    /// </summary>
+    private static string N(string raw) =>
+        m3uCrawler.Services.Matching.ChannelNormalizer.Normalize(raw);
+
     private async Task<CanonicalChannelEntity> CreateCanonicalAsync(string key)
     {
         return await _resolver.CreateCanonicalChannelAsync(
@@ -80,7 +88,7 @@ public class Phase9C6CanonicalIdentityTests : IAsyncLifetime
         await _resolver.CreateAffinityGroupAsync(
             "Phase 9C6 RTP 1", AffinityKind.Channel, key, null, new[] { member });
 
-        var before = await _resolver.ResolveAsync(member);
+        var before = await _resolver.ResolveAsync(N(member));
         Assert.Equal(CatalogResolutionKind.Canonical, before.Kind);
         Assert.Equal(key, before.CanonicalKey);
         Assert.Equal(oldId, before.CanonicalChannelId);
@@ -92,7 +100,7 @@ public class Phase9C6CanonicalIdentityTests : IAsyncLifetime
 
         Assert.NotEqual(oldId, newId);
 
-        var after = await _resolver.ResolveAsync(member);
+        var after = await _resolver.ResolveAsync(N(member));
         Assert.Equal(CatalogResolutionKind.Canonical, after.Kind);
         Assert.Equal(key, after.CanonicalKey);
         Assert.Equal(newId, after.CanonicalChannelId);
@@ -110,7 +118,7 @@ public class Phase9C6CanonicalIdentityTests : IAsyncLifetime
 
         await UpdateAffinityGroupRowAsync(group.Id, g => g.CanonicalChannelId = null);
 
-        var resolution = await _resolver.ResolveAsync(member);
+        var resolution = await _resolver.ResolveAsync(N(member));
         Assert.Equal(CatalogResolutionKind.Canonical, resolution.Kind);
         Assert.Equal(key, resolution.CanonicalKey);
         Assert.Equal(canonical.Id, resolution.CanonicalChannelId);
@@ -131,7 +139,7 @@ public class Phase9C6CanonicalIdentityTests : IAsyncLifetime
 
         await UpdateAffinityGroupRowAsync(group.Id, g => g.CanonicalChannelId = b.Id);
 
-        var resolution = await _resolver.ResolveAsync(member);
+        var resolution = await _resolver.ResolveAsync(N(member));
         Assert.Equal(CatalogResolutionKind.Canonical, resolution.Kind);
         Assert.Equal(keyA, resolution.CanonicalKey);
         Assert.Equal(a.Id, resolution.CanonicalChannelId);
@@ -157,7 +165,7 @@ public class Phase9C6CanonicalIdentityTests : IAsyncLifetime
             g.CanonicalChannelId = b.Id;
         });
 
-        var resolution = await _resolver.ResolveAsync(member);
+        var resolution = await _resolver.ResolveAsync(N(member));
         Assert.Equal(CatalogResolutionKind.Unknown, resolution.Kind);
         Assert.Null(resolution.CanonicalKey);
         Assert.Null(resolution.CanonicalChannelId);
@@ -176,7 +184,7 @@ public class Phase9C6CanonicalIdentityTests : IAsyncLifetime
 
         await UpdateAffinityGroupRowAsync(group.Id, g => g.CanonicalChannelKey = null);
 
-        var resolution = await _resolver.ResolveAsync(member);
+        var resolution = await _resolver.ResolveAsync(N(member));
         Assert.Equal(CatalogResolutionKind.Canonical, resolution.Kind);
         Assert.Equal(key, resolution.CanonicalKey);
         Assert.Equal(canonical.Id, resolution.CanonicalChannelId);

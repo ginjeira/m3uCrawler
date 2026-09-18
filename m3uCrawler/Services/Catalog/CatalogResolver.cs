@@ -4,6 +4,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.EntityFrameworkCore;
+using m3uCrawler.Services.Matching;
 
 namespace m3uCrawler.Services.Catalog;
 
@@ -127,8 +128,17 @@ public sealed class CatalogResolver
 
     /// <summary>
     /// Regista (ou actualiza) um item de revisão. Idempotente: se
-    /// já existir um item com o mesmo fingerprint em estado Open,
-    /// não cria duplicado. Devolve a entrada persistida.
+    /// já existir um item com o mesmo fingerprint, não cria duplicado.
+    ///
+    /// <para>
+    /// <b>Decisão humana não é revertida.</b> Se o item já estiver
+    /// <see cref="ReviewItemState.Approved"/> ou
+    /// <see cref="ReviewItemState.Excluded"/>, uma nova observação
+    /// apenas actualiza <c>UpdatedAtUtc</c> (nova evidência); o
+    /// estado decidido, o <c>ResolvedAtUtc</c>, a nota e o canal
+    /// aprovado permanecem intactos. Só um item <c>Open</c> é
+    /// devolvido tal como está.
+    /// </para>
     /// </summary>
     public async Task<ReviewItemEntity> UpsertReviewItemAsync(
         string normalizedIdentity,
@@ -153,11 +163,11 @@ public sealed class CatalogResolver
             {
                 return existing;
             }
-            // Aprovado/excluído: reabrir como Open para nova evidência.
-            existing.State = ReviewItemState.Open;
+            // Aprovado/excluído: uma decisão humana NÃO é revertida
+            // silenciosamente por uma nova observação. Registamos a
+            // nova evidência actualizando o timestamp, sem resetar o
+            // estado nem apagar a nota/decisão.
             existing.UpdatedAtUtc = DateTime.UtcNow;
-            existing.ResolvedAtUtc = null;
-            existing.Note = string.Empty;
             await context.SaveChangesAsync(cancellationToken);
             return existing;
         }
@@ -486,7 +496,7 @@ public sealed class CatalogResolver
         if (string.IsNullOrWhiteSpace(name))
             throw new ArgumentException("name required", nameof(name));
 
-        var members = CleanMembers(normalizedMembers);
+        var members = CleanMembers(normalizedMembers, kind);
         if (members.Count == 0)
             throw new ArgumentException("at least one member required", nameof(normalizedMembers));
 
@@ -563,7 +573,14 @@ public sealed class CatalogResolver
             .ToListAsync(cancellationToken);
     }
 
-    private static List<string> CleanMembers(IReadOnlyList<string>? normalizedMembers)
+    /// <summary>
+    /// Limpa e deduplica os membros de uma afinidade. Membros de
+    /// uma <see cref="AffinityKind.Channel"/> affinity são
+    /// normalizados via <see cref="ChannelNormalizer.Normalize"/>
+    /// (forma única matchable). Membros <see cref="AffinityKind.Country"/>
+    /// são apenas trim'd — são tokens de país, não identidades de canal.
+    /// </summary>
+    private static List<string> CleanMembers(IReadOnlyList<string>? normalizedMembers, AffinityKind kind)
     {
         if (normalizedMembers == null) return new List<string>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -572,6 +589,11 @@ public sealed class CatalogResolver
         {
             if (string.IsNullOrWhiteSpace(raw)) continue;
             var value = raw.Trim();
+            if (kind == AffinityKind.Channel)
+            {
+                value = ChannelNormalizer.Normalize(value);
+            }
+            if (value.Length == 0) continue;
             if (seen.Add(value)) result.Add(value);
         }
         return result;
@@ -589,7 +611,7 @@ public sealed class CatalogResolver
         if (string.IsNullOrWhiteSpace(name))
             throw new ArgumentException("name required", nameof(name));
 
-        var members = CleanMembers(normalizedMembers);
+        var members = CleanMembers(normalizedMembers, kind);
         if (members.Count == 0)
             throw new ArgumentException("at least one member required", nameof(normalizedMembers));
 
@@ -779,9 +801,13 @@ public sealed class CatalogResolver
     }
 
     /// <summary>
-    /// Aprova um canal pendente: cria IdentityRule com CreateEligible
-    /// e marca o pending como Approved. Opcionalmente adiciona o membro
-    /// ao grupo de afinidade do país (criando o grupo se não existir).
+    /// Aprova um canal pendente: cria <see cref="IdentityRuleEntity"/>
+    /// com <see cref="RuleDisposition.ReviewOnly"/> e marca o pending
+    /// como Approved. <b>ReviewOnly não autoriza criação automática</b>
+    /// de canal (apenas desbloqueia o matching/revisão), pelo que a
+    /// criação continua a ser uma decisão humana explícita. Opcionalmente
+    /// adiciona o membro ao grupo de afinidade do país (criando o grupo
+    /// se não existir).
     /// </summary>
     public async Task<PendingCountryApprovalEntity?> ApprovePendingCountryApprovalAsync(
         long id,
@@ -885,14 +911,20 @@ public sealed class CatalogResolver
                 $"Já existe um canal canónico com a key '{key}' (id={existingByKey.Id}).");
         }
 
-        var normalizedAliasSet = new HashSet<string>(
-            normalizedAliases.Select(a => a.Trim()), StringComparer.Ordinal);
-        if (normalizedAliasSet.Count != normalizedAliases.Count)
+        var normalizedAliasSet = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var alias in normalizedAliases ?? Array.Empty<string>())
         {
-            throw new ChannelAdministrationException(
-                ChannelAdministrationError.InvalidInput,
-                "Aliases duplicados no payload (cada alias deve aparecer uma única vez).");
+            // Forma única matchable: o mesmo normalizador que o
+            // matcher usa antes de consultar o catálogo. Aliases que
+            // colapsam para a mesma forma (ou para vazio) são
+            // deduplicados silenciosamente.
+            var canonical = ChannelNormalizer.Normalize(alias);
+            if (canonical.Length > 0)
+            {
+                normalizedAliasSet.Add(canonical);
+            }
         }
+
         var conflictAliases = await context.ChannelAliases
             .Where(a => normalizedAliasSet.Contains(a.NormalizedAlias))
             .Select(a => a.NormalizedAlias)
@@ -987,10 +1019,18 @@ public sealed class CatalogResolver
     /// identificado por <paramref name="key"/>. Se já existir, devolve
     /// o existente (sem mexer em campos). Se não existir, cria um novo
     /// canal com os parâmetros fornecidos, e adiciona
-    /// <paramref name="normalizedAlias"/> como alias se for não-vazio
-    /// e não colidir com nenhum alias já existente noutro canal.
-    /// Usado pela pipeline de ingestão (Telegram/M3U/M3U8-search) para
-    /// criar canais desconhecidos sem bloquear em duplicados.
+    /// <paramref name="normalizedAlias"/> (normalizado via
+    /// <see cref="ChannelNormalizer.Normalize"/>) como alias se for
+    /// não-vazio e não colidir com nenhum alias já existente noutro
+    /// canal.
+    ///
+    /// <para>
+    /// <b>Não é a pipeline de ingestão.</b> A ingestão
+    /// (<see cref="PipelineIngestionService"/>) não cria canais: usa
+    /// apenas <see cref="ResolveAsync"/>. Este método permanece para
+    /// chamadas administrativas/explícitas que já tenham decidido a
+    /// identidade canónica.
+    /// </para>
     /// </summary>
     public async Task<(CanonicalChannelEntity Channel, bool Created)> EnsureCanonicalChannelAsync(
         string key,
@@ -1036,7 +1076,11 @@ public sealed class CatalogResolver
 
         if (!string.IsNullOrWhiteSpace(normalizedAlias))
         {
-            var alias = normalizedAlias.Trim();
+            var alias = ChannelNormalizer.Normalize(normalizedAlias);
+            if (alias.Length == 0)
+            {
+                return (channel, true);
+            }
             var aliasConflict = await context.ChannelAliases
                 .AnyAsync(a => a.NormalizedAlias == alias, cancellationToken);
             if (!aliasConflict)
@@ -1053,6 +1097,13 @@ public sealed class CatalogResolver
         return (channel, true);
     }
 
+    /// <summary>
+    /// Adiciona um alias a um canal canónico. O alias é normalizado
+    /// via <see cref="ChannelNormalizer.Normalize"/> antes de ser
+    /// persistido, para que fique na mesma forma que o matcher
+    /// consulta (forma única matchable). Aliases que normalizam para
+    /// vazio são rejeitados.
+    /// </summary>
     public async Task<ChannelAliasEntity> AddAliasAsync(
         long channelId,
         string normalizedAlias,
@@ -1064,7 +1115,13 @@ public sealed class CatalogResolver
                 ChannelAdministrationError.InvalidInput,
                 "Alias é obrigatório.");
         }
-        var alias = normalizedAlias.Trim();
+        var alias = ChannelNormalizer.Normalize(normalizedAlias);
+        if (alias.Length == 0)
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.InvalidInput,
+                $"Alias '{normalizedAlias}' normaliza para vazio e não é matchable.");
+        }
 
         await using var context = await _factory.CreateDbContextAsync(cancellationToken);
         var channel = await context.CanonicalChannels
@@ -1112,9 +1169,14 @@ public sealed class CatalogResolver
     {
         if (string.IsNullOrWhiteSpace(normalizedAlias)) return false;
 
+        // Aceita a forma exacta (removendo aliases legados ainda não
+        // normalizados) ou a forma normalizada matchable.
+        var trimmed = normalizedAlias.Trim();
+        var normalized = ChannelNormalizer.Normalize(trimmed);
         await using var context = await _factory.CreateDbContextAsync(cancellationToken);
         var alias = await context.ChannelAliases
-            .FirstOrDefaultAsync(a => a.CanonicalChannelId == channelId && a.NormalizedAlias == normalizedAlias, cancellationToken);
+            .FirstOrDefaultAsync(a => a.CanonicalChannelId == channelId
+                                   && (a.NormalizedAlias == trimmed || a.NormalizedAlias == normalized), cancellationToken);
         if (alias == null) return false;
 
         context.ChannelAliases.Remove(alias);
@@ -1277,10 +1339,19 @@ public sealed class CatalogResolver
     /// Cria ou actualiza uma <see cref="SourceEntity"/> pela chave
     /// (slug). A origem é sanitizada antes de ser persistida para
     /// não guardar credenciais em claro.
+    ///
+    /// <para>
+    /// <paramref name="updatePriority"/> controla se a prioridade de
+    /// uma Source já existente é reescrita. A ingestão automática
+    /// passa <c>false</c> para não destruir a prioridade definida pelo
+    /// operador; a criação de uma Source nova usa sempre
+    /// <paramref name="priority"/>.
+    /// </para>
     /// </summary>
     public async Task<SourceEntity> EnsureSourceAsync(
         string key, string name, SourceKind kind, string origin, int priority,
-        bool isEnabled = true, CancellationToken cancellationToken = default)
+        bool isEnabled = true, CancellationToken cancellationToken = default,
+        bool updatePriority = true)
     {
         if (string.IsNullOrWhiteSpace(key)) throw new ArgumentException("Key é obrigatória.", nameof(key));
         if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Name é obrigatório.", nameof(name));
@@ -1301,7 +1372,10 @@ public sealed class CatalogResolver
             existing.Name = name.Trim();
             existing.Kind = kind;
             existing.Origin = sanitizedOrigin;
-            existing.Priority = priority;
+            if (updatePriority)
+            {
+                existing.Priority = priority;
+            }
             existing.IsEnabled = isEnabled;
             existing.UpdatedAtUtc = now;
             await context.SaveChangesAsync(cancellationToken);

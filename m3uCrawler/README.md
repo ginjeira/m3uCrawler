@@ -510,7 +510,7 @@ Quando um stream tem indicadores de país (e.g. "PT" no título ou group-title) 
 
 **Como funciona a aprovação manual:**
 
-1. **Aprovar** → Cria uma `IdentityRule` com `ReviewOnly` que permite fuzzy matching futuro. O canal fica elegível para ser criado automaticamente em sincronizações futuras.
+1. **Aprovar** → Cria uma `IdentityRule` com `ReviewOnly`. Isto desbloqueia o matching/revisão do canal, mas **não** autoriza a criação automática: `ReviewOnly` nunca gera NewChannel. A criação continua a ser uma decisão humana explícita no catálogo canónico.
 2. **Reprovar** → Cria uma `IdentityRule` com `Excluded` que impede o canal de ser aceite. Útil para descartar canais extranjeros que usam indicadores de país enganosos.
 
 **Nota de segurança**: As URLs mostradas na lista de pending approvals são sanitizadas antes de guardar (`CredentialSanitizer.SanitizeUrl`), pelo que nunca expõem credenciais Xtream.
@@ -672,11 +672,11 @@ read-only (nunca insere a linha default).
   `channels`. **Limitação de paridade: `ResponseTime`** — o preview usa o valor
   **persistido** `ChannelSourceEntity.LastResponseTimeMs` quando presente; na
   prática essa coluna só é escrita como `0` no insert e nunca é actualizada
-  (`CatalogResolver.cs:1422`; update `:1392-1404`), pelo que está normalmente a
+  (`CatalogResolver.cs:1496`; update `:1466-1478`), pelo que está normalmente a
   `0`/indisponível e **não** representa o `DurationMs` da probe ao vivo; a
   observação é append-only e sem flag de sucesso
   (`WebDashboardService.cs:2156`) e o pipeline ignora `stream.ResponseTime`
-  (`PipelineIngestionService.cs:250-264`); o valor real em produção é o stopwatch
+  (`PipelineIngestionService.cs:236-247`); o valor real em produção é o stopwatch
   `DurationMs` da probe exacta (`M3uTesterService.cs:550,555`). Por isso o
   preview **não** reproduz a ordenação por `ResponseTimeKey`
   (`ChannelSourceSelector.cs:128,260-261`) e a sua ordenação por response time

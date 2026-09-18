@@ -6,6 +6,7 @@ using System.Threading.Tasks;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using m3uCrawler.Services.Matching;
 
 namespace m3uCrawler.Services.Catalog;
 
@@ -122,6 +123,13 @@ public sealed class ChannelCatalogBootstrapper
         // Este passo adiciona os canais e aliases da baseline
         // canónica portuguesa sem remover nada do seed legacy.
         await TryImportBaselineAsync(context, cancellationToken);
+
+        // Wave B — normalização de aliases legacy. As instalações
+        // pré-existentes podem ter aliases gravados em bruto (com
+        // tokens de país/qualidade, maiúsculas, diacríticos). Sem
+        // normalização esses aliases nunca são encontrados pelo
+        // matcher. A operação é idempotente e collision-safe.
+        await NormalizeExistingAliasesAsync(context, _logger, cancellationToken);
 
         lockStream?.Dispose();
         return context;
@@ -290,6 +298,17 @@ public sealed class ChannelCatalogBootstrapper
     /// Aplica o seed de forma idempotente. Em condições normais a
     /// migration inicial já popula o seed, mas este método
     /// suporta cenários em que o seed é reaplicado manualmente.
+    ///
+    /// <para>
+    /// Os aliases do seed são normalizados via
+    /// <see cref="ChannelNormalizer.Normalize"/> antes de serem
+    /// inseridos, para que uma instalação fresca fique imediatamente
+    /// matchable. A normalização pode colapsar vários aliases numa
+    /// única forma: esses duplicados são deduplicados; colisões com
+    /// aliases já pertencentes a outro canal são ignoradas
+    /// deterministicamente (o alias existente mantém o dono). As
+    /// <c>Key</c> dos canais não são alteradas.
+    /// </para>
     /// </summary>
     public static async Task SeedAsync(ChannelCatalogDbContext context, CancellationToken cancellationToken = default)
     {
@@ -318,6 +337,17 @@ public sealed class ChannelCatalogBootstrapper
         var now = DateTime.UtcNow;
         foreach (var ch in CatalogSeed.Channels)
         {
+            // Forma única matchable, deduplicada por canal.
+            var channelAliases = new System.Collections.Generic.List<string>();
+            var seenForChannel = new System.Collections.Generic.HashSet<string>(
+                System.StringComparer.Ordinal);
+            foreach (var rawAlias in ch.Aliases)
+            {
+                var normalizedAlias = ChannelNormalizer.Normalize(rawAlias);
+                if (normalizedAlias.Length == 0) continue;
+                if (seenForChannel.Add(normalizedAlias)) channelAliases.Add(normalizedAlias);
+            }
+
             if (!existingChannelKeySet.Contains(ch.Key))
             {
                 var entity = new CanonicalChannelEntity
@@ -332,9 +362,9 @@ public sealed class ChannelCatalogBootstrapper
                     UpdatedAtUtc = now,
                 };
                 context.CanonicalChannels.Add(entity);
-                foreach (var alias in ch.Aliases)
+                foreach (var alias in channelAliases)
                 {
-                    if (existingAliasSet.Contains(alias)) continue;
+                    if (!existingAliasSet.Add(alias)) continue;
                     context.ChannelAliases.Add(new ChannelAliasEntity
                     {
                         NormalizedAlias = alias,
@@ -350,10 +380,10 @@ public sealed class ChannelCatalogBootstrapper
                 var existing = await context.CanonicalChannels
                     .Include(c => c.Aliases)
                     .FirstAsync(c => c.Key == ch.Key, cancellationToken);
-                foreach (var alias in ch.Aliases)
+                foreach (var alias in channelAliases)
                 {
                     if (existing.Aliases.Any(a => a.NormalizedAlias == alias)) continue;
-                    if (existingAliasSet.Contains(alias)) continue;
+                    if (!existingAliasSet.Add(alias)) continue;
                     existing.Aliases.Add(new ChannelAliasEntity
                     {
                         NormalizedAlias = alias,
@@ -378,5 +408,105 @@ public sealed class ChannelCatalogBootstrapper
         }
 
         await context.SaveChangesAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Wave B — normaliza in-place os <c>NormalizedAlias</c> de
+    /// instalações pré-existentes para a forma matchable do
+    /// <see cref="ChannelNormalizer.Normalize"/> (o que o matcher
+    /// consulta). Idempotente e collision-safe:
+    /// <list type="bullet">
+    ///   <item>valor normalizado vazio ou já igual → sem alteração;</item>
+    ///   <item>colisão com outro alias do MESMO canal → o alias
+    ///         duplicado é removido (merge);</item>
+    ///   <item>colisão com um alias de OUTRO canal → o alias existente
+    ///         mantém o dono e o alias legacy é deixado como está
+    ///         (skip determinístico; nunca lança).</item>
+    /// </list>
+    /// Devolve o número de aliases efectivamente alterados.
+    /// </summary>
+    internal static async Task<int> NormalizeExistingAliasesAsync(
+        ChannelCatalogDbContext context,
+        ILogger? logger,
+        CancellationToken cancellationToken = default)
+    {
+        var aliases = await context.ChannelAliases
+            .OrderBy(a => a.Id)
+            .ToListAsync(cancellationToken);
+
+        // value -> (aliasRowId, channelId) do dono actual. Mantido
+        // actualizado à medida que renomeamos/removemos.
+        var ownerByValue = new System.Collections.Generic.Dictionary<
+            string, (long AliasId, long ChannelId)>(System.StringComparer.Ordinal);
+        foreach (var alias in aliases)
+        {
+            ownerByValue[alias.NormalizedAlias] = (alias.Id, alias.CanonicalChannelId);
+        }
+
+        var changed = 0;
+        var merged = 0;
+        var skipped = 0;
+        var toRemove = new System.Collections.Generic.List<ChannelAliasEntity>();
+
+        foreach (var alias in aliases)
+        {
+            var current = alias.NormalizedAlias;
+            var target = ChannelNormalizer.Normalize(current);
+            if (target.Length == 0) continue;
+            if (string.Equals(target, current, StringComparison.Ordinal)) continue;
+
+            if (ownerByValue.TryGetValue(target, out var owner))
+            {
+                if (owner.ChannelId == alias.CanonicalChannelId)
+                {
+                    // Já existe a forma normalizada neste canal: o
+                    // alias legacy é redundante → merge/remove.
+                    toRemove.Add(alias);
+                    ownerByValue.Remove(current);
+                    merged++;
+                    changed++;
+                }
+                else
+                {
+                    // Colisão com outro canal: não roubar identidade.
+                    // Deixa o alias legacy como está (não-matchable,
+                    // mas sem corromper o dono existente).
+                    skipped++;
+                }
+                continue;
+            }
+
+            ownerByValue.Remove(current);
+            alias.NormalizedAlias = target;
+            ownerByValue[target] = (alias.Id, alias.CanonicalChannelId);
+            changed++;
+        }
+
+        if (toRemove.Count > 0)
+        {
+            context.ChannelAliases.RemoveRange(toRemove);
+        }
+
+        if (changed > 0 || skipped > 0)
+        {
+            await context.SaveChangesAsync(cancellationToken);
+        }
+
+        if (changed > 0)
+        {
+            logger?.LogWarning(
+                "Channel alias normalization: {Changed} legacy aliases normalised " +
+                "({Merged} merged, {Skipped} collision(s) skipped).",
+                changed, merged, skipped);
+        }
+        else if (skipped > 0)
+        {
+            logger?.LogWarning(
+                "Channel alias normalization: {Skipped} legacy alias collision(s) " +
+                "skipped; no alias changed.",
+                skipped);
+        }
+
+        return changed;
     }
 }
