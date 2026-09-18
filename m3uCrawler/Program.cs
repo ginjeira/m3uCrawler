@@ -568,7 +568,11 @@ namespace m3uCrawler
                             Console.WriteLine("❌ Nenhum stream funcional encontrado no Telegram.");
                         }
 
-                        await TrySyncToDispatcharrAsync(playlistPath, outputDir, args);
+                        // PHASE 13 (Wave 13-6 part 2) — artefacto de selecção
+                        // correlacionado com o stage (single-cycle).
+                        var dispatcharrSelection = m3uCrawler.Services.Sync.DispatcharrSourceSelectionFactory
+                            .FromStageResult(singleCycleSelection, singleCyclePolicies);
+                        await TrySyncToDispatcharrAsync(playlistPath, outputDir, args, selection: dispatcharrSelection);
 
                         await importHistoryService.RecordImportAsync(new ImportHistoryEntry
                         {
@@ -639,6 +643,8 @@ namespace m3uCrawler
                     return;
                 }
 
+                // Legacy standalone path: sem stage de selecção nesta execução,
+                // portanto selection fica null (sem correlação heurística).
                 await TrySyncToDispatcharrAsync(playlistPath, outputDir, args);
                 return;
             }
@@ -1137,7 +1143,13 @@ namespace m3uCrawler
             await playlistManager.SaveToJsonReport(finalStreams, reportPath);
             await SaveRunReportAsync(outputDir, runReport);
 
-            await TrySyncToDispatcharrAsync(mainPath, outputDir, args, liveRunProgress, cancellationToken);
+            // PHASE 13 (Wave 13-6 part 2) — artefacto de selecção correlacionado
+            // com o stage (modo manutenção).
+            var maintenanceDispatcharrSelection = m3uCrawler.Services.Sync.DispatcharrSourceSelectionFactory
+                .FromStageResult(maintenanceSelection, maintenancePolicies);
+            await TrySyncToDispatcharrAsync(
+                mainPath, outputDir, args, liveRunProgress, cancellationToken,
+                selection: maintenanceDispatcharrSelection);
 
             var historyEntry = new ImportHistoryEntry
             {
@@ -1288,7 +1300,8 @@ namespace m3uCrawler
         static async Task TrySyncToDispatcharrAsync(
             string playlistPath, string outputDir, string[] args,
             ILiveRunProgress? liveRunProgress = null,
-            CancellationToken cancellationToken = default)
+            CancellationToken cancellationToken = default,
+            DispatcharrSourceSelection? selection = null)
         {
             var cfg = DispatcharrConfigLoader.Load();
             if (!cfg.Enabled)
@@ -1348,7 +1361,7 @@ namespace m3uCrawler
                     ordering: ordering,
                     matcher: matcher,
                     catalog: catalog);
-                await sync.RunAsync(playlistPath);
+                await sync.RunAsync(playlistPath, selection);
 
                 if (liveRunProgress is not null)
                 {

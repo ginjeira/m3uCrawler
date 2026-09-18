@@ -1,6 +1,6 @@
 # Dispatcharr Source Selection (PHASE 13)
 
-> Estado: **Waves 13-1, 13-3, 13-4, 13-4b e 13-5 implementadas.** 13-1: política pura,
+> Estado: **Waves 13-1, 13-3, 13-4, 13-4b, 13-5 e 13-6 implementadas.** 13-1: política pura,
 > determinística, sem I/O. 13-3: aplicação da política ao pipeline Telegram antes
 > da publicação em `output/playlist.m3u` (§10). 13-4: persistência **global** da
 > política na BD do catálogo, resolver e exposição no Dashboard (§10.1;
@@ -9,12 +9,16 @@
 > substitui a global, resolvida em lote por execução e gerida no Dashboard
 > (§10.2). 13-5: **preview/dry-run read-only + métricas** sobre o catálogo, com
 > endpoint `GET` e cartão no Dashboard, a correr o **mesmo** `SourceSelectionStage`
-> da produção, sem publicação nem escrita (§10.3). **Não** implementados: os
-> produtores de Quality/EPG, a correcção do reset de `Source.Priority` e a
-> integração no composer/`MatchPlan`/`DispatcharrSyncService`
-> (ver `docs/IMPLEMENTATION_ROADMAP.md` §32.19). A **Wave 13-6**
-> (`MatchPlan` + `DispatcharrSourceSelection`, cleanup selectivo e teste 100→10)
-> permanece **não implementada e fora de âmbito da 13-5**.
+> da produção, sem publicação nem escrita (§10.3). 13-6: **integração no
+> Dispatcharr** — artefacto `DispatcharrSourceSelection` construído a partir do
+> `SourceSelectionStageResult`, associação apenas das fontes `Selected`,
+> registo de ownership das streams criadas, cleanup selectivo e persistência
+> sanitizada (`output/dispatcharr_selection_<ts>.json`) (§11). **Não**
+> implementados: os produtores de Quality/EPG, a correcção do reset de
+> `Source.Priority`, a integração no composer e alterações ao `MatchPlan`,
+> `ProviderDefinition`, `SelectionPolicy` separada, `MinimumValidatedSources`,
+> churn/estabilidade, review-queue/hard-block e a persistência de
+> `ResponseTime` em produção (ver `docs/IMPLEMENTATION_ROADMAP.md` §32.19).
 
 ## 1. Finalidade
 
@@ -305,7 +309,9 @@ Detalhe em `docs/architecture/phase-13-4-source-selection-policy.md`.
 específicas da selecção, churn/estabilidade, `ProviderDefinition`,
 `SelectionPolicy` separada nem integração explícita no
 composer/`MatchPlan`/`DispatcharrSyncService` (ver
-`docs/IMPLEMENTATION_ROADMAP.md` §32.19).
+`docs/IMPLEMENTATION_ROADMAP.md` §32.19). A integração no
+`DispatcharrSyncService` foi entregue depois, na Wave 13-6 (§11); continuam
+fora de âmbito a integração no composer e quaisquer alterações ao `MatchPlan`.
 
 ### 10.3 Preview / Dry-Run + métricas (Wave 13-5)
 
@@ -485,12 +491,13 @@ primeiras quatro chaves de ranking, a ordem — e portanto o conjunto selecciona
 — pode diferir da produção. Não se afirma paridade de ordenação com a produção.
 
 **Fora de âmbito explícito (13-5).** O contrato `MatchPlan` +
-`DispatcharrSourceSelection`, o ownership/cleanup selectivo, o teste 100→10,
-`ProviderDefinition`, uma `SelectionPolicy` de ranking separada,
-`MinimumValidatedSources` e churn/estabilidade pertencem à Wave 13-6 (ou
-posterior) e **não** são implementados aqui. `RunReport.SourceSelection`
+`DispatcharrSourceSelection`, o ownership/cleanup selectivo e o teste 100→10
+foram entregues na **Wave 13-6** (§11), que **não** alterou o `MatchPlan`.
+Permanecem fora de âmbito (13-5 e posterior): `ProviderDefinition`, uma
+`SelectionPolicy` de ranking separada, `MinimumValidatedSources`,
+churn/estabilidade e review-queue/hard-block. `RunReport.SourceSelection`
 permanece **inalterado** (só contagens); as métricas ricas são âmbito exclusivo do
-preview. A **13-6 permanece não implementada**.
+preview.
 
 ### Identidade canónica no loader (Wave 9C.6)
 
@@ -524,24 +531,160 @@ Nunca contém URLs, usernames, passwords ou tokens.
 
 ### Segurança
 
-A URL real existe apenas em memória e no artefacto funcional (playlist). O catálogo
-continua sanitizado; a projecção não escreve no catálogo. Qualquer diagnóstico passa
-por contagens (sem URL) — não há novo artefacto persistente com credenciais.
+A URL real existe apenas em memória, no artefacto funcional (playlist) e no
+artefacto de selecção em memória (`DispatcharrSourceSelection`, Wave 13-6). A
+partir da 13-6, o artefacto de selecção é persistido em
+`output/dispatcharr_selection_<ts>.json`, mas **sempre sanitizado**:
+`DispatcharrSourceSelectionSerializer` aplica `CredentialSanitizer.SanitizeUrl` a
+cada `StreamUrl` antes de escrever. O catálogo continua sanitizado; a projecção
+não escreve no catálogo. Qualquer diagnóstico passa por contagens (sem URL) — o
+novo artefacto em disco não contém credenciais.
 
 ### Fora de âmbito (13-3)
 
 Correcção do reset de `Source.Priority`, produtores de Quality/EPG, persistência de
 `LastResponseTimeMs`, integração no composer/discovery/validation, alterações ao
-`MatchPlan`/`DispatcharrSyncService`/ownership, `BuildPlanFromCompositionAsync`,
-`ProviderDefinition`, identidade de conta Xtream. Não faz `ProviderDefinition`
-completa. A persistência/Dashboard da política deixou de ser fora de âmbito na
-Wave 13-4 (§10.1), os **overrides por canal** na Wave 13-4b (§10.2) e o
-**preview/dry-run + métricas** na Wave 13-5 (§10.3). Permanecem fora de âmbito a
-Wave 13-6 (contrato `MatchPlan` + `DispatcharrSourceSelection`, cleanup
-selectivo, teste 100→10, `ProviderDefinition`, `SelectionPolicy` separada,
-`MinimumValidatedSources` e churn/estabilidade) e os restantes itens da §32.19.
+`MatchPlan`, `BuildPlanFromCompositionAsync`, `ProviderDefinition`, identidade de
+conta Xtream. Não faz `ProviderDefinition` completa. A persistência/Dashboard da
+política deixou de ser fora de âmbito na Wave 13-4 (§10.1), os **overrides por
+canal** na Wave 13-4b (§10.2), o **preview/dry-run + métricas** na Wave 13-5
+(§10.3) e a **integração no Dispatcharr** (`DispatcharrSourceSelection`,
+associação só de `Selected`, registo de ownership, cleanup selectivo e teste
+100→10) na Wave 13-6 (§11). O `MatchPlan` **não** foi alterado. Permanecem fora
+de âmbito: `ProviderDefinition` completa, `SelectionPolicy` separada,
+`MinimumValidatedSources`, churn/estabilidade, review-queue/hard-block,
+persistência de `LastResponseTimeMs` em produção e os restantes itens da §32.19.
 
-## 11. Testes de referência
+## 11. Integração com Dispatcharr (`DispatcharrSourceSelection`, Wave 13-6)
+
+### Fluxo
+
+```text
+SourceSelectionStageResult                (autoritativo, §10)
+        │
+        ▼
+DispatcharrSourceSelectionFactory.FromStageResult(result, policies, nowUtc)
+        │  projecção pura; reutiliza literalmente `SelectionReasons`
+        │  não recalcula a selecção nem toca no catálogo
+        ▼
+DispatcharrSourceSelection                (artefacto; URL real só em memória)
+        │
+        ▼
+DispatcharrSyncService.RunAsync(playlistPath, selection, ct)
+        │  escreve dispatcharr_selection_<ts>.json (sanitizado)
+        │  ANTES do branch dry-run/apply (o dry-run também o produz)
+        ▼
+Dry-run (sem escrita HTTP)  |  ApplyAsync(plan, existing, selection, failed, ct)
+```
+
+`MatchPlan` **não** é alterado e continua a ser exclusivamente o resultado do
+matching. O `DispatcharrSourceSelection` é um artefacto **separado**, produzido
+a partir do `SourceSelectionStageResult`, e é o único transporte da decisão de
+selecção até ao apply; não há um segundo cálculo da selecção no apply.
+
+- `IDispatcharrSyncService`/`DispatcharrSyncService` ganharam
+  `RunAsync(string playlistPath, DispatcharrSourceSelection? selection, CancellationToken ct = default)`
+  e `ApplyAsync(plan, existing, selection, failed, ct)`. Os overloads antigos
+  delegam com `selection: null`, mantendo a compatibilidade retroativa.
+
+### Artefacto e identidade
+
+`DispatcharrSourceSelection` (`m3uCrawler/Models/DispatcharrSourceSelection.cs`):
+`generatedAtUtc`, `channels[]` e `counts`.
+
+- `ChannelSourceSelection`: `canonicalChannelKey` (**identidade**),
+  `canonicalChannelId` (transiente; apenas transportado), `policyScope`
+  (`override`/`global`/`default`; `null` quando a política não é fornecida),
+  `candidateCount`, `rejectedCount` e `selected[]`.
+- `SelectedStreamSelection`: `streamUrl`, `rank`, `provider`, `reason`
+  (vocabulário literal de `SelectionReasons`), `sourceId`.
+- `SelectionCounts`: `channels`, `candidates`, `selected`, `rejected`,
+  `unmatched`, `ambiguous`. `ambiguous` é `AmbiguousStreams.Count` e `unmatched`
+  é `Unmatched.Count - Ambiguous.Count` (só as não-ambíguas), mantendo as duas
+  listas disjuntas (§10.3).
+
+A identidade do artefacto é `CanonicalChannel.Key`. O `CanonicalChannelId` é
+apenas transportado; nunca é a chave de associação. A correlação de URL usa
+`CredentialSanitizer.SanitizeUrl` em ambos os lados (artefacto e plano), tal como
+a chave de unicidade do catálogo (`CatalogResolver.RecordChannelSourceAsync`).
+
+### Persistência sanitizada
+
+- `DispatcharrSourceSelectionSerializer`: `Serialize`/`WriteAsync` aplicam
+  `CredentialSanitizer.SanitizeUrl` a **cada** `StreamUrl` antes de escrever;
+  `Deserialize`/`ReadAsync` fazem o round-trip.
+- Ficheiro `output/dispatcharr_selection_<yyyyMMdd_HHmmss>.json`, com o mesmo
+  `startedAt` do `MatchPlan`, escrito por `RunAsync` **antes** do branch
+  dry-run/apply — o dry-run também o produz. Nunca contém credenciais.
+
+### Regra de associação (`selection != null`)
+
+- Apenas as fontes `Selected` são associadas/publicadas. `Selected` é a **única**
+  autoridade de associação.
+- `Unmatched` e `Ambiguous` **não** são associados — alteração de comportamento
+  **deliberada** face ao caminho legacy. Uma stream sem entrada `Selected` é
+  descartada.
+- A regra aplica-se consistentemente à associação de canal e às listas
+  `globalKeepStreamIds` e `globalRemoveCandidates`. O `plan` **nunca** é mutado:
+  a filtragem é feita sobre uma lista efectiva calculada por canal.
+- `selection == null` (legacy): comportamento inalterado (todas as streams do
+  plano são associadas), coberto pelo overload antigo.
+
+### Limpeza e ownership
+
+`ComputeEffectiveStreams` (por canal, sob selecção):
+
+- `Selected` → mantida na associação;
+- excluída com `ExistingStreamId` **CrawlerManaged** (ou sem catálogo → default
+  legado `CrawlerManaged`) → removida da associação e marcada para `DELETE`;
+- excluída com `ExistingStreamId` **External/Unknown** → mantida na associação
+  (protegida; nunca se desassocia uma stream de outro owner) e nunca eliminada;
+- excluída **sem** `ExistingStreamId` → descartada (nunca é feito `POST` de uma
+  fonte não seleccionada).
+
+As streams CrawlerManaged removidas pela selecção são adicionadas a
+`globalRemoveCandidates` e removidas pelo caminho global da Phase 4, com o guard
+de ownership pré-existente inalterado (`External`/`Unknown`/sem registo nunca
+recebem `DELETE`; sem catálogo mantém-se o default legado CrawlerManaged).
+
+**Registo de ownership na criação:** as streams criadas pelo crawler passam a
+ser registadas como `CrawlerManaged` via `EnsureStreamOwnershipAsync` depois do
+`CreateAsync` (antes desta wave, esse registo estava em falta). O canal criado
+fica associado ao seu id; um canal novo sem streams efectivas não é criado e um
+canal existente sem streams efectivas só recebe `PATCH streams=[]` se
+actualmente tiver streams (idempotência).
+
+**Fora de âmbito desta wave:** hard-block/review-queue, churn/estabilidade,
+`RebalanceOnSync`, `KeepExistingHealthySources`, `ProviderDefinition`,
+`SelectionPolicy` separada e `MinimumValidatedSources`.
+
+### Correlação e limitação documentada
+
+- **Single-cycle Telegram** e **manutenção Telegram** constroem o
+  `DispatcharrSourceSelection` em memória a partir do mesmo
+  `SourceSelectionStageResult` da execução e passam-no directamente ao sync
+  (mesma execução ⇒ correlação segura).
+- **`--dispatcharr-sync` standalone** e **`ScheduledDispatcharrSyncAction`**
+  passam `selection = null` (legacy), por não existir stage de selecção nessa
+  execução. **Limitação documentada:** nesses caminhos **não** há correlação
+  heurística entre a playlist e o artefacto de selecção, pelo que se mantém o
+  comportamento legado (todas as streams do plano).
+- **Limitação documentada:** churn/review-queue/hard-block não são
+  implementados nesta wave.
+
+### Aceitação 100→10
+
+Cenário coberto por testes (`DispatcharrSyncServiceSourceSelectionTests`): com
+100 candidatos e `MaxSourcesPerChannel=10`, apenas 10 são publicadas (`POST`) e
+associadas ao canal; as 90 restantes **nunca** são `POST`ed nem associadas. No
+cenário de cleanup com 100 streams existentes, as CrawlerManaged não
+seleccionadas são removidas (80 de 90 no teste) enquanto as `External`/`Unknown`
+ficam protegidas e associadas; a segunda execução é idempotente (sem `POST`/
+`PATCH`/`DELETE`) e o dry-run não faz escrita HTTP e produz o artefacto
+sanitizado. O registo de ownership das streams criadas (e do canal criado) é
+verificado.
+
+## 12. Testes de referência
 
 - `m3uCrawler.Tests/ChannelSourceSelectorTests.cs` (53 testes) — unidade algorítmica:
   volume, dedup e identidade de URL, fornecedores, diversidade, limites, fallback,
@@ -560,3 +703,15 @@ selectivo, teste 100→10, `ProviderDefinition`, `SelectionPolicy` separada,
   dos overrides por canal (auth/CSRF e validação de `0`/negativos).
 - `m3uCrawler.Tests/SourceSelectionPolicyRuntimeIntegrationTests.cs` — resolução
   efectiva em runtime e integração do provider no estágio.
+- `m3uCrawler.Tests/DispatcharrSourceSelectionTests.cs` — unidade do artefacto:
+  projecção determinística (ordem, identidade por `CanonicalChannelKey`,
+  `CanonicalChannelId` transportado), contagens exactas (`unmatched`/`ambiguous`
+  disjuntas), `policyScope` (`override`/`global`/`default`/`null`) e sanitização
+  de credenciais na serialização (`Serialize`/`WriteAsync`/round-trip).
+- `m3uCrawler.Tests/DispatcharrSyncServiceSourceSelectionTests.cs` — integração
+  do artefacto no apply: 100→10 (só as 10 `Selected` são `POST`ed/associadas),
+  diversidade e `MaxSourcesPerProvider`, cleanup selectivo (CrawlerManaged
+  removível; `External`/`Unknown` protegidas), registo de ownership das streams
+  criadas, ausência/entrada vazia de selecção, `selection == null` legacy,
+  idempotência da segunda execução e dry-run sem escrita HTTP com artefacto
+  sanitizado.

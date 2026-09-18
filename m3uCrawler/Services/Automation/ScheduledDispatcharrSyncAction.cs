@@ -144,6 +144,8 @@ public sealed class ScheduledDispatcharrSyncAction : IScheduledAction
                 catalog: _catalog);
         }
 
+        // Legacy scheduled path: sem artefacto de selecção, selection null
+        // (sem correlação heurística com a playlist).
         var result = await sync.RunAsync(playlistPath, cancellationToken);
         var counts = result.Report?.Counts;
         return $"newChannels={counts?.NewChannels ?? 0} newStreams={counts?.NewStreams ?? 0} matched={counts?.Matched ?? 0} ambiguous={counts?.Ambiguous ?? 0} dryRun={result.DryRun}";

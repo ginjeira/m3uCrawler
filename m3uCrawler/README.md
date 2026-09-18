@@ -551,7 +551,7 @@ Quando um stream tem indicadores de país (e.g. "PT" no título ou group-title) 
   antiga, **aborta** com erro explícito sem apagar dados; só conclui a remoção
   da proveniência e do schema novo quando o rollback é possível.
 
-### Política de selecção de fontes (Waves 13-4 / 13-4b / 13-5)
+### Política de selecção de fontes (Waves 13-4 / 13-4b / 13-5 / 13-6)
 
 O endpoint `GET/POST /api/catalog/source-selection-policies` gere a política
 **global** que limita quantas fontes (streams) de um canal são publicadas.
@@ -661,8 +661,52 @@ read-only (nunca insere a linha default).
   **pode divergir** da produção — em empates nas primeiras quatro chaves, a
   ordem e o conjunto seleccionado podem diferir da produção. As métricas ricas
   são âmbito do preview — `RunReport.SourceSelection`
-  mantém-se só contagens, e o contrato `MatchPlan`/`DispatcharrSourceSelection`
-  (Wave 13-6) permanece fora de âmbito.
+  mantém-se só contagens. A integração no Dispatcharr foi entregue na **Wave
+  13-6** (secção seguinte); o `MatchPlan` mantém-se inalterado.
+
+#### Integração no Dispatcharr (Wave 13-6)
+
+A selecção de fontes é transportada até ao apply do Dispatcharr por um artefacto
+próprio, `DispatcharrSourceSelection`, sem alterar o `MatchPlan` (que continua a
+ser exclusivamente o resultado do matching).
+
+- **Artefacto:** `DispatcharrSourceSelection` tem `generatedAtUtc`, `channels[]`
+  (`canonicalChannelKey` — identidade; `canonicalChannelId` transiente;
+  `policyScope`; `candidateCount`; `rejectedCount`; `selected[]` com
+  `streamUrl`/`rank`/`provider`/`reason`/`sourceId`) e `counts` (`channels`,
+  `candidates`, `selected`, `rejected`, `unmatched`, `ambiguous`; `unmatched` e
+  `ambiguous` são disjuntos). É construído **uma vez** a partir do
+  `SourceSelectionStageResult` por
+  `DispatcharrSourceSelectionFactory.FromStageResult(result, policies, nowUtc)`
+  (projecção pura; reutiliza literalmente `SelectionReasons`; não recalcula a
+  selecção nem toca no catálogo). A identidade é `CanonicalChannel.Key`; o
+  `CanonicalChannelId` é apenas transportado.
+- **Regra de associação:** apenas as fontes `Selected` são associadas/publicadas;
+  `Unmatched` e `Ambiguous` **não** são associados (alteração deliberada face ao
+  comportamento legado). Aplica-se à associação de canal e a
+  `globalKeepStreamIds`/`globalRemoveCandidates`, sem mutar o `plan`.
+- **Ownership e cleanup:** as streams criadas pelo crawler passam a ser
+  registadas `CrawlerManaged` via `EnsureStreamOwnershipAsync` após o
+  `CreateAsync` (antes em falta). Sob selecção, as CrawlerManaged não
+  seleccionadas são removidas da associação e tornam-se candidatas a `DELETE`
+  (guard de ownership inalterado); as `External`/`Unknown` não seleccionadas
+  ficam associadas e **nunca** são eliminadas. Um canal novo sem streams
+  efectivas não é criado; um canal existente só recebe `PATCH streams=[]` se
+  actualmente tiver streams (idempotência).
+- **Persistência sanitizada:** `DispatcharrSourceSelectionSerializer` aplica
+  `CredentialSanitizer.SanitizeUrl` a cada `StreamUrl`; o ficheiro
+  `output/dispatcharr_selection_<yyyyMMdd_HHmmss>.json` é escrito por
+  `DispatcharrSyncService.RunAsync(path, selection, ct)` **antes** do branch
+  dry-run/apply — o dry-run também o produz e nunca contém credenciais.
+- **Compatibilidade:** `RunAsync`/`ApplyAsync` ganharam overloads com
+  `DispatcharrSourceSelection? selection`; os overloads antigos delegam com
+  `selection: null` (comportamento legado).
+- **Limitação documentada:** os caminhos `--dispatcharr-sync` standalone e
+  `ScheduledDispatcharrSyncAction` passam `selection = null` por não existir
+  stage de selecção nessa execução; nesses caminhos **não** há correlação
+  heurística entre a playlist e o artefacto de selecção. Churn/estabilidade,
+  review-queue/hard-block, `ProviderDefinition`, `SelectionPolicy` separada e
+  `MinimumValidatedSources` permanecem fora de âmbito.
 
 ### Modelo de segurança do dashboard
 
@@ -1016,6 +1060,7 @@ m3uCrawler/
 - `output/telegram_playlist_<timestamp>.m3u` e `output/telegram_report_<timestamp>.json` — Saída de uma pesquisa `--telegram` ad-hoc.
 - `output/telegram_maintain_report.json` — Relatório do ciclo de manutenção.
 - `output/import_history.json` — Histórico persistente.
+- `output/dispatcharr_selection_<timestamp>.json` — Artefacto da selecção de fontes (Wave 13-6), escrito pelo sync Dispatcharr **antes** do branch dry-run/apply (o dry-run também o produz). As URLs são sanitizadas (`CredentialSanitizer.SanitizeUrl`); nunca contém credenciais.
 
 ## Configuração
 
