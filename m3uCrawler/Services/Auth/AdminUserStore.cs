@@ -129,6 +129,30 @@ public sealed class AdminUserStore
         return user;
     }
 
+    /// <summary>
+    /// W10b — Verifica a password de um administrador pelo <c>Id</c>. Mesma
+    /// uniformização temporal de <see cref="VerifyCredentialsAsync"/>: para
+    /// utilizador inexistente ou inactivo executa a derivação dummy e devolve
+    /// <c>false</c>, sem revelar a existência do utilizador. Usado para
+    /// reautenticar a sessão actual antes de uma alteração de password.
+    /// </summary>
+    public async Task<bool> VerifyCredentialsByIdAsync(
+        int userId,
+        string password,
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var user = await context.AdminUsers
+            .FirstOrDefaultAsync(u => u.Id == userId, cancellationToken);
+        if (user == null || !user.IsEnabled)
+        {
+            PasswordHasher.VerifyDummy(password);
+            return false;
+        }
+
+        return PasswordHasher.Verify(password, user.PasswordHash);
+    }
+
     public async Task MarkLoginAsync(long adminUserId, DateTime atUtc, CancellationToken cancellationToken = default)
     {
         await using var context = await _factory.CreateDbContextAsync(cancellationToken);

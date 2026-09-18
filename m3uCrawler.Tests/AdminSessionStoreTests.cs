@@ -94,6 +94,27 @@ public class AdminSessionStoreTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Verify_credentials_by_id_handles_wrong_unknown_and_disabled()
+    {
+        var store = new AdminUserStore(_factory);
+        await store.CreateFirstAdminAsync("admin", "a-strong-password-12");
+        var user = await store.FindByUsernameAsync("admin");
+
+        Assert.True(await store.VerifyCredentialsByIdAsync((int)user!.Id, "a-strong-password-12"));
+        Assert.False(await store.VerifyCredentialsByIdAsync((int)user.Id, "wrong-password-12"));
+        Assert.False(await store.VerifyCredentialsByIdAsync(987654, "a-strong-password-12"));
+
+        await using (var context = _factory.CreateDbContext())
+        {
+            var entity = context.AdminUsers.Single();
+            entity.IsEnabled = false;
+            context.SaveChanges();
+        }
+
+        Assert.False(await store.VerifyCredentialsByIdAsync((int)user.Id, "a-strong-password-12"));
+    }
+
+    [Fact]
     public async Task Session_survives_restart_and_is_revocable()
     {
         var users = new AdminUserStore(_factory);

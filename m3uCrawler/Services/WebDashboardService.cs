@@ -394,8 +394,12 @@ namespace m3uCrawler.Services
                 return;
             }
 
-            // --- Sessão (login/logout/user actual) ---
-            if (requestPath.Equals("/api/session", StringComparison.OrdinalIgnoreCase))
+            // --- Sessão (login/logout/user actual/alterar password) ---
+            // Nota: /api/session/password é encaminhado AQUI, antes do gate
+            // genérico de enforcement, e faz as suas próprias verificações de
+            // sessão + CSRF (tal como DELETE /api/session).
+            if (requestPath.Equals("/api/session", StringComparison.OrdinalIgnoreCase)
+                || requestPath.Equals("/api/session/password", StringComparison.OrdinalIgnoreCase))
             {
                 await HandleSessionEndpointAsync(context);
                 return;
@@ -4637,6 +4641,30 @@ namespace m3uCrawler.Services
         </div>
         <div id='setupDispatcharrStatus' class='setup-status muted'>—</div>
       </div>
+
+      <!-- CONTA (W10b) -->
+      <div class='card' style='margin-top:16px;'>
+        <h3>Alterar password</h3>
+        <p class='muted'>Altera a password do administrador com sessão activa. Por segurança, todas as sessões são revogadas e será necessário voltar a autenticar-se.</p>
+        <div style='display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));'>
+          <div>
+            <label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Password actual</label>
+            <input id='accountCurrentPassword' type='password' autocomplete='off' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+          </div>
+          <div>
+            <label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Nova password</label>
+            <input id='accountNewPassword' type='password' autocomplete='off' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+          </div>
+          <div>
+            <label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Confirmar nova password</label>
+            <input id='accountConfirmPassword' type='password' autocomplete='off' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+          </div>
+        </div>
+        <div class='toolbar' style='margin-top:12px;'>
+          <button onclick='changePassword()'>Alterar password</button>
+        </div>
+        <div id='accountPasswordStatus' class='setup-status muted'>—</div>
+      </div>
     </section>
   </main>
 
@@ -6975,6 +7003,37 @@ const rows = Object.entries(inv).map(([k, v]) => {
       await Promise.all([loadSetupReadiness(), loadTelegramSetup(), loadDispatcharrSetup()]);
     }
 
+    // === W10b — Conta: alterar password ===
+    async function changePassword() {
+      var statusEl = document.getElementById('accountPasswordStatus');
+      var current = document.getElementById('accountCurrentPassword').value;
+      var next = document.getElementById('accountNewPassword').value;
+      var confirm = document.getElementById('accountConfirmPassword').value;
+      if (next !== confirm) { statusEl.textContent = 'nova password inválida'; return; }
+
+      var r = await setupFetch('/api/session/password', 'POST',
+        { currentPassword: current, newPassword: next });
+
+      document.getElementById('accountCurrentPassword').value = '';
+      document.getElementById('accountNewPassword').value = '';
+      document.getElementById('accountConfirmPassword').value = '';
+
+      if (r.status === 200) {
+        statusEl.textContent = 'password alterada — faça login novamente';
+        setTimeout(function () { location.href = '/'; }, 800);
+        return;
+      }
+      if (r.json && r.json.error === 'invalid-current-password') {
+        statusEl.textContent = 'password actual incorrecta';
+        return;
+      }
+      if (r.json && r.json.error === 'invalid-new-password') {
+        statusEl.textContent = 'nova password inválida';
+        return;
+      }
+      statusEl.textContent = 'erro inesperado';
+    }
+
     function showView(name) {
       console.log('[DEBUG] showView called:', name);
       if (name !== 'liverun') stopLiveRunPolling();
@@ -7016,6 +7075,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
     window.submitTelegram2fa = submitTelegram2fa;
     window.saveDispatcharrConfig = saveDispatcharrConfig;
     window.testDispatcharrConnection = testDispatcharrConnection;
+    window.changePassword = changePassword;
 
     window.showAddRuleForm = showAddRuleForm;
     window.hideAddRuleForm = hideAddRuleForm;
@@ -7306,6 +7366,20 @@ const rows = Object.entries(inv).map(([k, v]) => {
         }
 
         /// <summary>
+        /// W10b — Corpo de <c>POST /api/session/password</c>. Nunca é
+        /// registado nem ecoado; as passwords existem apenas em memória
+        /// durante o pedido.
+        /// </summary>
+        private sealed class PasswordChangePayload
+        {
+            [JsonPropertyName("currentPassword")]
+            public string? CurrentPassword { get; set; }
+
+            [JsonPropertyName("newPassword")]
+            public string? NewPassword { get; set; }
+        }
+
+        /// <summary>
         /// PHASE 9C.5 (F6) — Decide o modo de autorização e devolve também o
         /// estado de lifecycle efectivo, para que respostas de diagnóstico
         /// (ex.: <c>403 bootstrap-required</c>) não mintam sobre o estado.
@@ -7568,6 +7642,13 @@ const rows = Object.entries(inv).map(([k, v]) => {
 
         private static async Task HandleSessionEndpointAsync(HttpListenerContext context)
         {
+            var requestPath = context.Request.Url?.AbsolutePath ?? string.Empty;
+            if (requestPath.Equals("/api/session/password", StringComparison.OrdinalIgnoreCase))
+            {
+                await HandlePasswordChangeEndpointAsync(context);
+                return;
+            }
+
             var method = context.Request.HttpMethod;
 
             if (method.Equals("POST", StringComparison.OrdinalIgnoreCase))
@@ -7653,6 +7734,105 @@ const rows = Object.entries(inv).map(([k, v]) => {
                 csrfToken = current.CsrfToken,
                 expiresAtUtc = current.ExpiresAtUtc.ToString("o"),
             });
+        }
+
+        /// <summary>
+        /// W10b — <c>POST /api/session/password</c>: altera a password do
+        /// administrador da sessão actual após reautenticação (password
+        /// actual) e validação CSRF.
+        ///
+        /// <para>
+        /// Contrato: apenas <c>POST</c> (restantes métodos → <c>405</c> com
+        /// <c>Allow: POST</c>). Sem sessão válida → <c>401
+        /// authentication-required</c>; CSRF inválido → <c>403 csrf-invalid</c>;
+        /// password actual incorrecta (ou utilizador desconhecido) →
+        /// <c>400 invalid-current-password</c>; nova password viola a política →
+        /// <c>400 invalid-new-password</c>; sucesso → <c>200
+        /// {message:"password-changed", reloginRequired:true}</c>. O store revoga
+        /// todas as sessões do utilizador (incluindo a actual), pelo que o
+        /// cliente tem de voltar a autenticar-se. Nunca devolve nem registra
+        /// passwords ou hashes.
+        /// </para>
+        /// </summary>
+        private static async Task HandlePasswordChangeEndpointAsync(HttpListenerContext context)
+        {
+            var method = context.Request.HttpMethod;
+            if (!method.Equals("POST", StringComparison.OrdinalIgnoreCase))
+            {
+                context.Response.Headers["Allow"] = "POST";
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = "method-not-allowed" },
+                    HttpStatusCode.MethodNotAllowed);
+                return;
+            }
+
+            var sessionId = GetCookieValue(context.Request, SessionCookieName);
+            var session = _authService != null
+                ? await _authService.ValidateSessionAsync(sessionId)
+                : null;
+            if (session == null)
+            {
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = "authentication-required" },
+                    HttpStatusCode.Unauthorized);
+                return;
+            }
+
+            if (!CsrfValid(context.Request, session))
+            {
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = "csrf-invalid" },
+                    HttpStatusCode.Forbidden);
+                return;
+            }
+
+            var payload = await TryReadJsonAsync<PasswordChangePayload>(context.Request);
+            if (payload == null)
+            {
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = "invalid-payload" },
+                    HttpStatusCode.BadRequest);
+                return;
+            }
+
+            // Reautenticação: a password actual é verificada pelo Id da sessão
+            // (a sessão não expõe o username). Utilizador desconhecido e
+            // password errada produzem a mesma resposta.
+            var userId = (int)session.AdminUserId;
+            var currentOk = await _authService!.VerifyCurrentPasswordAsync(
+                userId, payload.CurrentPassword ?? string.Empty);
+            if (!currentOk)
+            {
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = "invalid-current-password" },
+                    HttpStatusCode.BadRequest);
+                return;
+            }
+
+            var outcome = await _authService.ChangePasswordAsync(
+                userId, payload.NewPassword ?? string.Empty);
+            if (outcome != ChangePasswordResult.Changed)
+            {
+                var error = outcome == ChangePasswordResult.InvalidPassword
+                    ? "invalid-new-password"
+                    : "invalid-current-password";
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error },
+                    HttpStatusCode.BadRequest);
+                return;
+            }
+
+            // A password mudou e as sessões foram revogadas na mesma
+            // transacção pela store — o cliente tem de voltar a autenticar-se.
+            await WriteJsonAsync(
+                context.Response,
+                new { message = "password-changed", reloginRequired = true });
         }
 
         /// <summary>

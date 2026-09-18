@@ -672,10 +672,27 @@ public class Phase94LiveRunApiTests : IAsyncLifetime
 
         // Wave 6 — a vista de Setup nomeia legitimamente o campo de 2FA do
         // Telegram: atributo type='password' (mascaramento), rota interactiva
-        // /api/telegram/auth/password e a chave do payload JSON. Neutralizamos
-        // apenas essas referências de UI antes da varredura, mantendo o
-        // invariante de que nenhum outro marcador de segredo aparece.
+        // /api/telegram/auth/password e a chave do payload JSON. A W10b
+        // acrescenta a área de alteração de password do administrador (campos
+        // mascarados e rota /api/session/password). Neutralizamos apenas essas
+        // referências de UI antes da varredura, mantendo o invariante de que
+        // nenhum outro marcador de segredo aparece.
         var scrubbed = html
+            .Replace("/api/session/password", "/api/session/secret-rotation", StringComparison.OrdinalIgnoreCase)
+            .Replace("accountPasswordStatus", "accountRotationStatus", StringComparison.OrdinalIgnoreCase)
+            .Replace("accountCurrentPassword", "accountCurrentSecret", StringComparison.OrdinalIgnoreCase)
+            .Replace("accountNewPassword", "accountNewSecret", StringComparison.OrdinalIgnoreCase)
+            .Replace("accountConfirmPassword", "accountConfirmSecret", StringComparison.OrdinalIgnoreCase)
+            .Replace("Confirmar nova password", "Confirmar novo segredo", StringComparison.OrdinalIgnoreCase)
+            .Replace("changePassword", "changeSecret", StringComparison.OrdinalIgnoreCase)
+            .Replace("Alterar password", "Alterar segredo", StringComparison.OrdinalIgnoreCase)
+            .Replace("Password actual", "Segredo actual", StringComparison.OrdinalIgnoreCase)
+            .Replace("Nova password", "Novo segredo", StringComparison.OrdinalIgnoreCase)
+            .Replace("password do administrador", "segredo do administrador", StringComparison.OrdinalIgnoreCase)
+            .Replace("password actual incorrecta", "segredo actual incorrecto", StringComparison.OrdinalIgnoreCase)
+            .Replace("password alterada", "segredo alterado", StringComparison.OrdinalIgnoreCase)
+            .Replace("invalid-current-password", "invalid-current-secret", StringComparison.OrdinalIgnoreCase)
+            .Replace("invalid-new-password", "invalid-new-secret", StringComparison.OrdinalIgnoreCase)
             .Replace("/api/telegram/auth/password", "/api/telegram/auth/2fa", StringComparison.OrdinalIgnoreCase)
             .Replace("type='password'", "type='2fa'", StringComparison.OrdinalIgnoreCase)
             .Replace("password:", "2fa:", StringComparison.OrdinalIgnoreCase);

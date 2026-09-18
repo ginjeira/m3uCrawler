@@ -78,4 +78,26 @@ public sealed class AuthService
 
     public Task LogoutAsync(string? sessionId, CancellationToken cancellationToken = default)
         => _sessions.DeleteAsync(sessionId, cancellationToken);
+
+    /// <summary>
+    /// W10b — Reautentica a sessão actual verificando a password do
+    /// administrador pelo <c>Id</c>. Tempo uniforme para utilizador
+    /// inexistente/inactivo (nunca permite distinguir a causa).
+    /// </summary>
+    public Task<bool> VerifyCurrentPasswordAsync(
+        int userId,
+        string password,
+        CancellationToken cancellationToken = default)
+        => _users.VerifyCredentialsByIdAsync(userId, password, cancellationToken);
+
+    /// <summary>
+    /// W10b — Delega a alteração de password para o
+    /// <see cref="AdminUserStore"/>, que aplica a política de credenciais e
+    /// revoga as sessões do utilizador na mesma transacção.
+    /// </summary>
+    public Task<ChangePasswordResult> ChangePasswordAsync(
+        int userId,
+        string newPassword,
+        CancellationToken cancellationToken = default)
+        => _users.ChangePasswordAsync(userId, newPassword, cancellationToken);
 }
