@@ -77,6 +77,9 @@ public sealed class CatalogResolver
 
         // 2. AffinityMember (Kind = Channel) -> AffinityGroup ->
         //    CanonicalChannel. Membros Country não resolvem canal.
+        //    Wave 9C.6: CanonicalChannelKey é a identidade de runtime
+        //    autoritativa; CanonicalChannelId/nav é apenas fallback
+        //    legado quando a Key está ausente.
         var member = await context.AffinityMembers
             .AsNoTracking()
             .Include(m => m.AffinityGroup)
@@ -84,9 +87,28 @@ public sealed class CatalogResolver
             .FirstOrDefaultAsync(
                 m => m.NormalizedMember == normalizedIdentity && m.Kind == AffinityKind.Channel,
                 cancellationToken);
-        if (member?.AffinityGroup?.CanonicalChannel != null && member.AffinityGroup.CanonicalChannel.IsEnabled)
+        if (member?.AffinityGroup != null)
         {
-            return CatalogResolution.FromCanonical(member.AffinityGroup.CanonicalChannel);
+            var affinityKey = member.AffinityGroup.CanonicalChannelKey;
+            if (!string.IsNullOrWhiteSpace(affinityKey))
+            {
+                var canonicalByKey = await context.CanonicalChannels
+                    .AsNoTracking()
+                    .FirstOrDefaultAsync(c => c.Key == affinityKey, cancellationToken);
+                if (canonicalByKey != null && canonicalByKey.IsEnabled)
+                {
+                    return CatalogResolution.FromCanonical(canonicalByKey);
+                }
+
+                // Key presente mas sem resolução (inexistente/desactivada):
+                // a Key é autoritativa, logo não cair no CanonicalChannelId
+                // obsoleto. Prossegue para o passo de alias.
+            }
+            else if (member.AffinityGroup.CanonicalChannel != null
+                && member.AffinityGroup.CanonicalChannel.IsEnabled)
+            {
+                return CatalogResolution.FromCanonical(member.AffinityGroup.CanonicalChannel);
+            }
         }
 
         // 3. ChannelAlias -> CanonicalChannel.
@@ -1413,7 +1435,10 @@ public sealed class CatalogResolver
         CancellationToken cancellationToken = default)
     {
         await using var context = await _factory.CreateDbContextAsync(cancellationToken);
-        var query = context.ChannelSources.AsNoTracking().AsQueryable();
+        var query = context.ChannelSources
+            .AsNoTracking()
+            .Include(cs => cs.CanonicalChannel)
+            .AsQueryable();
         if (canonicalChannelId.HasValue) query = query.Where(cs => cs.CanonicalChannelId == canonicalChannelId.Value);
         if (sourceId.HasValue) query = query.Where(cs => cs.SourceId == sourceId.Value);
         return await query

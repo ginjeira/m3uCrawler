@@ -482,6 +482,48 @@ será feita numa migration dedicada posterior.
 4. só se válido: remove a proveniência, remove as colunas novas e recria o
    índice único global.
 
+### Identidade canónica em runtime (Wave 9C.6)
+
+`CanonicalChannel.Key` é a **identidade de runtime** para a resolução de
+afinidades de canal. `CatalogResolver.ResolveAsync` passou a ser
+**Key-autoritativo**:
+
+- quando `AffinityGroup.CanonicalChannelKey` está presente, o canal canónico é
+  resolvido por `Key` (encontrado **e** `IsEnabled`);
+- se a `Key` está presente mas não resolve (inexistente ou desactivada),
+  **não** cai para o `CanonicalChannelId`/navegação obsoletos — prossegue para
+  o passo seguinte da cadeia (`ChannelAlias`);
+- linhas legadas com `Key` nula/vazia mantêm o fallback existente por
+  `CanonicalChannelId`/navegação `CanonicalChannel`.
+
+Consequência: uma afinidade **sobrevive** a apagar e recriar o canal canónico
+com a **mesma** `Key` — o `Id` técnico muda, a `Key` mantém-se, e a resolução
+devolve o canal recriado (novo `Id`).
+
+`CatalogResolver.ListChannelSourcesAsync` passou a incluir
+`CanonicalChannel` (`.Include(cs => cs.CanonicalChannel)`), pelo que a `Key`
+está disponível no caminho de selecção de fontes sem queries adicionais.
+
+Não há alteração de schema, migration, coluna ou FK: `CanonicalChannelId`
+mantém-se como **coluna de transição**.
+
+**Continua dependente de `Id`** (não migrado nesta wave):
+
+- FK `channel_aliases.CanonicalChannelId`;
+- FK `channel_sources.CanonicalChannelId`;
+- FK `ordering_items.CanonicalChannelId`;
+- `source_priority_policies` com scope por canal (`CanonicalChannelId`);
+- `dispatcharr_channel_ownerships.CanonicalChannelId`;
+- `matching_audits.CanonicalChannelId`;
+- `MatchPlan` (`CanonicalChannelId` por decisão);
+- agrupamento por canal do `SourceSelectionStage` (ainda por
+  `CanonicalChannelId`).
+
+Esta wave **não** é uma migração completa `Id → Key`. O ponto que resta para a
+futura Wave 13-4b é passar a pesquisa de política por canal do
+`SourceSelectionStage` a usar `CanonicalChannelKey` (resolver + contrato do
+estágio); os overrides por canal **não** foram implementados.
+
 ## 13. Caminho agendado e contrato da playlist (Wave 10-0)
 
 ### Sincronização agendada com o pipeline canónico

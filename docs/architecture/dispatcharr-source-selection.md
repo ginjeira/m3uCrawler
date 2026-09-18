@@ -253,6 +253,22 @@ final quando não existe linha (§10.1).
 
 Detalhe em `docs/architecture/phase-13-4-source-selection-policy.md`.
 
+### Identidade canónica no loader (Wave 9C.6)
+
+`CatalogResolver.ListChannelSourcesAsync` passou a incluir a navegação
+`CanonicalChannel` (`.Include(cs => cs.CanonicalChannel)`), pelo que
+`ChannelSource.CanonicalChannel.Key` está agora acessível ao caminho de
+selecção de fontes **sem** queries adicionais. Isto satisfaz o pré-requisito de
+identidade para a política por canal.
+
+O `SourceSelectionStage` **continua a agrupar por `CanonicalChannelId`**
+(semântica do selector, ranking e limites inalterados), e a política
+persistida mantém identidade por `CanonicalChannelKey`
+(`SourceSelectionPolicyEntity`, §10.1). A Wave 13-4b — passar a pesquisa de
+política por canal do estágio a usar `CanonicalChannelKey` (resolver + contrato
+do estágio) — permanece **fora de âmbito e não implementada**; a migração
+completa `Id → Key` **não** foi feita.
+
 ### Pontos de publicação integrados
 
 - single-cycle Telegram (`Program.cs`, `telegram_playlist_<ts>.m3u`);
