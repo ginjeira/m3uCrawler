@@ -10,10 +10,65 @@ namespace m3uCrawler.Services
         public async Task SaveToM3uPlaylist(List<M3uStream> streams, string filePath)
         {
             var workingStreams = streams.Where(s => s.IsWorking).ToList();
-            
+
+            await File.WriteAllTextAsync(filePath, BuildM3uPlaylistContent(streams), Encoding.UTF8);
+            Console.WriteLine($"Playlist M3U guardada em: {filePath}");
+            Console.WriteLine($"Total de streams funcionais: {workingStreams.Count}");
+        }
+
+        /// <summary>
+        /// Publicação atómica da playlist M3U (ver <c>11-OUTPUT.md</c> §4):
+        /// gera o conteúdo para um ficheiro temporário no mesmo directório e
+        /// substitui o alvo com <see cref="File.Move(string,string,bool)"/>.
+        /// Um output parcial nunca fica visível no caminho final.
+        /// </summary>
+        public async Task SaveToM3uPlaylistAtomic(List<M3uStream> streams, string filePath, DateTime? generatedAt = null)
+        {
+            var fullPath = Path.GetFullPath(filePath);
+            var directory = Path.GetDirectoryName(fullPath);
+            if (string.IsNullOrEmpty(directory))
+            {
+                directory = ".";
+            }
+            Directory.CreateDirectory(directory);
+
+            var tempPath = Path.Combine(
+                directory,
+                $".{Path.GetFileName(fullPath)}.{Guid.NewGuid():N}.tmp");
+
+            try
+            {
+                await File.WriteAllTextAsync(tempPath, BuildM3uPlaylistContent(streams, generatedAt), Encoding.UTF8);
+                File.Move(tempPath, fullPath, overwrite: true);
+            }
+            catch
+            {
+                try
+                {
+                    if (File.Exists(tempPath))
+                    {
+                        File.Delete(tempPath);
+                    }
+                }
+                catch
+                {
+                    // Limpeza best-effort; o erro original propaga-se.
+                }
+                throw;
+            }
+
+            Console.WriteLine($"Playlist M3U guardada em: {fullPath}");
+            Console.WriteLine($"Total de streams funcionais: {streams.Count(s => s.IsWorking)}");
+        }
+
+        private static string BuildM3uPlaylistContent(IEnumerable<M3uStream> streams, DateTime? generatedAt = null)
+        {
+            var workingStreams = streams.Where(s => s.IsWorking).ToList();
+            var generated = generatedAt ?? DateTime.Now;
+
             var m3uContent = new StringBuilder();
             m3uContent.AppendLine("#EXTM3U");
-            m3uContent.AppendLine($"#PLAYLIST:m3uCrawler - Generated on {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+            m3uContent.AppendLine($"#PLAYLIST:m3uCrawler - Generated on {generated:yyyy-MM-dd HH:mm:ss}");
             m3uContent.AppendLine();
 
             foreach (var stream in workingStreams)
@@ -22,9 +77,7 @@ namespace m3uCrawler.Services
                 m3uContent.AppendLine();
             }
 
-            await File.WriteAllTextAsync(filePath, m3uContent.ToString(), Encoding.UTF8);
-            Console.WriteLine($"Playlist M3U guardada em: {filePath}");
-            Console.WriteLine($"Total de streams funcionais: {workingStreams.Count}");
+            return m3uContent.ToString();
         }
 
         /// <summary>
@@ -56,7 +109,7 @@ namespace m3uCrawler.Services
             Console.WriteLine($"Entradas: {composition.TotalEntries}; faltam: {composition.MissingChannels.Count}");
         }
 
-        public async Task SaveToJsonReport(List<M3uStream> streams, string filePath)
+        public async Task SaveToJsonReport(List<M3uStream> streams, string filePath, DateTime? generatedAt = null)
         {
             var workingStreams = streams.Where(s => s.IsWorking).ToList();
 
@@ -77,7 +130,7 @@ namespace m3uCrawler.Services
 
             var report = new
             {
-                GeneratedAt = DateTime.Now,
+                GeneratedAt = generatedAt ?? DateTime.Now,
                 TotalStreams = streams.Count,
                 WorkingStreams = workingStreams.Count,
                 NonWorkingStreams = streams.Count(s => !s.IsWorking),

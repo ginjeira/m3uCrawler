@@ -9,6 +9,7 @@ using m3uCrawler.Services.LiveRun;
 using m3uCrawler.Services.Matching;
 using m3uCrawler.Services.SourceOrdering;
 using m3uCrawler.Services.SourceSelection;
+using m3uCrawler.Services.Sync;
 using m3uCrawler.Services.Telegram;
 using m3uCrawler.Services.Validation;
 using m3uCrawler.Models;
@@ -211,10 +212,11 @@ namespace m3uCrawler
                         webCatalogResolver,
                         dashboardOutputDir,
                         dispatcharrConfig,
-                        gate: new ConfigurationGate(lifecycle, operationalReadiness),
+                        gate: new ConfigurationGate(lifecycle),
                         liveRunHost: liveRunHost,
                         dispatcharrConfigLoader: DispatcharrConfigLoader.Load,
-                        discoverySettings: discoverySettingsProvider);
+                        discoverySettings: discoverySettingsProvider,
+                        capabilityGate: new ActionCapabilityGate(operationalReadiness));
                     WebDashboardService.SetScheduledActions(automationHost.RegisteredActions);
                     automationHost.Start();
                     Console.WriteLine(
@@ -393,8 +395,12 @@ namespace m3uCrawler
                 // Wave 4 (PHASE 9C) — O caminho CLI manual/automático mantém
                 // deliberadamente apenas o gate de lifecycle (sem readiness
                 // operacional): continua a ser o operador a decidir quando
-                // correr. O gate composto (lifecycle + readiness) aplica-se
-                // ao scheduler/dashboard construído no bloco --web.
+                // correr.
+                //
+                // Wave W2 — O scheduler/dashboard usa o gate global de
+                // bootstrap (lifecycle) mais um gate POR CAPACIDADE
+                // (ActionCapabilityGate): acções não-Telegram não ficam
+                // bloqueadas só porque o Telegram não está autenticado.
                 bool automaticDiscovery = maintenanceMode || loopHours > 0;
                 var configurationLifecycle = BuildConfigurationLifecycle(
                     catalogDbPath, outputDir, catalogForIngestion);
@@ -422,11 +428,66 @@ namespace m3uCrawler
                 //     sem --web (degradação graciosa, comportamento
                 //     preservado).
                 RunCoordinator? liveRunCoordinator = null;
-                List<M3uStream>? liveRunStreams = null;
-                RunReport? liveRunReport = null;
                 Exception? liveRunException = null;
                 var countriesDirectory = Path.Combine(
                     Directory.GetCurrentDirectory(), "runtime-data", "countries");
+
+                // Wave W2 — Serviço de publicação único: country gate →
+                // selecção de fontes (política persistida) → publicação
+                // atómica → run report → histórico → Dispatcharr. É a única
+                // implementação da cauda do pipeline Telegram; CLI,
+                // manutenção, dashboard e scheduler convergem aqui.
+                var dispatcharrSyncCoordinator = new DispatcharrSyncCoordinator(
+                    DispatcharrConfigLoader.Load);
+                var publicationService = new RunPublicationService(
+                    outputDir,
+                    telegramPlaylistManager,
+                    importHistoryService,
+                    countryChannelValidator,
+                    catalogForIngestion,
+                    dispatcharrSyncCoordinator);
+
+                // Wave W2 — Executor único da Live Run Telegram. Faz a
+                // discovery e delega a cauda no publicationService. É o
+                // mesmo executor usado pelo dashboard e pelo scheduler (via
+                // RunCoordinator) e pela CLI quando --web está activo.
+                var telegramLiveRunExecutor = new TelegramLiveRunExecutor(
+                    discover: async (effectiveDiscovery, progress, ct) =>
+                    {
+                        var (streams, report) = await scraper.SearchAndTestM3UInTelegramAsync(
+                            effectiveDiscovery.Keyword,
+                            limit: 200,
+                            maxConcurrency: 5,
+                            maxUrlsToTest: effectiveDiscovery.MaxStreams,
+                            historyHours: effectiveDiscovery.HistoryHours,
+                            countryCode: countryCode,
+                            countriesDir: countriesDirectory,
+                            pipelineIngestor: pipelineIngestor,
+                            pipelineSourceKey: $"telegram-{Slugify(effectiveDiscovery.Keyword)}",
+                            liveRunProgress: progress,
+                            cancellationToken: ct);
+                        return new TelegramDiscoveryResult(streams, report);
+                    },
+                    maintain: (effectiveDiscovery, progress, ct) => RunTelegramMaintenanceCycle(
+                        scraper,
+                        telegramPlaylistManager,
+                        importHistoryService,
+                        publicationService,
+                        effectiveDiscovery.Keyword,
+                        outputDir,
+                        effectiveDiscovery.MaxStreams,
+                        domainFilter,
+                        effectiveDiscovery.HistoryHours,
+                        args,
+                        pipelineIngestor,
+                        countryCode,
+                        countriesDirectory,
+                        progress,
+                        ct),
+                    publication: publicationService,
+                    discoverySettings: discoverySettingsProvider,
+                    countryCode: countryCode,
+                    domainFilter: domainFilter);
 
                 if (catalogForIngestion is not null)
                 {
@@ -436,47 +497,8 @@ namespace m3uCrawler
                             liveRunException = null;
                             try
                             {
-                                // Wave C — Overrides do run (CLI/dashboard) têm
-                                // prioridade; na sua ausência lê-se o store
-                                // persistido neste instante (sem snapshot de arranque).
-                                var effectiveDiscovery = discoverySettingsProvider.Resolve(
-                                    request.Keyword, request.HistoryHours, request.MaxStreams);
-                                if (request.Mode == LiveRunMode.TelegramMaintain)
-                                {
-                                    await RunTelegramMaintenanceCycle(
-                                        scraper,
-                                        telegramPlaylistManager,
-                                        importHistoryService,
-                                        effectiveDiscovery.Keyword,
-                                        outputDir,
-                                        effectiveDiscovery.MaxStreams,
-                                        domainFilter,
-                                        effectiveDiscovery.HistoryHours,
-                                        args,
-                                        pipelineIngestor,
-                                        catalogForIngestion,
-                                        countryCode,
-                                        countriesDirectory,
-                                        progress,
-                                        ct);
-                                }
-                                else
-                                {
-                                    var (streams, report) = await scraper.SearchAndTestM3UInTelegramAsync(
-                                        effectiveDiscovery.Keyword,
-                                        limit: 200,
-                                        maxConcurrency: 5,
-                                        maxUrlsToTest: effectiveDiscovery.MaxStreams,
-                                        historyHours: effectiveDiscovery.HistoryHours,
-                                        countryCode: countryCode,
-                                        countriesDir: countriesDirectory,
-                                        pipelineIngestor: pipelineIngestor,
-                                        pipelineSourceKey: $"telegram-{Slugify(effectiveDiscovery.Keyword)}",
-                                        liveRunProgress: progress,
-                                        cancellationToken: ct);
-                                    liveRunStreams = streams;
-                                    liveRunReport = report;
-                                }
+                                await telegramLiveRunExecutor
+                                    .ExecuteAsync(request, progress, ct);
                             }
                             catch (Exception ex)
                             {
@@ -547,6 +569,7 @@ namespace m3uCrawler
                     {
                         if (liveRunCoordinator is not null)
                         {
+                            liveRunException = null;
                             await liveRunCoordinator.StartAsync(new LiveRunRequest
                             {
                                 Mode = LiveRunMode.TelegramMaintain,
@@ -568,6 +591,7 @@ namespace m3uCrawler
                                 scraper,
                                 telegramPlaylistManager,
                                 importHistoryService,
+                                publicationService,
                                 cycleDiscovery.Keyword,
                                 outputDir,
                                 cycleDiscovery.MaxStreams,
@@ -575,19 +599,15 @@ namespace m3uCrawler
                                 cycleDiscovery.HistoryHours,
                                 args,
                                 pipelineIngestor,
-                                catalogForIngestion,
                                 countryCode,
                                 countriesDirectory);
                         }
                     }
                     else
                     {
-                        List<M3uStream> workingStreams;
-                        RunReport runReport;
                         if (liveRunCoordinator is not null)
                         {
-                            liveRunStreams = null;
-                            liveRunReport = null;
+                            liveRunException = null;
                             await liveRunCoordinator.StartAsync(new LiveRunRequest
                             {
                                 Mode = LiveRunMode.Telegram,
@@ -602,13 +622,13 @@ namespace m3uCrawler
                                 System.Runtime.ExceptionServices.ExceptionDispatchInfo
                                     .Capture(liveRunException).Throw();
                             }
-
-                            workingStreams = liveRunStreams ?? new List<M3uStream>();
-                            runReport = liveRunReport ?? new RunReport();
                         }
                         else
                         {
-                            (workingStreams, runReport) = await scraper.SearchAndTestM3UInTelegramAsync(
+                            // Sem coordinator (catálogo indisponível): a CLI
+                            // executa a discovery e publica pelo MESMO serviço
+                            // partilhado usado pelo dashboard e scheduler.
+                            var (directStreams, directReport) = await scraper.SearchAndTestM3UInTelegramAsync(
                                 cycleDiscovery.Keyword,
                                 limit: 200,
                                 maxConcurrency: 5,
@@ -618,95 +638,19 @@ namespace m3uCrawler
                                 countriesDir: countriesDirectory,
                                 pipelineIngestor: pipelineIngestor,
                                 pipelineSourceKey: $"telegram-{Slugify(cycleDiscovery.Keyword)}");
+
+                            await publicationService.PublishAsync(new RunPublicationRequest
+                            {
+                                Streams = directStreams,
+                                Report = directReport,
+                                Keyword = cycleDiscovery.Keyword,
+                                HistoryHours = cycleDiscovery.HistoryHours,
+                                MaxStreams = cycleDiscovery.MaxStreams,
+                                DomainFilter = domainFilter,
+                                CountryCode = countryCode,
+                                HistoryMode = "TelegramSearch",
+                            }, null, CancellationToken.None);
                         }
-
-                        if (!string.IsNullOrWhiteSpace(domainFilter))
-                        {
-                            int beforeFilter = workingStreams.Count;
-                            workingStreams = workingStreams
-                                .Where(s => UrlMatchesDomain(s.Url, domainFilter))
-                                .ToList();
-                            Console.WriteLine($"🌐 Após filtro de domínio: {workingStreams.Count}/{beforeFilter} streams");
-                        }
-
-                        Console.WriteLine($"\n✅ Streams funcionais encontradas no Telegram: {workingStreams.Count}");
-
-                        foreach (var stream in workingStreams)
-                        {
-                            Console.WriteLine($"  • {stream.Title} ({stream.ResponseTime}ms) :: {CredentialSanitizer.SanitizeUrl(stream.Url)}");
-                        }
-
-                        var countryMatches = countryChannelValidator.ValidateStreams(workingStreams, countryCode);
-                        Console.WriteLine($"📡 Validação por canais {countryCode.ToUpperInvariant()}: {countryMatches.Count} stream(s) correspondentes.");
-                        foreach (var match in countryMatches.Take(10))
-                        {
-                            Console.WriteLine($"  • {countryCode.ToUpperInvariant()} match: {match.Stream.Title} -> {string.Join(", ", match.MatchedAliases)}");
-                        }
-
-                        var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-                        var playlistPath = Path.Combine(outputDir, $"telegram_playlist_{timestamp}.m3u");
-                        var reportPath = Path.Combine(outputDir, $"telegram_report_{timestamp}.json");
-
-                        // PHASE 13 (Wave 13-3) — selecção de fontes antes da publicação.
-                        // PHASE 13 (Wave 13-4b) — políticas efectivas (global + overrides por canal) do catálogo.
-                        var singleCyclePolicies = catalogForIngestion is null
-                            ? SourceSelectionPolicySet.Default
-                            : await new SourceSelectionPolicyResolver(catalogForIngestion)
-                                .LoadEffectivePoliciesAsync(CancellationToken.None);
-                        var singleCycleSelection = await new SourceSelectionStage(catalogForIngestion)
-                            .ApplyAsync(workingStreams, singleCyclePolicies, CancellationToken.None);
-                        runReport.SourceSelection = singleCycleSelection.ToReport();
-                        if (singleCycleSelection.Applied)
-                        {
-                            Console.WriteLine(
-                                $"🧩 Selecção Phase 13: selected={singleCycleSelection.Selected.Count} " +
-                                $"rejected={singleCycleSelection.Rejected.Count} unmatched={singleCycleSelection.Unmatched.Count} " +
-                                $"canais={singleCycleSelection.MatchedChannelCount} ambíguos={singleCycleSelection.AmbiguousCount}");
-                        }
-                        workingStreams = singleCycleSelection.Published.ToList();
-
-                        await telegramPlaylistManager.SaveToM3uPlaylist(workingStreams, playlistPath);
-                        await telegramPlaylistManager.SaveToJsonReport(workingStreams, reportPath);
-                        await SaveRunReportAsync(outputDir, runReport);
-
-                        Console.WriteLine($"\n✨ Arquivos gerados:");
-                        Console.WriteLine($"   • Playlist: {playlistPath}");
-                        Console.WriteLine($"   • Relatório: {reportPath}");
-                        Console.WriteLine($"   • Relatório de execução: {Path.Combine(outputDir, "telegram_run_report.json")}");
-
-                        if (workingStreams.Count == 0)
-                        {
-                            Console.WriteLine("❌ Nenhum stream funcional encontrado no Telegram.");
-                        }
-
-                        // PHASE 13 (Wave 13-6 part 2) — artefacto de selecção
-                        // correlacionado com o stage (single-cycle). Só é
-                        // construído quando o stage aplicou a selecção; caso
-                        // contrário seria interpretado como "seleccionar zero".
-                        var dispatcharrSelection = singleCycleSelection.Applied
-                            ? m3uCrawler.Services.Sync.DispatcharrSourceSelectionFactory
-                                .FromStageResult(singleCycleSelection, singleCyclePolicies)
-                            : null;
-                        await TrySyncToDispatcharrAsync(playlistPath, outputDir, args, selection: dispatcharrSelection);
-
-                        await importHistoryService.RecordImportAsync(new ImportHistoryEntry
-                        {
-                            Timestamp = DateTime.UtcNow,
-                            Mode = "TelegramSearch",
-                            SearchTerm = cycleDiscovery.Keyword,
-                            HistoryHours = cycleDiscovery.HistoryHours,
-                            MaxStreams = cycleDiscovery.MaxStreams,
-                            NewFunctionalCount = workingStreams.Count,
-                            MessagesAnalyzed = runReport.MessagesAnalyzed,
-                            CandidatesFound = runReport.CandidatesFound,
-                            PlaylistsDownloaded = runReport.PlaylistsDownloaded,
-                            CountryMatches = runReport.CountryMatches,
-                            PlaylistsRejected = runReport.PlaylistsRejected,
-                            StreamsExtracted = runReport.StreamsExtracted,
-                            StreamsTested = runReport.StreamsTested,
-                            StreamsWorking = runReport.StreamsWorking,
-                            StreamsFailed = runReport.StreamsFailed
-                        });
                     }
 
                     if (loopHours > 0)
@@ -760,7 +704,27 @@ namespace m3uCrawler
 
                 // Legacy standalone path: sem stage de selecção nesta execução,
                 // portanto selection fica null (sem correlação heurística).
-                await TrySyncToDispatcharrAsync(playlistPath, outputDir, args);
+                var standaloneConfig = DispatcharrConfigLoader.Load();
+                CatalogResolver? standaloneCatalog = null;
+                if (standaloneConfig.Enabled)
+                {
+                    try
+                    {
+                        standaloneCatalog = await InitializeCatalogAsync(
+                            ResolveCatalogDbPath(args), CancellationToken.None);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine(
+                            $"❌ Catálogo indisponível. Sincronização abortada antes de qualquer " +
+                            $"escrita HTTP. Erro: {ex.GetType().Name}");
+                        return;
+                    }
+                }
+                var standaloneSync = new DispatcharrSyncCoordinator(() => standaloneConfig);
+                await standaloneSync.RunAsync(
+                    playlistPath, outputDir, standaloneCatalog, selection: null,
+                    liveRunProgress: null, CancellationToken.None);
                 return;
             }
 
@@ -1220,6 +1184,7 @@ namespace m3uCrawler
             TelegramScraperService scraper,
             PlaylistManagerService playlistManager,
             ImportHistoryService importHistory,
+            IRunPublicationService publication,
             string term,
             string outputDir,
             int telegramMaxStreams,
@@ -1227,7 +1192,6 @@ namespace m3uCrawler
             int telegramHistoryHours,
             string[] args,
             PipelineIngestionService? pipelineIngestor,
-            CatalogResolver? catalog,
             string countryCode = "pt",
             string? countriesDir = null,
             ILiveRunProgress? liveRunProgress = null,
@@ -1235,7 +1199,6 @@ namespace m3uCrawler
         {
             var tempPath = Path.Combine(outputDir, "playlist_temp.m3u");
             var mainPath = Path.Combine(outputDir, "playlist.m3u");
-            var reportPath = Path.Combine(outputDir, "telegram_maintain_report.json");
 
             Console.WriteLine();
             Console.WriteLine("🧹 Início do ciclo de manutenção Telegram...");
@@ -1355,72 +1318,42 @@ namespace m3uCrawler
             }
             var finalStreams = TelegramScraperService.MergeStreams(stillWorkingMain, freshStreams);
 
-            // PHASE 13 (Wave 13-3) — selecção de fontes sobre a playlist final.
-            // PHASE 13 (Wave 13-4b) — políticas efectivas (global + overrides por canal) do catálogo.
-            var maintenancePolicies = catalog is null
-                ? SourceSelectionPolicySet.Default
-                : await new SourceSelectionPolicyResolver(catalog)
-                    .LoadEffectivePoliciesAsync(cancellationToken);
-            var maintenanceSelection = await new SourceSelectionStage(catalog)
-                .ApplyAsync(finalStreams, maintenancePolicies, cancellationToken);
-            runReport.SourceSelection = maintenanceSelection.ToReport();
-            if (maintenanceSelection.Applied)
-            {
-                Console.WriteLine(
-                    $"🧩 Selecção Phase 13: selected={maintenanceSelection.Selected.Count} " +
-                    $"rejected={maintenanceSelection.Rejected.Count} unmatched={maintenanceSelection.Unmatched.Count} " +
-                    $"canais={maintenanceSelection.MatchedChannelCount} ambíguos={maintenanceSelection.AmbiguousCount}");
-            }
-            finalStreams = maintenanceSelection.Published.ToList();
+            // Wave W2 — A selecção de fontes, a publicação atómica, o run
+            // report, o histórico e o sync Dispatcharr passam pelo serviço
+            // de publicação único. Zero duplicação entre manutenção e ciclo
+            // único: ambos produzem o mesmo contrato.
+            var published = await publication.PublishAsync(
+                new RunPublicationRequest
+                {
+                    Streams = finalStreams,
+                    Report = runReport,
+                    Keyword = term,
+                    HistoryHours = telegramHistoryHours,
+                    MaxStreams = telegramMaxStreams,
+                    CountryCode = countryCode,
+                    HistoryMode = "TelegramMaintenance",
+                    PlaylistFileName = "playlist.m3u",
+                    JsonReportFileName = "telegram_maintain_report.json",
+                    RunCountryGate = false,
+                    Verbose = false,
+                    NewFunctionalCountOverride = freshStreams.Count(s => s.IsWorking),
+                    ExistingRetestedCount = existingMain.Count,
+                    ExistingStillWorkingCount = stillWorkingMain.Count,
+                    TrackFinalPlaylistCount = true,
+                },
+                liveRunProgress,
+                cancellationToken).ConfigureAwait(false);
 
             liveRunProgress?.ReportCounts(counts =>
             {
-                counts.TargetPlaylistEntries = finalStreams.Count;
+                counts.TargetPlaylistEntries = published.Published.Count;
                 counts.ExistingPlaylistRetested = existingMain.Count;
             });
-
-            await playlistManager.SaveToM3uPlaylist(finalStreams, mainPath);
-            await playlistManager.SaveToJsonReport(finalStreams, reportPath);
-            await SaveRunReportAsync(outputDir, runReport);
-
-            // PHASE 13 (Wave 13-6 part 2) — artefacto de selecção correlacionado
-            // com o stage (modo manutenção). Só é construído quando o stage
-            // aplicou a selecção; caso contrário não se filtra.
-            var maintenanceDispatcharrSelection = maintenanceSelection.Applied
-                ? m3uCrawler.Services.Sync.DispatcharrSourceSelectionFactory
-                    .FromStageResult(maintenanceSelection, maintenancePolicies)
-                : null;
-            await TrySyncToDispatcharrAsync(
-                mainPath, outputDir, args, liveRunProgress, cancellationToken,
-                selection: maintenanceDispatcharrSelection);
-
-            var historyEntry = new ImportHistoryEntry
-            {
-                Timestamp = DateTime.UtcNow,
-                Mode = "TelegramMaintenance",
-                SearchTerm = term,
-                HistoryHours = telegramHistoryHours,
-                MaxStreams = telegramMaxStreams,
-                NewFunctionalCount = freshStreams.Count(s => s.IsWorking),
-                ExistingRetestedCount = existingMain.Count,
-                ExistingStillWorkingCount = stillWorkingMain.Count,
-                FinalPlaylistCount = finalStreams.Count,
-                MessagesAnalyzed = runReport.MessagesAnalyzed,
-                CandidatesFound = runReport.CandidatesFound,
-                PlaylistsDownloaded = runReport.PlaylistsDownloaded,
-                CountryMatches = runReport.CountryMatches,
-                PlaylistsRejected = runReport.PlaylistsRejected,
-                StreamsExtracted = runReport.StreamsExtracted,
-                StreamsTested = runReport.StreamsTested,
-                StreamsWorking = runReport.StreamsWorking,
-                StreamsFailed = runReport.StreamsFailed
-            };
-            await importHistory.RecordImportAsync(historyEntry);
 
             Console.WriteLine("✅ Ciclo concluído.");
             Console.WriteLine($"   • Mantidas de playlist.m3u: {stillWorkingMain.Count}");
             Console.WriteLine($"   • Novas funcionais de playlist_temp.m3u: {freshStreams.Count(s => s.IsWorking)}");
-            Console.WriteLine($"   • Total final em playlist.m3u: {finalStreams.Count}");
+            Console.WriteLine($"   • Total final em playlist.m3u: {published.Published.Count}");
             Console.WriteLine($"   • playlist_temp.m3u: {tempPath}");
             Console.WriteLine($"   • playlist.m3u: {mainPath}");
             Console.WriteLine($"   • Relatório de execução: {Path.Combine(outputDir, "telegram_run_report.json")}");
@@ -1445,24 +1378,6 @@ namespace m3uCrawler
                     CountryChannelValidator.SetAffinityMembersStatic(group.Key, members);
                     Console.WriteLine($"  [{group.Key}] {members.Count} membro(s) de afinidade injetados");
                 }
-            }
-        }
-
-        static async Task SaveRunReportAsync(string outputDir, RunReport report)
-        {
-            try
-            {
-                var path = Path.Combine(outputDir, "telegram_run_report.json");
-                var json = System.Text.Json.JsonSerializer.Serialize(report, new System.Text.Json.JsonSerializerOptions
-                {
-                    WriteIndented = true,
-                    PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase
-                });
-                await File.WriteAllTextAsync(path, json, Encoding.UTF8);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"⚠️ Não foi possível guardar o relatório de execução: {ex.Message}");
             }
         }
 
@@ -1591,95 +1506,6 @@ namespace m3uCrawler
             {
                 Console.WriteLine(
                     $"🧭 Configuration lifecycle: {snapshot.State.ToWireName()}");
-            }
-        }
-
-        static async Task TrySyncToDispatcharrAsync(
-            string playlistPath, string outputDir, string[] args,
-            ILiveRunProgress? liveRunProgress = null,
-            CancellationToken cancellationToken = default,
-            DispatcharrSourceSelection? selection = null)
-        {
-            var cfg = DispatcharrConfigLoader.Load();
-            if (!cfg.Enabled)
-            {
-                // PHASE 9C.4 — SYNCING_DISPATCHARR não ocorre quando a
-                // integração está desligada; regista-se apenas o skip.
-                if (liveRunProgress is not null)
-                {
-                    liveRunProgress.ReportCounts(counts => counts.DispatcharrSyncSkipped++);
-                    liveRunProgress.ReportActivity(
-                        LiveRunActivityCategory.Dispatcharr,
-                        LiveRunActivityLevel.Info,
-                        "dispatcharr sync skipped (disabled)");
-                }
-                return;
-            }
-
-            if (liveRunProgress is not null)
-            {
-                await liveRunProgress.EnterPhaseAsync(
-                    LiveRunPhase.SyncingDispatcharr, "syncing dispatcharr", cancellationToken)
-                    .ConfigureAwait(false);
-                liveRunProgress.ReportCounts(counts => counts.DispatcharrSyncAttempted++);
-            }
-
-            CatalogResolver catalog;
-            try
-            {
-                catalog = await InitializeCatalogAsync(
-                    ResolveCatalogDbPath(args), CancellationToken.None);
-            }
-            catch (Exception ex)
-            {
-                if (liveRunProgress is not null)
-                {
-                    liveRunProgress.ReportCounts(counts => counts.DispatcharrSyncFailed++);
-                    liveRunProgress.ReportActivity(
-                        LiveRunActivityCategory.Dispatcharr,
-                        LiveRunActivityLevel.Error,
-                        "dispatcharr sync failed: catalog unavailable");
-                }
-                Console.WriteLine(
-                    $"❌ Catálogo falhou a inicializar em '{ResolveCatalogDbPath(args)}'. " +
-                    $"Sincronização Dispatcharr abortada antes de qualquer escrita HTTP. " +
-                    $"Erro: {ex.Message}");
-                throw;
-            }
-
-            try
-            {
-                var aliases = AliasResolver.FromFile(cfg.AliasFile);
-                var ordering = new StreamOrderingPolicy(cfg.ProviderPriority);
-                var matcher = new ChannelMatcher(aliases, null, catalog);
-                var sync = new m3uCrawler.Services.Sync.DispatcharrSyncService(
-                    cfg, outputDir,
-                    aliases: aliases,
-                    ordering: ordering,
-                    matcher: matcher,
-                    catalog: catalog);
-                await sync.RunAsync(playlistPath, selection);
-
-                if (liveRunProgress is not null)
-                {
-                    liveRunProgress.ReportCounts(counts => counts.DispatcharrSyncCompleted++);
-                    liveRunProgress.ReportActivity(
-                        LiveRunActivityCategory.Dispatcharr,
-                        LiveRunActivityLevel.Info,
-                        "dispatcharr sync completed");
-                }
-            }
-            catch (Exception ex)
-            {
-                if (liveRunProgress is not null)
-                {
-                    liveRunProgress.ReportCounts(counts => counts.DispatcharrSyncFailed++);
-                    liveRunProgress.ReportActivity(
-                        LiveRunActivityCategory.Dispatcharr,
-                        LiveRunActivityLevel.Error,
-                        "dispatcharr sync failed");
-                }
-                Console.WriteLine($"⚠️ Falha na sincronização Dispatcharr: {ex.Message}");
             }
         }
     }

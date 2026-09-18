@@ -69,6 +69,13 @@ public sealed class ScheduledTelegramRunAction : IScheduledAction
         ? TelegramMaintainActionName
         : TelegramActionName;
 
+    /// <summary>
+    /// Discovery Telegram exige sessão autenticada. O gate por capacidade
+    /// não enfraquece este requisito: só as acções Telegram o declaram.
+    /// </summary>
+    public ScheduledActionCapabilities RequiredCapabilities =>
+        ScheduledActionCapabilities.Telegram;
+
     public async Task<string> ExecuteAsync(CancellationToken cancellationToken)
     {
         var coordinator = _host?.Coordinator;

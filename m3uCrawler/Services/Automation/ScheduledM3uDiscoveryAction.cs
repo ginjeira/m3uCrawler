@@ -22,6 +22,15 @@ namespace m3uCrawler.Services.Automation;
 /// ambos serviços existentes. Esta acção NÃO duplica o pipeline:
 /// apenas orquestra os serviços já presentes na aplicação.
 /// </para>
+///
+/// <para>
+/// Wave W2 — <b>capacidade distinta e deliberada.</b> Esta é a
+/// descoberta M3U por pesquisa web (não-Telegram). Publica a playlist
+/// funcional <c>output/playlist.m3u</c> e não participa no
+/// <c>RunCoordinator</c> Telegram. Declara apenas
+/// <see cref="ScheduledActionCapabilities.Output"/>: pode correr quando o
+/// Telegram não está autenticado, desde que o output seja gravável.
+/// </para>
 /// </summary>
 public sealed class ScheduledM3uDiscoveryAction : IScheduledAction
 {
@@ -48,6 +57,13 @@ public sealed class ScheduledM3uDiscoveryAction : IScheduledAction
     }
 
     public string Name => ActionName;
+
+    /// <summary>
+    /// Discovery M3U escreve a playlist funcional; não depende do Telegram
+    /// nem do catálogo canónico.
+    /// </summary>
+    public ScheduledActionCapabilities RequiredCapabilities =>
+        ScheduledActionCapabilities.Output;
 
     public async Task<string> ExecuteAsync(CancellationToken cancellationToken)
     {

@@ -48,6 +48,12 @@ public sealed class ScheduledValidationAction : IScheduledAction
 
     public string Name => ActionName;
 
+    /// <summary>
+    /// Re-testa a playlist funcional; não depende do Telegram.
+    /// </summary>
+    public ScheduledActionCapabilities RequiredCapabilities =>
+        ScheduledActionCapabilities.Output;
+
     public async Task<string> ExecuteAsync(CancellationToken cancellationToken)
     {
         // Wave C — Recarregar a policy de validação a cada execução. O

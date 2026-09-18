@@ -17,7 +17,31 @@ namespace m3uCrawler.Services.Automation;
 public interface IScheduledAction
 {
     string Name { get; }
+
+    /// <summary>
+    /// Capacidades operacionais exigidas por esta acção. Default
+    /// <see cref="ScheduledActionCapabilities.None"/>: verificado apenas o
+    /// gate global de bootstrap. As acções que dependem do Telegram,
+    /// Dispatcharr, catálogo ou output declaram-no aqui.
+    /// </summary>
+    ScheduledActionCapabilities RequiredCapabilities => ScheduledActionCapabilities.None;
+
     Task<string> ExecuteAsync(CancellationToken cancellationToken);
+}
+
+/// <summary>
+/// Contexto do job entregue a acções que precisam de o interpretar (por
+/// exemplo, o sufixo <c>&lt;id&gt;</c> no nome do job).
+/// </summary>
+public sealed record ScheduledJobContext(long Id, string Name, string ActionName);
+
+/// <summary>
+/// Acção que precisa do job concreto que a disparou (nome/id). Mantém
+/// <see cref="IScheduledAction"/> intacto para as restantes acções.
+/// </summary>
+public interface IJobAwareScheduledAction : IScheduledAction
+{
+    Task<string> ExecuteAsync(ScheduledJobContext job, CancellationToken cancellationToken);
 }
 
 /// <summary>
@@ -31,10 +55,14 @@ public sealed class ScheduledJobRunner : IDisposable
 {
     public const string BlockedResult = "blocked:not-configured";
 
+    /// <summary>Prefixo do resultado quando a acção é bloqueada por capacidade.</summary>
+    public const string BlockedCapabilityPrefix = "blocked:capability";
+
     private readonly IDbContextFactory<ChannelCatalogDbContext> _dbFactory;
     private readonly IServiceProvider _services;
     private readonly TimeSpan _pollInterval;
     private readonly IConfigurationGate? _gate;
+    private readonly IActionCapabilityGate? _capabilityGate;
     private readonly CancellationTokenSource _cts = new();
     private Task? _loop;
     private bool _blockedLogged;
@@ -43,12 +71,14 @@ public sealed class ScheduledJobRunner : IDisposable
         IDbContextFactory<ChannelCatalogDbContext> dbFactory,
         IServiceProvider services,
         TimeSpan? pollInterval = null,
-        IConfigurationGate? gate = null)
+        IConfigurationGate? gate = null,
+        IActionCapabilityGate? capabilityGate = null)
     {
         _dbFactory = dbFactory;
         _services = services;
         _pollInterval = pollInterval ?? TimeSpan.FromSeconds(30);
         _gate = gate;
+        _capabilityGate = capabilityGate;
     }
 
     public void Start()
@@ -150,11 +180,35 @@ public sealed class ScheduledJobRunner : IDisposable
                 await c2.SaveChangesAsync(cancellationToken);
                 continue;
             }
+
+            // Gate por capacidade: uma acção que não exige Telegram corre
+            // mesmo que a sessão Telegram não esteja autenticada. O gate
+            // global de bootstrap já foi verificado acima.
+            if (_capabilityGate != null
+                && action.RequiredCapabilities != ScheduledActionCapabilities.None
+                && !await _capabilityGate.IsReadyForAsync(
+                    action.RequiredCapabilities, cancellationToken))
+            {
+                await using var cCap = await _dbFactory.CreateDbContextAsync(cancellationToken);
+                var jobCap = await cCap.ScheduledJobs.FirstAsync(j => j.Id == job.Id, cancellationToken);
+                jobCap.LastResult = Truncate(
+                    $"{BlockedCapabilityPrefix}:{DescribeCapabilities(action.RequiredCapabilities)}", 120);
+                jobCap.LastRunAtUtc = now;
+                jobCap.NextRunAtUtc = nextAfterNow;
+                jobCap.UpdatedAtUtc = now;
+                await cCap.SaveChangesAsync(cancellationToken);
+                continue;
+            }
+
             var started = DateTime.UtcNow;
             string result;
             try
             {
-                result = await action.ExecuteAsync(cancellationToken);
+                result = action is IJobAwareScheduledAction aware
+                    ? await aware.ExecuteAsync(
+                        new ScheduledJobContext(job.Id, job.Name, job.ActionName),
+                        cancellationToken)
+                    : await action.ExecuteAsync(cancellationToken);
             }
             catch (Exception ex)
             {
@@ -241,4 +295,14 @@ public sealed class ScheduledJobRunner : IDisposable
     }
 
     private static string Truncate(string s, int max) => s.Length <= max ? s : s[..max];
+
+    private static string DescribeCapabilities(ScheduledActionCapabilities capabilities)
+    {
+        var parts = new List<string>();
+        if (capabilities.HasFlag(ScheduledActionCapabilities.Telegram)) parts.Add("telegram");
+        if (capabilities.HasFlag(ScheduledActionCapabilities.Dispatcharr)) parts.Add("dispatcharr");
+        if (capabilities.HasFlag(ScheduledActionCapabilities.Catalog)) parts.Add("catalog");
+        if (capabilities.HasFlag(ScheduledActionCapabilities.Output)) parts.Add("output");
+        return parts.Count == 0 ? "none" : string.Join("+", parts);
+    }
 }

@@ -55,7 +55,8 @@ public sealed class ScheduledAutomationHost : IDisposable
         IConfigurationGate? gate = null,
         LiveRun.LiveRunHost? liveRunHost = null,
         Func<DispatcharrConfig>? dispatcharrConfigLoader = null,
-        DiscoverySettingsProvider? discoverySettings = null)
+        DiscoverySettingsProvider? discoverySettings = null,
+        IActionCapabilityGate? capabilityGate = null)
     {
         var options = new ScheduledActionOptions { OutputDir = outputDir };
         configureOptions?.Invoke(options);
@@ -119,7 +120,8 @@ public sealed class ScheduledAutomationHost : IDisposable
             catalog.GetFactory(),
             provider,
             pollInterval,
-            gate);
+            gate,
+            capabilityGate);
 
         return new ScheduledAutomationHost(provider, runner, options, actions);
     }

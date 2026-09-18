@@ -104,6 +104,13 @@ public sealed class ScheduledDispatcharrSyncAction : IScheduledAction
 
     public string Name => ActionName;
 
+    /// <summary>
+    /// Sincronização requer Dispatcharr activo e válido (quando activado).
+    /// Não depende do Telegram.
+    /// </summary>
+    public ScheduledActionCapabilities RequiredCapabilities =>
+        ScheduledActionCapabilities.Dispatcharr;
+
     public async Task<string> ExecuteAsync(CancellationToken cancellationToken)
     {
         // Wave C — Releitura da config por execução (paridade com o
