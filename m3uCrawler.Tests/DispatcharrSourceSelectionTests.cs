@@ -232,6 +232,53 @@ public class DispatcharrSourceSelectionTests
         Assert.All(noPolicies.Channels, c => Assert.Null(c.PolicyScope));
     }
 
+    // ---------------- applied flag (Wave 13-6 audit F1) ----------------
+
+    [Fact]
+    public void Factory_sets_applied_from_stage_result()
+    {
+        // NoOp: o stage não aplicou selecção → Applied=false.
+        var noOp = SourceSelectionStageResult.NoOp(new[] { Stream("http://one.example/noop.ts") });
+        var fromNoOp = DispatcharrSourceSelectionFactory.FromStageResult(noOp, policies: null, FixedNow);
+        Assert.False(fromNoOp.Applied);
+
+        // Stage aplicado → Applied=true.
+        Assert.True(SingleChannelResult("key-applied", "http://one.example/a.ts").Applied);
+
+        // Default do modelo: true (artefactos anteriores ao campo não filtram).
+        Assert.True(new DispatcharrSourceSelection().Applied);
+    }
+
+    [Fact]
+    public void Serializer_round_trips_applied_flag_and_defaults_to_true_when_absent()
+    {
+        var applied = SingleChannelResult("key-applied", "http://one.example/a.ts");
+        var jsonApplied = DispatcharrSourceSelectionSerializer.Serialize(applied);
+        Assert.Contains("\"applied\": true", jsonApplied, StringComparison.Ordinal);
+        var roundApplied = DispatcharrSourceSelectionSerializer.Deserialize(jsonApplied);
+        Assert.NotNull(roundApplied);
+        Assert.True(roundApplied!.Applied);
+
+        var notApplied = new DispatcharrSourceSelection
+        {
+            GeneratedAtUtc = FixedNow.ToString("o"),
+            Applied = false,
+            Channels = Array.Empty<ChannelSourceSelection>(),
+            Counts = new SelectionCounts(),
+        };
+        var jsonNotApplied = DispatcharrSourceSelectionSerializer.Serialize(notApplied);
+        Assert.Contains("\"applied\": false", jsonNotApplied, StringComparison.Ordinal);
+        var roundNotApplied = DispatcharrSourceSelectionSerializer.Deserialize(jsonNotApplied);
+        Assert.NotNull(roundNotApplied);
+        Assert.False(roundNotApplied!.Applied);
+
+        // Artefacto legado sem o campo: default true, nunca filtragem implícita.
+        var legacy = DispatcharrSourceSelectionSerializer.Deserialize(
+            "{\"generatedAtUtc\":\"2026-01-01T00:00:00Z\",\"channels\":[],\"counts\":{}}");
+        Assert.NotNull(legacy);
+        Assert.True(legacy!.Applied);
+    }
+
     // ---------------- serializer ----------------
 
     [Fact]

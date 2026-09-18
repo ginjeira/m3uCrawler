@@ -670,21 +670,34 @@ A selecção de fontes é transportada até ao apply do Dispatcharr por um artef
 próprio, `DispatcharrSourceSelection`, sem alterar o `MatchPlan` (que continua a
 ser exclusivamente o resultado do matching).
 
-- **Artefacto:** `DispatcharrSourceSelection` tem `generatedAtUtc`, `channels[]`
-  (`canonicalChannelKey` — identidade; `canonicalChannelId` transiente;
-  `policyScope`; `candidateCount`; `rejectedCount`; `selected[]` com
+- **Artefacto:** `DispatcharrSourceSelection` tem `generatedAtUtc`, `applied`,
+  `channels[]` (`canonicalChannelKey` — identidade; `canonicalChannelId`
+  transiente; `policyScope`; `candidateCount`; `rejectedCount`; `selected[]` com
   `streamUrl`/`rank`/`provider`/`reason`/`sourceId`) e `counts` (`channels`,
   `candidates`, `selected`, `rejected`, `unmatched`, `ambiguous`; `unmatched` e
-  `ambiguous` são disjuntos). É construído **uma vez** a partir do
+  `ambiguous` são disjuntos). `applied` (default `true`) indica se o estágio
+  aplicou a selecção; é construído **uma vez** a partir do
   `SourceSelectionStageResult` por
   `DispatcharrSourceSelectionFactory.FromStageResult(result, policies, nowUtc)`
   (projecção pura; reutiliza literalmente `SelectionReasons`; não recalcula a
   selecção nem toca no catálogo). A identidade é `CanonicalChannel.Key`; o
   `CanonicalChannelId` é apenas transportado.
+- **Artefacto não aplicado:** `Program.cs` só constrói/passa o artefacto quando
+  `SourceSelectionStageResult.Applied == true`; um resultado não aplicado
+  (catálogo nulo, input vazio, falha de leitura ou catálogo sem `ChannelSource`)
+  resulta em `selection = null` (sem filtragem e sem artefacto escrito). O
+  `DispatcharrSyncService` também trata `applied == false` como `null` — um
+  artefacto não aplicado **nunca** significa "seleccionar zero".
 - **Regra de associação:** apenas as fontes `Selected` são associadas/publicadas;
   `Unmatched` e `Ambiguous` **não** são associados (alteração deliberada face ao
   comportamento legado). Aplica-se à associação de canal e a
   `globalKeepStreamIds`/`globalRemoveCandidates`, sem mutar o `plan`.
+- **Canal avaliado vs não avaliado:** um canal com entrada no artefacto — mesmo
+  com `Selected = []` — é **avaliado** e segue selecção estrita. Um canal com
+  `CanonicalChannelKey` nula/vazia **ou sem** entrada no artefacto é **não
+  avaliado**: comportamento conservador — mantém as streams existentes na
+  associação (qualquer ownership), **não** desassocia nem `DELETE`, e **não**
+  faz `POST` de streams novas. Os dois casos são deliberadamente distintos.
 - **Ownership e cleanup:** as streams criadas pelo crawler passam a ser
   registadas `CrawlerManaged` via `EnsureStreamOwnershipAsync` após o
   `CreateAsync` (antes em falta). Sob selecção, as CrawlerManaged não
@@ -693,6 +706,16 @@ ser exclusivamente o resultado do matching).
   ficam associadas e **nunca** são eliminadas. Um canal novo sem streams
   efectivas não é criado; um canal existente só recebe `PATCH streams=[]` se
   actualmente tiver streams (idempotência).
+- **Resiliência e compensação:** cada escrita de `EnsureStreamOwnershipAsync` é
+  protegida individualmente — uma falha é registada no relatório
+  (`FailedReportEntry`) e a run **continua** (sem row de ownership falsa, guards
+  preservados). Se a criação do canal novo falhar depois de a Phase 2 ter criado
+  streams, ou se um `POST` de stream falhar a meio da Phase 2 depois de já
+  existir pelo menos uma criada, essas streams são registadas `CrawlerManaged`
+  com channel id `0` e adicionadas aos candidatos de remoção da Phase 4, em
+  qualquer early-return posterior à Phase 2, para que o `DELETE` com guard remova
+  **apenas** streams provadamente criadas pelo crawler. A mensagem de falha de
+  criação de stream é sanitizada (`CredentialSanitizer.SanitizeUrl`).
 - **Persistência sanitizada:** `DispatcharrSourceSelectionSerializer` aplica
   `CredentialSanitizer.SanitizeUrl` a cada `StreamUrl`; o ficheiro
   `output/dispatcharr_selection_<yyyyMMdd_HHmmss>.json` é escrito por
@@ -700,7 +723,12 @@ ser exclusivamente o resultado do matching).
   dry-run/apply — o dry-run também o produz e nunca contém credenciais.
 - **Compatibilidade:** `RunAsync`/`ApplyAsync` ganharam overloads com
   `DispatcharrSourceSelection? selection`; os overloads antigos delegam com
-  `selection: null` (comportamento legado).
+  `selection: null`. **Correcção documental:** nesse caminho,
+  matching/ordering/rename/criação de canal e relatório mantêm-se equivalentes,
+  mas o **registo de ownership das streams criadas nessa execução também
+  ocorre** quando há catálogo — alteração intencional da Wave 13-6 que habilita
+  cleanup futuro seguro. Não se afirma que `selection == null` seja totalmente
+  inalterado face ao pré-13-6.
 - **Limitação documentada:** os caminhos `--dispatcharr-sync` standalone e
   `ScheduledDispatcharrSyncAction` passam `selection = null` por não existir
   stage de selecção nessa execução; nesses caminhos **não** há correlação

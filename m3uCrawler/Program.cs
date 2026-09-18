@@ -569,9 +569,13 @@ namespace m3uCrawler
                         }
 
                         // PHASE 13 (Wave 13-6 part 2) — artefacto de selecção
-                        // correlacionado com o stage (single-cycle).
-                        var dispatcharrSelection = m3uCrawler.Services.Sync.DispatcharrSourceSelectionFactory
-                            .FromStageResult(singleCycleSelection, singleCyclePolicies);
+                        // correlacionado com o stage (single-cycle). Só é
+                        // construído quando o stage aplicou a selecção; caso
+                        // contrário seria interpretado como "seleccionar zero".
+                        var dispatcharrSelection = singleCycleSelection.Applied
+                            ? m3uCrawler.Services.Sync.DispatcharrSourceSelectionFactory
+                                .FromStageResult(singleCycleSelection, singleCyclePolicies)
+                            : null;
                         await TrySyncToDispatcharrAsync(playlistPath, outputDir, args, selection: dispatcharrSelection);
 
                         await importHistoryService.RecordImportAsync(new ImportHistoryEntry
@@ -1144,9 +1148,12 @@ namespace m3uCrawler
             await SaveRunReportAsync(outputDir, runReport);
 
             // PHASE 13 (Wave 13-6 part 2) — artefacto de selecção correlacionado
-            // com o stage (modo manutenção).
-            var maintenanceDispatcharrSelection = m3uCrawler.Services.Sync.DispatcharrSourceSelectionFactory
-                .FromStageResult(maintenanceSelection, maintenancePolicies);
+            // com o stage (modo manutenção). Só é construído quando o stage
+            // aplicou a selecção; caso contrário não se filtra.
+            var maintenanceDispatcharrSelection = maintenanceSelection.Applied
+                ? m3uCrawler.Services.Sync.DispatcharrSourceSelectionFactory
+                    .FromStageResult(maintenanceSelection, maintenancePolicies)
+                : null;
             await TrySyncToDispatcharrAsync(
                 mainPath, outputDir, args, liveRunProgress, cancellationToken,
                 selection: maintenanceDispatcharrSelection);

@@ -18,6 +18,15 @@ namespace m3uCrawler.Models
     public sealed class DispatcharrSourceSelection
     {
         [JsonPropertyName("generatedAtUtc")] public string GeneratedAtUtc { get; init; } = string.Empty;
+
+        /// <summary>
+        /// PHASE 13 (Wave 13-6 audit F1) — Indica se o artefacto resulta de um
+        /// stage que efectivamente aplicou a selecção. <c>false</c> significa
+        /// que o artefacto NUNCA deve ser interpretado como "seleccionar
+        /// zero": o apply trata-o como ausência de selecção (legacy).
+        /// </summary>
+        [JsonPropertyName("applied")] public bool Applied { get; init; } = true;
+
         [JsonPropertyName("channels")] public IReadOnlyList<ChannelSourceSelection> Channels { get; init; } = Array.Empty<ChannelSourceSelection>();
         [JsonPropertyName("counts")] public SelectionCounts Counts { get; init; } = new();
     }

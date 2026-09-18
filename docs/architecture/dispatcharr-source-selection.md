@@ -590,8 +590,14 @@ selecção até ao apply; não há um segundo cálculo da selecção no apply.
 ### Artefacto e identidade
 
 `DispatcharrSourceSelection` (`m3uCrawler/Models/DispatcharrSourceSelection.cs`):
-`generatedAtUtc`, `channels[]` e `counts`.
+`generatedAtUtc`, `applied`, `channels[]` e `counts`.
 
+- `applied` (default `true`): indica se o artefacto resulta de um estágio que
+  **efectivamente aplicou** a selecção. `false` significa que o artefacto
+  **nunca** deve ser interpretado como "seleccionar zero": é tratado como
+  ausência de selecção (legacy). `Program.cs` só constrói/passa o artefacto
+  quando `SourceSelectionStageResult.Applied == true`; caso contrário
+  `selection = null` e nenhum artefacto é escrito.
 - `ChannelSourceSelection`: `canonicalChannelKey` (**identidade**),
   `canonicalChannelId` (transiente; apenas transportado), `policyScope`
   (`override`/`global`/`default`; `null` quando a política não é fornecida),
@@ -617,6 +623,22 @@ a chave de unicidade do catálogo (`CatalogResolver.RecordChannelSourceAsync`).
   `startedAt` do `MatchPlan`, escrito por `RunAsync` **antes** do branch
   dry-run/apply — o dry-run também o produz. Nunca contém credenciais.
 
+### Artefacto não aplicado (`applied == false`)
+
+`SourceSelectionStageResult.Applied` é `false` em quatro casos: catálogo
+ausente, input vazio, falha de leitura do catálogo e catálogo sem
+`ChannelSource`. Nesses casos o artefacto **não** significa "seleccionar
+zero":
+
+- `Program.cs` só constrói/passa o artefacto quando
+  `SourceSelectionStageResult.Applied == true`; um resultado não aplicado
+  resulta em `selection = null` (sem filtragem);
+- `DispatcharrSyncService` trata defensivamente `applied == false` como
+  `null`, tanto em `RunAsync` (antes de escrever o artefacto, que por isso
+  não é produzido) como em `ApplyAsync` (defesa redundante);
+- um artefacto não aplicado nunca filtra, nunca desassocia e nunca é
+  interpretado como "seleccionar zero".
+
 ### Regra de associação (`selection != null`)
 
 - Apenas as fontes `Selected` são associadas/publicadas. `Selected` é a **única**
@@ -627,10 +649,31 @@ a chave de unicidade do catálogo (`CatalogResolver.RecordChannelSourceAsync`).
 - A regra aplica-se consistentemente à associação de canal e às listas
   `globalKeepStreamIds` e `globalRemoveCandidates`. O `plan` **nunca** é mutado:
   a filtragem é feita sobre uma lista efectiva calculada por canal.
-- `selection == null` (legacy): comportamento inalterado (todas as streams do
-  plano são associadas), coberto pelo overload antigo.
+- `selection == null` (legacy): matching/ordering/rename/criação de canal e
+  relatório mantêm-se equivalentes. **Correcção documental:** a afirmação de
+  que este caminho fica "totalmente inalterado" é inexacta — o **registo de
+  ownership das streams criadas nessa execução também ocorre neste caminho**
+  quando há catálogo. É uma alteração intencional da Wave 13-6 (não uma
+  regressão), que habilita cleanup futuro seguro: as streams criadas pelo
+  crawler ficam provadamente `CrawlerManaged`. Coberto pelo overload antigo
+  que delega com `selection: null`.
 
 ### Limpeza e ownership
+
+**Canal avaliado vs não avaliado (`ResolveSelectedSet`, tri-state).** A entrada
+de um canal no artefacto é resolvida para um tri-state:
+
+- **Avaliado** — `CanonicalChannelKey` presente no artefacto (mesmo com
+  `Selected = []`): segue a selecção estrita descrita abaixo.
+- **Não avaliado** — `CanonicalChannelKey` nula/vazia **ou** sem entrada no
+  artefacto: comportamento **conservador**. As streams existentes são mantidas
+  na associação (qualquer ownership), **não** são desassociadas nem `DELETE`d,
+  e **não** é feito `POST` de streams novas. Uma ausência no artefacto **não**
+  significa "seleccionar zero".
+
+Os dois casos são **deliberadamente distintos**: um canal avaliado com
+`Selected = []` remove as CrawlerManaged não seleccionadas; um canal não
+avaliado mantém tudo.
 
 `ComputeEffectiveStreams` (por canal, sob selecção):
 
@@ -646,6 +689,28 @@ As streams CrawlerManaged removidas pela selecção são adicionadas a
 `globalRemoveCandidates` e removidas pelo caminho global da Phase 4, com o guard
 de ownership pré-existente inalterado (`External`/`Unknown`/sem registo nunca
 recebem `DELETE`; sem catálogo mantém-se o default legado CrawlerManaged).
+
+**Falha de escrita de ownership não aborta a run.** Cada
+`EnsureStreamOwnershipAsync` é protegido individualmente (`try/catch`): uma
+falha é registada num `FailedReportEntry` (`Reason` prefixado `ownership:` com
+o id da stream), o log assinala-a e a run **continua**; o relatório é escrito
+na mesma. Não é criada uma row de ownership falsa e os guards de ownership
+existentes mantêm-se.
+
+**Compensação de órfãos na falha de criação de canal.** Se a criação do canal
+novo falha depois da Phase 2 já ter criado streams, **ou** se um `POST` de
+stream falha a meio da Phase 2 depois de já existir pelo menos uma stream
+criada, essas streams ficariam sem canal associado. O crawler **prova** que as
+criou: cada uma é registada `CrawlerManaged` com **channel id `0`** (sem canal)
+e adicionada aos candidatos de remoção da Phase 4, pelo que o `DELETE` com guard
+de ownership remove **apenas** streams provadamente criadas pelo crawler (nunca
+`External`/`Unknown`). A compensação corre em **todos** os early-returns
+posteriores ao início da Phase 2, não apenas no fim normal; a falha continua a
+ser reportada e não ficam órfãos silenciosamente sem owner.
+
+**Log sanitizado na falha de criação de stream.** A mensagem de falha do
+`CreateAsync` passa `StreamUrl` por `CredentialSanitizer.SanitizeUrl` — a URL
+crua (possivelmente com credenciais Xtream) nunca é logada.
 
 **Registo de ownership na criação:** as streams criadas pelo crawler passam a
 ser registadas como `CrawlerManaged` via `EnsureStreamOwnershipAsync` depois do

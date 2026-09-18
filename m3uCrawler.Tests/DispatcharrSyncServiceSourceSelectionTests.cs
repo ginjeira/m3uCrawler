@@ -469,6 +469,328 @@ public class DispatcharrSyncServiceSourceSelectionTests : IAsyncLifetime
         }
     }
 
+    // ---------------- Scenario 1: Applied=false (Wave 13-6 audit F1) ----------------
+
+    [Fact]
+    public async Task Non_applied_selection_never_filters_or_deletes()
+    {
+        // (1) Canal novo com streams novas: Applied=false → o guard converte
+        //     para ausência de selecção (legacy); tudo é POSTed. Sem o guard,
+        //     Channels=[] seria tratado como NÃO AVALIADO e nada seria POSTed.
+        var handler = new SourceSelectionRecordingHandler { NextNewStreamId = 5900, NewChannelId = 9900 };
+        var (svc, _, state) = BuildApplySvc(handler: handler);
+        var urls = new[] { "http://one.example/na1.ts", "http://one.example/na2.ts" };
+        var decision = NewChannelDecision(
+            "legacy-non-applied", null,
+            urls.Select((u, i) => NewStream(u, i)).ToArray());
+        var nonApplied = new DispatcharrSourceSelection
+        {
+            GeneratedAtUtc = "2026-01-01T00:00:00Z",
+            Applied = false,
+            Channels = Array.Empty<ChannelSourceSelection>(),
+            Counts = new SelectionCounts(),
+        };
+
+        await svc.ApplyAsync(Plan(decision), state, nonApplied, new List<FailedReportEntry>(), CancellationToken.None);
+
+        Assert.Equal(2, handler.StreamPostBodies.Count);
+        Assert.Equal(new[] { urls[0], urls[1] }, handler.StreamPostBodies.Select(ParseUrl).ToArray());
+        Assert.Single(handler.ChannelPostBodies);
+        Assert.Equal(2, ParseStreams(handler.ChannelPostBodies.Single()).Length);
+        Assert.Empty(handler.DeleteStreamIds);
+
+        // (2) Entrada estrita com Selected=[] mas Applied=false: o guard
+        //     converte para legacy. Sem o guard haveria PATCH vazio + DELETE.
+        await SeedOwnershipAsync(new List<long> { 1, 2 }, channelId: 701);
+        var handlerStrict = new SourceSelectionRecordingHandler();
+        handlerStrict.ChannelStreamIds[701] = new List<long> { 1, 2 };
+        var (svcStrict, _, stateStrict) = BuildApplySvc(catalog: _resolver, handler: handlerStrict);
+        var strictNonApplied = new DispatcharrSourceSelection
+        {
+            GeneratedAtUtc = "2026-01-01T00:00:00Z",
+            Applied = false,
+            Channels = new[]
+            {
+                new ChannelSourceSelection
+                {
+                    CanonicalChannelKey = "strict-non-applied",
+                    Selected = Array.Empty<SelectedStreamSelection>(),
+                },
+            },
+            Counts = new SelectionCounts { Channels = 1 },
+        };
+        var strictDecision = ExistingChannelDecision(
+            701, "strict-non-applied",
+            ExistingUnchanged("http://one.example/se1.ts", 1, 0),
+            ExistingUnchanged("http://one.example/se2.ts", 2, 1));
+
+        await svcStrict.ApplyAsync(
+            Plan(strictDecision), stateStrict, strictNonApplied,
+            new List<FailedReportEntry>(), CancellationToken.None);
+
+        Assert.Empty(handlerStrict.DeleteStreamIds);
+        Assert.Empty(handlerStrict.PatchBodies);
+    }
+
+    // ---------------- Scenario 2: key não avaliada (conservador) ----------------
+
+    [Fact]
+    public async Task Unknown_channel_key_does_not_unlink_or_delete()
+    {
+        await SeedOwnershipAsync(new List<long> { 1 }, channelId: 700);
+        var handler = new SourceSelectionRecordingHandler { NextNewStreamId = 5700 };
+        handler.ChannelStreamIds[700] = new List<long> { 42 };
+        var (svc, _, state) = BuildApplySvc(catalog: _resolver, handler: handler);
+
+        var decision = ExistingChannelDecision(
+            700, "X",
+            ExistingUnchanged("http://one.example/x1.ts", 1, 0),
+            NewStream("http://one.example/x2.ts", 1));
+
+        var selection = SelectionWithChannels(
+            ("A", new[] { "http://a.example/a.ts" }),
+            ("B", new[] { "http://b.example/b.ts" }));
+
+        await svc.ApplyAsync(Plan(decision), state, selection, new List<FailedReportEntry>(), CancellationToken.None);
+
+        // Não avaliado: mantém a stream existente associada, não faz POST de
+        // nenhuma stream nova e não produz remove candidates.
+        Assert.Empty(handler.StreamPostBodies);
+        Assert.Empty(handler.DeleteStreamIds);
+        Assert.Single(handler.PatchBodies);
+        Assert.Equal(new long[] { 1 }, ParseStreams(handler.PatchBodies.Single()));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    public async Task Null_or_empty_channel_key_is_not_evaluated_and_never_filters(string? key)
+    {
+        await SeedOwnershipAsync(new List<long> { 1 }, channelId: 702);
+        var handler = new SourceSelectionRecordingHandler { NextNewStreamId = 5701 };
+        handler.ChannelStreamIds[702] = new List<long> { 42 };
+        var (svc, _, state) = BuildApplySvc(catalog: _resolver, handler: handler);
+
+        var decision = ExistingChannelDecision(
+            702, key,
+            ExistingUnchanged("http://one.example/n1.ts", 1, 0),
+            NewStream("http://one.example/n2.ts", 1));
+
+        var selection = SelectionWithChannels(
+            ("A", new[] { "http://a.example/a.ts" }),
+            ("B", new[] { "http://b.example/b.ts" }));
+
+        await svc.ApplyAsync(Plan(decision), state, selection, new List<FailedReportEntry>(), CancellationToken.None);
+
+        Assert.Empty(handler.StreamPostBodies);
+        Assert.Empty(handler.DeleteStreamIds);
+        Assert.Single(handler.PatchBodies);
+        Assert.Equal(new long[] { 1 }, ParseStreams(handler.PatchBodies.Single()));
+    }
+
+    // ---------------- Scenario 3: entrada presente vazia (estrita) ----------------
+
+    [Fact]
+    public async Task Present_entry_with_empty_selected_applies_strict_semantics()
+    {
+        await SeedOwnershipAsync(new List<long> { 1, 2 }, channelId: 703);
+        var handler = new SourceSelectionRecordingHandler { NextNewStreamId = 5750 };
+        handler.ChannelStreamIds[703] = new List<long> { 1, 2 };
+        var (svc, _, state) = BuildApplySvc(catalog: _resolver, handler: handler);
+
+        var decision = ExistingChannelDecision(
+            703, "X",
+            ExistingUnchanged("http://one.example/s1.ts", 1, 0),
+            ExistingUnchanged("http://one.example/s2.ts", 2, 1),
+            NewStream("http://one.example/s3.ts", 2));
+
+        await svc.ApplyAsync(Plan(decision), state, Selection("X"), new List<FailedReportEntry>(), CancellationToken.None);
+
+        // Entrada presente com Selected=[]: PATCH vazio + DELETE das
+        // CrawlerManaged; a stream nova nunca é POSTed.
+        Assert.Empty(handler.StreamPostBodies);
+        Assert.Single(handler.PatchBodies);
+        Assert.Empty(ParseStreams(handler.PatchBodies.Single()));
+        Assert.Equal(new long[] { 1, 2 }, handler.DeleteStreamIds.OrderBy(x => x).ToArray());
+
+        // Controlo independente: o mesmo plano com a key ausente é conservador
+        // (DELETE vazio), provando que a diferença vem da entrada presente vazia.
+        await SeedOwnershipAsync(new List<long> { 11, 12 }, channelId: 704);
+        var handlerAbsent = new SourceSelectionRecordingHandler();
+        handlerAbsent.ChannelStreamIds[704] = new List<long> { 11, 12 };
+        var (svcAbsent, _, stateAbsent) = BuildApplySvc(catalog: _resolver, handler: handlerAbsent);
+        var absentDecision = ExistingChannelDecision(
+            704, "absent-key",
+            ExistingUnchanged("http://one.example/a1.ts", 11, 0),
+            ExistingUnchanged("http://one.example/a2.ts", 12, 1));
+
+        await svcAbsent.ApplyAsync(
+            Plan(absentDecision), stateAbsent, Selection("X"),
+            new List<FailedReportEntry>(), CancellationToken.None);
+
+        Assert.Empty(handlerAbsent.DeleteStreamIds);
+        Assert.Empty(handlerAbsent.PatchBodies);
+    }
+
+    // ---------------- Scenario 4: falha de escrita de ownership ----------------
+
+    [Fact]
+    public async Task Ownership_write_failure_is_reported_and_does_not_abort_apply()
+    {
+        // Falha determinística na escrita de ownership: um trigger SQLite que
+        // aborta INSERTs em dispatcharr_stream_ownerships. Ao contrário de um
+        // DROP TABLE, preserva o caminho de leitura, permitindo provar que
+        // nenhuma row falsa foi criada.
+        await using (var ctx = _factory.CreateDbContext())
+        {
+            await ctx.Database.ExecuteSqlRawAsync(
+                "CREATE TRIGGER trg_stream_ownership_insert_fail " +
+                "BEFORE INSERT ON dispatcharr_stream_ownerships " +
+                "BEGIN SELECT RAISE(ABORT, 'forced ownership failure'); END;");
+        }
+
+        var handler = new SourceSelectionRecordingHandler { NextNewStreamId = 5800, NewChannelId = 9800 };
+        var (svc, _, state) = BuildApplySvc(catalog: _resolver, handler: handler);
+
+        var decision = NewChannelDecision(
+            "own-fail", null,
+            NewStream("http://one.example/w1.ts", 0));
+        var failed = new List<FailedReportEntry>();
+
+        // Não deve lançar: a falha de ownership é registada e a run conclui.
+        await svc.ApplyAsync(Plan(decision), state, failed, CancellationToken.None);
+
+        Assert.Single(handler.StreamPostBodies);
+        Assert.Single(handler.ChannelPostBodies);
+
+        var entry = Assert.Single(failed);
+        Assert.Contains("ownership", entry.Reason, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("DbUpdateException", entry.Reason, StringComparison.Ordinal);
+        Assert.Contains("(stream 5800)", entry.Reason, StringComparison.Ordinal);
+
+        // Nenhuma row de ownership foi criada (nem verdadeira nem falsa).
+        var ownership = await _resolver.GetStreamOwnershipMapAsync(new long[] { 5800 });
+        Assert.False(ownership.ContainsKey(5800));
+    }
+
+    // ---------------- Scenario 5: falha de criação de canal / órfãos ----------------
+
+    [Fact]
+    public async Task Channel_creation_failure_compensates_orphan_streams()
+    {
+        var handler = new SourceSelectionRecordingHandler
+        {
+            NextNewStreamId = 5850,
+            ChannelCreateShouldFail = true,
+        };
+        var (svc, _, state) = BuildApplySvc(catalog: _resolver, handler: handler);
+
+        var urls = new[] { "http://one.example/o1.ts", "http://one.example/o2.ts" };
+        var decision = NewChannelDecision(
+            "orphan", null,
+            urls.Select((u, i) => NewStream(u, i)).ToArray());
+        var failed = new List<FailedReportEntry>();
+
+        await svc.ApplyAsync(Plan(decision), state, failed, CancellationToken.None);
+
+        // As streams foram criadas mas o canal não.
+        Assert.Equal(2, handler.StreamPostBodies.Count);
+        Assert.Single(handler.ChannelPostBodies);
+        var createdIds = handler.PostedStreamIds.OrderBy(x => x).ToArray();
+        Assert.Equal(new long[] { 5850, 5851 }, createdIds);
+
+        // Ownership CrawlerManaged registado (prova de que fomos nós que as
+        // criámos), com canal desconhecido (0).
+        var ownership = await _resolver.GetStreamOwnershipMapAsync(createdIds);
+        Assert.Equal(2, ownership.Count);
+        Assert.All(ownership.Values, o => Assert.Equal(StreamOwnership.CrawlerManaged, o));
+
+        // Compensação: órfãs marcadas para DELETE na Phase 4.
+        Assert.Equal(createdIds, handler.DeleteStreamIds.OrderBy(x => x).ToArray());
+
+        // Falha do canal reportada (não silenciosa).
+        var entry = Assert.Single(failed);
+        Assert.Null(entry.ExistingChannelId);
+    }
+
+    // ---------------- Scenario 5b: falha a meio da Phase 2 (Wave 13-6 audit 3-F2) ----------------
+
+    [Fact]
+    public async Task Partial_stream_create_failure_compensates_already_created_streams()
+    {
+        // Duas streams novas; só o SEGUNDO POST /api/channels/streams/ falha.
+        // A primeira foi criada com sucesso e ficaria órfã (canal nunca
+        // criado). A compensação 3-F2 tem de a tornar CrawlerManaged e
+        // agendá-la para DELETE na Phase 4 — sem ela, o early-return do
+        // catch da Phase 2 saltava a compensação.
+        var handler = new SourceSelectionRecordingHandler
+        {
+            NextNewStreamId = 7000,
+            FailStreamPostOnCall = 2,
+        };
+        var (svc, _, state) = BuildApplySvc(catalog: _resolver, handler: handler);
+
+        var urls = new[] { "http://one.example/p1.ts", "http://one.example/p2.ts" };
+        var decision = NewChannelDecision(
+            "partial-orphan", null,
+            urls.Select((u, i) => NewStream(u, i)).ToArray());
+        var failed = new List<FailedReportEntry>();
+
+        await svc.ApplyAsync(Plan(decision), state, failed, CancellationToken.None);
+
+        // Foram tentados os dois POSTs; só o primeiro teve sucesso e o
+        // canal nunca chegou a ser criado.
+        Assert.Equal(2, handler.StreamPostBodies.Count);
+        var createdIds = handler.PostedStreamIds.ToArray();
+        Assert.Equal(new long[] { 7000 }, createdIds);
+        Assert.Empty(handler.ChannelPostBodies);
+
+        // (a) ownership CrawlerManaged registado com canal desconhecido (0).
+        var ownership = await _resolver.GetStreamOwnershipMapAsync(createdIds);
+        Assert.Single(ownership);
+        Assert.Equal(StreamOwnership.CrawlerManaged, ownership[7000]);
+
+        // (b) compensada: órfã marcada para DELETE na Phase 4.
+        Assert.Equal(new long[] { 7000 }, handler.DeleteStreamIds.OrderBy(x => x).ToArray());
+
+        // (c) falha reportada (não silenciosa).
+        var entry = Assert.Single(failed);
+        Assert.Equal("partial-orphan", entry.Identity);
+
+        // (d) nenhuma stream criada ficou sem ownership.
+        Assert.All(createdIds, id => Assert.True(ownership.ContainsKey(id)));
+    }
+
+    // ---------------- Scenario 6: URL com credenciais não é logada ----------------
+
+    [Fact]
+    public async Task Credentialed_stream_create_failure_is_not_logged()
+    {
+        const string raw = "http://user:secret@host/live/USER/PASS/1";
+        var originalOut = Console.Out;
+        var sw = new StringWriter();
+        Console.SetOut(sw);
+        try
+        {
+            var handler = new SourceSelectionRecordingHandler { StreamCreateShouldFail = true };
+            var (svc, _, state) = BuildApplySvc(handler: handler);
+            var decision = NewChannelDecision("cred", null, NewStream(raw, 0));
+
+            await svc.ApplyAsync(
+                Plan(decision), state, new List<FailedReportEntry>(), CancellationToken.None);
+        }
+        finally
+        {
+            Console.SetOut(originalOut);
+        }
+
+        var output = sw.ToString();
+        Assert.DoesNotContain("secret", output, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("USER", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("PASS", output, StringComparison.Ordinal);
+        Assert.Contains("***", output, StringComparison.Ordinal);
+    }
+
     // ---------------- helpers ----------------
 
     private static string TempOutputDir()
@@ -558,11 +880,11 @@ public class DispatcharrSyncServiceSourceSelectionTests : IAsyncLifetime
             AmbiguousCandidates = Array.Empty<AmbiguousCandidate>(),
         };
 
-    private static ChannelDecision ExistingChannelDecision(long channelId, string key, params StreamMatchDecision[] streams)
+    private static ChannelDecision ExistingChannelDecision(long channelId, string? key, params StreamMatchDecision[] streams)
         => new()
         {
-            Identity = key,
-            CanonicalName = key,
+            Identity = key ?? "no-key",
+            CanonicalName = key ?? "no-key",
             CanonicalChannelKey = key,
             Outcome = SyncOutcome.ExistingReassigned,
             ExistingChannelId = channelId,
@@ -644,6 +966,41 @@ public class DispatcharrSyncServiceSourceSelectionTests : IAsyncLifetime
                 Channels = 1,
                 Candidates = urls.Length,
                 Selected = urls.Length,
+            },
+        };
+
+    /// <summary>
+    /// Artefacto com várias entradas de canal (keys diferentes), usado para
+    /// provar que uma key ausente do artefacto é NÃO AVALIADA.
+    /// </summary>
+    private static DispatcharrSourceSelection SelectionWithChannels(
+        params (string Key, string[] Urls)[] entries)
+        => new()
+        {
+            GeneratedAtUtc = "2026-01-01T00:00:00Z",
+            Channels = entries.Select(e => new ChannelSourceSelection
+            {
+                CanonicalChannelKey = e.Key,
+                CanonicalChannelId = null,
+                PolicyScope = "override",
+                CandidateCount = e.Urls.Length,
+                RejectedCount = 0,
+                Selected = e.Urls
+                    .Select((u, i) => new SelectedStreamSelection
+                    {
+                        StreamUrl = u,
+                        Rank = i,
+                        Provider = "p",
+                        Reason = SelectionReasons.Fill,
+                        SourceId = i + 1,
+                    })
+                    .ToList(),
+            }).ToList(),
+            Counts = new SelectionCounts
+            {
+                Channels = entries.Length,
+                Candidates = entries.Sum(e => e.Urls.Length),
+                Selected = entries.Sum(e => e.Urls.Length),
             },
         };
 
@@ -759,6 +1116,16 @@ public class DispatcharrSyncServiceSourceSelectionTests : IAsyncLifetime
         public long? NextNewStreamId { get; set; }
         public long NewChannelId { get; set; } = 9001;
         public bool PatchShouldFail { get; set; }
+        public bool ChannelCreateShouldFail { get; set; }
+        public bool StreamCreateShouldFail { get; set; }
+
+        /// <summary>
+        /// Falha o POST <c>/api/channels/streams/</c> cuja ordem de tentativa
+        /// (1-based) coincide com o valor. Usado para simular uma falha a
+        /// meio da Phase 2 depois de já existir pelo menos uma stream criada.
+        /// </summary>
+        public int? FailStreamPostOnCall { get; set; }
+        private int _streamPostAttempts;
 
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage req, CancellationToken ct)
         {
@@ -786,6 +1153,10 @@ public class DispatcharrSyncServiceSourceSelectionTests : IAsyncLifetime
             {
                 var body = req.Content!.ReadAsStringAsync().Result;
                 StreamPostBodies.Add(body);
+                _streamPostAttempts++;
+                if (StreamCreateShouldFail
+                    || (FailStreamPostOnCall.HasValue && _streamPostAttempts == FailStreamPostOnCall.Value))
+                    return Task.FromResult(new HttpResponseMessage(HttpStatusCode.InternalServerError));
                 var id = NextNewStreamId ?? new Random().Next(1_000_000, 10_000_000);
                 if (NextNewStreamId.HasValue) NextNewStreamId = id + 1;
                 PostedStreamIds.Add(id);
@@ -797,6 +1168,8 @@ public class DispatcharrSyncServiceSourceSelectionTests : IAsyncLifetime
             {
                 var body = req.Content!.ReadAsStringAsync().Result;
                 ChannelPostBodies.Add(body);
+                if (ChannelCreateShouldFail)
+                    return Task.FromResult(new HttpResponseMessage(HttpStatusCode.InternalServerError));
                 return Task.FromResult(JsonResponse(new
                 {
                     id = NewChannelId,

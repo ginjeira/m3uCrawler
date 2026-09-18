@@ -62,6 +62,7 @@ namespace m3uCrawler.Services.Sync
             return new DispatcharrSourceSelection
             {
                 GeneratedAtUtc = selection.GeneratedAtUtc,
+                Applied = selection.Applied,
                 Counts = selection.Counts,
                 Channels = channels,
             };
