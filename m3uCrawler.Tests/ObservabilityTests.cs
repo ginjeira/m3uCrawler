@@ -361,12 +361,18 @@ public class ObservabilityTests : IDisposable
         Assert.True(byCat.GetValueOrDefault(TraceCategory.HttpRequestStart) == 1);
         Assert.True(byCat.GetValueOrDefault(TraceCategory.HttpRequestFailed) == 1);
         var evt = trace.SnapshotByCategory(TraceCategory.HttpRequestFailed)[0];
-        // Em .NET 9 a ConnectionRefused pode ser reportada como
-        // HttpConnectTimeout (sem inner TimeoutException) ou Socket
-        // (com SocketException). Aceitar qualquer das duas.
+        // ConnectionRefused e' reportada de formas diferentes consoante o
+        // runtime/SO, mas sempre dentro desta classe de falha de ligacao:
+        //   kind=Socket            -> SocketException propagada directamente (Windows);
+        //   kind=HttpConnectTimeout -> timeout de connect sem inner TimeoutException;
+        //   kind=Network            -> HttpRequestException com SocketException interna
+        //                              (Linux/.NET 9, ECONNREFUSED imediato).
+        // A assertion aceita estritamente uma destas tres classificacoes.
         Assert.True(
-            evt.Message.Contains("kind=Socket") || evt.Message.Contains("kind=HttpConnectTimeout"),
-            $"expected Socket or HttpConnectTimeout, got: {evt.Message}");
+            evt.Message.Contains("kind=Socket") ||
+            evt.Message.Contains("kind=HttpConnectTimeout") ||
+            evt.Message.Contains("kind=Network"),
+            $"expected Socket, HttpConnectTimeout or Network, got: {evt.Message}");
     }
 
     [Fact]
