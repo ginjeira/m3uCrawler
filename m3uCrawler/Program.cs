@@ -1266,6 +1266,13 @@ namespace m3uCrawler
             string dbPath, CancellationToken ct)
         {
             Console.WriteLine($"📦 Inicializando catálogo persistente: {dbPath}");
+
+            // Provisiona a baseline de países antes de qualquer
+            // CountryChannelValidator/CountryChannelListService ser
+            // construído (vale para --web e --telegram).
+            CountryConfigProvisioner.EnsureProvisioned(
+                Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries"));
+
             var bootstrapper = new ChannelCatalogBootstrapper(dbPath);
             await using var context = await bootstrapper.InitializeAsync(ct);
             await context.DisposeAsync();
