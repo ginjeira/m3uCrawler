@@ -36,14 +36,23 @@ public interface ISourceSelectionStage
 }
 
 /// <summary>
-/// PHASE 13 (Wave 13-3) — Junta as streams do pipeline (URL real, em
+/// PHASE 13 (Wave 13-3 / 13-4b) — Junta as streams do pipeline (URL real, em
 /// memória) aos <c>ChannelSource</c> do catálogo (URL sanitizada) e
 /// aplica <see cref="IChannelSourceSelector"/> por canal canónico.
 ///
 /// <para>
-/// <b>Read-only.</b> Só lê o catálogo. Não insere/actualiza/apaga nada e
-/// nunca persiste a URL real. Não escreve ficheiros; a publicação é
-/// responsabilidade do caller (<c>PlaylistManagerService.SaveToM3uPlaylist</c>).
+/// <b>Read-only e sem persistência.</b> Só lê o catálogo. Não insere/
+/// actualiza/apaga nada e nunca persiste a URL real. Não escreve ficheiros;
+/// a publicação é responsabilidade do caller
+/// (<c>PlaylistManagerService.SaveToM3uPlaylist</c>).
+/// </para>
+///
+/// <para>
+/// Recebe um <see cref="ISourceSelectionPolicyProvider"/> (tipicamente um
+/// <see cref="SourceSelectionPolicySet"/>) e resolve a política efectiva por
+/// canal canónico antes de invocar o selector. O overload que recebe uma
+/// única <see cref="SourceSelectionPolicy"/> continua suportado e delega no
+/// overload de provider através de <see cref="SourceSelectionPolicySet.Constant"/>.
 /// </para>
 ///
 /// <para>
@@ -78,13 +87,30 @@ public sealed class SourceSelectionStage : ISourceSelectionStage
         _selector = selector ?? new ChannelSourceSelector();
     }
 
-    public async Task<SourceSelectionStageResult> ApplyAsync(
+    /// <summary>
+    /// Overload legado: aplica uma política única a todos os canais.
+    /// Delega no overload que recebe um provider, sem duplicar o algoritmo.
+    /// </summary>
+    public Task<SourceSelectionStageResult> ApplyAsync(
         IReadOnlyList<M3uStream> streams,
         SourceSelectionPolicy policy,
         CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(streams);
         ArgumentNullException.ThrowIfNull(policy);
+        return ApplyAsync(streams, SourceSelectionPolicySet.Constant(policy), cancellationToken);
+    }
+
+    /// <summary>
+    /// Aplica a selecção resolvendo a política efectiva por canal canónico
+    /// através de <paramref name="policies"/>.
+    /// </summary>
+    public async Task<SourceSelectionStageResult> ApplyAsync(
+        IReadOnlyList<M3uStream> streams,
+        ISourceSelectionPolicyProvider policies,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(streams);
+        ArgumentNullException.ThrowIfNull(policies);
 
         if (_catalog is null || streams.Count == 0)
         {
@@ -165,6 +191,14 @@ public sealed class SourceSelectionStage : ISourceSelectionStage
         {
             matchedChannelCount++;
 
+            // Agrupamento continua por CanonicalChannelId; a Key serve apenas
+            // para resolver o override de política (ListChannelSourcesAsync
+            // já faz Include de CanonicalChannel).
+            var canonicalKey = group
+                .Select(e => e.ChannelSource.CanonicalChannel?.Key)
+                .FirstOrDefault(k => !string.IsNullOrEmpty(k));
+            var groupPolicy = policies.Resolve(canonicalKey);
+
             var enabled = new List<MatchedEntry>();
             foreach (var entry in group)
             {
@@ -186,7 +220,7 @@ public sealed class SourceSelectionStage : ISourceSelectionStage
                 byCandidate[entry.Candidate] = entry;
             }
 
-            var result = _selector.Select(candidates, policy);
+            var result = _selector.Select(candidates, groupPolicy);
 
             foreach (var sel in result.Selected)
             {

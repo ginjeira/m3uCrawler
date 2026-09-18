@@ -1868,6 +1868,127 @@ public sealed class CatalogResolver
         return existing;
     }
 
+    // ----------------------------------------------------------------------------
+    // PHASE 13 (Wave 13-4b) — Source Selection Policy (override por canal)
+    //
+    // O âmbito por canal usa ScopeKey = "channel:{key}". É intencionalmente
+    // FK-less: não há validação de existência do canal canónico. Um override
+    // órfão (canal inexistente/removido) fica simplesmente inerte — nunca é
+    // resolvido porque nenhum ChannelSource aponta para essa chave.
+    // ----------------------------------------------------------------------------
+
+    /// <summary>
+    /// Devolve o override de política de selecção de fontes para o canal
+    /// canónico indicado, ou <c>null</c> se não existir.
+    /// </summary>
+    public async Task<SourceSelectionPolicyEntity?> GetChannelSourceSelectionPolicyAsync(
+        string canonicalChannelKey,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(canonicalChannelKey))
+        {
+            throw new ArgumentException("Chave canónica é obrigatória.", nameof(canonicalChannelKey));
+        }
+
+        var scopeKey = SourceSelectionPolicyScopes.ForChannel(canonicalChannelKey.Trim());
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.SourceSelectionPolicies
+            .AsNoTracking()
+            .FirstOrDefaultAsync(p => p.ScopeKey == scopeKey, cancellationToken);
+    }
+
+    /// <summary>
+    /// Cria ou actualiza o override de política de selecção de fontes do
+    /// canal canónico indicado. Um override é uma política <b>completa</b>:
+    /// substitui a global por inteiro quando presente.
+    /// </summary>
+    public async Task<SourceSelectionPolicyEntity> UpsertChannelSourceSelectionPolicyAsync(
+        string canonicalChannelKey,
+        int maxSourcesPerChannel,
+        bool preferDistinctProviders,
+        int? maxSourcesPerProvider,
+        bool allowFallbackToSameProvider,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(canonicalChannelKey))
+        {
+            throw new ArgumentException("Chave canónica é obrigatória.", nameof(canonicalChannelKey));
+        }
+
+        var key = canonicalChannelKey.Trim();
+        var scopeKey = SourceSelectionPolicyScopes.ForChannel(key);
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var now = DateTime.UtcNow;
+        var existing = await context.SourceSelectionPolicies
+            .FirstOrDefaultAsync(p => p.ScopeKey == scopeKey, cancellationToken);
+
+        if (existing != null)
+        {
+            existing.CanonicalChannelKey = key;
+            existing.MaxSourcesPerChannel = maxSourcesPerChannel;
+            existing.PreferDistinctProviders = preferDistinctProviders;
+            existing.MaxSourcesPerProvider = maxSourcesPerProvider;
+            existing.AllowFallbackToSameProvider = allowFallbackToSameProvider;
+            existing.UpdatedAtUtc = now;
+            await context.SaveChangesAsync(cancellationToken);
+            return existing;
+        }
+
+        existing = new SourceSelectionPolicyEntity
+        {
+            ScopeKey = scopeKey,
+            CanonicalChannelKey = key,
+            MaxSourcesPerChannel = maxSourcesPerChannel,
+            PreferDistinctProviders = preferDistinctProviders,
+            MaxSourcesPerProvider = maxSourcesPerProvider,
+            AllowFallbackToSameProvider = allowFallbackToSameProvider,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+        };
+        context.SourceSelectionPolicies.Add(existing);
+        await context.SaveChangesAsync(cancellationToken);
+        return existing;
+    }
+
+    /// <summary>
+    /// Apaga o override de política de selecção de fontes do canal
+    /// canónico indicado. Devolve <c>true</c> se uma linha foi apagada.
+    /// </summary>
+    public async Task<bool> DeleteChannelSourceSelectionPolicyAsync(
+        string canonicalChannelKey,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(canonicalChannelKey))
+        {
+            throw new ArgumentException("Chave canónica é obrigatória.", nameof(canonicalChannelKey));
+        }
+
+        var scopeKey = SourceSelectionPolicyScopes.ForChannel(canonicalChannelKey.Trim());
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var existing = await context.SourceSelectionPolicies
+            .FirstOrDefaultAsync(p => p.ScopeKey == scopeKey, cancellationToken);
+        if (existing == null) return false;
+
+        context.SourceSelectionPolicies.Remove(existing);
+        await context.SaveChangesAsync(cancellationToken);
+        return true;
+    }
+
+    /// <summary>
+    /// Lista todos os overrides de política de selecção de fontes por canal,
+    /// ordenados por <see cref="SourceSelectionPolicyEntity.ScopeKey"/>.
+    /// </summary>
+    public async Task<IReadOnlyList<SourceSelectionPolicyEntity>> ListChannelSourceSelectionPoliciesAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.SourceSelectionPolicies
+            .AsNoTracking()
+            .Where(p => p.ScopeKey.StartsWith(SourceSelectionPolicyScopes.ChannelPrefix))
+            .OrderBy(p => p.ScopeKey)
+            .ToListAsync(cancellationToken);
+    }
+
     // ============================================================================
     // PHASE 8 — TV/Radio/VOD/Groups + Import Policies
     // ============================================================================

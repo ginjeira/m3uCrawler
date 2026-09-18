@@ -1,13 +1,15 @@
 # Dispatcharr Source Selection (PHASE 13)
 
-> Estado: **Waves 13-1, 13-3 e 13-4 implementadas.** 13-1: política pura,
+> Estado: **Waves 13-1, 13-3, 13-4 e 13-4b implementadas.** 13-1: política pura,
 > determinística, sem I/O. 13-3: aplicação da política ao pipeline Telegram antes
 > da publicação em `output/playlist.m3u` (§10). 13-4: persistência **global** da
 > política na BD do catálogo, resolver e exposição no Dashboard (§10.1;
-> `docs/architecture/phase-13-4-source-selection-policy.md`). **Não**
-> implementados: overrides por canal (reservados à Wave 13-4b), preview/dry-run,
-> os produtores de Quality/EPG, a correcção do reset de `Source.Priority` e a
-> integração no composer/`MatchPlan`/`DispatcharrSyncService`
+> `docs/architecture/phase-13-4-source-selection-policy.md`). 13-4b: **overrides
+> por canal** — política completa chaveada por `CanonicalChannel.Key` que
+> substitui a global, resolvida em lote por execução e gerida no Dashboard
+> (§10.2). **Não** implementados: preview/dry-run, os produtores de Quality/EPG,
+> a correcção do reset de `Source.Priority` e a integração no
+> composer/`MatchPlan`/`DispatcharrSyncService`
 > (ver `docs/IMPLEMENTATION_ROADMAP.md` §32.19).
 
 ## 1. Finalidade
@@ -243,8 +245,9 @@ final quando não existe linha (§10.1).
   efectiva; `SourceSelectionStage` mantém-se **sem persistência** e recebe a
   política explicitamente. Os dois pontos de publicação Telegram
   (`Program.cs:540-541`, `:1108-1109`) resolvem via resolver.
-- **Dashboard:** `GET/POST /api/catalog/source-selection-policies` (apenas
-  global), sob o gate de autenticação/CSRF existente.
+- **Dashboard:** `GET/POST /api/catalog/source-selection-policies` (linha
+  global), sob o gate de autenticação/CSRF existente. Os endpoints de override
+  por canal da Wave 13-4b estão em §10.2.
 - **Semântica:** `MaxSourcesPerChannel >= 0`, com `0` válido (zero selecções) e
   negativos inválidos; `MaxSourcesPerProvider` `null` = sem limite, com
   `0`/negativos inválidos.
@@ -252,6 +255,52 @@ final quando não existe linha (§10.1).
   `LegacyConfigurationEvidenceEvaluator`, tal como `source_priority_policies`.
 
 Detalhe em `docs/architecture/phase-13-4-source-selection-policy.md`.
+
+### 10.2 Overrides por canal (Wave 13-4b)
+
+- **Identidade:** um override é chaveado por `CanonicalChannel.Key` (string
+  estável), **nunca** por `CanonicalChannelId`. O `ScopeKey` persistido é
+  `channel:<CanonicalChannelKey>` (`SourceSelectionPolicyScopes.ForChannel`);
+  o `ScopeKey` é a chave única da tabela (§10.1).
+- **Substituição completa:** um override por canal é uma política **completa**
+  que substitui a política global por inteiro quando existe. A entidade
+  persistida não tem representação de "campo não definido", pelo que **não há
+  merge campo a campo**.
+- **Ordem de resolução:** override por canal → política global → defaults
+  (`10/true/null/true`). Uma chave nula/vazia resolve directamente para a global.
+- **Órfãos inertes:** os overrides não têm FK. Um override para um canal
+  inexistente (ou apagado) nunca é resolvido pelo estágio; a identidade mantém-se
+  válida se o canal for recriado com a mesma `Key`.
+- **Semântica de valores:** inalterada — `MaxSourcesPerChannel` `0` é válido e
+  publica zero fontes para esse canal, `1..N` são válidos e negativos são
+  inválidos; `MaxSourcesPerProvider` `null` = sem limite, com `0`/negativos
+  inválidos.
+- **Resolução em lote (sem N+1):** `SourceSelectionPolicyResolver.LoadEffectivePoliciesAsync()`
+  carrega a política global e todos os overrides numa leitura em lote e devolve
+  um `SourceSelectionPolicySet : ISourceSelectionPolicyProvider`. São **2 queries
+  por execução** (overrides + global), sem cache partilhada entre execuções. O
+  `SourceSelectionStage` resolve a política efectiva **por grupo de canal
+  canónico** via `CanonicalChannel.Key` através do overload
+  `ApplyAsync(streams, provider, ct)`; o overload legado de política única
+  mantém-se e o estágio continua **sem persistência**.
+- **Selector inalterado:** o agrupamento continua a ser por `CanonicalChannelId`
+  e o ranking, a diversidade e os limites mantêm a semântica da 13-1/13-4.
+- **Dashboard:** `GET/POST /api/catalog/source-selection-policies/channels` e
+  `GET/DELETE /api/catalog/source-selection-policies/channels/{key}`, sob o
+  mesmo gate de autenticação/CSRF dos endpoints globais. A UI lista, edita e
+  elimina overrides; a identidade exposta é a chave canónica.
+- **Persistência:** `CatalogResolver` expõe
+  `GetChannelSourceSelectionPolicyAsync`,
+  `UpsertChannelSourceSelectionPolicyAsync`,
+  `DeleteChannelSourceSelectionPolicyAsync` e
+  `ListChannelSourceSelectionPoliciesAsync`; os métodos globais mantêm-se
+  inalterados.
+
+**Limites explícitos desta wave:** a 13-4b **não** introduz preview/dry-run,
+produtores de Quality/EPG, métricas/auditoria específicas da selecção, churn/
+estabilidade, `ProviderDefinition`, `SelectionPolicy` separada nem integração
+explícita no composer/`MatchPlan`/`DispatcharrSyncService` (ver
+`docs/IMPLEMENTATION_ROADMAP.md` §32.19).
 
 ### Identidade canónica no loader (Wave 9C.6)
 
@@ -262,12 +311,14 @@ selecção de fontes **sem** queries adicionais. Isto satisfaz o pré-requisito 
 identidade para a política por canal.
 
 O `SourceSelectionStage` **continua a agrupar por `CanonicalChannelId`**
-(semântica do selector, ranking e limites inalterados), e a política
-persistida mantém identidade por `CanonicalChannelKey`
-(`SourceSelectionPolicyEntity`, §10.1). A Wave 13-4b — passar a pesquisa de
-política por canal do estágio a usar `CanonicalChannelKey` (resolver + contrato
-do estágio) — permanece **fora de âmbito e não implementada**; a migração
-completa `Id → Key` **não** foi feita.
+(semântica do selector, ranking e limites inalterados). A partir da Wave 13-4b,
+a pesquisa de política por canal passou a usar `CanonicalChannel.Key` (resolver e
+contrato do estágio), pelo que a política persistida e a sua resolução usam a
+identidade lógica estável. A migração completa `Id → Key` do domínio **não** foi
+feita: continuam dependentes de `Id` as FKs de
+`channel_aliases`/`channel_sources`/`ordering_items`, `source_priority_policies`
+por canal, `dispatcharr_channel_ownerships`, `matching_audits`, `MatchPlan` e o
+agrupamento do `SourceSelectionStage`.
 
 ### Pontos de publicação integrados
 
@@ -294,7 +345,7 @@ Correcção do reset de `Source.Priority`, produtores de Quality/EPG, persistên
 `MatchPlan`/`DispatcharrSyncService`/ownership, `BuildPlanFromCompositionAsync`,
 `ProviderDefinition`, identidade de conta Xtream. Não faz `ProviderDefinition`
 completa. A persistência/Dashboard da política deixou de ser fora de âmbito na
-Wave 13-4 (§10.1); overrides por canal permanecem fora (reservados à 13-4b) e o
+Wave 13-4 (§10.1) e os **overrides por canal** na Wave 13-4b (§10.2); o
 preview/dry-run continua por implementar.
 
 ## 11. Testes de referência
@@ -307,3 +358,12 @@ preview/dry-run continua por implementar.
   matching (zero/ambíguo/no-op), `source-disabled`, limites/diversidade/fallback/
   dedup, ordem de publicação, determinismo e segurança de credenciais
   (URL real preservada; relatório sem URLs/credenciais).
+- `m3uCrawler.Tests/SourceSelectionPolicyResolverTests.cs` — unidade do resolver:
+  global, override por canal (substituição completa) e fallback para defaults.
+- `m3uCrawler.Tests/SourceSelectionPolicyChannelPersistenceTests.cs` — persistência
+  dos overrides por canal (upsert/delete/lista; órfãos inertes; identidade por
+  `CanonicalChannel.Key` sobrevivente a delete/recreate).
+- `m3uCrawler.Tests/SourceSelectionPolicyChannelEndpointTests.cs` — endpoints HTTP
+  dos overrides por canal (auth/CSRF e validação de `0`/negativos).
+- `m3uCrawler.Tests/SourceSelectionPolicyRuntimeIntegrationTests.cs` — resolução
+  efectiva em runtime e integração do provider no estágio.

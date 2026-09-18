@@ -459,7 +459,9 @@ O dashboard (`Services/WebDashboardService.cs`, `HttpListener`) serve a UI em `h
 | `/api/playlist/preview` / `/api/playlist_temp/preview` | **Diagnóstico**: mesmo conteúdo com URLs sanitizadas (`CredentialSanitizer.SanitizeM3uContent`). Usado pela pré-visualização HTML para nunca expor credenciais. |
 | `/api/run-report` | `RunReport` da última execução (sanitizado). |
 | `/api/discovered-playlists` | Lista de playlists descobertas na última execução (sanitizado). |
-| `/api/catalog/source-selection-policies` (GET/POST) | Política global de selecção de fontes por canal (ver secção seguinte). |
+| `/api/catalog/source-selection-policies` (GET/POST) | Política **global** de selecção de fontes por canal (ver secção seguinte). |
+| `/api/catalog/source-selection-policies/channels` (GET/POST) | Overrides **por canal** da política de selecção de fontes (identidade = chave canónica; ver secção seguinte). |
+| `/api/catalog/source-selection-policies/channels/{key}` (GET/DELETE) | Lê/elimina o override do canal canónico `{key}`. |
 
 ### Navegação do Dashboard
 
@@ -548,7 +550,7 @@ Quando um stream tem indicadores de país (e.g. "PT" no título ou group-title) 
   antiga, **aborta** com erro explícito sem apagar dados; só conclui a remoção
   da proveniência e do schema novo quando o rollback é possível.
 
-### Política global de selecção de fontes (Wave 13-4)
+### Política de selecção de fontes (Waves 13-4 / 13-4b)
 
 O endpoint `GET/POST /api/catalog/source-selection-policies` gere a política
 **global** que limita quantas fontes (streams) de um canal são publicadas.
@@ -565,9 +567,31 @@ faz upsert com os campos:
 Payloads inválidos (campo obrigatório ausente, `maxSourcesPerChannel` negativo
 ou `maxSourcesPerProvider` `<= 0`) devolvem `400 Bad Request` com
 `{ "error": "..." }`. O sucesso devolve a política gravada (campos `id`,
-`scopeKey`, `canonicalChannelKey`, `createdAtUtc`, `updatedAtUtc`). Overrides
-por canal estão reservados para a Wave 13-4b — este endpoint expõe apenas a
-política global.
+`scopeKey`, `canonicalChannelKey`, `createdAtUtc`, `updatedAtUtc`).
+
+#### Overrides por canal (Wave 13-4b)
+
+Os endpoints `GET/POST /api/catalog/source-selection-policies/channels` e
+`GET/DELETE /api/catalog/source-selection-policies/channels/{key}` gerem
+overrides **por canal**, sob o mesmo gate de autenticação/CSRF:
+
+- **Identidade:** a chave canónica (`CanonicalChannel.Key`, string estável) —
+  nunca o `CanonicalChannelId`.
+- **Substituição completa:** um override é uma política **completa** que
+  substitui a política global por inteiro quando existe; **não** há merge campo
+  a campo. A resolução efectiva é override por canal → global → defaults. Não
+  há Foreign Key: um override de um canal inexistente é inerte, e a identidade
+  sobrevive a apagar/recriar o canal com a mesma `Key`.
+- **Validação:** os mesmos campos e regras da tabela acima. `maxSourcesPerChannel`
+  `0` é válido (o canal não publica fontes por esse override); negativos são
+  rejeitados com `400`.
+- **Persistência por execução:** a política global e os overrides são carregados
+  em lote no início de cada execução (2 queries, sem N+1 e sem cache entre
+  execuções); o pipeline resolve a política efectiva por canal canónico.
+- `GET .../channels` devolve a lista de overrides; `POST .../channels` faz
+  upsert; `GET .../channels/{key}` devolve o override do canal; `DELETE
+  .../channels/{key}` elimina-o. O dashboard inclui a gestão de overrides na
+  área Catálogo, ao lado do cartão global.
 
 ### Modelo de segurança do dashboard
 

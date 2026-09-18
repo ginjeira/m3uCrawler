@@ -537,13 +537,13 @@ namespace m3uCrawler
                         var reportPath = Path.Combine(outputDir, $"telegram_report_{timestamp}.json");
 
                         // PHASE 13 (Wave 13-3) — selecção de fontes antes da publicação.
-                        // PHASE 13 (Wave 13-4) — política global resolvida do catálogo.
-                        var singleCyclePolicy = catalogForIngestion is null
-                            ? SourceSelectionDefaults.DefaultPolicy
+                        // PHASE 13 (Wave 13-4b) — políticas efectivas (global + overrides por canal) do catálogo.
+                        var singleCyclePolicies = catalogForIngestion is null
+                            ? SourceSelectionPolicySet.Default
                             : await new SourceSelectionPolicyResolver(catalogForIngestion)
-                                .ResolveGlobalAsync(CancellationToken.None);
+                                .LoadEffectivePoliciesAsync(CancellationToken.None);
                         var singleCycleSelection = await new SourceSelectionStage(catalogForIngestion)
-                            .ApplyAsync(workingStreams, singleCyclePolicy, CancellationToken.None);
+                            .ApplyAsync(workingStreams, singleCyclePolicies, CancellationToken.None);
                         runReport.SourceSelection = singleCycleSelection.ToReport();
                         if (singleCycleSelection.Applied)
                         {
@@ -1110,13 +1110,13 @@ namespace m3uCrawler
             var finalStreams = TelegramScraperService.MergeStreams(stillWorkingMain, freshStreams);
 
             // PHASE 13 (Wave 13-3) — selecção de fontes sobre a playlist final.
-            // PHASE 13 (Wave 13-4) — política global resolvida do catálogo.
-            var maintenancePolicy = catalog is null
-                ? SourceSelectionDefaults.DefaultPolicy
+            // PHASE 13 (Wave 13-4b) — políticas efectivas (global + overrides por canal) do catálogo.
+            var maintenancePolicies = catalog is null
+                ? SourceSelectionPolicySet.Default
                 : await new SourceSelectionPolicyResolver(catalog)
-                    .ResolveGlobalAsync(cancellationToken);
+                    .LoadEffectivePoliciesAsync(cancellationToken);
             var maintenanceSelection = await new SourceSelectionStage(catalog)
-                .ApplyAsync(finalStreams, maintenancePolicy, cancellationToken);
+                .ApplyAsync(finalStreams, maintenancePolicies, cancellationToken);
             runReport.SourceSelection = maintenanceSelection.ToReport();
             if (maintenanceSelection.Applied)
             {

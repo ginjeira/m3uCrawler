@@ -2,9 +2,11 @@
 
 > Estado: **Wave 13-4 implementada** — política global de selecção de fontes
 > persistida na BD do catálogo, resolvida em runtime e exposta no Dashboard
-> (§0). As decisões deste documento foram fechadas (§13). **Fora de âmbito e
-> não implementados:** overrides por canal (reservados à Wave 13-4b) e
-> auditoria de alterações administrativas.
+> (§0). As decisões deste documento foram fechadas (§13). **Os overrides por
+> canal (Wave 13-4b) foram implementados subsequentemente**, de forma aditiva e
+> sem alteração de schema (ver §0.1 e
+> `docs/architecture/dispatcharr-source-selection.md` §10.2). **Fora de âmbito e
+> não implementados:** auditoria de alterações administrativas.
 >
 > Base implementada:
 > - **Wave 13-1** — algoritmo de selecção puro e determinístico
@@ -19,7 +21,8 @@
 > Convenções deste documento:
 > - **[FACT]** — comportamento verificado no código, com `ficheiro:linha`.
 > - **[DECISÃO]** — escolha de arquitectura adoptada/ratificada.
-> - **[PENDENTE]** — trabalho explicitamente fora desta wave (13-4b, auditoria).
+> - **[PENDENTE]** — trabalho explicitamente fora desta wave (auditoria). Os
+>   overrides por canal (13-4b) foram entretanto implementados (§0.1).
 
 ## 0. Estado implementado (Wave 13-4)
 
@@ -54,8 +57,48 @@
   negativos são inválidos. `MaxSourcesPerProvider` mantém `null` = sem limite,
   com `0`/negativos inválidos (§8, §13.3).
 
-**Não implementado nesta wave:** overrides por canal (Wave 13-4b) e qualquer
-log de auditoria de alterações administrativas (§10).
+**Não implementado nesta wave:** qualquer log de auditoria de alterações
+administrativas (§10). Os overrides por canal, originalmente reservados à Wave
+13-4b, estão implementados (§0.1).
+
+### 0.1 Estado implementado (Wave 13-4b)
+
+**[FACT]** A Wave 13-4b acrescentou os **overrides por canal** de forma aditiva,
+sem alteração de schema (a coluna `ScopeKey` já acomodava
+`channel:<CanonicalChannelKey>`):
+
+- **Identidade:** `CanonicalChannel.Key` (nunca `CanonicalChannelId`). O
+  `ScopeKey` é `channel:<key>` (`SourceSelectionPolicyScopes`).
+- **Substituição completa:** o override é uma política completa que substitui a
+  global por inteiro quando existe; não há merge campo a campo (a entidade não
+  representa "campo não definido"). Resolução: override por canal → global →
+  defaults (`10/true/null/true`).
+- **Fachada de catálogo:** `CatalogResolver` expõe
+  `GetChannelSourceSelectionPolicyAsync`,
+  `UpsertChannelSourceSelectionPolicyAsync`,
+  `DeleteChannelSourceSelectionPolicyAsync` e
+  `ListChannelSourceSelectionPoliciesAsync`. Os overrides são FK-less; órfãos
+  (canal inexistente) são inertes.
+- **Resolver:** `SourceSelectionPolicyResolver` mantém `ResolveGlobalAsync` e
+  acrescenta `ResolveEffectiveAsync(key)` e `LoadEffectivePoliciesAsync()`, que
+  devolve um `SourceSelectionPolicySet : ISourceSelectionPolicyProvider`
+  (snapshot por execução, 2 queries, sem cache entre execuções e sem N+1).
+- **Estágio:** `SourceSelectionStage` ganha o overload
+  `ApplyAsync(streams, ISourceSelectionPolicyProvider, ct)` e resolve a política
+  efectiva por grupo de canal canónico via `CanonicalChannel.Key`; o overload
+  legado de política única mantém-se e o estágio permanece **sem persistência**.
+  O agrupamento continua por `CanonicalChannelId` e o selector/ranking/limites
+  não mudam.
+- **Dashboard:** `GET/POST /api/catalog/source-selection-policies/channels` e
+  `GET/DELETE /api/catalog/source-selection-policies/channels/{key}`, sob o mesmo
+  gate de auth/CSRF; a UI lista, edita e elimina overrides (texto de ajuda
+  "substitui a global"; `0` mantém-se válido e negativos são rejeitados).
+- **Semântica preservada:** `MaxSourcesPerChannel` `0` válido / `1..N` válido /
+  negativos inválidos; `MaxSourcesPerProvider` `null` = sem limite, `0`/negativos
+  inválidos.
+- **Testes:** +23 casos (resolver, persistência por canal, endpoints e
+  integração runtime); suite serial 1845 passed / 0 failed / 1 skipped. A
+  identidade sobrevive a apagar/recriar o canal com a mesma `Key`.
 
 ## 1. Estado antes da 13-4 (contexto factual pós-13-3)
 
@@ -269,9 +312,9 @@ repositório de políticas por canal.
 > `CatalogResolver.GetOrCreateGlobalSourceSelectionPolicyAsync`, e exposta em
 > `GET/POST /api/catalog/source-selection-policies`.
 >
-> A 13-4 implementa **apenas a linha global** e o resolver; o schema e o
-> resolver são desenhados para que o override por canal seja
-> **puramente aditivo** (wave 13-4b), sem alteração de schema.
+> A 13-4 implementou a **linha global** e o resolver; o schema e o resolver
+> foram desenhados para que o override por canal fosse **puramente aditivo**, e a
+> Wave 13-4b implementou-o sem alteração de schema (§0.1).
 
 Justificação (derivada dos factos de §2–§3, não uma re-derivação da política):
 
@@ -284,9 +327,10 @@ Justificação (derivada dos factos de §2–§3, não uma re-derivação da pol
 2. **Reutiliza infraestrutura de migration já validada.** `MigrateAsync`,
    backup pré-migration e `.lock` exclusivo já existem e cobrem a nova tabela
    sem código novo (`ChannelCatalogBootstrapper.cs:95,219-243,62-73`).
-3. **Suporta per-channel de forma transaccional.** Se a 13-4b o exigir, o
-   override por canal é uma linha na mesma tabela, na mesma transacção que o
-   resto do catálogo — impossível sem esforço adicional num ficheiro JSON.
+3. **Suporta per-channel de forma transaccional.** O override por canal é uma
+   linha na mesma tabela, na mesma transacção que o resto do catálogo —
+   implementado sem esforço adicional na Wave 13-4b, ao contrário do que
+   sucederia num ficheiro JSON.
 4. **Evita a ambiguidade de dois "roots".** Os stores JSON vivem em
    `<cwd>/runtime-data`, que pode divergir do bind mount `/data`
    (`WebDashboardService.cs:2347-2348` vs `:2388-2389`). A BD do catálogo
@@ -328,8 +372,9 @@ nem alterações ao `MatchPlan`/`DispatcharrSyncService` (ver §13 e §14).
 
 **[DECISÃO]** O escopo é codificado **numa única coluna** `ScopeKey`:
 
-- `"global"` — linha por defeito do sistema (única em 13-4);
-- `"channel:<CanonicalChannelKey>"` — override por canal (13-4b).
+- `"global"` — linha por defeito do sistema;
+- `"channel:<CanonicalChannelKey>"` — override por canal (implementado na 13-4b,
+  política completa que substitui a global).
 
 O `ScopeKey` é a chave de unicidade. `CanonicalChannelKey` é mantida como
 coluna derivada legível (e para o resolver validar consistência), mas **não**
@@ -388,32 +433,38 @@ Fluxo implementado:
 ```text
 BD do catálogo (source_selection_policies)
    │  linha "global" (criada lazily),
-   │  futuramente "channel:<Key>"
+   │  overrides "channel:<Key>" (13-4b)
    ▼
-SourceSelectionPolicyResolver.GetEffectivePolicyAsync(channelKey?)
-   │  1. override por canal (13-4b) → se existir, usa-o
-   │  2. senão, linha global
-   │  3. senão, SourceSelectionDefaults.DefaultPolicy  (fallback final)
+SourceSelectionPolicyResolver.LoadEffectivePoliciesAsync()
+   │  snapshot por execução (2 queries; sem cache entre execuções)
+   │  Resolve(key): 1. override por canal → se existir, usa-o
+   │                 2. senão, linha global
+   │                 3. senão, SourceSelectionDefaults.DefaultPolicy (fallback final)
    ▼
-SourceSelectionPolicy (record em memória)
+SourceSelectionPolicySet (ISourceSelectionPolicyProvider)
    │
    ▼
-SourceSelectionStage.ApplyAsync(streams, policy)
-   │  (permanece persistence-free)
+SourceSelectionStage.ApplyAsync(streams, provider)
+   │  (permanece persistence-free; resolve por CanonicalChannel.Key)
    ▼
 output/playlist.m3u
 ```
+
+`ResolveEffectiveAsync(key)` (e `ResolveGlobalAsync()`) mantêm-se para resolução
+pontual; o caminho de publicação usa a leitura em lote.
 
 Pontos de integração:
 
 - **[DECISÃO implementada]** Serviço `SourceSelectionPolicyResolver`
   (`m3uCrawler/Services/SourceSelection/SourceSelectionPolicyResolver.cs`),
-  devolvendo a política efectiva. O *fallback* final é
-  `SourceSelectionDefaults.DefaultPolicy`
-  (`SourceSelectionStage.cs:16-23`).
+  devolvendo a política efectiva (global ou override por canal). O *fallback*
+  final é `SourceSelectionDefaults.DefaultPolicy`
+  (`SourceSelectionStage.cs:16-23`). A leitura em lote é
+  `LoadEffectivePoliciesAsync()` (2 queries; `SourceSelectionPolicySet`).
 - **[DECISÃO implementada]** `SourceSelectionStage` **não** ganha persistência:
-  continua a ser o componente de aplicação, recebendo a política como argumento
-  (`ISourceSelectionStage.ApplyAsync(..., policy, ...)`,
+  continua a ser o componente de aplicação, recebendo a política (ou o
+  `ISourceSelectionPolicyProvider`, na 13-4b) como argumento
+  (`ISourceSelectionStage.ApplyAsync(..., policy|provider, ...)`,
   `SourceSelectionStage.cs:30-36`).
 - **[DECISÃO implementada]** `Program.cs:540-541` e `Program.cs:1108-1109`
   chamam o resolver em vez da constante. Como o resolver devolve os defaults
@@ -444,22 +495,26 @@ global, exactamente ao lado de `/api/catalog/priority-policies`
   (`:2965-2972`), valida (§8), faz *upsert* via resolver e devolve a projecção.
 - Serialização com o `JsonOptions` partilhado (`:2522-2527`) e helper
   `WriteJsonAsync` (`:2592`).
-- Em 13-4 o `POST` só aceita/actualiza a linha global; overrides por canal
-  ficam para 13-4b.
+- Os endpoints acima gerem a **linha global**. A Wave 13-4b acrescentou
+  `GET/POST /api/catalog/source-selection-policies/channels` e
+  `GET/DELETE /api/catalog/source-selection-policies/channels/{key}` para os
+  overrides por canal (substituição completa; identidade = chave canónica;
+  mesmo gate de auth/CSRF) — ver §0.1.
 
 ### 7.2 Payload
 
 `SourceSelectionPolicyPayload` (camelCase, com `[JsonPropertyName]`):
 `maxSourcesPerChannel`, `preferDistinctProviders`, `maxSourcesPerProvider`
-(nullable), `allowFallbackToSameProvider`, e (13-4b) `scopeKey`.
+(nullable), `allowFallbackToSameProvider` e (13-4b) `scopeKey`/chave canónica.
 
 ### 7.3 UI
 
 **[DECISÃO implementada]** Um cartão *data-driven* na área **Catálogo**,
 espelhando o formulário *data-driven* já usado para a Stream Validation
 (`GET/POST /api/validation/policy`,
-`WebDashboardService.cs:2345-2381`). O cartão expõe apenas os quatro campos
-globais; controlo de overrides por canal fica para 13-4b.
+`WebDashboardService.cs:2345-2381`). O cartão expõe os quatro campos globais; a
+Wave 13-4b acrescentou a gestão de overrides por canal (lista/edita/elimina,
+com texto de ajuda de substituição completa e `0` válido).
 
 **[FACT]** Não existe hoje qualquer componente de UI para
 `/api/catalog/priority-policies` que possa ser copiado linha-a-linha; o padrão
@@ -549,7 +604,7 @@ Estratégia de testes registada para a Wave 13-4.
 
 | Nível | Testes previstos | Padrão de referência |
 |---|---|---|
-| Unidade (resolver) | fallback: sem linha → `DefaultPolicy`; com linha global → valores persistidos; (13-4b) override por canal → global → default | — |
+| Unidade (resolver) | fallback: sem linha → `DefaultPolicy`; com linha global → valores persistidos; override por canal → global → default (implementado na 13-4b) | — |
 | Persistência EF | *get-or-create* idempotente (2 chamadas → 1 linha); *upsert* actualiza `UpdatedAtUtc`; unicidade de `ScopeKey` (2.ª linha global → violação); round-trip dos 4 valores | `TestDbContextFactory` + `ChannelCatalogBootstrapper(path).InitializeAsync()` + `new CatalogResolver(factory, path)` (`ChannelCatalogIntegrationTests.cs:569-588`) |
 | Migration | migration aditiva: tabela existe e está vazia após `MigrateAsync`; dados pré-existentes intactos; reversibilidade (`IMigrator` + `__EFMigrationsHistory`) | `Phase93MigrationReversibilityTests.cs` |
 | Dashboard HTTP | `GET` devolve defaults; `POST` válido persiste; `POST` inválido → `400`; mutante sem CSRF → `403` `csrf-invalid`; sem sessão → `401` | `DashboardHarness` (`DashboardBootstrapEndpointTests.cs:723-817`), `[Collection("DashboardStaticState")]` (`DashboardStaticStateCollection.cs:13`), padrão CSRF em `:278-289` |
@@ -596,11 +651,12 @@ Implementada na Wave 13-4:
 
 **[DECISÃO ratificada]** A identidade é por `CanonicalChannelKey` (string
 estável e imutável), **não** por `CanonicalChannelId`; o `ScopeKey` é a chave de
-unicidade da tabela (`"global"` na linha única da 13-4). A inconsistência
-existente de `ChannelSourceEntity`/`SourceSelectionStage` a usar
-`CanonicalChannelId` (`CatalogEntities.cs:699-731`,
-`SourceSelectionStage.cs:162-164`) permanece **fora de escopo**; o mapeamento
-`Id → Key` para overrides por canal fica para a 13-4b.
+unicidade da tabela. A Wave 13-4b implementou os overrides por canal já com
+identidade por `Key`. A inconsistência existente de
+`ChannelSourceEntity`/`SourceSelectionStage` a usar `CanonicalChannelId` no
+agrupamento (`CatalogEntities.cs:699-731`, `SourceSelectionStage.cs:162-164`)
+permanece **fora de escopo**: a migração completa `Id → Key` do domínio **não**
+foi feita.
 
 ### 13.2 Limite superior de `MaxSourcesPerChannel`
 
@@ -621,9 +677,10 @@ qualquer inteiro `>= 0`.
 
 ### 13.4 Override por canal: 13-4 ou 13-4b
 
-**[DECISÃO ratificada]** Overrides por canal **não** fazem parte da 13-4: ficam
-**reservados para a Wave 13-4b**, de forma aditiva e sem alteração de schema. A
-13-4 implementa apenas a linha global e o respectivo UI.
+**[DECISÃO ratificada e implementada na Wave 13-4b]** Os overrides por canal
+**não** fizeram parte da 13-4; foram implementados na Wave 13-4b, de forma
+aditiva e sem alteração de schema (§0.1). A 13-4 manteve-se na linha global e no
+respectivo UI.
 
 ### 13.5 Auditoria
 
@@ -645,8 +702,9 @@ não foi adoptada.
 
 ## 14. Wave 13-4 Implementation Plan (executado)
 
-Passos executados. **Não incluídos** (e assim permanecem): 13-4b, auditoria,
-Composer/Discovery, alterações a `MatchPlan`/`DispatcharrSyncService`.
+Passos executados. **Não incluídos** (e assim permanecem): auditoria,
+Composer/Discovery, alterações a `MatchPlan`/`DispatcharrSyncService`. Os
+overrides por canal foram implementados na Wave 13-4b (§0.1).
 
 1. **Entidade:** `SourceSelectionPolicyEntity` em
    `m3uCrawler/Services/Catalog/CatalogEntities.cs` (§5.1).
@@ -681,14 +739,16 @@ aditiva e reversível; endpoint sob o gate global (CSRF em mutações); `0` vál
 e negativos inválidos; sem regressão nos testes existentes da 13-1/13-3;
 documentação actualizada.
 
-Follow-up explícito: **Wave 13-4b (overrides por canal)** e auditoria
-administrativa (wave transversal).
+Follow-up explícito: auditoria administrativa (wave transversal). Os overrides
+por canal (Wave 13-4b) foram entretanto implementados (§0.1).
 
 ## Ficheiros de referência
 
 - `m3uCrawler/Services/SourceSelection/SourceSelectionPolicyResolver.cs`
+- `m3uCrawler/Services/SourceSelection/SourceSelectionPolicySet.cs`
 - `m3uCrawler/Services/SourceSelection/SourceSelectionModels.cs`
 - `m3uCrawler/Services/SourceSelection/SourceSelectionStage.cs`
+- `m3uCrawler/Services/Catalog/SourceSelectionPolicyScopes.cs`
 - `m3uCrawler/Services/Catalog/ChannelCatalogDbContext.cs`
 - `m3uCrawler/Services/Catalog/CatalogEntities.cs`
 - `m3uCrawler/Services/Catalog/CatalogResolver.cs`
@@ -708,6 +768,10 @@ administrativa (wave transversal).
 
 - `m3uCrawler.Tests/ChannelSourceSelectorTests.cs`
 - `m3uCrawler.Tests/SourceSelectionStageTests.cs`
+- `m3uCrawler.Tests/SourceSelectionPolicyResolverTests.cs`
+- `m3uCrawler.Tests/SourceSelectionPolicyChannelPersistenceTests.cs`
+- `m3uCrawler.Tests/SourceSelectionPolicyChannelEndpointTests.cs`
+- `m3uCrawler.Tests/SourceSelectionPolicyRuntimeIntegrationTests.cs`
 - `m3uCrawler.Tests/ChannelCatalogIntegrationTests.cs` (`:569-588`)
 - `m3uCrawler.Tests/Phase93MigrationReversibilityTests.cs`
 - `m3uCrawler.Tests/DashboardBootstrapEndpointTests.cs` (`:723-817`, `:278-289`)

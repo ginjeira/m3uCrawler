@@ -3423,7 +3423,7 @@ observar:
 >
 > *Nota de scope (2026-09-17, simplificação 9C.5): o modelo first-run da 9C destina-se a instalações novas/limpas. Não está prevista migração/recuperação de configuração de administrador de versões anteriores; o bootstrap fecha com **qualquer** registo em `admin_users` (`HasAnyAsync`) e `READY` + administrador desactivado é um estado não suportado, podendo exigir reinicialização do `runtime-data`. A resposta `403 bootstrap-required` passa a reportar o estado de lifecycle real. Ver `docs/architecture/configuration-lifecycle.md` §"Upgrade de instalações existentes".*
 >
-> *Nota de implementação (2026-09-18, HEAD `69aeb98`, PHASE 9C.6 — identidade canónica em runtime): a resolução de afinidades de canal passou a ser **Key-autoritativa**. `CatalogResolver.ResolveAsync` resolve o canal por `AffinityGroup.CanonicalChannelKey` (encontrado e habilitado) quando a Key existe; se a Key existe mas não resolve (inexistente ou desactivada), **não** recua para o `CanonicalChannelId` obsoleto; linhas legadas com Key nula/vazia mantêm o fallback por FK/navegação. `CatalogResolver.ListChannelSourcesAsync` inclui agora `CanonicalChannel`, expondo a Key ao caminho de selecção de fontes. Sem alteração de schema, migration, coluna ou FK — `CanonicalChannelId` permanece coluna de transição. Cobertura em `m3uCrawler.Tests/Phase9C6CanonicalIdentityTests.cs` (6 testes). Permanecem dependentes de `Id`: FKs de `channel_aliases`/`channel_sources`/`ordering_items`, `source_priority_policies` por canal, `dispatcharr_channel_ownerships`, `matching_audits`, `MatchPlan` e o agrupamento do `SourceSelectionStage`. Overrides por canal (13-4b) **não** implementados.*
+> *Nota de implementação (2026-09-18, HEAD `69aeb98`, PHASE 9C.6 — identidade canónica em runtime): a resolução de afinidades de canal passou a ser **Key-autoritativa**. `CatalogResolver.ResolveAsync` resolve o canal por `AffinityGroup.CanonicalChannelKey` (encontrado e habilitado) quando a Key existe; se a Key existe mas não resolve (inexistente ou desactivada), **não** recua para o `CanonicalChannelId` obsoleto; linhas legadas com Key nula/vazia mantêm o fallback por FK/navegação. `CatalogResolver.ListChannelSourcesAsync` inclui agora `CanonicalChannel`, expondo a Key ao caminho de selecção de fontes. Sem alteração de schema, migration, coluna ou FK — `CanonicalChannelId` permanece coluna de transição. Cobertura em `m3uCrawler.Tests/Phase9C6CanonicalIdentityTests.cs` (6 testes). Permanecem dependentes de `Id`: FKs de `channel_aliases`/`channel_sources`/`ordering_items`, `source_priority_policies` por canal, `dispatcharr_channel_ownerships`, `matching_audits`, `MatchPlan` e o agrupamento do `SourceSelectionStage`. Overrides por canal (13-4b) **implementados** entretanto com identidade por `CanonicalChannel.Key` (sem migração completa `Id → Key` do domínio).*
 >
 > Esta fase é uma condição de consolidação do produto antes de novas
 > funcionalidades. Não introduz uma segunda arquitectura: fecha o lifecycle
@@ -4318,10 +4318,10 @@ Este documento define **como completar a evolução até ao sistema funcional pr
 | PHASE 12 — Automation / Scheduler | `[concluído]` | ScheduledJobEntity + CronExpression + Runner + 4 actions concretas (`discoverM3u`, `validatePlaylist`, `generatePlaylist`, `syncDispatcharr`) + arranque em produção via `Program.cs --web` + 19 testes. Ver 32.10 e 32.11. |
 | **PHASE 9C — First-Run / Configuration Lifecycle / Dashboard Hardening** | **`[em curso]`** | 9C.1 (lifecycle persistido `NOT_CONFIGURED/CONFIGURING/READY`, adopção legacy, gate de discovery/scheduler), 9C.2 (wizard de first-run, admin/sessões/CSRF, gate de autorização único), 9C.3 (affinity por país/canal, naming canónico normalizado, migration aditiva `AddCanonicalCountryAndAffinityKind`), 9C.4 (Live Run Monitor: `live_runs`/`live_run_steps`, `RunCoordinator` único, `GET /api/run/status` + `POST /api/run/start`, `--web-allow-trigger`, acções agendadas `telegramRun`/`telegramMaintainRun`, vista "Live Run" com polling) e 9C.5 (first-run/legacy bootstrap: `READY` ∧ sem admin resolve para `AuthMode.Bootstrap` em vez de `Legacy`, criação do primeiro admin sem alterar o estado nem reconfigurar a instalação, confirmação de password no wizard) e 9C.6 (identidade canónica em runtime: resolução de afinidades Key-autoritativa, com Key autoritativa sobre o `CanonicalChannelId` obsoleto e sobrevivência a delete/recreate com a mesma Key; `CanonicalChannel.Key` exposta no loader de selecção de fontes) implementadas. Nota documental 2026-09-17: esta linha descrevia 9C.2 como pendente apesar de já estar implementada; corrigida. Pendente (reconciliado 2026-09-18; 9C.6 acrescentada em 2026-09-18): redesign do Dashboard, gate de command/endpoints (CLI one-shot), dependências de `Id` remanescentes da identidade canónica (FKs de `channel_aliases`/`channel_sources`/`ordering_items`, `source_priority_policies` por canal, ownership, `matching_audits`, `MatchPlan`, agrupamento do `SourceSelectionStage`), auditoria administrativa, alargamento do wizard, instalação limpa validada e Manual/Ajuda contextual. Ver 32.18. |
 | PHASE-Bridge — Pipeline → Catálogo | `[concluído]` | `PipelineIngestionService` liga o pipeline real (Telegram/M3U8-search) ao catálogo persistente via `EnsureSourceAsync` + `ResolveAsync` + `RecordChannelSourceAsync` + novo `EnsureCanonicalChannelAsync` (upsert). 9 testes TDD. Ver 32.12. |
-| **PHASE 13 — Dispatcharr Source Selection, Diversity & Source Limits** | **`[em curso]`** (`[parcial]`) | 13-1/13-1a/13-3/13-4 implementadas e publicadas (`94a9c75`, `c1dda71`, `d36b803`, `bf04c34`); 13-2/13-2a/13-2b inexistentes. Gaps: preview/dry-run, Dashboard completo, estabilidade/churn, integração explícita `MatchPlan`/`DispatcharrSyncService`, métricas/auditoria, `ProviderDefinition`, overrides por canal (13-4b). Ver 32.19. |
+| **PHASE 13 — Dispatcharr Source Selection, Diversity & Source Limits** | **`[em curso]`** (`[parcial]`) | 13-1/13-1a/13-3/13-4/13-4b implementadas e publicadas (`94a9c75`, `c1dda71`, `d36b803`, `bf04c34`; 13-4b nesta wave); 13-2/13-2a/13-2b inexistentes. Gaps: preview/dry-run, Dashboard completo, estabilidade/churn, integração explícita `MatchPlan`/`DispatcharrSyncService`, ownership/limpeza selectiva testados, métricas/auditoria, `ProviderDefinition`, `SelectionPolicy`, `MinimumValidatedSources`, teste 100→10. Ver 32.19. |
 # 32.19 — PHASE 13 — Dispatcharr Source Selection, Diversity & Source Limits
 
-> Estado: `[em curso]` (`[parcial]`) — Waves **13-1, 13-1a, 13-3 e 13-4** implementadas e publicadas (`94a9c75`, `c1dda71`, `d36b803`, `bf04c34`). As sub-waves **13-2/13-2a/13-2b não existem** como artefacto (sem commit, código ou documento). A fase permanece parcial; gaps reais no §17 e no bloco de reconciliação abaixo.
+> Estado: `[em curso]` (`[parcial]`) — Waves **13-1, 13-1a, 13-3, 13-4 e 13-4b** implementadas e publicadas (`94a9c75`, `c1dda71`, `d36b803`, `bf04c34`). As sub-waves **13-2/13-2a/13-2b não existem** como artefacto (sem commit, código ou documento). A fase permanece parcial; gaps reais no §17 e no bloco de reconciliação abaixo.
 >
 > Esta fase fecha um problema operacional identificado na publicação para Dispatcharr:
 > actualmente, quando um canal é sincronizado, podem ser associadas ao mesmo canal todas
@@ -4388,19 +4388,54 @@ Este documento define **como completar a evolução até ao sistema funcional pr
 > com `0` **válido** (selecciona zero fontes) e negativos inválidos;
 > `MaxSourcesPerProvider` mantém `null` = sem limite, com `0`/negativos
 > inválidos. A tabela é excluída do `LegacyConfigurationEvidenceEvaluator`,
-> como `source_priority_policies`. **Reservado e não implementado:** overrides
-> por canal (Wave 13-4b) e auditoria de alterações administrativas. Detalhe em
+> como `source_priority_policies`. **Reservado nessa wave:** overrides por canal
+> (Wave 13-4b, entretanto implementados) e auditoria de alterações
+> administrativas. Detalhe em
 > `docs/architecture/phase-13-4-source-selection-policy.md`.
 
-> **Reconciliação de estado (2026-09-18, HEAD `bf04c34`) — evidência de código/testes.** Implementado e verificado: selector puro determinístico com deduplicação e diversidade (`ChannelSourceSelector.cs`), publicação Telegram nos dois pontos (`Program.cs:539-557`, `:1112-1136`) e política global persistida (entidade, migration `AddSourceSelectionPolicies`, resolver, endpoint/UI global). Itens do DoD (§17) ainda **não** implementados, com evidência:
+> **Nota factual (Wave 13-4b, 2026-09-18).** Foram implementados os
+> **overrides por canal** da política de selecção de fontes, de forma aditiva e
+> **sem alteração de schema** (a coluna `ScopeKey` já acomodava
+> `channel:<CanonicalChannelKey>`). A identidade é `CanonicalChannel.Key`
+> (`SourceSelectionPolicyScopes`), **nunca** `CanonicalChannelId`. Um override é
+> uma política **completa** que substitui a global por inteiro quando existe
+> (não há merge campo a campo); a resolução é override por canal → global →
+> defaults (`10/true/null/true`). `CatalogResolver` ganhou
+> `GetChannelSourceSelectionPolicyAsync`,
+> `UpsertChannelSourceSelectionPolicyAsync`,
+> `DeleteChannelSourceSelectionPolicyAsync` e
+> `ListChannelSourceSelectionPoliciesAsync` (overrides FK-less; órfãos inertes);
+> os métodos globais mantêm-se. `SourceSelectionPolicyResolver` mantém
+> `ResolveGlobalAsync` e acrescenta `ResolveEffectiveAsync(key)` e
+> `LoadEffectivePoliciesAsync()`, que devolve um `SourceSelectionPolicySet :
+> ISourceSelectionPolicyProvider` (snapshot por execução, **2 queries**, sem
+> N+1 e sem cache entre execuções). `SourceSelectionStage` ganhou o overload
+> `ApplyAsync(streams, provider, ct)` e resolve a política efectiva por grupo de
+> canal canónico via `CanonicalChannel.Key`; o overload legado mantém-se, o
+> estágio permanece **sem persistência** e o agrupamento continua por
+> `CanonicalChannelId` (selector/ranking/limites inalterados). Os dois pontos de
+> publicação Telegram usam `LoadEffectivePoliciesAsync` (fallback
+> `SourceSelectionPolicySet.Default` quando o catálogo é nulo). Dashboard:
+> `GET/POST /api/catalog/source-selection-policies/channels` e
+> `GET/DELETE /api/catalog/source-selection-policies/channels/{key}`, sob o
+> mesmo gate de auth/CSRF; UI lista/edita/elimina overrides. Semântica
+> preservada: `MaxSourcesPerChannel` `0` válido (`0` publica zero fontes) /
+> `1..N` válido / negativos inválidos; `MaxSourcesPerProvider` `null` = sem
+> limite, `0`/negativos inválidos. **+23 testes**; suite serial 1845 passed / 0
+> failed / 1 skipped. A identidade sobrevive a apagar/recriar o canal com a
+> mesma `Key`. Detalhe em
+> `docs/architecture/dispatcharr-source-selection.md` §10.2 e
+> `docs/architecture/phase-13-4-source-selection-policy.md` §0.1.
+
+> **Reconciliação de estado (2026-09-18, HEAD `bf04c34` + Wave 13-4b) — evidência de código/testes.** Implementado e verificado: selector puro determinístico com deduplicação e diversidade (`ChannelSourceSelector.cs`), publicação Telegram nos dois pontos (`Program.cs:539-557`, `:1112-1136`), política global persistida (entidade, migration `AddSourceSelectionPolicies`, resolver, endpoint/UI global) e **overrides por canal (13-4b)** persistidos/resolvidos/expostos por `CanonicalChannel.Key`, com substituição completa e leitura em lote. Itens do DoD (§17) ainda **não** implementados, com evidência:
 > - **preview/dry-run** — ausente (sem endpoint/lógica);
-> - **Dashboard completo** — só o cartão global; sem preview, estatísticas, comparação descobertas-vs-seleccionadas ou gestão por canal;
+> - **Dashboard completo** — cartões global e por canal; sem preview, estatísticas, comparação descobertas-vs-seleccionadas ou churn;
 > - **estabilidade/churn**, `KeepExistingHealthySources`, `RebalanceOnSync`, `MinimumValidatedSources` — ausentes (só mencionados na especificação);
 > - **integração explícita `MatchPlan` + `DispatcharrSourceSelection`** — ausente (`DispatcharrSourceSelection` só existe na especificação, linha 4612); a limitação transitiva do Dispatcharr resulta do fluxo da playlist, não de contrato;
 > - **ownership específico da selecção** e **limpeza selectiva testada** — ausentes; existe apenas o guard genérico pré-existente (`DispatcharrSyncService.cs:281-318`);
 > - **métricas específicas da selecção** — só contagens em `RunReport.SourceSelection`, não expostas no Dashboard; sem auditoria;
-> - **`ProviderDefinition`** completa, **`SelectionPolicy`** (estratégia de ranking separada) e **`MinimumValidatedSources`** — ausentes;
-> - **overrides por canal (13-4b)** — reservados, não implementados.
+> - **`ProviderDefinition`** completa e **`SelectionPolicy`** (estratégia de ranking separada) — ausentes;
+> - **teste "100 fontes descobertas não produzem 100 associações com limite 10"** — ausente.
 > **Não implementado por ausência de artefacto:** sub-waves 13-2/13-2a/13-2b.
 
 > **Nota factual (2026-09-17) — `BuildPlanFromCompositionAsync`.** O método
@@ -4747,7 +4782,7 @@ Com a política configurada para 10:
 - [ ] build e suite de testes passam;
 - [ ] commit.
 
-> **Reconciliação (2026-09-18).** **Cumpridos:** configuração persistente do limite; valor inicial 10 não hardcoded; deduplicação; ranking determinístico; diversidade de fornecedor; fallback configurável; documentação actualizada; build e suite de testes (Release 0 erros; suite serial 1816/0/1 no commit `bf04c34`); commit. **Parciais:** identificação normalizada de fornecedor (`ProviderIdentity` normaliza host, mas não existe a `ProviderDefinition` completa do §3-§4); "selecção antes do Dispatcharr" e "Dispatcharr recebe apenas o conjunto seleccionado" (garantidos por fluxo de dados antes de `SaveToM3uPlaylist`, sem contrato explícito `MatchPlan`+`DispatcharrSourceSelection`); limpeza segura das associações antigas e ownership (guard genérico pré-existente, não selectivo nem testado nesta fase); métricas (só contagens em `RunReport.SourceSelection`, sem auditoria nem Dashboard); idempotência (garantida para a política, não específica da selecção); testes (faltam cenários de ownership/cleanup/dry-run/Dispatcharr, incluindo "100 fontes descobertas não produzem 100 associações com limite 10"). **Não cumpridos:** preview/dry-run; Dashboard completo.
+> **Reconciliação (2026-09-18; actualizada com a Wave 13-4b).** **Cumpridos:** configuração persistente do limite (global **e** override por canal, 13-4b, com identidade por `CanonicalChannel.Key` e substituição completa); valor inicial 10 não hardcoded; deduplicação; ranking determinístico; diversidade de fornecedor; fallback configurável; documentação actualizada; build e suite de testes (Release 0 erros; suite serial 1845/0/1 após a 13-4b); commit. **Parciais:** identificação normalizada de fornecedor (`ProviderIdentity` normaliza host, mas não existe a `ProviderDefinition` completa do §3-§4); "selecção antes do Dispatcharr" e "Dispatcharr recebe apenas o conjunto seleccionado" (garantidos por fluxo de dados antes de `SaveToM3uPlaylist`, sem contrato explícito `MatchPlan`+`DispatcharrSourceSelection`); limpeza segura das associações antigas e ownership (guard genérico pré-existente, não selectivo nem testado nesta fase); métricas (só contagens em `RunReport.SourceSelection`, sem auditoria nem Dashboard); idempotência (garantida para a política, não específica da selecção); testes (faltam cenários de ownership/cleanup/dry-run/Dispatcharr, incluindo "100 fontes descobertas não produzem 100 associações com limite 10"). **Não cumpridos:** preview/dry-run; Dashboard completo. **Fora de âmbito remanescente:** `SelectionPolicy` (estratégia de ranking separada) e `MinimumValidatedSources`.
 
 ## 18. Regra de produto
 

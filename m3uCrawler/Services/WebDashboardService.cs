@@ -1572,6 +1572,136 @@ namespace m3uCrawler.Services
                 return;
             }
 
+            // === PHASE 13 (Wave 13-4b) — Per-channel Source Selection Policy API ===
+            // GET    /api/catalog/source-selection-policies/channels
+            // POST   /api/catalog/source-selection-policies/channels
+            // GET    /api/catalog/source-selection-policies/channels/{key}
+            // DELETE /api/catalog/source-selection-policies/channels/{key}
+            //
+            // A identidade é a chave canónica pública (CanonicalChannel.Key).
+            // O CanonicalChannelId nunca é exposto nem aceite aqui.
+            const string channelSelectionPoliciesPath = "/api/catalog/source-selection-policies/channels";
+            if (requestPath.Equals(channelSelectionPoliciesPath, StringComparison.OrdinalIgnoreCase))
+            {
+                if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    var overrides = await _catalogResolver.ListChannelSourceSelectionPoliciesAsync();
+                    await WriteJsonAsync(context.Response, new
+                    {
+                        overrides = overrides.Select(ChannelSourceSelectionPolicyToJson).ToList(),
+                    });
+                    return;
+                }
+                if (context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
+                        var body = await reader.ReadToEndAsync();
+                        var payload = JsonSerializer.Deserialize<ChannelSourceSelectionPolicyPayload>(body, JsonOptions);
+                        if (payload == null)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "Payload inválido." }, HttpStatusCode.BadRequest);
+                            return;
+                        }
+                        var canonicalChannelKey = payload.CanonicalChannelKey?.Trim();
+                        if (string.IsNullOrEmpty(canonicalChannelKey))
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "canonicalChannelKey é obrigatório." }, HttpStatusCode.BadRequest);
+                            return;
+                        }
+                        if (payload.MaxSourcesPerChannel is null)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "maxSourcesPerChannel é obrigatório." }, HttpStatusCode.BadRequest);
+                            return;
+                        }
+                        if (payload.MaxSourcesPerChannel.Value < 0)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "maxSourcesPerChannel não pode ser negativo." }, HttpStatusCode.BadRequest);
+                            return;
+                        }
+                        if (payload.PreferDistinctProviders is null)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "preferDistinctProviders é obrigatório." }, HttpStatusCode.BadRequest);
+                            return;
+                        }
+                        if (payload.AllowFallbackToSameProvider is null)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "allowFallbackToSameProvider é obrigatório." }, HttpStatusCode.BadRequest);
+                            return;
+                        }
+                        if (payload.MaxSourcesPerProvider is <= 0)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "maxSourcesPerProvider deve ser >= 1 ou ausente/null para sem limite." }, HttpStatusCode.BadRequest);
+                            return;
+                        }
+                        var saved = await _catalogResolver.UpsertChannelSourceSelectionPolicyAsync(
+                            canonicalChannelKey,
+                            payload.MaxSourcesPerChannel.Value,
+                            payload.PreferDistinctProviders.Value,
+                            payload.MaxSourcesPerProvider,
+                            payload.AllowFallbackToSameProvider.Value);
+                        await WriteJsonAsync(context.Response, ChannelSourceSelectionPolicyToJson(saved));
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                        await WriteJsonAsync(context.Response, new { error = ex.Message }, HttpStatusCode.BadRequest);
+                        return;
+                    }
+                }
+                context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
+                return;
+            }
+
+            if (requestPath.StartsWith(channelSelectionPoliciesPath + "/", StringComparison.OrdinalIgnoreCase))
+            {
+                var canonicalChannelKey = Uri.UnescapeDataString(
+                    requestPath.Substring((channelSelectionPoliciesPath + "/").Length));
+
+                if (string.IsNullOrWhiteSpace(canonicalChannelKey))
+                {
+                    context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                    await WriteJsonAsync(context.Response, new { error = "Override não encontrado." }, HttpStatusCode.NotFound);
+                    return;
+                }
+
+                if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    var existing = await _catalogResolver.GetChannelSourceSelectionPolicyAsync(canonicalChannelKey);
+                    if (existing == null)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                        await WriteJsonAsync(context.Response, new { error = "Override não encontrado." }, HttpStatusCode.NotFound);
+                        return;
+                    }
+                    await WriteJsonAsync(context.Response, ChannelSourceSelectionPolicyToJson(existing));
+                    return;
+                }
+                if (context.Request.HttpMethod.Equals("DELETE", StringComparison.OrdinalIgnoreCase))
+                {
+                    var deleted = await _catalogResolver.DeleteChannelSourceSelectionPolicyAsync(canonicalChannelKey);
+                    if (!deleted)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                        await WriteJsonAsync(context.Response, new { error = "Override não encontrado." }, HttpStatusCode.NotFound);
+                        return;
+                    }
+                    await WriteJsonAsync(context.Response, new { deleted = true });
+                    return;
+                }
+                context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
+                return;
+            }
+
             // === PHASE 9 — Stream degradation dashboard ===
             // GET /api/catalog/degradation/recent?lookbackMinutes={n}&limit={n}
             // GET /api/catalog/degradation/stats?lookbackMinutes={n}
@@ -3053,6 +3183,16 @@ namespace m3uCrawler.Services
         [JsonPropertyName("allowFallbackToSameProvider")] public bool? AllowFallbackToSameProvider { get; set; }
     }
 
+    // === PHASE 13 (Wave 13-4b) — Per-channel Source Selection Policy payload ===
+    private sealed class ChannelSourceSelectionPolicyPayload
+    {
+        [JsonPropertyName("canonicalChannelKey")] public string? CanonicalChannelKey { get; set; }
+        [JsonPropertyName("maxSourcesPerChannel")] public int? MaxSourcesPerChannel { get; set; }
+        [JsonPropertyName("preferDistinctProviders")] public bool? PreferDistinctProviders { get; set; }
+        [JsonPropertyName("maxSourcesPerProvider")] public int? MaxSourcesPerProvider { get; set; }
+        [JsonPropertyName("allowFallbackToSameProvider")] public bool? AllowFallbackToSameProvider { get; set; }
+    }
+
     // === PHASE 8 — payloads ===
     private sealed class ImportPolicyPayload
     {
@@ -3282,6 +3422,21 @@ namespace m3uCrawler.Services
         return new
         {
             id = p.Id,
+            scopeKey = p.ScopeKey,
+            canonicalChannelKey = p.CanonicalChannelKey,
+            maxSourcesPerChannel = p.MaxSourcesPerChannel,
+            preferDistinctProviders = p.PreferDistinctProviders,
+            maxSourcesPerProvider = p.MaxSourcesPerProvider,
+            allowFallbackToSameProvider = p.AllowFallbackToSameProvider,
+            createdAtUtc = p.CreatedAtUtc.ToString("o"),
+            updatedAtUtc = p.UpdatedAtUtc.ToString("o"),
+        };
+    }
+
+    private static object ChannelSourceSelectionPolicyToJson(SourceSelectionPolicyEntity p)
+    {
+        return new
+        {
             scopeKey = p.ScopeKey,
             canonicalChannelKey = p.CanonicalChannelKey,
             maxSourcesPerChannel = p.MaxSourcesPerChannel,
@@ -3870,6 +4025,40 @@ namespace m3uCrawler.Services
             <button class='secondary' onclick='loadSourceSelectionPolicy()'>Recarregar</button>
           </div>
           <div id='sourceSelectionPolicyStatus' class='muted' style='margin-top:8px;'></div>
+        </div>
+
+        <div class='card' style='margin-top:16px;'>
+          <h3>Override por canal</h3>
+          <p class='muted'>Um override por canal <strong>substitui por completo a política global</strong> para esse canal. <strong>MaxSourcesPerChannel = 0</strong> é válido e significa que nenhuma fonte seleccionada é publicada para esse canal. Valores negativos são rejeitados. MaxSourcesPerProvider em branco significa sem limite. A identidade usada é a chave canónica do canal.</p>
+          <div style='display:grid;gap:8px;grid-template-columns:1fr 1fr;'>
+            <div>
+              <label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Chave canónica do canal</label>
+              <input id='cssp_channelKey' list='cssp_channelKeyList' placeholder='ex: sic-pt' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              <datalist id='cssp_channelKeyList'></datalist>
+            </div>
+            <div>
+              <label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Max sources per channel (0 = não publicar nenhuma)</label>
+              <input id='cssp_maxSourcesPerChannel' type='number' min='0' value='3' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+            </div>
+            <div>
+              <label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Max sources per provider (vazio = sem limite)</label>
+              <input id='cssp_maxSourcesPerProvider' type='number' min='1' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+            </div>
+            <div>
+              <label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Prefer distinct providers</label>
+              <select id='cssp_preferDistinctProviders'><option value='true'>sim</option><option value='false'>não</option></select>
+            </div>
+            <div>
+              <label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Allow fallback to same provider</label>
+              <select id='cssp_allowFallbackToSameProvider'><option value='true'>sim</option><option value='false'>não</option></select>
+            </div>
+          </div>
+          <div style='margin-top:10px;display:flex;gap:8px;'>
+            <button onclick='saveChannelSourceSelectionPolicy()'>Guardar override</button>
+            <button class='secondary' onclick='loadChannelSourceSelectionPolicies()'>Recarregar</button>
+          </div>
+          <div id='channelSourceSelectionPolicyStatus' class='muted' style='margin-top:8px;'></div>
+          <div id='channelSourceSelectionPoliciesTable' style='margin-top:12px;'></div>
         </div>
       </div>
 
@@ -4555,7 +4744,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
       else if (tab === 'sources') { loadSources(); loadChannelSources(); }
       else if (tab === 'ordering') loadOrderingLists();
       else if (tab === 'priority') loadGlobalPriority();
-      else if (tab === 'sourceselection') loadSourceSelectionPolicy();
+      else if (tab === 'sourceselection') { loadSourceSelectionPolicy(); loadChannelSourceSelectionKeys(); loadChannelSourceSelectionPolicies(); }
       else if (tab === 'matching') loadMatchingAudits();
       else if (tab === 'degradation') loadDegradation();
       else if (tab === 'scheduled') { loadScheduledActions(); loadScheduledJobs(); }
@@ -5391,6 +5580,95 @@ const rows = Object.entries(inv).map(([k, v]) => {
       }
     }
 
+    // === PHASE 13 (Wave 13-4b) — Per-channel Source Selection Policy ===
+    let channelSourceSelectionPolicies = [];
+
+    async function loadChannelSourceSelectionKeys() {
+      const channels = await safeFetchJson('/api/catalog/channels', []);
+      const datalist = document.getElementById('cssp_channelKeyList');
+      if (!datalist || !Array.isArray(channels)) return;
+      datalist.innerHTML = channels
+        .filter(c => c && c.key)
+        .map(c => `<option value='${escapeHtml(c.key)}'>${escapeHtml(c.displayName || '')}</option>`)
+        .join('');
+    }
+
+    async function loadChannelSourceSelectionPolicies() {
+      const table = document.getElementById('channelSourceSelectionPoliciesTable');
+      const status = document.getElementById('channelSourceSelectionPolicyStatus');
+      const data = await safeFetchJson('/api/catalog/source-selection-policies/channels', null);
+      const list = data && Array.isArray(data.overrides) ? data.overrides : null;
+      channelSourceSelectionPolicies = list || [];
+      if (!list) { table.innerHTML = '<p class="muted">Erro ao carregar overrides.</p>'; return; }
+      if (!list.length) { table.innerHTML = '<p class="muted">Nenhum override por canal.</p>'; return; }
+      const rows = list.map((p, i) => `<tr>
+        <td><code>${escapeHtml(p.canonicalChannelKey || '')}</code></td>
+        <td>${p.maxSourcesPerChannel}</td>
+        <td>${p.preferDistinctProviders ? 'sim' : 'não'}</td>
+        <td>${p.maxSourcesPerProvider ?? '—'}</td>
+        <td>${p.allowFallbackToSameProvider ? 'sim' : 'não'}</td>
+        <td>
+          <button class='secondary' onclick='editChannelSourceSelectionPolicy(${i})'>Editar</button>
+          <button class='secondary' style='color:var(--err);' onclick='deleteChannelSourceSelectionPolicy(${i})'>Eliminar</button>
+        </td>
+      </tr>`).join('');
+      table.innerHTML = `<table><thead><tr><th>Chave canónica</th><th>Max/canal</th><th>Distintos</th><th>Max/provedor</th><th>Fallback</th><th>Acções</th></tr></thead><tbody>${rows}</tbody></table>`;
+      if (status) status.textContent = '';
+    }
+
+    function editChannelSourceSelectionPolicy(index) {
+      const p = channelSourceSelectionPolicies[index];
+      if (!p) return;
+      document.getElementById('cssp_channelKey').value = p.canonicalChannelKey || '';
+      document.getElementById('cssp_maxSourcesPerChannel').value = p.maxSourcesPerChannel;
+      document.getElementById('cssp_maxSourcesPerProvider').value = p.maxSourcesPerProvider ?? '';
+      document.getElementById('cssp_preferDistinctProviders').value = p.preferDistinctProviders ? 'true' : 'false';
+      document.getElementById('cssp_allowFallbackToSameProvider').value = p.allowFallbackToSameProvider ? 'true' : 'false';
+      document.getElementById('channelSourceSelectionPolicyStatus').textContent = 'Override carregado para edição.';
+    }
+
+    async function saveChannelSourceSelectionPolicy() {
+      const status = document.getElementById('channelSourceSelectionPolicyStatus');
+      const key = document.getElementById('cssp_channelKey').value.trim();
+      if (!key) { status.textContent = 'Indica a chave canónica do canal.'; return; }
+      const maxChannelRaw = document.getElementById('cssp_maxSourcesPerChannel').value.trim();
+      const maxProviderRaw = document.getElementById('cssp_maxSourcesPerProvider').value.trim();
+      const payload = {
+        canonicalChannelKey: key,
+        maxSourcesPerChannel: maxChannelRaw === '' ? null : parseInt(maxChannelRaw, 10),
+        maxSourcesPerProvider: maxProviderRaw === '' ? null : parseInt(maxProviderRaw, 10),
+        preferDistinctProviders: document.getElementById('cssp_preferDistinctProviders').value === 'true',
+        allowFallbackToSameProvider: document.getElementById('cssp_allowFallbackToSameProvider').value === 'true',
+      };
+      const r = await fetch('/api/catalog/source-selection-policies/channels', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (r.ok) {
+        status.textContent = 'Override guardado.';
+        await loadChannelSourceSelectionPolicies();
+      } else {
+        const err = await r.json();
+        status.textContent = 'Erro: ' + (err.error || r.status);
+      }
+    }
+
+    async function deleteChannelSourceSelectionPolicy(index) {
+      const p = channelSourceSelectionPolicies[index];
+      if (!p || !p.canonicalChannelKey) return;
+      if (!confirm('Eliminar o override do canal "' + p.canonicalChannelKey + '"?')) return;
+      const status = document.getElementById('channelSourceSelectionPolicyStatus');
+      const r = await fetch('/api/catalog/source-selection-policies/channels/' + encodeURIComponent(p.canonicalChannelKey), { method: 'DELETE' });
+      if (r.ok) {
+        status.textContent = 'Override eliminado.';
+        await loadChannelSourceSelectionPolicies();
+      } else {
+        const err = await r.json();
+        status.textContent = 'Erro: ' + (err.error || r.status);
+      }
+    }
+
     async function loadImportPolicies() {
       const list = await safeFetchJson('/api/catalog/import-policies', []);
       if (!Array.isArray(list)) { document.getElementById('importPoliciesTable').innerHTML = '<p class="muted">Erro.</p>'; return; }
@@ -6077,6 +6355,11 @@ const rows = Object.entries(inv).map(([k, v]) => {
     window.saveAffinityDelimiter = saveAffinityDelimiter;
     window.loadSourceSelectionPolicy = loadSourceSelectionPolicy;
     window.saveSourceSelectionPolicy = saveSourceSelectionPolicy;
+    window.loadChannelSourceSelectionPolicies = loadChannelSourceSelectionPolicies;
+    window.loadChannelSourceSelectionKeys = loadChannelSourceSelectionKeys;
+    window.editChannelSourceSelectionPolicy = editChannelSourceSelectionPolicy;
+    window.saveChannelSourceSelectionPolicy = saveChannelSourceSelectionPolicy;
+    window.deleteChannelSourceSelectionPolicy = deleteChannelSourceSelectionPolicy;
 
     // === PHASE 9C.4 — Live Run (polling leve; sem SSE/WebSocket, sem tail de logs) ===
     var liveRunTimer = null;
