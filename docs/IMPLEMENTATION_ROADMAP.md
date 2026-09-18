@@ -4319,6 +4319,138 @@ Este documento define **como completar a evolução até ao sistema funcional pr
 | **PHASE 9C — First-Run / Configuration Lifecycle / Dashboard Hardening** | **`[em curso]`** | 9C.1 (lifecycle persistido `NOT_CONFIGURED/CONFIGURING/READY`, adopção legacy, gate de discovery/scheduler), 9C.2 (wizard de first-run, admin/sessões/CSRF, gate de autorização único), 9C.3 (affinity por país/canal, naming canónico normalizado, migration aditiva `AddCanonicalCountryAndAffinityKind`), 9C.4 (Live Run Monitor: `live_runs`/`live_run_steps`, `RunCoordinator` único, `GET /api/run/status` + `POST /api/run/start`, `--web-allow-trigger`, acções agendadas `telegramRun`/`telegramMaintainRun`, vista "Live Run" com polling) e 9C.5 (first-run/legacy bootstrap: `READY` ∧ sem admin resolve para `AuthMode.Bootstrap` em vez de `Legacy`, criação do primeiro admin sem alterar o estado nem reconfigurar a instalação, confirmação de password no wizard) e 9C.6 (identidade canónica em runtime: resolução de afinidades Key-autoritativa, com Key autoritativa sobre o `CanonicalChannelId` obsoleto e sobrevivência a delete/recreate com a mesma Key; `CanonicalChannel.Key` exposta no loader de selecção de fontes) implementadas. Nota documental 2026-09-17: esta linha descrevia 9C.2 como pendente apesar de já estar implementada; corrigida. Pendente (reconciliado 2026-09-18; 9C.6 acrescentada em 2026-09-18): redesign do Dashboard, gate de command/endpoints (CLI one-shot), dependências de `Id` remanescentes da identidade canónica (FKs de `channel_aliases`/`channel_sources`/`ordering_items`, `source_priority_policies` por canal, ownership, `matching_audits`, `MatchPlan`, agrupamento do `SourceSelectionStage`), auditoria administrativa, alargamento do wizard, instalação limpa validada e Manual/Ajuda contextual. Ver 32.18. |
 | PHASE-Bridge — Pipeline → Catálogo | `[concluído]` | `PipelineIngestionService` liga o pipeline real (Telegram/M3U8-search) ao catálogo persistente via `EnsureSourceAsync` + `ResolveAsync` + `RecordChannelSourceAsync` + novo `EnsureCanonicalChannelAsync` (upsert). 9 testes TDD. Ver 32.12. |
 | **PHASE 13 — Dispatcharr Source Selection, Diversity & Source Limits** | **`[em curso]`** (`[parcial]`) | 13-1/13-1a/13-3/13-4/13-4b implementadas e publicadas (`94a9c75`, `c1dda71`, `d36b803`, `bf04c34`; 13-4b nesta wave); 13-2/13-2a/13-2b inexistentes. Gaps: preview/dry-run, Dashboard completo, estabilidade/churn, integração explícita `MatchPlan`/`DispatcharrSyncService`, ownership/limpeza selectiva testados, métricas/auditoria, `ProviderDefinition`, `SelectionPolicy`, `MinimumValidatedSources`, teste 100→10. Ver 32.19. |
+# Implementation Wave Map — visão executiva
+
+> Secção exclusivamente documental (2026-09-18). Não altera requisitos, Definition of Done, código nem estado funcional. Construída a partir da documentação do projecto e do histórico Git local.
+>
+> Convenção de estado:
+> - `[CONCLUÍDA]` — wave com código e commit real;
+> - `[DESIGN / ANÁLISE]` — análise/desenho sem implementação;
+> - `[PROPOSTA]` — sugestão ainda não formalizada como execução;
+> - `[FORMALMENTE PLANEADA]` — estabelecida como wave futura por documentação do projecto;
+> - `[NÃO DECOMPOSTA]` — trabalho ainda sem wave atribuída.
+>
+> Evidência: os hashes abaixo são commits reais do histórico local. O commit `637bddd` (13-4b) está commitado localmente e **ainda não foi empurrado**; o upstream da branch permanece em `4562489`.
+
+## Visão por fase
+
+```text
+PHASE 9C — First-Run / Configuration Lifecycle / Dashboard Hardening   [em curso / parcial]
+├── 9C.1  [CONCLUÍDA]
+├── 9C.2  [CONCLUÍDA]
+├── 9C.3  [CONCLUÍDA]
+├── 9C.4  [CONCLUÍDA]
+├── 9C.5  [CONCLUÍDA]
+├── 9C.6  [CONCLUÍDA]   (identidade Key)
+└── restante DoD 9C      [NÃO DECOMPOSTA]
+
+PHASE 13 — Dispatcharr Source Selection, Diversity & Source Limits     [em curso / parcial]
+├── 13-1   [CONCLUÍDA]
+├── 13-1a  [CONCLUÍDA]
+├── 13-2   [NÃO DECOMPOSTA]
+├── 13-2a  [NÃO DECOMPOSTA]
+├── 13-2b  [NÃO DECOMPOSTA]
+├── 13-3   [CONCLUÍDA]
+├── 13-4   [CONCLUÍDA]
+├── 13-4b  [CONCLUÍDA]   (local, não empurrada)
+├── 13-5   [PROPOSTA]
+└── 13-6   [PROPOSTA]
+```
+
+## PHASE 9C — waves
+
+| Wave | Estado | Commit | Descrição |
+|---|---|---|---|
+| 9C.1 | CONCLUÍDA | `2730c89` | Lifecycle persistido `NOT_CONFIGURED/CONFIGURING/READY`, adopção legacy, gate de discovery/scheduler |
+| 9C.2 | CONCLUÍDA | `347ae4f` (+ fecho `394061e`) | Wizard de first-run, primeiro administrador, sessões/CSRF e gate de autorização único |
+| 9C.3 | CONCLUÍDA | `ad1d3f6` | Afinidades por país/canal e naming canónico; migration aditiva `AddCanonicalCountryAndAffinityKind` |
+| 9C.4 | CONCLUÍDA | série `e6d4be3`…`fc0440e` (+ fecho `394061e`) | Live Run Monitor (`live_runs`/`live_run_steps`, `RunCoordinator`, `GET /api/run/status`, `POST /api/run/start`) |
+| 9C.5 | CONCLUÍDA | `6fc2fa3` | `READY` sem administrador activo resolve para `AuthMode.Bootstrap`; primeiro admin sem reconfigurar |
+| 9C.6 | CONCLUÍDA | `4562489` | Identidade canónica em runtime: resolução de afinidades Key-autoritativa; `CanonicalChannel.Key` exposta ao loader de selecção |
+
+> A definição normativa de 9C.1–9C.6 vive em `docs/architecture/configuration-lifecycle.md`, `docs/architecture/run-observability-and-manual-trigger.md` (§18) e `docs/architecture/channel-catalog-and-ownership.md` (§12 e "Identidade canónica em runtime"). Apenas 9C.3 (`ad1d3f6`), o fecho 9C.2/9C.3/9C.4 (`394061e`) e o estado de 9C.6 têm hashes referidos na documentação; os restantes hashes são evidência do histórico Git.
+
+## PHASE 13 — waves
+
+| Wave | Estado | Commit | Descrição |
+|---|---|---|---|
+| 13-1 | CONCLUÍDA | `94a9c75` | Selector puro, determinístico e sem I/O (`ChannelSourceSelector`) |
+| 13-1a | CONCLUÍDA | `c1dda71` | Hardening de 13-1: ordem total determinística, precedência de motivos, cobertura de testes |
+| 13-2 | NÃO DECOMPOSTA | — | Não existe como artefacto (sem commit, código ou documento) |
+| 13-2a | NÃO DECOMPOSTA | — | Não existe como artefacto (sem commit, código ou documento) |
+| 13-2b | NÃO DECOMPOSTA | — | Não existe como artefacto (sem commit, código ou documento) |
+| 13-3 | CONCLUÍDA | `d36b803` | Aplicação da política ao pipeline Telegram antes de `SaveToM3uPlaylist` (`SourceSelectionStage`) |
+| 13-4 | CONCLUÍDA | `bf04c34` | Persistência da política global (`source_selection_policies`), resolver, endpoint/UI |
+| 13-4b | CONCLUÍDA | `637bddd` | Overrides por canal por `CanonicalChannel.Key`; **commit local, não empurrado** |
+| 13-5 | PROPOSTA | — | Preview/dry-run + métricas (auditoria; não consta de documento do repositório) |
+| 13-6 | PROPOSTA | — | Integração `MatchPlan` + `DispatcharrSourceSelection`, cleanup e teste 100→10 (auditoria) |
+
+> A auditoria de dependências apontava a **13-4b como próxima wave**. Entretanto a implementação foi realizada e commitada localmente em `637bddd` (`feat(13): add per-channel source selection policies`), pelo que o mapa a classifica como **CONCLUÍDA**. O commit `637bddd` **não foi empurrado**; o upstream da branch é `4562489`.
+>
+> A tabela de fases (Apêndice) e a §32.19 listam as waves publicadas como `94a9c75`, `c1dda71`, `d36b803`, `bf04c34`; `637bddd` é a evidência de 13-4b. As sub-waves 13-2/13-2a/13-2b são declaradas inexistentes na §32.19.
+
+## Próxima wave
+
+Não existe, à data, uma wave **formalmente estabelecida** como próxima. A primeira candidata por ordem de execução sugerida pela auditoria de dependências é a **13-5 (PROPOSTA)** — preview/dry-run + métricas —, seguida da **13-6 (PROPOSTA)**. Ambas permanecem **não formalizadas**: não constam de `docs/IMPLEMENTATION_ROADMAP.md`, `CHANGELOG.md`, `m3uCrawler/README.md` nem de `docs/architecture/*`.
+
+```text
+NENHUMA wave com o estado [FORMALMENTE PLANEADA] foi identificada para a PHASE 9C ou a PHASE 13.
+```
+
+## Waves → PHASE → Definition of Done
+
+```text
+Waves (esta secção)
+    ↓
+PHASE 9C  →  DoD específica §15 ("Definition of Done específica")
+              + Reconciliação §15 (2026-09-18, actualizada com a Wave 9C.6)
+    ↓
+PHASE 13  →  DoD da fase §17 ("Definition of Done da fase")
+              + Reconciliação §17 (2026-09-18, actualizada com a Wave 13-4b)
+    ↓
+Definition of Done global §33 ("Definition of Done")
+```
+
+Requisitos de DoD sem wave atribuída (classificados `[NÃO DECOMPOSTA]`, sem criar waves novas):
+
+**PHASE 9C (§15):**
+
+- wizard funcional completo (apenas admin; §6 itens 4–11 fora do wizard);
+- discovery gate em *todas* as entradas relevantes (CLI one-shot `--telegram` sem gate);
+- auditoria completa do Dashboard;
+- auditoria administrativa (log de mutações) — lacuna transversal;
+- instalação limpa validada;
+- suite Release verde formalizada;
+- dependências remanescentes de `CanonicalChannelId` (FKs de `channel_aliases`/`channel_sources`/`ordering_items`, `source_priority_policies` por canal, `dispatcharr_channel_ownerships`, `matching_audits`, `MatchPlan`, agrupamento do `SourceSelectionStage`);
+- Manual/Ajuda contextual.
+
+**PHASE 13 (§17):**
+
+- preview/dry-run;
+- Dashboard completo;
+- limpeza segura das associações antigas e ownership selectivo, testados;
+- métricas e auditoria;
+- contrato explícito `MatchPlan` + `DispatcharrSourceSelection`;
+- `ProviderDefinition` completa;
+- `SelectionPolicy` (estratégia de ranking separada) — explicitamente fora de âmbito remanescente;
+- `MinimumValidatedSources` — explicitamente fora de âmbito remanescente;
+- estabilidade/churn (`RebalanceOnSync`, `KeepExistingHealthySources`);
+- teste explícito 100→10.
+
+## Dependência 9C.6 → identidade Key → 13-4b
+
+A documentação registra explicitamente a ordem:
+
+```text
+9C.6 (identidade canónica em runtime, Key-autoritativa)
+    ↓
+desbloqueia identidade por CanonicalChannel.Key
+    ↓
+13-4b (overrides por canal keyados por CanonicalChannel.Key)
+```
+
+Ambas as waves estão concluídas. A migração completa `Id → Key` do domínio **não** foi feita (permanecem as dependências de `CanonicalChannelId` listadas acima).
+
 # 32.19 — PHASE 13 — Dispatcharr Source Selection, Diversity & Source Limits
 
 > Estado: `[em curso]` (`[parcial]`) — Waves **13-1, 13-1a, 13-3, 13-4 e 13-4b** implementadas e publicadas (`94a9c75`, `c1dda71`, `d36b803`, `bf04c34`). As sub-waves **13-2/13-2a/13-2b não existem** como artefacto (sem commit, código ou documento). A fase permanece parcial; gaps reais no §17 e no bloco de reconciliação abaixo.
