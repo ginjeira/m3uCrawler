@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
@@ -19,6 +20,7 @@ namespace m3uCrawler.Tests;
 public class ConfigurationGateSchedulerTests : IAsyncLifetime
 {
     private readonly string _dbPath;
+    private readonly List<string> _lifecycleDirs = new();
     private TestDbContextFactory _factory = null!;
     private CatalogResolver _resolver = null!;
 
@@ -39,6 +41,10 @@ public class ConfigurationGateSchedulerTests : IAsyncLifetime
     public Task DisposeAsync()
     {
         try { File.Delete(_dbPath); } catch { /* best effort */ }
+        foreach (var dir in _lifecycleDirs)
+        {
+            try { Directory.Delete(dir, recursive: true); } catch { /* best effort */ }
+        }
         return Task.CompletedTask;
     }
 
@@ -68,6 +74,28 @@ public class ConfigurationGateSchedulerTests : IAsyncLifetime
 
         public Task<bool> IsReadyAsync(CancellationToken cancellationToken = default)
             => Task.FromResult(_ready);
+    }
+
+    private sealed class FixedReadiness : IOperationalReadinessGate
+    {
+        private readonly bool _setupComplete;
+
+        public FixedReadiness(bool setupComplete)
+        {
+            _setupComplete = setupComplete;
+        }
+
+        public Task<bool> IsSetupCompleteAsync(CancellationToken ct = default)
+            => Task.FromResult(_setupComplete);
+    }
+
+    private ConfigurationLifecycleService NewLifecycle(ConfigurationLifecycleState state)
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"cfg-gate-lifecycle-{Guid.NewGuid():N}");
+        _lifecycleDirs.Add(dir);
+        var store = new ConfigurationLifecycleStore(Path.Combine(dir, ConfigurationLifecycleStore.FileName));
+        store.Save(new ConfigurationLifecycleSnapshot(state, false, null, "test", DateTime.UtcNow));
+        return new ConfigurationLifecycleService(store, null, null);
     }
 
     private ScheduledJobRunner BuildRunner(IConfigurationGate? gate, CountingAction action)
@@ -155,6 +183,81 @@ public class ConfigurationGateSchedulerTests : IAsyncLifetime
             Assert.Equal(1, await allowed.TickOnceAsync());
         }
 
+        Assert.Equal(1, action.Executions);
+    }
+
+    // === Wave 4 (PHASE 9C) — gate composto com prontidão operacional ===
+
+    [Fact]
+    public async Task Gate_requires_setup_complete_when_readiness_gate_present()
+    {
+        var lifecycle = NewLifecycle(ConfigurationLifecycleState.Ready);
+
+        var incomplete = new ConfigurationGate(lifecycle, new FixedReadiness(false));
+        Assert.False(await incomplete.IsReadyAsync());
+        Assert.False(await incomplete.IsOperationalReadyAsync());
+
+        var complete = new ConfigurationGate(lifecycle, new FixedReadiness(true));
+        Assert.True(await complete.IsReadyAsync());
+        Assert.True(await complete.IsOperationalReadyAsync());
+    }
+
+    [Fact]
+    public async Task Gate_without_readiness_gate_preserves_lifecycle_only_behaviour()
+    {
+        var lifecycle = NewLifecycle(ConfigurationLifecycleState.Ready);
+        var gate = new ConfigurationGate(lifecycle);
+
+        Assert.True(await gate.IsReadyAsync());
+        Assert.False(await gate.IsOperationalReadyAsync());
+        Assert.Empty(await gate.MissingOperationalAsync());
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Gate_is_false_when_lifecycle_not_ready_regardless_of_readiness(bool setupComplete)
+    {
+        var lifecycle = NewLifecycle(ConfigurationLifecycleState.Configuring);
+        var gate = new ConfigurationGate(lifecycle, new FixedReadiness(setupComplete));
+
+        Assert.False(await gate.IsReadyAsync());
+    }
+
+    [Fact]
+    public async Task Scheduler_does_not_run_when_setup_incomplete_and_keeps_job_due()
+    {
+        await MakeDiscoveryJobDueAsync();
+        var before = Assert.Single(await _resolver.ListScheduledJobsAsync());
+
+        var action = new CountingAction();
+        var gate = new ConfigurationGate(
+            NewLifecycle(ConfigurationLifecycleState.Ready), new FixedReadiness(false));
+        using var runner = BuildRunner(gate, action);
+
+        var ran = await runner.TickOnceAsync();
+
+        Assert.Equal(0, ran);
+        Assert.Equal(0, action.Executions);
+
+        var after = Assert.Single(await _resolver.ListScheduledJobsAsync());
+        Assert.Equal(ScheduledJobRunner.BlockedResult, after.LastResult);
+        Assert.Equal(before.NextRunAtUtc, after.NextRunAtUtc);
+    }
+
+    [Fact]
+    public async Task Scheduler_runs_when_setup_complete()
+    {
+        await MakeDiscoveryJobDueAsync();
+
+        var action = new CountingAction();
+        var gate = new ConfigurationGate(
+            NewLifecycle(ConfigurationLifecycleState.Ready), new FixedReadiness(true));
+        using var runner = BuildRunner(gate, action);
+
+        var ran = await runner.TickOnceAsync();
+
+        Assert.Equal(1, ran);
         Assert.Equal(1, action.Executions);
     }
 }

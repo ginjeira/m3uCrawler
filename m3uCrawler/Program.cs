@@ -8,6 +8,7 @@ using m3uCrawler.Services.LiveRun;
 using m3uCrawler.Services.Matching;
 using m3uCrawler.Services.SourceOrdering;
 using m3uCrawler.Services.SourceSelection;
+using m3uCrawler.Services.Telegram;
 using m3uCrawler.Services.Validation;
 using m3uCrawler.Models;
 using System.Text;
@@ -111,6 +112,43 @@ namespace m3uCrawler
                         lifecycle, adminUsers, bootstrapValidator);
                     WebDashboardService.SetAuth(authService, bootstrapService);
 
+                    // Wave 4 (PHASE 9C) — Prontidão operacional. O gate do
+                    // scheduler exige, além do lifecycle READY, que os
+                    // componentes obrigatórios estejam funcionais (admin,
+                    // Telegram, Dispatcharr quando activado, catálogo,
+                    // output). Sources NÃO bloqueia o SetupComplete — de
+                    // outra forma o discovery nunca arrancaria. Instalações
+                    // adoptadas como legacy ficam grandfathered (ver
+                    // OperationalReadinessService).
+                    var wtelegramStore = new WtelegramConfigStore();
+                    var telegramAuth = new TelegramAuthService(wtelegramStore);
+                    var dispatcharrService = new DispatcharrConfigurationService(wtelegramStore);
+                    var operationalReadiness = new OperationalReadinessService(
+                        lifecycle,
+                        adminUsers.HasActiveAdminAsync,
+                        () => telegramAuth.IsAuthenticated,
+                        dispatcharrService.Get,
+                        ct => HasCanonicalChannelsAsync(webCatalogResolver, ct),
+                        () => IsOutputWritable(dashboardOutputDir),
+                        ct => CountChannelSourcesAsync(webCatalogResolver, ct));
+
+                    try
+                    {
+                        var readinessSnapshot = await operationalReadiness.EvaluateAsync(CancellationToken.None);
+                        if (!readinessSnapshot.SetupComplete)
+                        {
+                            var missing = readinessSnapshot.MissingRequired.Count == 0
+                                ? "(sem componentes obrigatórios em falta)"
+                                : string.Join(", ", readinessSnapshot.MissingRequired);
+                            Console.WriteLine($"⚠️ setup operacional incompleto: {missing}");
+                        }
+                    }
+                    catch (Exception readinessEx)
+                    {
+                        Console.WriteLine(
+                            $"⚠️ Não foi possível avaliar a prontidão operacional: {readinessEx.Message}");
+                    }
+
                     // PHASE 9C.4 — Host do Live Run (RunCoordinator único).
                     // É construído aqui (antes de automationHost.Start) e
                     // partilhado entre o dashboard e o bloco --telegram
@@ -124,7 +162,7 @@ namespace m3uCrawler
                         webCatalogResolver,
                         dashboardOutputDir,
                         dispatcharrConfig,
-                        gate: new ConfigurationGate(lifecycle),
+                        gate: new ConfigurationGate(lifecycle, operationalReadiness),
                         liveRunHost: liveRunHost);
                     WebDashboardService.SetScheduledActions(automationHost.RegisteredActions);
                     automationHost.Start();
@@ -294,6 +332,12 @@ namespace m3uCrawler
                 // bloqueados. Uma invocação manual de um único ciclo
                 // (--telegram sem loop nem manutenção) é operador-iniciada e
                 // não é afectada nesta wave.
+                //
+                // Wave 4 (PHASE 9C) — O caminho CLI manual/automático mantém
+                // deliberadamente apenas o gate de lifecycle (sem readiness
+                // operacional): continua a ser o operador a decidir quando
+                // correr. O gate composto (lifecycle + readiness) aplica-se
+                // ao scheduler/dashboard construído no bloco --web.
                 bool automaticDiscovery = maintenanceMode || loopHours > 0;
                 var configurationLifecycle = BuildConfigurationLifecycle(
                     catalogDbPath, outputDir, catalogForIngestion);
@@ -1291,6 +1335,53 @@ namespace m3uCrawler
         {
             var store = ConfigurationLifecycleStore.ForCatalogDatabase(catalogDbPath);
             return new ConfigurationLifecycleService(store, catalog?.GetFactory(), outputDir);
+        }
+
+        /// <summary>
+        /// Wave 4 (PHASE 9C) — Probe de prontidão: o catálogo canónico tem
+        /// pelo menos um canal. Fail-safe (nunca lança).
+        /// </summary>
+        static async Task<bool> HasCanonicalChannelsAsync(CatalogResolver catalog, CancellationToken ct)
+        {
+            var stats = await catalog.GetStatsAsync(ct);
+            return stats.CanonicalChannels >= 1;
+        }
+
+        /// <summary>
+        /// Wave 4 (PHASE 9C) — Probe de prontidão: número de
+        /// <c>channel_sources</c> realmente ingeridas. Fail-safe (devolve 0
+        /// em erro). Não é requisito de SetupComplete.
+        /// </summary>
+        static async Task<int> CountChannelSourcesAsync(CatalogResolver catalog, CancellationToken ct)
+        {
+            var stats = await catalog.GetStatsAsync(ct);
+            return stats.ChannelSources;
+        }
+
+        /// <summary>
+        /// Wave 4 (PHASE 9C) — Probe de output: a pasta existe e é
+        /// gravável. Cria a pasta se necessário; nunca lança.
+        /// </summary>
+        static bool IsOutputWritable(string outputDir)
+        {
+            if (string.IsNullOrWhiteSpace(outputDir))
+            {
+                return false;
+            }
+
+            try
+            {
+                Directory.CreateDirectory(outputDir);
+                var probe = Path.Combine(outputDir, $".m3ucrawler-readiness-probe-{Guid.NewGuid():N}");
+                File.WriteAllText(probe, "ok");
+                File.Delete(probe);
+                return true;
+            }
+            catch (Exception ex) when (
+                ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+            {
+                return false;
+            }
         }
 
         /// <summary>
