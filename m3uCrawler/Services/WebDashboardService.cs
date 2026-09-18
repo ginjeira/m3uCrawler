@@ -830,9 +830,24 @@ namespace m3uCrawler.Services
 
             if (requestPath.Equals("/api/catalog/channels", StringComparison.OrdinalIgnoreCase))
             {
-                var channels = await _catalogResolver.ListCanonicalChannelsAsync();
-                await WriteJsonAsync(context.Response, channels.Select(ChannelToJson).ToList());
-                return;
+                // Apenas GET lista. POST é tratado pelo handler de criação
+                // abaixo; sem este guard o POST era capturado aqui e
+                // devolvia a lista (200) sem criar nada.
+                if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    var channels = await _catalogResolver.ListCanonicalChannelsAsync();
+                    await WriteJsonAsync(context.Response, channels.Select(ChannelToJson).ToList());
+                    return;
+                }
+
+                if (!context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = "Método não permitido." },
+                        HttpStatusCode.MethodNotAllowed);
+                    return;
+                }
             }
 
             if (requestPath.Equals("/api/catalog/identity-rules", StringComparison.OrdinalIgnoreCase))
@@ -1102,6 +1117,14 @@ namespace m3uCrawler.Services
 
             if (requestPath.Equals("/api/catalog/reviews", StringComparison.OrdinalIgnoreCase))
             {
+                if (!context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = "Método não permitido." },
+                        HttpStatusCode.MethodNotAllowed);
+                    return;
+                }
                 var reviews = await _catalogResolver.ListAllReviewItemsAsync();
                 await WriteJsonAsync(context.Response, reviews.Select(r => new
                 {
@@ -1185,6 +1208,14 @@ namespace m3uCrawler.Services
 
             if (requestPath.Equals("/api/catalog/sync-runs", StringComparison.OrdinalIgnoreCase))
             {
+                if (!context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = "Método não permitido." },
+                        HttpStatusCode.MethodNotAllowed);
+                    return;
+                }
                 var runs = await _catalogResolver.ListSyncRunsAsync();
                 await WriteJsonAsync(context.Response, runs.Select(r => new
                 {
@@ -1259,6 +1290,14 @@ namespace m3uCrawler.Services
             // Pending country approvals
             if (requestPath.Equals("/api/catalog/pending-country-approvals", StringComparison.OrdinalIgnoreCase))
             {
+                if (!context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = "Método não permitido." },
+                        HttpStatusCode.MethodNotAllowed);
+                    return;
+                }
                 var pending = await _catalogResolver.ListPendingCountryApprovalsAsync();
                 await WriteJsonAsync(context.Response, pending.Select(r => new
                 {
@@ -2559,8 +2598,10 @@ namespace m3uCrawler.Services
                         }
                     }
 
-                    context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
-                    await WriteJsonAsync(context.Response, new { error = "Método não permitido." });
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = "Método não permitido." },
+                        HttpStatusCode.MethodNotAllowed);
                     return;
                 }
 

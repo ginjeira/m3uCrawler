@@ -128,36 +128,38 @@ public sealed class ChannelCatalogBootstrapper
     }
 
     /// <summary>
-    /// Procura o ficheiro <c>docs/catalog/m3ucrawler_pt_canonical_catalog.json</c>
-    /// em três localizações canónicas:
-    /// <list type="number">
-    ///   <item>Directório de trabalho actual (override).</item>
-    ///   <item>Raiz do repo: <c>docs/catalog/m3ucrawler_pt_canonical_catalog.json</c>.</item>
-    ///   <item>Directório do executável + 5 níveis acima (caso esteja
-    ///         instalado a partir de um deploy empacotado).</item>
-    /// </list>
-    /// Se não encontrar, não falha — é um baseline opcional. Quando
-    /// encontra, importa-o idempotentemente via
-    /// <see cref="CatalogBaselineImporter"/>. O relatório da
-    /// importação fica registado em log.
+    /// Importa o baseline canónico a partir do ficheiro resolvido; se
+    /// não existir ficheiro, usa o recurso embutido na assembly. Esta
+    /// segunda via garante que uma instalação fresca (imagem sem
+    /// <c>docs/catalog/</c> no disco) continua a popular os canais PT
+    /// generalistas. A operação é idempotente e aditiva — não remove
+    /// nem duplica o que já existe.
     /// </summary>
     private async Task TryImportBaselineAsync(ChannelCatalogDbContext context, CancellationToken cancellationToken)
     {
         var baselinePath = ResolveBaselinePath();
+
         if (baselinePath is null)
         {
-            _logger.LogDebug("No baseline canonical catalog JSON found; skipping baseline import.");
-            return;
+            // Antes: LogDebug (invisível em produção). Agora LogWarning
+            // para o operador perceber que a baseline veio do recurso
+            // embutido e não do ficheiro empacotado — mas nunca falha,
+            // porque o recurso embutido está sempre disponível.
+            _logger.LogWarning(
+                "No baseline canonical catalog file found (checked M3U_BASELINE_PATH, " +
+                "CWD/docs/catalog and AppContext.BaseDirectory/docs/catalog); " +
+                "falling back to the embedded baseline resource.");
         }
 
         try
         {
-            _logger.LogInformation("Importing baseline canonical catalog from {Path}", baselinePath);
-            var baseline = await CatalogBaselineImporter.LoadFromFileAsync(baselinePath, cancellationToken);
+            var baseline = await LoadBaselineAsync(baselinePath, cancellationToken);
             var report = await CatalogBaselineImporter.ImportAsync(context, baseline, cancellationToken);
             _logger.LogInformation(
-                "Baseline import: catalogId={CatalogId} version={Version} channelsCreated={Created} " +
-                "channelsUpdated={Updated} aliasesAdded={AliasesAdded} aliasesSkipped={AliasesSkipped}",
+                "Baseline import: source={Source} catalogId={CatalogId} version={Version} " +
+                "channelsCreated={Created} channelsUpdated={Updated} aliasesAdded={AliasesAdded} " +
+                "aliasesSkipped={AliasesSkipped}",
+                baselinePath ?? ("embedded:" + CatalogBaselineImporter.EmbeddedBaselineResourceName),
                 report.CatalogId, report.Version, report.ChannelsCreated,
                 report.ChannelsUpdated, report.AliasesAdded, report.AliasesSkipped);
             foreach (var warning in report.Warnings)
@@ -165,36 +167,71 @@ public sealed class ChannelCatalogBootstrapper
                 _logger.LogWarning("Baseline import warning: {Warning}", warning);
             }
         }
-        catch (FileNotFoundException)
-        {
-            // Já tratado acima; re-throw não esperado.
-        }
         catch (Exception ex)
         {
-            // Baseline é uma extensão opcional. Falha na importação
-            // não aborta o arranque (o seed programático continua a
-            // funcionar) mas é registada para diagnóstico.
+            // A baseline embutida deve estar sempre presente; uma falha
+            // aqui é anómala e fica visível, mas não aborta o arranque
+            // (o seed programático continua activo).
             _logger.LogWarning(ex,
-                "Failed to import baseline canonical catalog from {Path}. The programmed seed is still active.",
-                baselinePath);
+                "Failed to load/import the baseline canonical catalog (path={Path}). " +
+                "The programmed seed is still active.",
+                baselinePath ?? "<embedded>");
         }
     }
 
-    private string? ResolveBaselinePath()
-    {
-        // Ordem de resolução:
-        //   1. Override via variável de ambiente M3U_BASELINE_PATH.
-        //   2. CWD/docs/catalog/m3ucrawler_pt_canonical_catalog.json.
-        //   3. Repo root / docs/catalog/m3ucrawler_pt_canonical_catalog.json
-        //      (a partir do CWD ou do BaseDirectory).
-        var env = Environment.GetEnvironmentVariable("M3U_BASELINE_PATH");
-        if (!string.IsNullOrEmpty(env) && File.Exists(env)) return env;
+    /// <summary>
+    /// Decide a origem do baseline: ficheiro quando
+    /// <paramref name="resolvedPath"/> é não-nulo (precedência), caso
+    /// contrário o recurso embutido. Interno para permitir testes
+    /// determinísticos da precedência sem depender do filesystem do
+    /// repositório.
+    /// </summary>
+    internal static Task<CatalogBaseline> LoadBaselineAsync(string? resolvedPath, CancellationToken cancellationToken = default)
+        => resolvedPath is null
+            ? CatalogBaselineImporter.LoadEmbeddedAsync(cancellationToken)
+            : CatalogBaselineImporter.LoadFromFileAsync(resolvedPath, cancellationToken);
 
+    /// <summary>
+    /// Resolve o caminho do ficheiro baseline usando o ambiente real
+    /// (CWD, directório da assembly, env var).
+    /// </summary>
+    private string? ResolveBaselinePath()
+        => ResolveBaselinePathFor(
+            Directory.GetCurrentDirectory(),
+            AppContext.BaseDirectory,
+            Environment.GetEnvironmentVariable("M3U_BASELINE_PATH"));
+
+    /// <summary>
+    /// Resolve o caminho do ficheiro baseline com entradas
+    /// explícitas. Ordem de resolução (maior precedência primeiro):
+    /// <list type="number">
+    ///   <item>Override via variável de ambiente
+    ///         <c>M3U_BASELINE_PATH</c> (usado em produção no
+    ///         Dockerfile).</item>
+    ///   <item><c>&lt;CWD&gt;/docs/catalog/m3ucrawler_pt_canonical_catalog.json</c>.</item>
+    ///   <item><c>&lt;AppContext.BaseDirectory&gt;/docs/catalog/…</c>
+    ///         (ficheiro empacotado em <c>/app/docs/catalog</c>).</item>
+    ///   <item>Raiz do repo a partir do
+    ///         <c>BaseDirectory</c> (5 e 4 níveis acima), para
+    ///         desenvolvimento/testes.</item>
+    /// </list>
+    /// Devolve <c>null</c> quando nenhum existe; nesse caso o caller
+    /// usa o recurso embutido.
+    /// </summary>
+    internal static string? ResolveBaselinePathFor(
+        string currentDirectory,
+        string baseDirectory,
+        string? envPath)
+    {
+        if (!string.IsNullOrEmpty(envPath) && File.Exists(envPath)) return envPath;
+
+        var fileName = CatalogBaselineImporter.BaselineFileName;
         var candidates = new[]
         {
-            Path.Combine(Directory.GetCurrentDirectory(), "docs", "catalog", "m3ucrawler_pt_canonical_catalog.json"),
-            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", "docs", "catalog", "m3ucrawler_pt_canonical_catalog.json"),
-            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "docs", "catalog", "m3ucrawler_pt_canonical_catalog.json"),
+            Path.Combine(currentDirectory, "docs", "catalog", fileName),
+            Path.Combine(baseDirectory, "docs", "catalog", fileName),
+            Path.Combine(baseDirectory, "..", "..", "..", "..", "..", "docs", "catalog", fileName),
+            Path.Combine(baseDirectory, "..", "..", "..", "..", "docs", "catalog", fileName),
         };
         foreach (var c in candidates)
         {

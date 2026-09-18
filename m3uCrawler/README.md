@@ -515,6 +515,26 @@ Quando um stream tem indicadores de país (e.g. "PT" no título ou group-title) 
 
 **Nota de segurança**: As URLs mostradas na lista de pending approvals são sanitizadas antes de guardar (`CredentialSanitizer.SanitizeUrl`), pelo que nunca expõem credenciais Xtream.
 
+### Baseline canónico PT
+
+O catálogo canónico PT (`docs/catalog/m3ucrawler_pt_canonical_catalog.json`,
+`catalog_id=pt-canonical-tv`) é importado de forma idempotente e aditiva em cada
+arranque por `ChannelCatalogBootstrapper.TryImportBaselineAsync`, depois do
+`CatalogSeed`. A origem é resolvida por esta ordem de precedência:
+
+1. `M3U_BASELINE_PATH` (override; definido na imagem Docker).
+2. `<CWD>/docs/catalog/m3ucrawler_pt_canonical_catalog.json`.
+3. `<AppContext.BaseDirectory>/docs/catalog/m3ucrawler_pt_canonical_catalog.json`
+   (ficheiro empacotado em `/app/docs/catalog`).
+4. Raiz do repositório (5 e 4 níveis acima do `BaseDirectory`), para
+   desenvolvimento e testes.
+
+Quando não existe ficheiro em nenhum destes caminhos, o baseline é lido do
+**recurso embutido** na assembly (`EmbeddedResource`), garantindo que uma
+instalação fresca tem na mesma os canais PT generalistas (RTP 1/2, SIC, TVI,
+CNN Portugal, CMTV, …). A ausência do ficheiro é registada como warning, mas
+não aborta o arranque.
+
 ### Afinidades e catálogo canónico por país (PHASE 9C.3)
 
 - **Catálogo canónico por país**: `CanonicalChannelEntity.Country` (opcional,

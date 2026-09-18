@@ -41,6 +41,23 @@ namespace m3uCrawler.Services.Catalog;
 public static class CatalogBaselineImporter
 {
     /// <summary>
+    /// Nome do ficheiro canónico versionado. Usado pelo resolver de
+    /// caminho (<see cref="ChannelCatalogBootstrapper"/>) e pelo
+    /// loader embutido.
+    /// </summary>
+    public const string BaselineFileName = "m3ucrawler_pt_canonical_catalog.json";
+
+    /// <summary>
+    /// Nome lógico do recurso embutido definido em
+    /// <c>m3uCrawler.csproj</c> (<c>LogicalName</c>). O loader
+    /// tolera variações de nome (procura qualquer recurso que termine
+    /// por <see cref="BaselineFileName"/>), mas o valor explícito é a
+    /// fonte canónica.
+    /// </summary>
+    public const string EmbeddedBaselineResourceName =
+        "m3uCrawler.docs.catalog.m3ucrawler_pt_canonical_catalog.json";
+
+    /// <summary>
     /// Resolve o <see cref="EditorialCategory"/> heurística a
     /// partir do <c>group id</c> do baseline (e.g.
     /// <c>pt-desporto</c> → <see cref="EditorialCategory.Desporto"/>).
@@ -176,6 +193,64 @@ public static class CatalogBaselineImporter
                 $"Catálogo baseline não encontrado: {jsonPath}", jsonPath);
 
         await using var stream = File.OpenRead(jsonPath);
+        return await DeserializeBaselineAsync(stream, jsonPath, ct);
+    }
+
+    /// <summary>
+    /// Lê o baseline canónico a partir do recurso embutido na
+    /// assembly (<c>EmbeddedResource</c> definido no
+    /// <c>m3uCrawler.csproj</c>). É a rede de segurança para
+    /// instalações em que o ficheiro <c>docs/catalog/…</c> não é
+    /// empacotado: o catálogo arranca sempre com os canais PT
+    /// generalistas em vez de ficar limitado ao <see cref="CatalogSeed"/>.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">
+    /// Se o recurso não existir na assembly (build mal configurado).
+    /// </exception>
+    public static async Task<CatalogBaseline> LoadEmbeddedAsync(CancellationToken ct = default)
+    {
+        var assembly = typeof(CatalogBaselineImporter).Assembly;
+        var resourceName = ResolveEmbeddedResourceName(assembly);
+        if (resourceName is null)
+        {
+            throw new InvalidOperationException(
+                $"Recurso embutido do baseline canónico não encontrado na assembly " +
+                $"'{assembly.GetName().Name}'. Esperado '{EmbeddedBaselineResourceName}' " +
+                $"ou um recurso com sufixo '{BaselineFileName}'.");
+        }
+
+        await using var stream = assembly.GetManifestResourceStream(resourceName)
+            ?? throw new InvalidOperationException(
+                $"Não foi possível abrir o recurso embutido '{resourceName}'.");
+
+        return await DeserializeBaselineAsync(stream, resourceName, ct);
+    }
+
+    private static string? ResolveEmbeddedResourceName(System.Reflection.Assembly assembly)
+    {
+        var names = assembly.GetManifestResourceNames();
+        foreach (var name in names)
+        {
+            if (string.Equals(name, EmbeddedBaselineResourceName, StringComparison.Ordinal))
+                return name;
+        }
+
+        // Tolerância a variações da derivação automática do nome lógico
+        // (e.g. se o LogicalName explícito for removido do csproj).
+        var suffix = "." + BaselineFileName;
+        foreach (var name in names)
+        {
+            if (name.EndsWith(suffix, StringComparison.Ordinal)
+                || string.Equals(name, BaselineFileName, StringComparison.Ordinal))
+                return name;
+        }
+
+        return null;
+    }
+
+    private static async Task<CatalogBaseline> DeserializeBaselineAsync(
+        Stream stream, string sourceLabel, CancellationToken ct)
+    {
         var baseline = await JsonSerializer.DeserializeAsync<CatalogBaseline>(
             stream, new JsonSerializerOptions
             {
@@ -186,7 +261,7 @@ public static class CatalogBaselineImporter
 
         if (baseline is null)
             throw new InvalidOperationException(
-                $"Catálogo baseline vazio ou inválido: {jsonPath}");
+                $"Catálogo baseline vazio ou inválido: {sourceLabel}");
 
         return baseline;
     }
