@@ -6,12 +6,12 @@
 
 ## Current State
 - Branch: `feature/phase-9c-first-run-dashboard`
-- HEAD: `a2c2eae68992c09db2b037a36683a21eb9ae8957`
+- HEAD: `b19d95b99b35590d7f6b9b64f34076effaa47831`
 - Phase: 9C / 13 — implementação das waves da BÍBLIA (reconstrução)
-- Wave: W5 concluída; W6 definida e pendente
-- Status: PARCIALMENTE CONFORME — waves A/B, Onboarding, Admin Password e W1/W2/W3s/W4a/W4b/W5 concluídas; W6+ pendentes
-- Last validated commit: `a2c2eae` (2026-09-19)
-- Last validation: build 0 errors / 52 warnings; suite 2137 passed / 0 failed / 1 skipped (total 2138)
+- Wave: W6a/W6b-1/W6b-2/W6c concluídas; W6b-3 definida e pendente
+- Status: PARCIALMENTE CONFORME — waves A/B, Onboarding, Admin Password, W1/W2/W3s/W4a/W4b/W5, ADR-0001 (completo — pendente de aprovação) e W6a/W6b-1/W6b-2/W6c concluídas; W6b-3+ pendentes
+- Last validated commit: `b19d95b` (2026-09-19)
+- Last validation: build 0 errors / 51 warnings; suite 2186 passed / 0 failed / 1 skipped (total 2187)
 
 ## Completed
 | Phase | Wave | Result | Commit | Validation |
@@ -30,18 +30,23 @@
 | 9C / 13 | W4a | DL-101 num único selector; priority `1` = preferido | fa1b593 | 2104/1 flaky/1; 52 warn |
 | 9C / 13 | W4b | `ExternalIdentity` + migração aditiva; passo tvg-id no matching | 146b507 | 2131/0/1; 52 warn |
 | 9C / 13 | W5 | Fresh install mantém-se de pé sem Telegram; cliente autenticado reutilizado | a2c2eae | 2136/1 flaky/1 (isolado 9/9); 52 warn |
+| 9C / 13 | ADR-0001 completion | ADR-0001 completo: schema `country.json` v1, invariantes, migração/merge e contratos da API de país; `Proposed (completo — pendente de aprovação)` | 4de2773 | docs-only |
+| 9C / 13 | W6a | `audit_records` + migração aditiva; `IAuditService` sanitizado e best-effort; `GET /api/audit` | 39eefe7 | 2148/0/1 |
+| 9C / 13 | W6b-1 | Aprovação de Review aplica mudança explícita de catálogo (`add-alias`/`create-channel`/`exclude`), auditada e idempotente | db9959b | 2162/0/1 |
+| 9C / 13 | W6b-2 | `SyncRun`+steps emitidos pelo sync Dispatcharr; `ChannelSourceObservation` por stream validado | ee7baab | 2170/0/1; 51 warn |
+| 9C / 13 | W6c | Config Dispatcharr completa (patch/mascarada), teste de ligação persistido exigido pela readiness (≤24h, Connected); sync agendado aplica a selection | b19d95b | 2186/0/1; 51 warn |
 
 ## In Progress
 | Wave | Objective | Status | Branch | Commit |
 |---|---|---|---|---|
-| W6 | Audit records de mutações administrativas + ligar/esconder funcionalidades inertes (import-policies, canonical-groups/group-mappings, sync-runs, pending-country-approvals, degradation, aprovação de Review) | Definida / pendente (bloqueada por ADRs e contratos de API) | feature/phase-9c-first-run-dashboard | n/d |
+| W6b-3 | Ligar/esconder funcionalidades inertes decididas: `import-policies`, `canonical-groups`/`group-mappings`, `pending-country-approvals` | Definida / pendente (a decidir quando ligar vs. esconder) | feature/phase-9c-first-run-dashboard | n/d |
 
 ## Pending
 | Item | Origin | Dependency | Status |
 |---|---|---|---|
-| W6 — audit records + wires | Plano de waves (auditoria transversal) | ADRs (schemas/contratos), `17-SECURITY.md:45-53`, `22-API-CONTRACTS.md:52-54` | Pendente |
-| Wire de funcionalidades inertes: import-policies, canonical-groups/group-mappings, sync-runs, pending-country-approvals, degradation, review approval | F-09(dash)/F-10/F-11/F-12/F-13/F-14 | Decisões de produto/ADR | Pendente |
-| E2E de dois ciclos (idempotência: sem duplicar channels/streams/sources/ownership; sem apagar externos) | Critério de sucesso 7 | W6 | Pendente |
+| W6 — audit records + wires | Plano de waves (auditoria transversal) | ADRs (schemas/contratos), `17-SECURITY.md:45-53`, `22-API-CONTRACTS.md:52-54` | Concluída: W6a (39eefe7), W6b-1 (db9959b), W6b-2 (ee7baab), W6c (b19d95b); resta W6b-3 |
+| Wire/hide de funcionalidades inertes: import-policies, canonical-groups/group-mappings, pending-country-approvals | F-12/D-F12 | Decisão de produto (ligar vs. esconder) | Pendente (W6b-3) |
+| E2E de dois ciclos (idempotência: sem duplicar channels/streams/sources/ownership; sem apagar externos) | Critério de sucesso 7 | W6b-3 (restante) | Pendente |
 | Descoberta: dedup por `AccountId`; `max-streams` por candidato | Perf (auditoria transversal) | Decisão de produto | Pendente |
 | Raiz única de `runtime-data` | C-08 / F-21 | Decisão de deployment/compose | Pendente |
 | Secret store isolado conforme ADR-0004 | ADR-0004 | Aprovação do ADR | Pendente |
@@ -81,25 +86,27 @@ IDs da auditoria transversal (`docs/project/waves/2026-09-18-audit-transversal-f
 | C-08 / F-21 | Raiz de runtime única | Duas raízes `<cwd>/runtime-data` vs `/data` | Edições do operador podem ser ignoradas | Pendente |
 | F-07 / F-25 | SSOT de país | Duas fontes de país disjuntas (ficheiros vs `AffinityGroup` DB); UI mostra só uma | Inconsistência | Pendente |
 | F-08 | Mesma instância de serviços (DL-021) | Gate de ingestão usa instância de `CountryChannelValidator` diferente do scraper | Inconsistência | Pendente |
-| F-13 | Review que altera catálogo deve declarar a mudança (`05-CATALOGUE.md:63-67`) | Aprovação de Review inerte (nada lê `Approved`) | Review sem efeito | Pendente (W6) |
-| F-14 | Observation/histórico (DL-023) | Degradação só tem produtor manual; pipeline não grava observações | Histórico incompleto | Pendente (W6) |
-| F-15 | Contratos de API (`22-API-CONTRACTS.md:1-46`) | `/api/dispatcharr/config` só edita subconjunto de chaves | Configuração incompleta | Pendente (W6) |
-| F-16 | Readiness de Dispatcharr (`15-APPLICATION.md:48-52`) | Readiness não testa ligação; último teste não persistido nem gate | Readiness fraca | Pendente (W6) |
+| F-13 | Review que altera catálogo deve declarar a mudança (`05-CATALOGUE.md:63-67`) | Aprovação declara e aplica a mudança (`add-alias`/`create-channel`/`exclude`), auditada e idempotente | — | Resolvido (db9959b) |
+| F-14 | Observation/histórico (DL-023) | `ChannelSourceObservation` gravada no pipeline para streams validados (dedupe `ChannelSourceId`+`ObservedAtUtc`) | — | Resolvido (ee7baab) |
+| F-11 (sync-runs) | Observabilidade de runs (DL-023) | `DispatcharrSyncService` emite `SyncRun`+steps (`ok`/`partial`/`error`/`dry-run`) | — | Resolvido (ee7baab) |
+| F-15 | Contratos de API (`22-API-CONTRACTS.md:1-46`) | `/api/dispatcharr/config` cobre todas as chaves `dispatcharr_*` (patch; segredos mascarados) | — | Resolvido (b19d95b) |
+| F-16 | Readiness de Dispatcharr (`15-APPLICATION.md:48-52`) | Readiness exige teste de ligação persistido e recente (≤24h, `Connected`) | — | Resolvido (b19d95b) |
 | F-22 | Dashboard operacional (`15-APPLICATION.md`) | `--web-allow-trigger` ausente do compose → "Run now" 503 | Feature inacessível | Pendente |
 | F-27 | Handlers com método explícito (`22-API-CONTRACTS.md:5-14`) | Guardas de método/405 apenas parciais | Menor | Parcial (4dff2bf) |
 | D-F2 | Unicidade de policy (`16-PERSISTENCE.md:19-30`) | Prioridade por `Id` vs selection por `Key`; unicidade de `Scope` inconsistente | Risco de duplicados | Pendente |
 | D-F3 | `ChannelSource` com chave estável (`32-DOMAIN-SCHEMA.md:150-163`) | `StreamUrl` sanitizada usada como identidade | Identidade frágil | Pendente |
 | D-F4 | Matching determinístico (`05-CATALOGUE.md:29-41`) | Streams Dispatcharr associados por nome normalizado | Associação frágil | Pendente |
 | D-F5 | Ordering ≠ Priority (DL-010, DL-011) | `StreamOrderingPolicy` faz ordenação e preferência de provider | Conceitos misturados | Pendente |
-| D-F10 / F16 | Output usa a selection | `playlist.m3u`/sync agendado podem ignorar a selection | Output inconsistente | Pendente (W6) |
-| D-F12 | Entidades com consumidor | `ImportPolicy`/`CanonicalGroup.Order`/`GroupMapping` sem consumidor runtime | Funcionalidade inerte | Pendente (W6) |
+| D-F10 / F16 | Output usa a selection | Sync agendado aplica a selection persistida com o mesmo `SourceSelectionStage` do caminho manual | — | Resolvido (b19d95b) |
+| D-F12 | Entidades com consumidor | `ImportPolicy`/`CanonicalGroup.Order`/`GroupMapping` sem consumidor runtime | Funcionalidade inerte | Pendente (W6b-3) |
 | D-F14 | Constraints de invariantes (`16-PERSISTENCE.md:19-30`) | Índices de `channel_sources` não únicos → duplicados sob concorrência | Risco de duplicados | Pendente |
+| ADR-0001 | Regra de Completude (`00-BIBLE.md` §5/§6) | ADR-0001 completo: schema `country.json` v1, invariantes, migração/merge e contratos da API de país; permanece `Proposed (completo — pendente de aprovação)` | — | Já não é `BIBLE_GAP`; Resolvido (4de2773) |
 | Doc | Documentação derivada reflecte a BÍBLIA (`00-BIBLE.md:39-41`) | README/roadmap ainda descrevem país como fonte de aliases e ordem de matching inexistente | Documentação divergente | Pendente |
 | Testes | Quality gates (`44-QUALITY-GATES.md`) | Flaky de timing; cobertura de endpoints esparsa | Regressões difíceis de isolar | Pendente |
 
 ## Decisions Since Last Status
 ADRs (`docs/adr/README.md`):
-- ADR-0001 country-data-ownership — Proposed (completo — pendente de aprovação)
+- ADR-0001 country-data-ownership — Proposed (completo — pendente de aprovação; completude em 4de2773)
 - ADR-0002 stream-fingerprint-canonicalization — Proposed
 - ADR-0003 source-selection-ranking — Accepted
 - ADR-0004 secret-storage-lifecycle — Proposed
@@ -115,10 +122,10 @@ Recalibrações normativas (não alteram a BÍBLIA; clarificam leitura):
 - Ordem de Selection lexicográfica fechada em DL-101 (`31-DECISION-LOCK.md:86-98`), documentada por ADR-0003.
 
 ## Latest Validation
-- Build Release (`--no-incremental`): 0 errors / 52 warnings.
-- Suite completa: 2137 passed / 0 failed / 1 skipped (total 2138).
+- Build Release (`--no-incremental`): 0 errors / 51 warnings.
+- Suite completa: 2186 passed / 0 failed / 1 skipped (total 2187).
 - Skipped (by design): `HttpTimeoutAutopsyTests.LEGACY_PATTERN_blackhole_blocks_until_30s_HttpClient_timeout`.
-- Flaky conhecidos que passam isoladamente: `XtreamAccountLockManagerTests`, `Phase93AccountGateCoordinatorTests`.
+- Flaky conhecidos que passam isoladamente (28/28): `XtreamAccountLockManagerTests`, `Phase93AccountGateCoordinatorTests`.
 
 ## Next Executable Step
-W6 (audit records de mutações administrativas + ligar/esconder funcionalidades inertes), seguida do E2E de dois ciclos (idempotência Discovery→…→Dispatcharr). Os itens de W6 dependem de ADRs/contratos de API ainda em aberto.
+W6b-3 (ligar/esconder funcionalidades inertes: `import-policies`, `canonical-groups`/`group-mappings`, `pending-country-approvals`), seguida do E2E de dois ciclos: deploy do HEAD para o runtime fresco e execução Discovery→Selection→Playlist→Dispatcharr duas vezes, com verificação de idempotência (sem duplicar channels/streams/sources/ownership; sem apagar externos).

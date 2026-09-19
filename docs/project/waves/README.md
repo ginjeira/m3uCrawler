@@ -20,5 +20,11 @@ normativos (`docs/Reestructure/00-BIBLE.md:30-41`, `:105-128`).
 | 12 | [W4a — Selection DL-101](2026-09-19-w4a-selection-dl101.md) | 2026-09-19 | Concluída | fa1b593 | 2104/1 flaky/1; 52 warn |
 | 13 | [W4b — Identidade externa (tvg-id)](2026-09-19-w4b-external-identity.md) | 2026-09-19 | Concluída | 146b507 | 2131/0/1; 52 warn |
 | 14 | [W5 — Fresh install sem Telegram](2026-09-19-w5-fresh-install.md) | 2026-09-19 | Concluída | a2c2eae | 2136/1 flaky/1 (isolado 9/9); 52 warn |
+| 15 | [ADR-0001 — Completude do ADR de país](2026-09-19-adr-0001-completion.md) | 2026-09-19 | Concluída (docs-only) | 4de2773 | n/d |
+| 16 | [W6a — Audit records](2026-09-19-w6a-audit-records.md) | 2026-09-19 | Concluída | 39eefe7 | 2148/0/1 |
+| 17 | [W6b-1 — Aprovação de Review](2026-09-19-w6b1-review-approval.md) | 2026-09-19 | Concluída | db9959b | 2162/0/1 |
+| 18 | [W6b-2 — Observabilidade](2026-09-19-w6b2-observability.md) | 2026-09-19 | Concluída | ee7baab | 2170/0/1; 51 warn |
+| 19 | [W6c — Config Dispatcharr, readiness e selection](2026-09-19-w6c-dispatcharr-config-readiness-selection.md) | 2026-09-19 | Concluída | b19d95b | 2186/0/1; 51 warn |
 
-Wave W6 (audit records + wires) está definida e pendente — ver `docs/PROJECT_STATUS.md`.
+W6b-3 (import-policies, canonical-groups/group-mappings, pending-country-approvals) está definida e pendente — ver `docs/PROJECT_STATUS.md`.
+O E2E de dois ciclos (idempotência Discovery→…→Dispatcharr) é o próximo passo executável.
