@@ -76,6 +76,16 @@ public sealed class AuthService
         CancellationToken cancellationToken = default)
         => _sessions.GetValidAsync(sessionId, cancellationToken);
 
+    /// <summary>
+    /// W6a — Nome de utilizador de um administrador pelo <c>Id</c>, usado para
+    /// atribuir o nome do actor em registos de auditoria. <c>null</c> se não
+    /// existir. Nunca devolve hash nem password.
+    /// </summary>
+    public Task<string?> GetAdminUsernameAsync(
+        long adminUserId,
+        CancellationToken cancellationToken = default)
+        => _users.GetUsernameAsync(adminUserId, cancellationToken);
+
     public Task LogoutAsync(string? sessionId, CancellationToken cancellationToken = default)
         => _sessions.DeleteAsync(sessionId, cancellationToken);
 

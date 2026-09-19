@@ -62,6 +62,22 @@ public sealed class AdminUserStore
     }
 
     /// <summary>
+    /// W6a — Nome de utilizador pelo <c>Id</c>, para atribuição de actor em
+    /// registos de auditoria. Devolve <c>null</c> se o utilizador não existir.
+    /// Nunca expõe hash nem password.
+    /// </summary>
+    public async Task<string?> GetUsernameAsync(
+        long adminUserId,
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.AdminUsers
+            .Where(u => u.Id == adminUserId)
+            .Select(u => u.Username)
+            .FirstOrDefaultAsync(cancellationToken);
+    }
+
+    /// <summary>
     /// Cria o primeiro administrador de forma transaccional. Se já existir
     /// qualquer administrador, devolve <see cref="CreateAdminResult.AlreadyExists"/>
     /// sem alterar nada (idempotente).

@@ -1,5 +1,6 @@
 using m3uCrawler.Build;
 using m3uCrawler.Services;
+using m3uCrawler.Services.Audit;
 using m3uCrawler.Services.Auth;
 using m3uCrawler.Services.Automation;
 using m3uCrawler.Services.Catalog;
@@ -135,6 +136,11 @@ namespace m3uCrawler
                     var bootstrapService = new BootstrapService(
                         lifecycle, adminUsers, bootstrapValidator);
                     WebDashboardService.SetAuth(authService, bootstrapService);
+
+                    // W6a — Auditoria administrativa persistida no mesmo catálogo
+                    // SQLite. Best-effort; nunca bloqueia a mutação.
+                    WebDashboardService.SetAuditService(
+                        new AuditService(webCatalogResolver.GetFactory()));
 
                     // Wave 4 (PHASE 9C) — Prontidão operacional. O gate do
                     // scheduler exige, além do lifecycle READY, que os

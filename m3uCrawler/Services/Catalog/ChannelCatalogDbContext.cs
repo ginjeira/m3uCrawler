@@ -39,6 +39,7 @@ public sealed class ChannelCatalogDbContext : DbContext
     public DbSet<AdminSessionEntity> AdminSessions => Set<AdminSessionEntity>();
     public DbSet<LiveRunEntity> LiveRuns => Set<LiveRunEntity>();
     public DbSet<LiveRunStepEntity> LiveRunSteps => Set<LiveRunStepEntity>();
+    public DbSet<AuditRecordEntity> AuditRecords => Set<AuditRecordEntity>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -575,6 +576,28 @@ public sealed class ChannelCatalogDbContext : DbContext
             e.Property(x => x.Result).IsRequired().HasMaxLength(40);
             e.HasIndex(x => new { x.LiveRunId, x.PhaseIndex }).IsUnique();
             e.HasIndex(x => new { x.LiveRunId, x.Phase });
+        });
+
+        // W6a — AuditRecord (administrative audit trail)
+        modelBuilder.Entity<AuditRecordEntity>(e =>
+        {
+            e.ToTable("audit_records");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Id).ValueGeneratedOnAdd();
+            e.Property(x => x.OccurredAtUtc).IsRequired();
+            e.Property(x => x.ActorType).IsRequired().HasMaxLength(20);
+            e.Property(x => x.ActorId).HasMaxLength(64);
+            e.Property(x => x.ActorName).HasMaxLength(128);
+            e.Property(x => x.Operation).IsRequired().HasMaxLength(80);
+            e.Property(x => x.ObjectType).IsRequired().HasMaxLength(80);
+            e.Property(x => x.ObjectId).HasMaxLength(128);
+            e.Property(x => x.BeforeJson).HasMaxLength(4000);
+            e.Property(x => x.AfterJson).HasMaxLength(4000);
+            e.Property(x => x.Result).IsRequired().HasMaxLength(20);
+            e.Property(x => x.Detail).HasMaxLength(1000);
+            e.HasIndex(x => x.OccurredAtUtc);
+            e.HasIndex(x => x.ObjectType);
+            e.HasIndex(x => x.ObjectId);
         });
     }
 }

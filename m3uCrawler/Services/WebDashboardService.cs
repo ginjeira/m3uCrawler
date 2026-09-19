@@ -1,5 +1,6 @@
 using m3uCrawler.Build;
 using m3uCrawler.Models;
+using m3uCrawler.Services.Audit;
 using m3uCrawler.Services.Auth;
 using m3uCrawler.Services.Automation;
 using m3uCrawler.Services.Catalog;
@@ -16,6 +17,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Microsoft.EntityFrameworkCore;
 
 namespace m3uCrawler.Services
 {
@@ -41,6 +43,11 @@ namespace m3uCrawler.Services
         private static DispatcharrConfigurationService? _dispatcharrConfigurationService;
         private static DispatcharrConnectionTester? _dispatcharrConnectionTester;
         private static OperationalReadinessService? _operationalReadinessService;
+
+        // W6a — Serviço de auditoria administrativa. Opcional: quando ausente
+        // (ex.: testes que não o injectam) as mutações correm normalmente sem
+        // auditoria; GET /api/audit responde 503 audit-unavailable.
+        private static IAuditService? _auditService;
 
         /// <summary>
         /// PHASE 9C.2 (S1-E) — Indica que o Dashboard corre num contexto
@@ -137,6 +144,15 @@ namespace m3uCrawler.Services
         }
 
         /// <summary>
+        /// W6a — Regista o serviço de auditoria administrativa. Passar
+        /// <c>null</c> repõe o comportamento "não ligado" (usado em testes).
+        /// </summary>
+        public static void SetAuditService(IAuditService? auditService)
+        {
+            _auditService = auditService;
+        }
+
+        /// <summary>
         /// Wave C — Directório de runtime-data usado pelos endpoints de
         /// configuração operacional. Produção: <c><cwd>/runtime-data</c>.
         /// Testes podem sobrepor via <see cref="StaticRuntimeDataDirScope"/>
@@ -224,12 +240,14 @@ namespace m3uCrawler.Services
             TelegramAuthService? telegramAuth = null,
             DispatcharrConfigurationService? dispatcharrConfig = null,
             DispatcharrConnectionTester? dispatcharrTester = null,
-            OperationalReadinessService? readiness = null)
+            OperationalReadinessService? readiness = null,
+            IAuditService? auditService = null)
         {
             using var scope = new StaticResolverScope(resolver);
             using var authScope = new StaticAuthScope(lifecycle, authService, bootstrapService);
             using var setupScope = new StaticSetupScope(
                 telegramAuth, dispatcharrConfig, dispatcharrTester, readiness);
+            using var auditScope = new StaticAuditScope(auditService);
             await HandleRequestAsync(context, outputDir, historyService, webToken);
         }
 
@@ -268,6 +286,26 @@ namespace m3uCrawler.Services
                 _dispatcharrConfigurationService = _previousDispatcharrConfig;
                 _dispatcharrConnectionTester = _previousDispatcharrTester;
                 _operationalReadinessService = _previousReadiness;
+            }
+        }
+
+        /// <summary>
+        /// W6a — Scope testável para o serviço de auditoria. Restaura o valor
+        /// anterior em <see cref="Dispose"/>, isolando testes paralelos.
+        /// </summary>
+        public sealed class StaticAuditScope : IDisposable
+        {
+            private readonly IAuditService? _previous;
+
+            public StaticAuditScope(IAuditService? auditService)
+            {
+                _previous = _auditService;
+                _auditService = auditService;
+            }
+
+            public void Dispose()
+            {
+                _auditService = _previous;
             }
         }
 
@@ -410,6 +448,9 @@ namespace m3uCrawler.Services
             var (authMode, lifecycleState) = await ResolveAuthDecisionAsync();
             var sessionId = GetCookieValue(context.Request, SessionCookieName);
             var isRootPath = requestPath.Length == 0 || requestPath == "/";
+            // W6a — Sessão humana validada pelo gate, usada para atribuir o actor
+            // dos registos de auditoria das mutações administrativas.
+            AdminSessionEntity? auditSession = null;
 
             // --- Bootstrap HTML + endpoints (só activos em bootstrap) ---
             if (requestPath.Equals("/bootstrap", StringComparison.OrdinalIgnoreCase))
@@ -475,6 +516,7 @@ namespace m3uCrawler.Services
                         return;
                     }
 
+                    auditSession = session;
                     var method = context.Request.HttpMethod;
                     if (IsMutatingMethod(method))
                     {
@@ -503,6 +545,20 @@ namespace m3uCrawler.Services
                 return;
             }
 
+            // W6a — Auditoria administrativa (read-only). Requer sessão humana
+            // (ou credencial de máquina) como qualquer rota não pública. Filtros
+            // opcionais: objectType, objectId, limit. Método ≠ GET → 405.
+            if (requestPath.Equals("/api/audit", StringComparison.OrdinalIgnoreCase))
+            {
+                await HandleAuditEndpointAsync(context);
+                return;
+            }
+
+            // W6a — Actor atribuído a todas as mutações administrativas.
+            var auditActor = auditSession is not null
+                ? await ResolveAuditActorAsync(auditSession)
+                : (machineAuthorized ? AuditActor.System("machine-token") : AuditActor.System("system"));
+
             // PHASE 9C.1 — Estado do ciclo de vida de configuração.
             // Endpoint de leitura apenas: em NOT_CONFIGURED o dashboard
             // continua acessível e mostra inequivocamente que a aplicação
@@ -521,7 +577,7 @@ namespace m3uCrawler.Services
             // (sessão + CSRF para métodos mutantes). Método errado → 405.
             if (IsSetupPath(requestPath))
             {
-                await HandleSetupEndpointAsync(context, requestPath);
+                await HandleSetupEndpointAsync(context, requestPath, auditActor);
                 return;
             }
 
@@ -720,7 +776,7 @@ namespace m3uCrawler.Services
             // CSRF para este método mutante).
             if (requestPath.Equals("/api/discovery/settings", StringComparison.OrdinalIgnoreCase))
             {
-                await HandleDiscoverySettingsEndpointAsync(context);
+                await HandleDiscoverySettingsEndpointAsync(context, auditActor);
                 return;
             }
 
@@ -933,6 +989,16 @@ namespace m3uCrawler.Services
 
                         var disposition = Enum.TryParse<RuleDisposition>(payload.Disposition, true, out var d) ? d : RuleDisposition.ReviewOnly;
                         var rule = await _catalogResolver.CreateIdentityRuleAsync(payload.NormalizedIdentity, disposition, payload.Reason ?? string.Empty);
+                        await RecordAuditAsync(auditActor, "catalog.identity-rule.create", "identity-rule",
+                            rule.NormalizedIdentity, null,
+                            new
+                            {
+                                id = rule.Id,
+                                normalizedIdentity = rule.NormalizedIdentity,
+                                disposition = rule.Disposition.ToString(),
+                                reason = rule.Reason,
+                            },
+                            AuditResult.Success);
                         await WriteJsonAsync(context.Response, new
                         {
                             id = rule.Id,
@@ -970,10 +1036,14 @@ namespace m3uCrawler.Services
                     var deleted = await _catalogResolver.DeleteIdentityRuleAsync(identity);
                     if (!deleted)
                     {
+                        await RecordAuditAsync(auditActor, "catalog.identity-rule.delete", "identity-rule",
+                            identity, new { normalizedIdentity = identity }, null, AuditResult.Failure, "not-found");
                         context.Response.StatusCode = (int)HttpStatusCode.NotFound;
                         await WriteJsonAsync(context.Response, new { error = $"Regra não encontrada: {identity}" });
                         return;
                     }
+                    await RecordAuditAsync(auditActor, "catalog.identity-rule.delete", "identity-rule",
+                        identity, new { normalizedIdentity = identity }, null, AuditResult.Success);
                     await WriteJsonAsync(context.Response, new { deleted = true, identity });
                     return;
                 }
@@ -1033,6 +1103,19 @@ namespace m3uCrawler.Services
                         }
                         var group = await _catalogResolver.CreateAffinityGroupAsync(
                             payload.Name, resolved.Kind, resolved.Key, resolved.Country, payload.Members);
+                        await RecordAuditAsync(auditActor, "catalog.affinity-group.create", "affinity-group",
+                            group.Id.ToString(),
+                            null,
+                            new
+                            {
+                                id = group.Id,
+                                name = group.Name,
+                                kind = group.Kind.ToString(),
+                                canonicalChannelKey = group.CanonicalChannelKey,
+                                countryCode = group.CountryCode,
+                                members = group.Members.Select(m => m.NormalizedMember).ToList(),
+                            },
+                            AuditResult.Success);
                         await WriteJsonAsync(context.Response, new
                         {
                             id = group.Id,
@@ -1079,10 +1162,14 @@ namespace m3uCrawler.Services
                 var deleted = await _catalogResolver.DeleteAffinityGroupAsync(groupId);
                 if (!deleted)
                 {
+                    await RecordAuditAsync(auditActor, "catalog.affinity-group.delete", "affinity-group",
+                        groupId.ToString(), null, null, AuditResult.Failure, "not-found");
                     context.Response.StatusCode = (int)HttpStatusCode.NotFound;
                     await WriteJsonAsync(context.Response, new { error = "Grupo não encontrado." });
                     return;
                 }
+                await RecordAuditAsync(auditActor, "catalog.affinity-group.delete", "affinity-group",
+                    groupId.ToString(), new { id = groupId }, null, AuditResult.Success);
                 await WriteJsonAsync(context.Response, new { deleted = true, id = groupId });
                 return;
             }
@@ -1126,6 +1213,8 @@ namespace m3uCrawler.Services
                             await WriteJsonAsync(context.Response, new { error = resolved.Error });
                             return;
                         }
+                        var beforeGroup = (await _catalogResolver.ListAffinityGroupsAsync())
+                            .FirstOrDefault(g => g.Id == groupId);
                         var group = await _catalogResolver.UpdateAffinityGroupAsync(
                             groupId, payload.Name, resolved.Kind, resolved.Key, resolved.Country, payload.Members);
                         if (group == null)
@@ -1134,6 +1223,11 @@ namespace m3uCrawler.Services
                             await WriteJsonAsync(context.Response, new { error = "Grupo não encontrado." });
                             return;
                         }
+                        await RecordAuditAsync(auditActor, "catalog.affinity-group.update", "affinity-group",
+                            group.Id.ToString(),
+                            AffinityGroupToAuditJson(beforeGroup),
+                            AffinityGroupToAuditJson(group),
+                            AuditResult.Success);
                         await WriteJsonAsync(context.Response, new
                         {
                             id = group.Id,
@@ -1448,6 +1542,8 @@ namespace m3uCrawler.Services
                         }
                         var list = await _catalogResolver.CreateOrderingListAsync(
                             payload.Key, payload.Name, payload.Country, payload.Description, payload.IsEnabled);
+                        await RecordAuditAsync(auditActor, "catalog.ordering-list.create", "ordering-list",
+                            list.Id.ToString(), null, OrderingListSummaryToJson(list), AuditResult.Success);
                         await WriteJsonAsync(context.Response, OrderingListSummaryToJson(list), HttpStatusCode.Created);
                         return;
                     }
@@ -1494,13 +1590,20 @@ namespace m3uCrawler.Services
                     }
                     if (context.Request.HttpMethod.Equals("DELETE", StringComparison.OrdinalIgnoreCase))
                     {
+                        var beforeList = await _catalogResolver.GetOrderingListAsync(listId, includeItems: false);
                         var ok = await _catalogResolver.DeleteOrderingListAsync(listId);
                         if (!ok)
                         {
+                            await RecordAuditAsync(auditActor, "catalog.ordering-list.delete", "ordering-list",
+                                listId.ToString(), beforeList is null ? null : OrderingListSummaryToJson(beforeList),
+                                null, AuditResult.Failure, "not-found");
                             context.Response.StatusCode = (int)HttpStatusCode.NotFound;
                             await WriteJsonAsync(context.Response, new { error = $"OrderingList #{listId} não encontrada." });
                             return;
                         }
+                        await RecordAuditAsync(auditActor, "catalog.ordering-list.delete", "ordering-list",
+                            listId.ToString(), beforeList is null ? null : OrderingListSummaryToJson(beforeList),
+                            null, AuditResult.Success);
                         await WriteJsonAsync(context.Response, new { deleted = true, id = listId });
                         return;
                     }
@@ -1521,6 +1624,8 @@ namespace m3uCrawler.Services
                             return;
                         }
                         var clone = await _catalogResolver.DuplicateOrderingListAsync(listId, payload.NewKey, payload.NewName);
+                        await RecordAuditAsync(auditActor, "catalog.ordering-list.duplicate", "ordering-list",
+                            clone.Id.ToString(), null, OrderingListSummaryToJson(clone), AuditResult.Success);
                         await WriteJsonAsync(context.Response, OrderingListSummaryToJson(clone), HttpStatusCode.Created);
                         return;
                     }
@@ -1548,6 +1653,8 @@ namespace m3uCrawler.Services
                         }
                         var item = await _catalogResolver.AddOrderingItemAsync(
                             listId, payload.CanonicalChannelId, payload.Position, payload.IsEnabled);
+                        await RecordAuditAsync(auditActor, "catalog.ordering-item.add", "ordering-item",
+                            item.Id.ToString(), null, OrderingItemToJson(item), AuditResult.Success);
                         await WriteJsonAsync(context.Response, OrderingItemToJson(item), HttpStatusCode.Created);
                         return;
                     }
@@ -1587,10 +1694,14 @@ namespace m3uCrawler.Services
                     var ok = await _catalogResolver.RemoveOrderingItemAsync(itemId);
                     if (!ok)
                     {
+                        await RecordAuditAsync(auditActor, "catalog.ordering-item.delete", "ordering-item",
+                            itemId.ToString(), null, null, AuditResult.Failure, "not-found");
                         context.Response.StatusCode = (int)HttpStatusCode.NotFound;
                         await WriteJsonAsync(context.Response, new { error = $"OrderingItem #{itemId} não encontrado." });
                         return;
                     }
+                    await RecordAuditAsync(auditActor, "catalog.ordering-item.delete", "ordering-item",
+                        itemId.ToString(), new { id = itemId }, null, AuditResult.Success);
                     await WriteJsonAsync(context.Response, new { deleted = true, id = itemId });
                     return;
                 }
@@ -1615,6 +1726,10 @@ namespace m3uCrawler.Services
                         {
                             await _catalogResolver.SetOrderingItemEnabledAsync(itemId, payload.IsEnabled.Value);
                         }
+                        await RecordAuditAsync(auditActor, "catalog.ordering-item.update", "ordering-item",
+                            itemId.ToString(), null,
+                            new { id = itemId, position = payload.Position, isEnabled = payload.IsEnabled },
+                            AuditResult.Success);
                         await WriteJsonAsync(context.Response, new { updated = true, id = itemId });
                         return;
                     }
@@ -1664,6 +1779,8 @@ namespace m3uCrawler.Services
                             payload.Scope, payload.CanonicalChannelId,
                             payload.CriteriaJson ?? "[]", payload.PreferredQuality ?? "",
                             payload.AllowFallback);
+                        await RecordAuditAsync(auditActor, "catalog.priority-policy.upsert", "source-priority-policy",
+                            saved.Scope, null, PriorityPolicyToJson(saved), AuditResult.Success);
                         await WriteJsonAsync(context.Response, PriorityPolicyToJson(saved));
                         return;
                     }
@@ -1737,6 +1854,8 @@ namespace m3uCrawler.Services
                             payload.PreferDistinctProviders.Value,
                             payload.MaxSourcesPerProvider,
                             payload.AllowFallbackToSameProvider.Value);
+                        await RecordAuditAsync(auditActor, "catalog.source-selection-policy.upsert", "source-selection-policy",
+                            saved.ScopeKey, null, SourceSelectionPolicyToJson(saved), AuditResult.Success);
                         await WriteJsonAsync(context.Response, SourceSelectionPolicyToJson(saved));
                         return;
                     }
@@ -1827,6 +1946,8 @@ namespace m3uCrawler.Services
                             payload.PreferDistinctProviders.Value,
                             payload.MaxSourcesPerProvider,
                             payload.AllowFallbackToSameProvider.Value);
+                        await RecordAuditAsync(auditActor, "catalog.source-selection-policy.channel.upsert", "source-selection-policy",
+                            saved.ScopeKey, null, ChannelSourceSelectionPolicyToJson(saved), AuditResult.Success);
                         await WriteJsonAsync(context.Response, ChannelSourceSelectionPolicyToJson(saved));
                         return;
                     }
@@ -1870,10 +1991,14 @@ namespace m3uCrawler.Services
                     var deleted = await _catalogResolver.DeleteChannelSourceSelectionPolicyAsync(canonicalChannelKey);
                     if (!deleted)
                     {
+                        await RecordAuditAsync(auditActor, "catalog.source-selection-policy.channel.delete", "source-selection-policy",
+                            canonicalChannelKey, null, null, AuditResult.Failure, "not-found");
                         context.Response.StatusCode = (int)HttpStatusCode.NotFound;
                         await WriteJsonAsync(context.Response, new { error = "Override não encontrado." }, HttpStatusCode.NotFound);
                         return;
                     }
+                    await RecordAuditAsync(auditActor, "catalog.source-selection-policy.channel.delete", "source-selection-policy",
+                        canonicalChannelKey, new { scopeKey = canonicalChannelKey }, null, AuditResult.Success);
                     await WriteJsonAsync(context.Response, new { deleted = true });
                     return;
                 }
@@ -2378,6 +2503,8 @@ namespace m3uCrawler.Services
                         var source = await _catalogResolver.EnsureSourceAsync(
                             payload.Key, payload.Name, kind, payload.Origin ?? string.Empty,
                             payload.Priority, payload.IsEnabled);
+                        await RecordAuditAsync(auditActor, "catalog.source.upsert", "source",
+                            source.Key, null, SourceToJson(source), AuditResult.Success);
                         await WriteJsonAsync(context.Response, SourceToJson(source), HttpStatusCode.Created);
                         return;
                     }
@@ -2410,13 +2537,20 @@ namespace m3uCrawler.Services
 
                 if (segments.Length == 1 && context.Request.HttpMethod.Equals("DELETE", StringComparison.OrdinalIgnoreCase))
                 {
+                    var beforeSource = await _catalogResolver.GetSourceAsync(sourceId);
                     var ok = await _catalogResolver.DeleteSourceAsync(sourceId);
                     if (!ok)
                     {
+                        await RecordAuditAsync(auditActor, "catalog.source.delete", "source",
+                            sourceId.ToString(), beforeSource is null ? null : SourceToJson(beforeSource),
+                            null, AuditResult.Failure, "not-found");
                         context.Response.StatusCode = (int)HttpStatusCode.NotFound;
                         await WriteJsonAsync(context.Response, new { error = $"Source #{sourceId} não encontrada." });
                         return;
                     }
+                    await RecordAuditAsync(auditActor, "catalog.source.delete", "source",
+                        beforeSource?.Key ?? sourceId.ToString(),
+                        beforeSource is null ? null : SourceToJson(beforeSource), null, AuditResult.Success);
                     await WriteJsonAsync(context.Response, new { deleted = true, id = sourceId });
                     return;
                 }
@@ -2458,6 +2592,8 @@ namespace m3uCrawler.Services
                                 payload.MatchMethod ?? "unknown",
                                 payload.ExternalStreamId,
                                 payload.IsEnabled);
+                            await RecordAuditAsync(auditActor, "catalog.channel-source.record", "channel-source",
+                                cs.Id.ToString(), null, ChannelSourceToJson(cs), AuditResult.Success);
                             await WriteJsonAsync(context.Response, ChannelSourceToJson(cs), HttpStatusCode.Created);
                             return;
                         }
@@ -2488,10 +2624,14 @@ namespace m3uCrawler.Services
                     var ok = await _catalogResolver.DeleteChannelSourceAsync(csId);
                     if (!ok)
                     {
+                        await RecordAuditAsync(auditActor, "catalog.channel-source.delete", "channel-source",
+                            csId.ToString(), null, null, AuditResult.Failure, "not-found");
                         context.Response.StatusCode = (int)HttpStatusCode.NotFound;
                         await WriteJsonAsync(context.Response, new { error = $"ChannelSource #{csId} não encontrada." });
                         return;
                     }
+                    await RecordAuditAsync(auditActor, "catalog.channel-source.delete", "channel-source",
+                        csId.ToString(), new { id = csId }, null, AuditResult.Success);
                     await WriteJsonAsync(context.Response, new { deleted = true, id = csId });
                     return;
                 }
@@ -2515,6 +2655,8 @@ namespace m3uCrawler.Services
                             await WriteJsonAsync(context.Response, new { error = $"ChannelSource #{csId} não encontrada." });
                             return;
                         }
+                        await RecordAuditAsync(auditActor, "catalog.channel-source.update", "channel-source",
+                            csId.ToString(), null, new { id = csId, isEnabled = payload.IsEnabled }, AuditResult.Success);
                         await WriteJsonAsync(context.Response, new { updated = true, id = csId, isEnabled = payload.IsEnabled });
                         return;
                     }
@@ -2607,6 +2749,7 @@ namespace m3uCrawler.Services
                                 return;
                             }
                             var isEnabled = payload.IsEnabled ?? true;
+                            var beforeChannel = await _catalogResolver.GetCanonicalChannelAsync(channelId);
                             var updated = await _catalogResolver.UpdateCanonicalChannelAsync(
                                 channelId, payload.DisplayName, editorialCategory,
                                 editorialGroup, publicationPolicy, isEnabled, payload.Country);
@@ -2617,6 +2760,11 @@ namespace m3uCrawler.Services
                                 return;
                             }
                             var reloaded = await _catalogResolver.GetCanonicalChannelAsync(channelId);
+                            await RecordAuditAsync(auditActor, "catalog.channel.update", "canonical-channel",
+                                channelId.ToString(),
+                                beforeChannel is null ? null : ChannelToJson(beforeChannel),
+                                reloaded is null ? null : ChannelToJson(reloaded),
+                                AuditResult.Success);
                             await WriteJsonAsync(context.Response, ChannelToJson(reloaded!));
                             return;
                         }
@@ -2631,13 +2779,22 @@ namespace m3uCrawler.Services
                     {
                         try
                         {
+                            var beforeChannel = await _catalogResolver.GetCanonicalChannelAsync(channelId);
                             var deleted = await _catalogResolver.DeleteCanonicalChannelAsync(channelId);
                             if (!deleted)
                             {
+                                await RecordAuditAsync(auditActor, "catalog.channel.delete", "canonical-channel",
+                                    channelId.ToString(),
+                                    beforeChannel is null ? null : ChannelToJson(beforeChannel),
+                                    null, AuditResult.Failure, "not-found");
                                 context.Response.StatusCode = (int)HttpStatusCode.NotFound;
                                 await WriteJsonAsync(context.Response, new { error = $"Canal #{channelId} não encontrado." });
                                 return;
                             }
+                            await RecordAuditAsync(auditActor, "catalog.channel.delete", "canonical-channel",
+                                channelId.ToString(),
+                                beforeChannel is null ? null : ChannelToJson(beforeChannel),
+                                null, AuditResult.Success);
                             await WriteJsonAsync(context.Response, new { deleted = true, id = channelId });
                             return;
                         }
@@ -2673,6 +2830,9 @@ namespace m3uCrawler.Services
                                 return;
                             }
                             var alias = await _catalogResolver.AddAliasAsync(channelId, payload.NormalizedAlias);
+                            await RecordAuditAsync(auditActor, "catalog.channel.alias.add", "canonical-channel",
+                                channelId.ToString(), null, new { id = alias.Id, normalizedAlias = alias.NormalizedAlias },
+                                AuditResult.Success);
                             await WriteJsonAsync(context.Response, new
                             {
                                 id = alias.Id,
@@ -2696,10 +2856,14 @@ namespace m3uCrawler.Services
                         var removed = await _catalogResolver.RemoveAliasAsync(channelId, alias);
                         if (!removed)
                         {
+                            await RecordAuditAsync(auditActor, "catalog.channel.alias.remove", "canonical-channel",
+                                channelId.ToString(), new { alias }, null, AuditResult.Failure, "not-found");
                             context.Response.StatusCode = (int)HttpStatusCode.NotFound;
                             await WriteJsonAsync(context.Response, new { error = $"Alias '{alias}' não encontrado no canal #{channelId}." });
                             return;
                         }
+                        await RecordAuditAsync(auditActor, "catalog.channel.alias.remove", "canonical-channel",
+                            channelId.ToString(), new { alias }, null, AuditResult.Success);
                         await WriteJsonAsync(context.Response, new { deleted = true, channelId, alias });
                         return;
                     }
@@ -2756,6 +2920,9 @@ namespace m3uCrawler.Services
                         editorialCategory, editorialGroup, publicationPolicy,
                         payload.IsEnabled, aliases, payload.Country);
                     var reloaded = await _catalogResolver.GetCanonicalChannelAsync(created.Id);
+                    await RecordAuditAsync(auditActor, "catalog.channel.create", "canonical-channel",
+                        reloaded?.Key ?? created.Key, null,
+                        reloaded is null ? null : ChannelToJson(reloaded), AuditResult.Success);
                     await WriteJsonAsync(context.Response, ChannelToJson(reloaded!), HttpStatusCode.Created);
                     return;
                 }
@@ -2793,7 +2960,10 @@ namespace m3uCrawler.Services
                             await WriteJsonAsync(context.Response, new { error = "Payload inválido." });
                             return;
                         }
+                        var beforePolicy = store.Load();
                         var saved = store.Save(incoming);
+                        await RecordAuditAsync(auditActor, "settings.validation-policy.update", "validation-policy",
+                            "global", beforePolicy, saved, AuditResult.Success);
                         await WriteJsonAsync(context.Response, saved);
                         return;
                     }
@@ -2834,11 +3004,19 @@ namespace m3uCrawler.Services
                             return;
                         }
                         var current = settingsStore.Load();
+                        var beforeSettings = new
+                        {
+                            affinityVariantDelimiter = current.AffinityVariantDelimiter,
+                        };
                         if (payload.AffinityVariantDelimiter != null)
                         {
                             current.AffinityVariantDelimiter = payload.AffinityVariantDelimiter;
                         }
                         var saved = settingsStore.Save(current);
+                        await RecordAuditAsync(auditActor, "settings.app.update", "app-settings",
+                            "global", beforeSettings,
+                            new { affinityVariantDelimiter = saved.AffinityVariantDelimiter },
+                            AuditResult.Success);
                         await WriteJsonAsync(context.Response, saved);
                         return;
                     }
@@ -7653,6 +7831,167 @@ const rows = Object.entries(inv).map(([k, v]) => {
             };
         }
 
+        // ================= W6a — Audit =================
+
+        private const string AuditUnavailableError = "audit-unavailable";
+
+        /// <summary>
+        /// Resolve o actor humano a partir da sessão validada. O username é uma
+        /// leitura best-effort: a ausência do utilizador não impede o registo.
+        /// </summary>
+        private static async Task<AuditActor> ResolveAuditActorAsync(AdminSessionEntity session)
+        {
+            string? name = null;
+            if (_authService is not null)
+            {
+                try
+                {
+                    name = await _authService.GetAdminUsernameAsync(session.AdminUserId);
+                }
+                catch
+                {
+                    // Best effort — nunca falhar a mutação por causa do actor.
+                }
+            }
+            return AuditActor.User(session.AdminUserId, name);
+        }
+
+        /// <summary>
+        /// W6a — Registo best-effort de uma mutação administrativa. Ausência do
+        /// serviço (ex.: testes antigos) ou falha de escrita nunca aborta a
+        /// mutação; a falha é observável via log.
+        /// </summary>
+        private static async Task RecordAuditAsync(
+            AuditActor actor,
+            string operation,
+            string objectType,
+            string? objectId,
+            object? before,
+            object? after,
+            string result,
+            string? detail = null)
+        {
+            var service = _auditService;
+            if (service is null) return;
+
+            try
+            {
+                await service.RecordAsync(new AuditRecord
+                {
+                    Actor = actor,
+                    Operation = operation,
+                    ObjectType = objectType,
+                    ObjectId = objectId,
+                    Before = before,
+                    After = after,
+                    Result = result,
+                    Detail = detail,
+                });
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"⚠️ Audit record failed ({operation}): {ex.GetType().Name}");
+            }
+        }
+
+        private static object AuditRecordToJson(AuditRecordEntity r) => new
+        {
+            id = r.Id,
+            occurredAtUtc = r.OccurredAtUtc.ToString("o"),
+            actorType = r.ActorType,
+            actorId = r.ActorId,
+            actorName = r.ActorName,
+            operation = r.Operation,
+            objectType = r.ObjectType,
+            objectId = r.ObjectId,
+            beforeJson = CredentialSanitizer.SanitizeJson(r.BeforeJson),
+            afterJson = CredentialSanitizer.SanitizeJson(r.AfterJson),
+            result = r.Result,
+            detail = CredentialSanitizer.SanitizeSensitiveText(r.Detail),
+        };
+
+        /// <summary>W6a — Projecção sanitizável (sem ciclos) de um grupo de afinidade.</summary>
+        private static object AffinityGroupToAuditJson(AffinityGroupEntity? g) => g is null
+            ? null!
+            : new
+            {
+                id = g.Id,
+                name = g.Name,
+                kind = g.Kind.ToString(),
+                canonicalChannelKey = g.CanonicalChannelKey,
+                countryCode = g.CountryCode,
+                members = g.Members.Select(m => m.NormalizedMember).ToList(),
+            };
+
+        /// <summary>
+        /// W6a — <c>GET /api/audit</c>: devolve registos de auditoria (nunca
+        /// segredos). Filtros opcionais <c>objectType</c>, <c>objectId</c> e
+        /// <c>limit</c> (1..1000, por defeito 100). Read-only; método errado → 405.
+        /// </summary>
+        private static async Task HandleAuditEndpointAsync(HttpListenerContext context)
+        {
+            if (!context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+            {
+                context.Response.Headers["Allow"] = "GET";
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = "method-not-allowed" },
+                    HttpStatusCode.MethodNotAllowed);
+                return;
+            }
+
+            var resolver = _catalogResolver;
+            if (resolver is null)
+            {
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = AuditUnavailableError },
+                    HttpStatusCode.ServiceUnavailable);
+                return;
+            }
+
+            var objectType = context.Request.QueryString["objectType"];
+            var objectId = context.Request.QueryString["objectId"];
+
+            var limit = 100;
+            var rawLimit = context.Request.QueryString["limit"];
+            if (!string.IsNullOrWhiteSpace(rawLimit)
+                && int.TryParse(rawLimit, out var parsedLimit)
+                && parsedLimit > 0)
+            {
+                limit = Math.Min(parsedLimit, 1000);
+            }
+
+            try
+            {
+                await using var auditContext = await resolver.GetFactory().CreateDbContextAsync();
+                var query = auditContext.AuditRecords.AsNoTracking().AsQueryable();
+                if (!string.IsNullOrWhiteSpace(objectType))
+                {
+                    query = query.Where(r => r.ObjectType == objectType);
+                }
+                if (!string.IsNullOrWhiteSpace(objectId))
+                {
+                    query = query.Where(r => r.ObjectId == objectId);
+                }
+
+                var rows = await query
+                    .OrderByDescending(r => r.OccurredAtUtc)
+                    .ThenByDescending(r => r.Id)
+                    .Take(limit)
+                    .ToListAsync();
+
+                await WriteJsonAsync(context.Response, rows.Select(AuditRecordToJson).ToList());
+            }
+            catch (Exception ex)
+            {
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = AuditUnavailableError, detail = CredentialSanitizer.SanitizeSensitiveText(ex.Message) },
+                    HttpStatusCode.ServiceUnavailable);
+            }
+        }
+
         private static async Task HandleBootstrapEndpointAsync(
             HttpListenerContext context,
             string requestPath,
@@ -7713,6 +8052,13 @@ const rows = Object.entries(inv).map(([k, v]) => {
                     BootstrapAdminOutcome.NotStarted => HttpStatusCode.Conflict,
                     _ => HttpStatusCode.BadRequest,
                 };
+
+                var adminSucceeded = outcome is BootstrapAdminOutcome.Created or BootstrapAdminOutcome.AlreadyCreated;
+                await RecordAuditAsync(AuditActor.System("bootstrap"), "bootstrap.admin.create", "admin-user",
+                    payload?.Username, null,
+                    new { outcome = outcome.ToString() },
+                    adminSucceeded ? AuditResult.Success : AuditResult.Failure,
+                    adminSucceeded ? null : error);
 
                 // Nunca ecoar a password; apenas a chave de erro estável.
                 await WriteJsonAsync(
@@ -7917,6 +8263,8 @@ const rows = Object.entries(inv).map(([k, v]) => {
                 userId, payload.CurrentPassword ?? string.Empty);
             if (!currentOk)
             {
+                await RecordAuditAsync(await ResolveAuditActorAsync(session), "session.password.change", "admin-user",
+                    userId.ToString(), null, null, AuditResult.Failure, "invalid-current-password");
                 await WriteJsonAsync(
                     context.Response,
                     new { error = "invalid-current-password" },
@@ -7931,12 +8279,17 @@ const rows = Object.entries(inv).map(([k, v]) => {
                 var error = outcome == ChangePasswordResult.InvalidPassword
                     ? "invalid-new-password"
                     : "invalid-current-password";
+                await RecordAuditAsync(await ResolveAuditActorAsync(session), "session.password.change", "admin-user",
+                    userId.ToString(), null, null, AuditResult.Failure, error);
                 await WriteJsonAsync(
                     context.Response,
                     new { error },
                     HttpStatusCode.BadRequest);
                 return;
             }
+
+            await RecordAuditAsync(await ResolveAuditActorAsync(session), "session.password.change", "admin-user",
+                userId.ToString(), null, new { changed = true }, AuditResult.Success);
 
             // A password mudou e as sessões foram revogadas na mesma
             // transacção pela store — o cliente tem de voltar a autenticar-se.
@@ -8113,7 +8466,9 @@ const rows = Object.entries(inv).map(([k, v]) => {
         /// O POST é mutante e por isso já passou pelo gate 9C.2
         /// (sessão humana + CSRF) ou por credencial de máquina.
         /// </summary>
-        private static async Task HandleDiscoverySettingsEndpointAsync(HttpListenerContext context)
+        private static async Task HandleDiscoverySettingsEndpointAsync(
+            HttpListenerContext context,
+            AuditActor auditActor)
         {
             var store = new AppSettingsStore(ResolveRuntimeDataDir());
 
@@ -8166,8 +8521,23 @@ const rows = Object.entries(inv).map(([k, v]) => {
                     return;
                 }
 
+                var beforeDiscovery = new
+                {
+                    historyHours = current.Discovery.HistoryHours,
+                    maxStreams = current.Discovery.MaxStreams,
+                    keyword = current.Discovery.Keyword,
+                };
                 current.Discovery = candidate;
                 var saved = store.Save(current);
+                await RecordAuditAsync(auditActor, "settings.discovery.update", "discovery-settings",
+                    "global", beforeDiscovery,
+                    new
+                    {
+                        historyHours = saved.Discovery.HistoryHours,
+                        maxStreams = saved.Discovery.MaxStreams,
+                        keyword = saved.Discovery.Keyword,
+                    },
+                    AuditResult.Success);
                 await WriteJsonAsync(context.Response, saved.Discovery);
                 return;
             }
@@ -8347,7 +8717,8 @@ fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
 
         private static async Task HandleSetupEndpointAsync(
             HttpListenerContext context,
-            string requestPath)
+            string requestPath,
+            AuditActor auditActor)
         {
             var method = context.Request.HttpMethod;
 
@@ -8387,8 +8758,14 @@ fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
                         return;
                     }
 
+                    var beforeConfig = _telegramAuthService.GetConfigForDisplay();
                     var display = _telegramAuthService.SaveConfig(
                         payload.ApiId, payload.ApiHash, payload.PhoneNumber, payload.SessionPath);
+                    await RecordAuditAsync(auditActor, "telegram.config.update", "telegram-config",
+                        "global",
+                        TelegramConfigDisplayToJson(beforeConfig),
+                        TelegramConfigDisplayToJson(display),
+                        AuditResult.Success);
                     await WriteJsonAsync(context.Response, TelegramConfigDisplayToJson(display));
                     return;
                 }
@@ -8427,6 +8804,10 @@ fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
                     }
 
                     var status = await _telegramAuthService.StartFromSavedAsync();
+                    await RecordAuditAsync(auditActor, "telegram.auth.start", "telegram-auth", "global",
+                        null, new { state = status.State.ToString() },
+                        status.State == TelegramAuthState.Error ? AuditResult.Failure : AuditResult.Success,
+                        status.Detail);
                     await WriteJsonAsync(context.Response, TelegramAuthStatusToJson(status));
                     return;
                 }
@@ -8442,6 +8823,10 @@ fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
                     }
 
                     var status = await _telegramAuthService.SubmitCodeAsync(payload.Code);
+                    await RecordAuditAsync(auditActor, "telegram.auth.code", "telegram-auth", "global",
+                        null, new { state = status.State.ToString() },
+                        status.State == TelegramAuthState.Error ? AuditResult.Failure : AuditResult.Success,
+                        status.Detail);
                     await WriteJsonAsync(context.Response, TelegramAuthStatusToJson(status));
                     return;
                 }
@@ -8457,6 +8842,10 @@ fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
                     }
 
                     var status = await _telegramAuthService.SubmitPasswordAsync(payload.Password);
+                    await RecordAuditAsync(auditActor, "telegram.auth.password", "telegram-auth", "global",
+                        null, new { state = status.State.ToString() },
+                        status.State == TelegramAuthState.Error ? AuditResult.Failure : AuditResult.Success,
+                        status.Detail);
                     await WriteJsonAsync(context.Response, TelegramAuthStatusToJson(status));
                     return;
                 }
@@ -8490,6 +8879,7 @@ fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
                         return;
                     }
 
+                    var beforeDispatcharr = _dispatcharrConfigurationService.GetForDisplay();
                     _dispatcharrConfigurationService.Save(new DispatcharrConfigurationWrite(
                         payload.Enabled,
                         payload.BaseUrl ?? string.Empty,
@@ -8498,9 +8888,14 @@ fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
                         payload.Username,
                         payload.Password));
 
+                    var afterDispatcharr = _dispatcharrConfigurationService.GetForDisplay();
+                    await RecordAuditAsync(auditActor, "dispatcharr.config.update", "dispatcharr-config", "global",
+                        DispatcharrConfigDisplayToJson(beforeDispatcharr),
+                        DispatcharrConfigDisplayToJson(afterDispatcharr),
+                        AuditResult.Success);
                     await WriteJsonAsync(
                         context.Response,
-                        DispatcharrConfigDisplayToJson(_dispatcharrConfigurationService.GetForDisplay()));
+                        DispatcharrConfigDisplayToJson(afterDispatcharr));
                     return;
                 }
 
@@ -8524,6 +8919,10 @@ fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
 
                 var result = await _dispatcharrConnectionTester.TestAsync(
                     _dispatcharrConfigurationService.Get());
+                await RecordAuditAsync(auditActor, "dispatcharr.test", "dispatcharr-config", "global",
+                    null, new { status = result.Status.ToString() },
+                    result.Status == DispatcharrConnectionStatus.Connected ? AuditResult.Success : AuditResult.Failure,
+                    result.SanitizedDetail);
                 await WriteJsonAsync(context.Response, new
                 {
                     status = result.Status.ToString(),

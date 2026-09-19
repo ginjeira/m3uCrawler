@@ -8,6 +8,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using m3uCrawler.Services;
+using m3uCrawler.Services.Audit;
 using m3uCrawler.Services.Auth;
 using m3uCrawler.Services.Catalog;
 using m3uCrawler.Services.Configuration;
@@ -752,7 +753,8 @@ public class DashboardBootstrapEndpointTests : IAsyncLifetime
             TelegramAuthService? telegramAuth = null,
             DispatcharrConfigurationService? dispatcharrConfig = null,
             DispatcharrConnectionTester? dispatcharrTester = null,
-            OperationalReadinessService? readiness = null)
+            OperationalReadinessService? readiness = null,
+            IAuditService? auditService = null)
         {
             var port = GetFreePort();
             var listener = new HttpListener();
@@ -789,7 +791,8 @@ public class DashboardBootstrapEndpointTests : IAsyncLifetime
                             await WebDashboardService.HandleRequestWithAuthOnTestAsync(
                                 context, outputDir, resolver, composer, history,
                                 lifecycle, auth, bootstrap, webToken,
-                                telegramAuth, dispatcharrConfig, dispatcharrTester, readiness);
+                                telegramAuth, dispatcharrConfig, dispatcharrTester, readiness,
+                                auditService);
                         }
                     }
                     catch

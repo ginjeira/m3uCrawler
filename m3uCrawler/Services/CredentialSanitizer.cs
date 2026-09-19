@@ -1,4 +1,6 @@
+using System.Collections.Generic;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 
 namespace m3uCrawler.Services
@@ -23,6 +25,23 @@ namespace m3uCrawler.Services
         // Parâmetros username/password/token em query string.
         private static readonly Regex _queryCredsRegex = new(
             @"([?&])(username|password|token)=([^&\s]*)",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+        // W6a — Nomes de propriedade JSON considerados sensíveis (comparação
+        // normalizada, sem separadores e case-insensitive). O valor é sempre
+        // substituído por "***" antes de um registo de auditoria ser persistido.
+        private static readonly HashSet<string> _sensitiveJsonKeys = new(StringComparer.Ordinal)
+        {
+            "password", "passwd", "pwd", "newpassword", "currentpassword",
+            "apihash", "apikey", "token", "accesstoken", "refreshtoken",
+            "csrf", "csrftoken", "secret", "clientsecret", "sessionid",
+            "session", "authorization", "privatekey", "code", "authcode",
+            "logincode", "codehash", "cookie",
+        };
+
+        // W6a — Redacção de pares chave=valor sensíveis em texto livre.
+        private static readonly Regex _sensitiveKeyValueRegex = new(
+            @"\b(password|passwd|pwd|api[_-]?hash|api[_-]?key|token|secret|session[_-]?id|csrf[_-]?token|authorization|auth[_-]?code|login[_-]?code|code)\b\s*[:=]\s*[^\s,;&""'}]+",
             RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
         public static string SanitizeUrl(string? url)
@@ -112,6 +131,106 @@ namespace m3uCrawler.Services
                 }
             }
             return sb.ToString();
+        }
+
+        /// <summary>
+        /// W6a — Sanitiza texto livre de diagnóstico: aplica <see cref="SanitizeText"/>
+        /// (URLs com credenciais) e redige pares <c>chave=valor</c> de campos
+        /// sensíveis (password, api_hash, api_key, token, secret, code, …).
+        /// Usado para o detalhe de registos de auditoria.
+        /// </summary>
+        public static string SanitizeSensitiveText(string? text)
+        {
+            if (string.IsNullOrEmpty(text)) return string.Empty;
+            var sanitized = SanitizeText(text);
+            return _sensitiveKeyValueRegex.Replace(sanitized, match => match.Groups[1].Value + "=***");
+        }
+
+        /// <summary>
+        /// W6a — Sanitiza um documento JSON recursivamente: propriedades sensíveis
+        /// (password/api_key/token/…) passam a <c>"***"</c> e cada valor de string é
+        /// sujeito a <see cref="SanitizeText"/> (URLs com credenciais). Se o texto não
+        /// for JSON válido, cai para <see cref="SanitizeSensitiveText"/>. Nunca lança.
+        /// </summary>
+        public static string SanitizeJson(string? json)
+        {
+            if (string.IsNullOrEmpty(json)) return string.Empty;
+            try
+            {
+                using var document = JsonDocument.Parse(json);
+                var sb = new StringBuilder(json.Length);
+                WriteSanitizedElement(document.RootElement, sb);
+                return sb.ToString();
+            }
+            catch (JsonException)
+            {
+                return SanitizeSensitiveText(json);
+            }
+        }
+
+        private static void WriteSanitizedElement(JsonElement element, StringBuilder sb)
+        {
+            switch (element.ValueKind)
+            {
+                case JsonValueKind.Object:
+                    sb.Append('{');
+                    var firstProperty = true;
+                    foreach (var property in element.EnumerateObject())
+                    {
+                        if (!firstProperty) sb.Append(',');
+                        firstProperty = false;
+                        sb.Append(JsonSerializer.Serialize(property.Name));
+                        sb.Append(':');
+                        if (IsSensitiveJsonKey(property.Name))
+                        {
+                            sb.Append("\"***\"");
+                        }
+                        else
+                        {
+                            WriteSanitizedElement(property.Value, sb);
+                        }
+                    }
+                    sb.Append('}');
+                    break;
+
+                case JsonValueKind.Array:
+                    sb.Append('[');
+                    var firstItem = true;
+                    foreach (var item in element.EnumerateArray())
+                    {
+                        if (!firstItem) sb.Append(',');
+                        firstItem = false;
+                        WriteSanitizedElement(item, sb);
+                    }
+                    sb.Append(']');
+                    break;
+
+                case JsonValueKind.String:
+                    sb.Append(JsonSerializer.Serialize(SanitizeSensitiveText(element.GetString())));
+                    break;
+
+                case JsonValueKind.Number:
+                    sb.Append(element.GetRawText());
+                    break;
+
+                case JsonValueKind.True:
+                    sb.Append("true");
+                    break;
+
+                case JsonValueKind.False:
+                    sb.Append("false");
+                    break;
+
+                default:
+                    sb.Append("null");
+                    break;
+            }
+        }
+
+        private static bool IsSensitiveJsonKey(string name)
+        {
+            var normalized = name.Replace("_", string.Empty).Replace("-", string.Empty);
+            return _sensitiveJsonKeys.Contains(normalized.ToLowerInvariant());
         }
     }
 }
