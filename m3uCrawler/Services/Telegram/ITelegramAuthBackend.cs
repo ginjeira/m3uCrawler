@@ -18,6 +18,15 @@ public interface ITelegramAuthBackend : IDisposable
     string? UserName { get; }
 
     /// <summary>
+    /// Wave W5 — Cliente WTelegram subjacente, quando o backend o detém.
+    /// O valor pertence ao backend e é libertado no
+    /// <see cref="IDisposable.Dispose"/>. Implementações de teste que não
+    /// usam a biblioteca real mantêm o default (<c>null</c>); o único
+    /// consumidor é a pipeline Telegram no caminho de aplicação.
+    /// </summary>
+    WTelegram.Client? Client => null;
+
+    /// <summary>
     /// Primeiro passo do login: submete o número de telefone. Devolve o
     /// próximo item pedido (<c>verification_code</c>, <c>password</c>, …)
     /// ou <c>null</c> quando o login conclui.

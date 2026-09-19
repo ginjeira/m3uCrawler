@@ -43,7 +43,7 @@ docker build -t m3ucrawler:latest https://github.com/<teu-user>/<teu-repo>.git#m
 
 ### Executar com Docker
 ```bash
-# Primeira execução do Telegram: usar -it para introduzir código/2FA
+# CLI interactiva (sem --web): a autenticação Telegram é pedida no terminal
 docker run --rm -it \
    -v $(pwd)/runtime-data:/data \
    m3ucrawler:latest --telegram portugal --max-streams 50
@@ -58,6 +58,25 @@ docker compose run --rm -it m3ucrawler --telegram portugal --telegram-maintain -
 Notas Docker:
 - Todos os dados de runtime (output, sessão Telegram e config opcional) ficam em `m3uCrawler/runtime-data`.
 - Se quiseres usar `wtelegram.config`, coloca o ficheiro em `m3uCrawler/runtime-data/wtelegram.config`.
+
+### Primeira execução (instalação nova)
+
+- O processo pode arrancar com o **comando normal** de produção (por exemplo
+  `--telegram … --web …`) mesmo sem `wtelegram.config`/`session.dat`. Nesse
+  caso **não termina nem reinicia em loop**: regista um aviso, não corre o
+  ciclo CLI Telegram e mantém o dashboard disponível para o Setup. As acções
+  Telegram do scheduler ficam bloqueadas até à autenticação (gate por
+  capacidade).
+- A autenticação Telegram é uma **operação de aplicação**, feita no dashboard
+  (`Setup → Telegram`): guardar `api_id`/`api_hash`/telefone, submeter o
+  código de verificação e, se aplicável, a password 2FA. A sessão é
+  persistida de forma segura.
+- **Não é necessário reiniciar o processo**: depois de autenticado, as
+  execuções agendadas (`telegramRun`/`telegramMaintainRun`) e o trigger
+  manual usam o mesmo cliente Telegram autenticado.
+- Não há passos manuais escondidos: numa instalação nova, o Setup do
+  dashboard cria `wtelegram.config`/`session.dat`. Colocar previamente
+  `m3uCrawler/runtime-data/wtelegram.config` continua a ser suportado.
 
 ## Como usar
 

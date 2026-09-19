@@ -38,6 +38,12 @@ docker exec m3ucrawler ls /opt/playlists/playlist.m3u
 docker inspect --format '{{index .Config.Cmd}}' m3ucrawler | tr ',' '\n'
 ```
 
+> **Instalação nova:** `wtelegram.config`/`session.dat` podem ainda não
+> existir. Nesse caso o processo **não reinicia em loop** — o dashboard fica
+> acessível e a autenticação Telegram é feita em `Setup → Telegram`. Após
+> autenticar, as execuções (agendadas ou manuais) funcionam no mesmo
+> processo, sem restart. O ciclo automático permanece bloqueado até lá.
+
 ---
 
 ## 2. Logs

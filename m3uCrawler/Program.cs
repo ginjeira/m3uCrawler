@@ -79,6 +79,12 @@ namespace m3uCrawler
             // e o InitializeCatalogAsync foi bem-sucedido). O executor da
             // pipeline Telegram é registado dentro do bloco --telegram.
             LiveRunHost? liveRunHost = null;
+            // Wave W5 — Serviço de autenticação Telegram de aplicação
+            // (dashboard/scheduler). É construído no bloco --web e
+            // reutilizado pelo bloco --telegram para que o cliente WTelegram
+            // vivo e autenticado seja partilhado, em vez de a pipeline
+            // construir um segundo cliente com login de consola.
+            TelegramAuthService? applicationTelegramAuth = null;
             if (webEnabled)
             {
                 var dashboardOutputDir = GetOptionValue(args, "--output-dir") ?? "output";
@@ -140,6 +146,9 @@ namespace m3uCrawler
                     // OperationalReadinessService).
                     var wtelegramStore = new WtelegramConfigStore();
                     var telegramAuth = new TelegramAuthService(wtelegramStore);
+                    // Wave W5 — expor o serviço ao bloco --telegram (abaixo)
+                    // para partilha do cliente autenticado.
+                    applicationTelegramAuth = telegramAuth;
                     var dispatcharrService = new DispatcharrConfigurationService(wtelegramStore);
 
                     // Wave 5 (PHASE 9C) — Hidratação da sessão Telegram em
@@ -260,7 +269,14 @@ namespace m3uCrawler
 
             if (args.Contains("--telegram"))
             {
-                var scraper = new TelegramScraperService();
+                // Wave W5 — Caminho de aplicação (dashboard/scheduler):
+                // a pipeline reutiliza o cliente WTelegram autenticado do
+                // TelegramAuthService. Sem serviço de aplicação (CLI
+                // interactiva), mantém-se o fallback legacy que constrói
+                // um cliente a partir de wtelegram.config.
+                var scraper = applicationTelegramAuth is not null
+                    ? new TelegramScraperService(applicationTelegramAuth)
+                    : new TelegramScraperService();
                 // PHASE-OBSERVABILITY (2026-09-15): activar tracing automaticamente
                 // quando a env var M3UCRAWLER_TRACE esta' definida. Em modo
                 // observabilidade (--telegram + M3UCRAWLER_TRACE=1), o pipeline
@@ -276,7 +292,16 @@ namespace m3uCrawler
                     scraper.SetTrace(pipelineTrace);
                     Console.WriteLine($"[OBSERVABILITY] PipelineTrace active runId={pipelineTrace.RunId} minimumLevel=Debug");
                 }
-                await scraper.LoginAsync();
+                // Wave W5 — Arranque seguro numa instalação nova: o
+                // Telegram pode ainda não estar configurado/autenticado.
+                // A autenticação é uma operação de aplicação (dashboard),
+                // pelo que o arranque não pode terminar por causa dela.
+                // Se não estiver pronta, registamos um aviso não sensível,
+                // não corremos o ciclo CLI e mantemos o dashboard vivo
+                // para o Setup. O scheduler continua a respeitar o gate
+                // por capacidade (W2) até estar autenticado.
+                bool telegramReady = await TryAuthenticateTelegramForStartupAsync(
+                    scraper, applicationTelegramAuth);
 
                 var catalogDbPath = ResolveCatalogDbPath(args);
                 IReadOnlyDictionary<string, IEnumerable<string>> countryAffinityMembers =
@@ -550,6 +575,32 @@ namespace m3uCrawler
                         Console.WriteLine(
                             $"⚠️ Falha em RecoverInterruptedRunsAsync: {recoveryEx.GetType().Name}: {recoveryEx.Message}");
                     }
+                }
+
+                if (!telegramReady)
+                {
+                    // Wave W5 — O executor já foi registado acima (quando o
+                    // catálogo está disponível), pelo que uma autenticação
+                    // concluída no dashboard habilita execuções
+                    // agendadas/manuais no MESMO processo, sem reiniciar.
+                    // Aqui apenas não corremos o ciclo CLI imediato.
+                    if (webEnabled && webTask is not null)
+                    {
+                        Console.WriteLine(
+                            $"🌐 Dashboard activo em http://+:{webPort}/ (Telegram pendente de Setup).");
+                        try
+                        {
+                            await webTask;
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"❌ Dashboard task falhou: {ex.GetBaseException().Message}");
+                        }
+
+                        automationHost?.Dispose();
+                    }
+
+                    return;
                 }
 
                 do
@@ -1040,6 +1091,63 @@ namespace m3uCrawler
             }
 
             return null;
+        }
+
+        /// <summary>
+        /// Wave W5 — Prepara o Telegram no arranque sem terminar o processo.
+        ///
+        /// <para>
+        /// No caminho de aplicação (<paramref name="applicationAuth"/> não
+        /// nulo) consulta o <see cref="TelegramAuthService"/>; uma
+        /// instalação nova sem <c>wtelegram.config</c>/<c>session.dat</c>
+        /// resolve rapidamente para <c>false</c> sem rede nem consola. No
+        /// caminho legacy (CLI interactiva) autentica o cliente de consola.
+        /// </para>
+        ///
+        /// <para>
+        /// Qualquer falha é convertida num aviso não sensível e em
+        /// <c>false</c>: o chamador mantém o dashboard vivo para o Setup.
+        /// </para>
+        /// </summary>
+        internal static async Task<bool> TryAuthenticateTelegramForStartupAsync(
+            TelegramScraperService scraper,
+            TelegramAuthService? applicationAuth,
+            TimeSpan? timeout = null)
+        {
+            try
+            {
+                if (applicationAuth is not null)
+                {
+                    var status = await applicationAuth
+                        .GetStatusAsync(CancellationToken.None)
+                        .WaitAsync(timeout ?? TimeSpan.FromSeconds(20));
+
+                    if (status.State == TelegramAuthState.Authenticated)
+                    {
+                        Console.WriteLine(
+                            $"🔐 Telegram autenticado: {status.UserName ?? "(conta)"}");
+                        return true;
+                    }
+
+                    Console.WriteLine(
+                        "⚠️ Telegram ainda não autenticado " +
+                        $"(estado={status.State}). Conclua o Setup no dashboard; " +
+                        "o ciclo Telegram automático fica bloqueado até lá.");
+                    return false;
+                }
+
+                await scraper.LoginAsync();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                // Nunca expor segredos: apenas o tipo da excepção.
+                Console.WriteLine(
+                    "⚠️ Telegram indisponível no arranque " +
+                    $"({ex.GetType().Name}). O dashboard permanece disponível " +
+                    "para Setup; o ciclo Telegram automático fica bloqueado.");
+                return false;
+            }
         }
 
         /// <summary>

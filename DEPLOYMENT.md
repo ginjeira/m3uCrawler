@@ -153,12 +153,15 @@ sudo mkdir -p /opt/m3ucrawler/runtime-data/output
 # Permissões: ajustar conforme o utilizador que corre o docker daemon. Em setups típicos,
 # 755 ou 775 para o grupo docker funciona; ajustar conforme política local.
 
-# 3. Copiar wtelegram.config (a partir de backup seguro) e session.dat (se aplicável)
-#    NUNCA versionar nem criar a partir de segredos conhecidos.
-sudo cp /caminho/seguro/wtelegram.config /opt/m3ucrawler/runtime-data/wtelegram.config
-sudo chmod 600 /opt/m3ucrawler/runtime-data/wtelegram.config
+# 3. (Opcional) Copiar wtelegram.config (a partir de backup seguro) e session.dat.
+#    Numa instalação NOVA é possível arrancar SEM estes ficheiros: o container
+#    mantém o dashboard disponível e a autenticação Telegram é feita em
+#    Setup → Telegram (nenhum passo manual escondido e sem reiniciar o processo).
+#    NUNCA versionar nem criar estes ficheiros a partir de segredos conhecidos.
+# sudo cp /caminho/seguro/wtelegram.config /opt/m3ucrawler/runtime-data/wtelegram.config
+# sudo chmod 600 /opt/m3ucrawler/runtime-data/wtelegram.config
 # session.dat: se existir de uma instalação anterior, copiar; senão, será criado
-# na primeira autenticação Telegram.
+# na primeira autenticação Telegram (dashboard ou CLI interactiva).
 
 # 4. Pull da imagem
 docker compose pull
@@ -173,6 +176,13 @@ docker compose up -d
 docker compose ps
 docker compose logs --tail=200 m3ucrawler
 ```
+
+> **Instalação nova (sem `wtelegram.config`/`session.dat`):** o container
+> arranca com o comando normal do Compose e o dashboard fica acessível. O
+> ciclo Telegram automático permanece bloqueado (aviso não sensível nos
+> logs) até a autenticação ser concluída em `Setup → Telegram`. Depois de
+> autenticado, as execuções agendadas/manuais passam a funcionar no mesmo
+> processo — **sem restart**. Ver `OPERATIONS.md` § 1.
 
 ---
 
@@ -230,11 +240,14 @@ Todas as condições abaixo devem ser verdadeiras. Se alguma falhar, ir a § 8 (
    docker inspect --format '{{index .Config.Cmd}}' m3ucrawler
    # esperado: contém a string "history-hours" e "360"
    ```
-5. **Telegram autentica** (logs do primeiro ciclo):
+5. **Telegram operacional**:
    ```bash
    docker compose logs --tail=200 m3ucrawler | grep -iE 'telegram|login|wtelegram'
-   # esperado: login bem-sucedido (sem prompt interactivo)
    ```
+   - Instalação já configurada: login bem-sucedido (sem prompt interactivo).
+   - Instalação nova (sem `wtelegram.config`/`session.dat`): aviso de Telegram
+     não autenticado e dashboard acessível; concluir `Setup → Telegram` e
+     confirmar que as execuções passam a correr **sem restart** do processo.
 6. **Primeiro ciclo de manutenção arranca** dentro de ~24h:
    ```bash
    sleep 30 && docker compose logs --tail=50 m3ucrawler | grep -iE 'ciclo|cycle|maintain'

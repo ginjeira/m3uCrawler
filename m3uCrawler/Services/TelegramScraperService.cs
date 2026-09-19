@@ -4,6 +4,7 @@ using System.Text.RegularExpressions;
 using m3uCrawler.Models;
 using m3uCrawler.Services.Catalog;
 using m3uCrawler.Services.LiveRun;
+using m3uCrawler.Services.Telegram;
 using m3uCrawler.Services.Validation;
 using TL;
 
@@ -12,6 +13,19 @@ namespace m3uCrawler.Services
     public class TelegramScraperService
     {
         private readonly WTelegram.Client? _client;
+
+        // Wave W5 — Caminho de aplicação: o cliente WTelegram vivo é
+        // detido pelo TelegramAuthService (dashboard/scheduler) e lido a
+        // cada execução. Quando presente, este scraper NUNCA constrói um
+        // cliente próprio nem lê da consola.
+        private readonly ITelegramClientProvider? _clientProvider;
+
+        // Fallback legacy (CLI interactiva sem serviço de aplicação): o
+        // cliente é criado preguiçosamente a partir do wtelegram.config
+        // lido no momento (sem snapshot estático).
+        private readonly object _fallbackClientGate = new();
+        private WTelegram.Client? _fallbackClient;
+
         private readonly M3uCandidateDetector _detector = new();
 
         // EXPERIMENT-SERIAL-PER-XTREAM (2026-09-16): singleton do lock
@@ -59,13 +73,14 @@ namespace m3uCrawler.Services
         }
 
         /// <summary>
-        /// Construtor padrão: lê <c>wtelegram.config</c> e instancia o
-        /// <see cref="WTelegram.Client"/> a partir dele. Requer credenciais reais
-        /// para descoberta em produção.
+        /// Construtor padrão (legacy CLI interactiva): não cria cliente de
+        /// imediato. O cliente é criado preguiçosamente a partir do
+        /// <c>wtelegram.config</c> lido no momento do login, permitindo
+        /// que alterações ao ficheiro se apliquem sem reiniciar o
+        /// processo. Requer credenciais reais para produção.
         /// </summary>
         public TelegramScraperService()
         {
-            _client = new WTelegram.Client(Config);
         }
 
         /// <summary>
@@ -79,12 +94,51 @@ namespace m3uCrawler.Services
             _client = client;
         }
 
-        private static readonly Dictionary<string, string> _fileConfig = LoadConfigFile();
+        /// <summary>
+        /// Wave W5 — Caminho de aplicação: reutiliza o <c>WTelegram.Client</c>
+        /// vivo e autenticado detido pelo <see cref="ITelegramClientProvider"/>
+        /// (o <c>TelegramAuthService</c> do dashboard). Não constrói um
+        /// cliente de consola nem lê credenciais de <c>wtelegram.config</c>.
+        /// </summary>
+        public TelegramScraperService(ITelegramClientProvider clientProvider)
+        {
+            _clientProvider = clientProvider
+                ?? throw new ArgumentNullException(nameof(clientProvider));
+        }
+
+        /// <summary>
+        /// Wave W5 — Resolve o cliente a usar em cada operação Telegram.
+        /// No caminho de aplicação valida a autenticação e devolve o
+        /// cliente vivo do provider; no caminho legacy devolve o cliente
+        /// injectado ou cria (uma vez) o fallback a partir do ficheiro.
+        /// </summary>
+        internal WTelegram.Client RequireClient()
+        {
+            if (_clientProvider is not null)
+            {
+                if (!_clientProvider.IsAuthenticated)
+                    throw new TelegramNotAuthenticatedException();
+
+                return _clientProvider.LiveClient ?? throw new TelegramNotAuthenticatedException();
+            }
+
+            if (_client is not null)
+                return _client;
+
+            lock (_fallbackClientGate)
+            {
+                _fallbackClient ??= new WTelegram.Client(Config);
+                return _fallbackClient;
+            }
+        }
+
+        // Wave W5 — somente para testes: leitura de um ficheiro de
+        // configuração num directório explícito, sem snapshot estático.
+        internal static Dictionary<string, string> LoadConfigFileFrom(string directory)
+            => ParseConfigFile(Path.Combine(directory, "wtelegram.config"));
 
         private static Dictionary<string, string> LoadConfigFile()
         {
-            var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-
             // Procura o ficheiro junto ao executável e, em alternativa, na
             // pasta atual de trabalho (útil ao correr via "dotnet run").
             string[] candidatePaths =
@@ -94,7 +148,16 @@ namespace m3uCrawler.Services
             };
 
             string? path = candidatePaths.FirstOrDefault(File.Exists);
-            if (path == null) return dict;
+            return path == null
+                ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                : ParseConfigFile(path);
+        }
+
+        private static Dictionary<string, string> ParseConfigFile(string path)
+        {
+            var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+            if (!File.Exists(path)) return dict;
 
             foreach (var line in File.ReadAllLines(path))
             {
@@ -112,10 +175,15 @@ namespace m3uCrawler.Services
             return dict;
         }
 
-        private static string? Config(string what)
+        private string? Config(string what)
         {
+            // Wave W5 — leitura sem snapshot estático: o ficheiro é
+            // relido a cada pedido, pelo que alterações a
+            // wtelegram.config se aplicam sem reiniciar o processo.
+            var fileConfig = LoadConfigFile();
+
             // "ask" no ficheiro significa pedir interativamente na consola
-            if (_fileConfig.TryGetValue(what, out var value))
+            if (fileConfig.TryGetValue(what, out var value))
             {
                 if (value.Equals("ask", StringComparison.OrdinalIgnoreCase))
                     return AskConsole($"{what}: ");
@@ -139,13 +207,26 @@ namespace m3uCrawler.Services
         // Chamado pelo Program.cs para autenticar antes de pesquisar
         public async Task LoginAsync()
         {
+            // Wave W5 — caminho de aplicação: a autenticação já foi
+            // conduzida pelo TelegramAuthService (dashboard). Não há
+            // login interactivo nem leitura da consola. Se o serviço
+            // ainda não estiver autenticado, falhar de forma explícita
+            // (o arranque trata esta excepção sem terminar o processo).
+            if (_clientProvider is not null)
+            {
+                if (_clientProvider.IsAuthenticated && _clientProvider.LiveClient is not null)
+                    return;
+                throw new TelegramNotAuthenticatedException();
+            }
+
+            var client = RequireClient();
             const int maxAttempts = 3;
 
             for (int attempt = 1; attempt <= maxAttempts; attempt++)
             {
                 try
                 {
-                    var me = await _client!.LoginUserIfNeeded();
+                    var me = await client.LoginUserIfNeeded();
                     Console.WriteLine($"Autenticado como: {(me?.username ?? me?.first_name ?? "(sem nome)")}");
                     return;
                 }
@@ -789,11 +870,15 @@ namespace m3uCrawler.Services
             var discoveredPublications = new List<TelegramPublicationRef>();
             int messagesAnalyzed = 0;
 
+            // Wave W5 — cliente vivo único: no caminho de aplicação é o
+            // cliente autenticado do dashboard/scheduler.
+            var client = RequireClient();
+
             // Idempotente: se já autenticado, não faz nada
-            var me = await _client!.LoginUserIfNeeded();
+            var me = await client.LoginUserIfNeeded();
             Console.WriteLine($"Autenticado como: {(me?.username ?? me?.first_name ?? "(sem nome)")}");
 
-            var dialogsBase = await _client.Messages_GetAllDialogs();
+            var dialogsBase = await client.Messages_GetAllDialogs();
 
             Dialog[] dialogList;
             Dictionary<long, ChatBase> chatsDict;
@@ -880,10 +965,10 @@ namespace m3uCrawler.Services
                         {
                             return resolvedPeer switch
                             {
-                                User user => await _client.Messages_GetHistory(
+                                User user => await client.Messages_GetHistory(
                                     user, offset_id: offsetId, offset_date: default,
                                     add_offset: 0, limit: 100, max_id: 0, min_id: 0),
-                                ChatBase chat => await _client.Messages_GetHistory(
+                                ChatBase chat => await client.Messages_GetHistory(
                                     chat, offset_id: offsetId, offset_date: default,
                                     add_offset: 0, limit: 100, max_id: 0, min_id: 0),
                                 _ => null
@@ -1298,7 +1383,7 @@ namespace m3uCrawler.Services
                 {
                     var inputChannel = new InputChannel(channel.id, channel.access_hash);
                     var ids = new InputMessage[] { new InputMessageID { id = messageId } };
-                    var response = await _client.Channels_GetMessages(inputChannel, ids);
+                    var response = await RequireClient().Channels_GetMessages(inputChannel, ids);
                     if (response is Messages_ChannelMessages mcm && mcm.messages != null && mcm.messages.Length > 0)
                     {
                         var msg = mcm.messages[0] as Message;
@@ -1580,7 +1665,7 @@ namespace m3uCrawler.Services
                 // InputDocumentFileLocation que implementa
                 // InputFileLocationBase. Tambem ha overloads Document-typed
                 // mas nao suportam fileSize.
-                await _client!.DownloadFileAsync(
+                await RequireClient().DownloadFileAsync(
                     fileLocation: document.ToFileLocation(),
                     outputStream: ms,
                     dc_id: 0,

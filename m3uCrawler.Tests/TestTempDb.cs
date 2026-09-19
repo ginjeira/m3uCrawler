@@ -109,6 +109,8 @@ internal static class TestTempDb
         "phase9c6-",
         // Wave W4b — identidade externa (tvg-id).
         "wave-w4b-",
+        // Wave W5 — arranque seguro e reutilização do cliente Telegram.
+        "wave-w5-",
         // Out dir.
         "out_",
     };
@@ -143,6 +145,8 @@ internal static class TestTempDb
         "phase9c6-", "phase9c6_",
         // Wave W4b — identidade externa (tvg-id).
         "wave_w4b-", "wave-w4b-",
+        // Wave W5 — arranque seguro e reutilização do cliente Telegram.
+        "wave_w5-", "wave-w5-",
         // Auditoria / validação live (timestamped).
         "bundle_guard_validation_", "content_type_distribution_",
         "country_opcao_c_live_validation_", "country_opcao_c_validation_",

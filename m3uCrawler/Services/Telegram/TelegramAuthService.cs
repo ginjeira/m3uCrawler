@@ -26,7 +26,7 @@ public sealed record TelegramConfigDisplay(string? ApiId, string? PhoneNumber, b
 /// todas as operações são serializadas por um <see cref="SemaphoreSlim"/>.
 /// </para>
 /// </summary>
-public sealed class TelegramAuthService
+public sealed class TelegramAuthService : ITelegramClientProvider
 {
     internal const string DefaultSessionPath = "session.dat";
     private static readonly TimeSpan ResumeCacheDuration = TimeSpan.FromSeconds(30);
@@ -55,6 +55,15 @@ public sealed class TelegramAuthService
     }
 
     public bool IsAuthenticated => _state == TelegramAuthState.Authenticated;
+
+    /// <summary>
+    /// Wave W5 — cliente WTelegram vivo detido pelo backend autenticado,
+    /// ou <c>null</c> se não houver sessão. É lido em cada execução para
+    /// que uma re-autenticação (que substitui o backend) passe a ser
+    /// usada sem reiniciar o processo. O cliente pertence a este serviço:
+    /// o consumidor nunca o deve libertar.
+    /// </summary>
+    public WTelegram.Client? LiveClient => _backend?.Client;
 
     /// <summary>
     /// Persiste as credenciais (preservando as restantes chaves) e arranca

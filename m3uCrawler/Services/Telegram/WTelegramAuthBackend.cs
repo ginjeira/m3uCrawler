@@ -21,6 +21,9 @@ public sealed class WTelegramAuthBackend : ITelegramAuthBackend
 
     public bool IsAuthenticated => _client.User != null;
 
+    /// <summary>Wave W5 — cliente vivo partilhado com a pipeline Telegram.</summary>
+    public WTelegram.Client Client => _client;
+
     public string? UserName
     {
         get
