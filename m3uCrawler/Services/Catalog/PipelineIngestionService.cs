@@ -234,7 +234,7 @@ public sealed class PipelineIngestionService
                     ? AvailabilityState.Reachable
                     : AvailabilityState.Dead;
 
-                await _catalog.RecordChannelSourceAsync(
+                var channelSource = await _catalog.RecordChannelSourceAsync(
                     canonicalChannelId: canonicalId,
                     sourceId: source.Id,
                     streamUrl: stream.Url,
@@ -245,6 +245,30 @@ public sealed class PipelineIngestionService
                     matchMethod: matchMethod,
                     isEnabled: stream.IsWorking,
                     cancellationToken: cancellationToken);
+
+                // Wave W6b-2 — observação histórica apenas para streams
+                // efectivamente validados (LastTested != default). Nunca se
+                // fabrica uma observação para um stream por testar. A
+                // re-ingerir o mesmo evento de validação (mesmo LastTested)
+                // não cria duplicados: a dedupe é por
+                // (ChannelSourceId, ObservedAtUtc).
+                if (stream.LastTested != default)
+                {
+                    var observedAtUtc = stream.LastTested.Kind == DateTimeKind.Utc
+                        ? stream.LastTested
+                        : stream.LastTested.ToUniversalTime();
+                    var responseTimeMs = stream.ResponseTime > 0
+                        ? (long)Math.Round(stream.ResponseTime)
+                        : 0L;
+                    await _catalog.RecordChannelSourceObservationIfAbsentAsync(
+                        channelSourceId: channelSource.Id,
+                        quality: StreamQuality.Unknown,
+                        epg: EpgState.Unknown,
+                        availability: availability,
+                        responseTimeMs: responseTimeMs,
+                        observedAtUtc: observedAtUtc,
+                        cancellationToken: cancellationToken);
+                }
 
                 await _catalog.RecordMatchingAuditAsync(
                     normalizedIdentity: auditIdentity,

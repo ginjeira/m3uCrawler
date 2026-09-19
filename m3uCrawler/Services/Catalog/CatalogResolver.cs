@@ -430,6 +430,45 @@ public sealed class CatalogResolver
     }
 
     /// <summary>
+    /// PHASE W6b-2 — Fecha um <see cref="SyncRunEntity"/> persistindo o
+    /// instante final, o resultado (texto sanitizado) e os contadores
+    /// agregados. Um run terminado nunca regressa a <c>running</c>:
+    /// actualizações repetidas são idempotentes (o último resultado
+    /// prevalece) e não criam novas rows.
+    /// </summary>
+    public async Task<bool> FinishSyncRunAsync(
+        long id,
+        DateTime finishedAtUtc,
+        string result,
+        int countCreatedCrawlerManaged = 0,
+        int countMergedIntoExternal = 0,
+        int countProtectedExternalStreams = 0,
+        int countRemovedCrawlerManagedStreams = 0,
+        int countReviewRequired = 0,
+        int countExcluded = 0,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(result))
+            throw new ArgumentException("Result é obrigatório.", nameof(result));
+        var normalizedResult = result.Length > 200 ? result[..200] : result;
+
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var run = await context.SyncRuns.FirstOrDefaultAsync(r => r.Id == id, cancellationToken);
+        if (run == null) return false;
+
+        run.FinishedAtUtc = finishedAtUtc;
+        run.Result = normalizedResult;
+        run.CountCreatedCrawlerManaged = countCreatedCrawlerManaged;
+        run.CountMergedIntoExternal = countMergedIntoExternal;
+        run.CountProtectedExternalStreams = countProtectedExternalStreams;
+        run.CountRemovedCrawlerManagedStreams = countRemovedCrawlerManagedStreams;
+        run.CountReviewRequired = countReviewRequired;
+        run.CountExcluded = countExcluded;
+        await context.SaveChangesAsync(cancellationToken);
+        return true;
+    }
+
+    /// <summary>
     /// Lista items de revisão em estado <c>Open</c>, ordenados por
     /// data de criação (mais antigos primeiro).
     /// </summary>
@@ -2870,6 +2909,50 @@ public sealed class CatalogResolver
             ObservedAtUtc = DateTime.UtcNow,
         });
         await context.SaveChangesAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// PHASE W6b-2 — Registo idempotente de uma observação associada a um
+    /// evento de validação concreto. Deduplica por
+    /// <c>(ChannelSourceId, ObservedAtUtc)</c>: a mesma validação
+    /// re-ingerida não cria uma segunda row, mas uma nova validação
+    /// (timestamp distinto) é registada como nova amostra histórica.
+    /// Devolve <c>null</c> quando a observação já existia.
+    /// </summary>
+    public async Task<ChannelSourceObservationEntity?> RecordChannelSourceObservationIfAbsentAsync(
+        long channelSourceId,
+        StreamQuality quality,
+        EpgState epg,
+        AvailabilityState availability,
+        long responseTimeMs,
+        DateTime observedAtUtc,
+        CancellationToken cancellationToken = default)
+    {
+        if (channelSourceId <= 0)
+            throw new ArgumentException("ChannelSourceId inválido.", nameof(channelSourceId));
+
+        var observedUtc = observedAtUtc.Kind == DateTimeKind.Utc
+            ? observedAtUtc
+            : observedAtUtc.ToUniversalTime();
+
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var exists = await context.ChannelSourceObservations
+            .AnyAsync(o => o.ChannelSourceId == channelSourceId
+                        && o.ObservedAtUtc == observedUtc, cancellationToken);
+        if (exists) return null;
+
+        var entity = new ChannelSourceObservationEntity
+        {
+            ChannelSourceId = channelSourceId,
+            Quality = quality,
+            Epg = epg,
+            Availability = availability,
+            ResponseTimeMs = Math.Max(0, responseTimeMs),
+            ObservedAtUtc = observedUtc,
+        };
+        context.ChannelSourceObservations.Add(entity);
+        await context.SaveChangesAsync(cancellationToken);
+        return entity;
     }
 
     public async Task<IReadOnlyList<ChannelSourceObservationEntity>> GetChannelSourceObservationsAsync(

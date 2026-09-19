@@ -356,12 +356,16 @@ public class PipelineIngestionBridgeTests : IAsyncLifetime
         var src = (await _resolver.ListSourcesAsync()).Single(s => s.Key == sourceKey);
         var cs = (await _resolver.ListChannelSourcesAsync(sourceId: src.Id)).Single();
 
-        // Cada ingestão deve persistir uma observação do stream
-        // (PHASE 9 b continua a funcionar via ingestor).
+        // Wave W6b-2 — a ingestão regista automaticamente uma observação
+        // para streams validados (LastTested preenchido). O registo manual
+        // do dashboard adiciona uma segunda amostra ao histórico.
+        var autoRecorded = await _resolver.GetChannelSourceObservationsAsync(cs.Id);
+        Assert.Single(autoRecorded);
+
         await _resolver.RecordChannelSourceObservationAsync(
             cs.Id, StreamQuality.HD, EpgState.Available, AvailabilityState.Reachable, 120);
         var obs = await _resolver.GetChannelSourceObservationsAsync(cs.Id);
-        Assert.Single(obs);
+        Assert.Equal(2, obs.Count);
     }
 
     // ============================================================

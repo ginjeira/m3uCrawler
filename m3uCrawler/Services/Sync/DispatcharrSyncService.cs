@@ -1,3 +1,4 @@
+using m3uCrawler.Build;
 using m3uCrawler.Models;
 using m3uCrawler.Services.Catalog;
 using m3uCrawler.Services.Dispatcharr;
@@ -27,6 +28,24 @@ namespace m3uCrawler.Services.Sync
 
     public sealed class DispatcharrSyncService : IDispatcharrSyncService
     {
+        /// <summary>
+        /// PHASE W6b-2 — Acumulador em memória das contagens observadas
+        /// durante a fase de apply. Não é persistido directamente: serve
+        /// de evidência para os <c>SyncRunStep</c> e para o resultado
+        /// final (<c>ok</c>/<c>partial</c>/<c>error</c>).
+        /// </summary>
+        internal sealed class DispatcharrApplyRecorder
+        {
+            public int AttemptedChannels { get; set; }
+            public int ChannelsCreated { get; set; }
+            public int StreamsCreated { get; set; }
+            public int StreamAssociations { get; set; }
+            public int StreamsRemoved { get; set; }
+            public int StreamsProtected { get; set; }
+            public int ChannelsFailed { get; set; }
+            public List<string> Errors { get; } = new();
+        }
+
         private readonly DispatcharrConfig _config;
         private readonly IChannelMatcher _matcher;
         private readonly IStreamOrderingPolicy _ordering;
@@ -110,82 +129,250 @@ namespace m3uCrawler.Services.Sync
             Directory.CreateDirectory(_outputDir);
 
             var startedAt = DateTime.UtcNow;
-            Console.WriteLine("🛰️  A iniciar sincronização com Dispatcharr...");
+            var runId = await StartSyncRunAsync(startedAt);
+            var recorder = new DispatcharrApplyRecorder();
 
-            var discovered = await PlaylistReader.ReadAsync(playlistPath, ct: ct);
-            Console.WriteLine($"📥 Streams extraídos da playlist: {discovered.Count}");
-
-            var existing = await FetchStateAsync(ct);
-            if (existing.Version != null)
-                Console.WriteLine($"🧾 Dispatcharr versão detetada: {existing.Version}");
-
-            var options = new MatchingOptions
+            try
             {
-                MatchThreshold = _config.MatchThreshold,
-                Aliases = AliasMapFor(_aliases),
-            };
+                Console.WriteLine("🛰️  A iniciar sincronização com Dispatcharr...");
 
-            var plan = _matcher.BuildPlan(
-                discovered,
-                existing,
-                options,
-                _ordering,
-                playlistPath,
-                _config.BaseUrl,
-                _config.DryRun);
+                var readStartedAt = DateTime.UtcNow;
+                var discovered = await PlaylistReader.ReadAsync(playlistPath, ct: ct);
+                Console.WriteLine($"📥 Streams extraídos da playlist: {discovered.Count}");
 
-            var planPath = Path.Combine(_outputDir, $"dispatcharr_plan_{startedAt:yyyyMMdd_HHmmss}.json");
-            await MatchPlanSerializer.WriteAsync(plan, planPath, ct);
+                var existing = await FetchStateAsync(ct);
+                if (existing.Version != null)
+                    Console.WriteLine($"🧾 Dispatcharr versão detetada: {existing.Version}");
 
-            // PHASE 13 (Wave 13-6 part 2) — artefacto da selecção de fontes,
-            // escrito ANTES do branch dry-run/apply para que o dry-run também
-            // o produza. Mesmo `startedAt` do plano. O serializer sanitiza as
-            // URLs (nunca credenciais em disco).
-            if (selection != null)
-            {
-                var selectionPath = Path.Combine(_outputDir, $"dispatcharr_selection_{startedAt:yyyyMMdd_HHmmss}.json");
-                await DispatcharrSourceSelectionSerializer.WriteAsync(selection, selectionPath, ct);
+                var options = new MatchingOptions
+                {
+                    MatchThreshold = _config.MatchThreshold,
+                    Aliases = AliasMapFor(_aliases),
+                };
+
+                var plan = _matcher.BuildPlan(
+                    discovered,
+                    existing,
+                    options,
+                    _ordering,
+                    playlistPath,
+                    _config.BaseUrl,
+                    _config.DryRun);
+
+                await RecordSyncRunStepSafeAsync(
+                    runId, "read-plan", readStartedAt, DateTime.UtcNow,
+                    itemsProcessed: discovered.Count,
+                    itemsSucceeded: plan.Channels.Count,
+                    itemsFailed: 0,
+                    result: "ok");
+
+                var planPath = Path.Combine(_outputDir, $"dispatcharr_plan_{startedAt:yyyyMMdd_HHmmss}.json");
+                await MatchPlanSerializer.WriteAsync(plan, planPath, ct);
+
+                // PHASE 13 (Wave 13-6 part 2) — artefacto da selecção de fontes,
+                // escrito ANTES do branch dry-run/apply para que o dry-run também
+                // o produza. Mesmo `startedAt` do plano. O serializer sanitiza as
+                // URLs (nunca credenciais em disco).
+                if (selection != null)
+                {
+                    var selectionPath = Path.Combine(_outputDir, $"dispatcharr_selection_{startedAt:yyyyMMdd_HHmmss}.json");
+                    await DispatcharrSourceSelectionSerializer.WriteAsync(selection, selectionPath, ct);
+                }
+
+                // PHASE W6b-2 — passo de selecção: distingue explicitamente
+                // "applied" de "skipped" (legacy / artefacto ausente).
+                var selectionStartedAt = DateTime.UtcNow;
+                await RecordSyncRunStepSafeAsync(
+                    runId, "selection", selectionStartedAt, DateTime.UtcNow,
+                    itemsProcessed: selection == null ? 0 : selection.Channels.Count,
+                    itemsSucceeded: selection == null ? 0 : selection.Counts.Selected,
+                    itemsFailed: 0,
+                    result: selection == null ? "skipped" : "applied");
+
+                var failed = new List<FailedReportEntry>();
+                var reportBuilder = new ReportBuilder(plan, existing.Version, playlistPath, startedAt);
+                var preReport = reportBuilder.Build();
+
+                if (_config.DryRun)
+                {
+                    Console.WriteLine("🟡 Dry-run activo: a aplicar seria um no-op. Plano + relatório gerados sem chamadas HTTP de escrita.");
+                    var dryRunStartedAt = DateTime.UtcNow;
+                    await RecordSyncRunStepSafeAsync(
+                        runId, "dry-run", dryRunStartedAt, DateTime.UtcNow,
+                        itemsProcessed: plan.Channels.Count,
+                        itemsSucceeded: 0,
+                        itemsFailed: 0,
+                        result: "dry-run");
+                }
+                else
+                {
+                    var applyStartedAt = DateTime.UtcNow;
+                    await ApplyAsync(plan, existing, selection, failed, ct, recorder);
+                    var applyFinishedAt = DateTime.UtcNow;
+
+                    var succeededChannels = Math.Max(0, recorder.AttemptedChannels - recorder.ChannelsFailed);
+                    await RecordSyncRunStepSafeAsync(
+                        runId, "apply", applyStartedAt, applyFinishedAt,
+                        itemsProcessed: recorder.AttemptedChannels,
+                        itemsSucceeded: succeededChannels,
+                        itemsFailed: recorder.ChannelsFailed,
+                        result: recorder.ChannelsFailed == 0 ? "ok" : "partial");
+
+                    var created = recorder.ChannelsCreated + recorder.StreamsCreated;
+                    await RecordSyncRunStepSafeAsync(
+                        runId, "apply-create", applyStartedAt, applyFinishedAt,
+                        itemsProcessed: created, itemsSucceeded: created, itemsFailed: 0, result: "ok");
+                    await RecordSyncRunStepSafeAsync(
+                        runId, "apply-associate", applyStartedAt, applyFinishedAt,
+                        itemsProcessed: recorder.StreamAssociations,
+                        itemsSucceeded: recorder.StreamAssociations, itemsFailed: 0, result: "ok");
+                    await RecordSyncRunStepSafeAsync(
+                        runId, "apply-remove", applyStartedAt, applyFinishedAt,
+                        itemsProcessed: recorder.StreamsRemoved,
+                        itemsSucceeded: recorder.StreamsRemoved, itemsFailed: 0, result: "ok");
+                    await RecordSyncRunStepSafeAsync(
+                        runId, "apply-protected", applyStartedAt, applyFinishedAt,
+                        itemsProcessed: recorder.StreamsProtected,
+                        itemsSucceeded: recorder.StreamsProtected, itemsFailed: 0, result: "ok");
+                    if (recorder.ChannelsFailed > 0)
+                    {
+                        await RecordSyncRunStepSafeAsync(
+                            runId, "apply-errors", applyStartedAt, applyFinishedAt,
+                            itemsProcessed: recorder.ChannelsFailed,
+                            itemsSucceeded: 0,
+                            itemsFailed: recorder.ChannelsFailed,
+                            result: "error");
+                    }
+                }
+
+                preReport.Counts.Failed = failed.Count;
+                var finishedAt = DateTime.UtcNow;
+                var finalReport = reportBuilder.Finish(finishedAt, preReport, failed);
+                var reportPath = Path.Combine(_outputDir, $"dispatcharr_report_{startedAt:yyyyMMdd_HHmmss}.json");
+                await MatchPlanSerializer.WriteReportAsync(finalReport, reportPath, ct);
+
+                var finalResult = ResolveRunResult(recorder, failed.Count);
+                await FinishSyncRunSafeAsync(runId, finishedAt, finalResult, recorder);
+
+                Console.WriteLine();
+                Console.WriteLine("✅ Sincronização concluída.");
+                Console.WriteLine($"   • Matched:         {finalReport.Counts.Matched}");
+                Console.WriteLine($"   • New channels:    {finalReport.Counts.NewChannels}");
+                Console.WriteLine($"   • New streams:     {finalReport.Counts.NewStreams}");
+                Console.WriteLine($"   • Removed streams: {finalReport.Counts.RemovedStreams}");
+                Console.WriteLine($"   • Skipped:         {finalReport.Counts.Skipped}");
+                Console.WriteLine($"   • Ambiguous:       {finalReport.Counts.Ambiguous}");
+                Console.WriteLine($"   • Unchanged:       {finalReport.Counts.Unchanged}");
+                Console.WriteLine($"   • Failed:          {finalReport.Counts.Failed}");
+                Console.WriteLine($"   • Plano:           {planPath}");
+                Console.WriteLine($"   • Relatório:       {reportPath}");
+
+                return new DispatcharrSyncResult
+                {
+                    Plan = plan,
+                    Report = finalReport,
+                    PlanPath = planPath,
+                    ReportPath = reportPath,
+                    DryRun = _config.DryRun,
+                };
             }
-
-            var failed = new List<FailedReportEntry>();
-            var reportBuilder = new ReportBuilder(plan, existing.Version, playlistPath, startedAt);
-            var preReport = reportBuilder.Build();
-
-            if (_config.DryRun)
+            catch (Exception ex)
             {
-                Console.WriteLine("🟡 Dry-run activo: a aplicar seria um no-op. Plano + relatório gerados sem chamadas HTTP de escrita.");
+                // Um run que falha termina como Failed — nunca como sucesso.
+                // Apenas o tipo da excepção é persistido (nunca a mensagem,
+                // que pode conter segredos).
+                await FinishSyncRunSafeAsync(
+                    runId, DateTime.UtcNow, $"error: {ex.GetType().Name}", recorder);
+                throw;
             }
-            else
+        }
+
+        /// <summary>
+        /// PHASE W6b-2 — Cria a row de <see cref="SyncRunEntity"/> no início
+        /// da execução (<c>running</c>). Best-effort: uma falha de
+        /// observabilidade nunca aborta a sincronização. Devolve
+        /// <c>null</c> sem catálogo ou se a criação falhar.
+        /// </summary>
+        private async Task<long?> StartSyncRunAsync(DateTime startedAtUtc)
+        {
+            if (_catalog == null) return null;
+            try
             {
-                await ApplyAsync(plan, existing, selection, failed, ct);
+                return await _catalog.RecordSyncRunAsync(new SyncRunEntity
+                {
+                    StartedAtUtc = startedAtUtc,
+                    FinishedAtUtc = startedAtUtc,
+                    AppVersion = BuildInfo.Current.Commit,
+                    Result = "running",
+                });
             }
-
-            preReport.Counts.Failed = failed.Count;
-            var finalReport = reportBuilder.Finish(DateTime.UtcNow, preReport, failed);
-            var reportPath = Path.Combine(_outputDir, $"dispatcharr_report_{startedAt:yyyyMMdd_HHmmss}.json");
-            await MatchPlanSerializer.WriteReportAsync(finalReport, reportPath, ct);
-
-            Console.WriteLine();
-            Console.WriteLine("✅ Sincronização concluída.");
-            Console.WriteLine($"   • Matched:         {finalReport.Counts.Matched}");
-            Console.WriteLine($"   • New channels:    {finalReport.Counts.NewChannels}");
-            Console.WriteLine($"   • New streams:     {finalReport.Counts.NewStreams}");
-            Console.WriteLine($"   • Removed streams: {finalReport.Counts.RemovedStreams}");
-            Console.WriteLine($"   • Skipped:         {finalReport.Counts.Skipped}");
-            Console.WriteLine($"   • Ambiguous:       {finalReport.Counts.Ambiguous}");
-            Console.WriteLine($"   • Unchanged:       {finalReport.Counts.Unchanged}");
-            Console.WriteLine($"   • Failed:          {finalReport.Counts.Failed}");
-            Console.WriteLine($"   • Plano:           {planPath}");
-            Console.WriteLine($"   • Relatório:       {reportPath}");
-
-            return new DispatcharrSyncResult
+            catch (Exception ex)
             {
-                Plan = plan,
-                Report = finalReport,
-                PlanPath = planPath,
-                ReportPath = reportPath,
-                DryRun = _config.DryRun,
-            };
+                Console.WriteLine($"⚠️ Não foi possível registar a SyncRun: {ex.GetType().Name}");
+                return null;
+            }
+        }
+
+        /// <summary>PHASE W6b-2 — Fecho best-effort de um SyncRun.</summary>
+        private async Task FinishSyncRunSafeAsync(
+            long? runId, DateTime finishedAtUtc, string result, DispatcharrApplyRecorder recorder)
+        {
+            if (_catalog == null || runId is null) return;
+            try
+            {
+                await _catalog.FinishSyncRunAsync(
+                    runId.Value,
+                    finishedAtUtc,
+                    result,
+                    countCreatedCrawlerManaged: recorder.ChannelsCreated + recorder.StreamsCreated,
+                    countProtectedExternalStreams: recorder.StreamsProtected,
+                    countRemovedCrawlerManagedStreams: recorder.StreamsRemoved);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"⚠️ Não foi possível fechar a SyncRun {runId}: {ex.GetType().Name}");
+            }
+        }
+
+        /// <summary>PHASE W6b-2 — Registo best-effort de um passo do run.</summary>
+        private async Task RecordSyncRunStepSafeAsync(
+            long? runId, string step,
+            DateTime startedAtUtc, DateTime finishedAtUtc,
+            int itemsProcessed, int itemsSucceeded, int itemsFailed, string result)
+        {
+            if (_catalog == null || runId is null) return;
+            try
+            {
+                await _catalog.RecordSyncRunStepAsync(
+                    runId.Value, step, startedAtUtc, finishedAtUtc,
+                    itemsProcessed, itemsSucceeded, itemsFailed, result);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"⚠️ Não foi possível registar o passo '{step}' da SyncRun: {ex.GetType().Name}");
+            }
+        }
+
+        /// <summary>
+        /// PHASE W6b-2 — Semântica do resultado do run:
+        /// <list type="bullet">
+        ///   <item><c>dry-run</c> — plano/relatório gerados sem escrita;</item>
+        ///   <item><c>ok</c> — sem falhas de aplicação;</item>
+        ///   <item><c>partial</c> — algumas unidades aplicadas e outras
+        ///         falhadas (<c>12-DISPATCHARR.md</c> §5);</item>
+        ///   <item><c>error</c> — todas as unidades tentadas falharam, ou
+        ///         falhas sem qualquer aplicação com sucesso.</item>
+        /// </list>
+        /// </summary>
+        private string ResolveRunResult(DispatcharrApplyRecorder recorder, int failedEntries)
+        {
+            if (_config.DryRun) return "dry-run";
+            var totalFailures = Math.Max(recorder.ChannelsFailed, failedEntries);
+            if (totalFailures == 0) return "ok";
+            if (recorder.AttemptedChannels > 0 && recorder.ChannelsFailed < recorder.AttemptedChannels)
+                return "partial";
+            if (recorder.AttemptedChannels > 0) return "error";
+            return "partial";
         }
 
         private async Task<DispatcharrState> FetchStateAsync(CancellationToken ct)
@@ -203,7 +390,11 @@ namespace m3uCrawler.Services.Sync
         // PHASE 13 (Wave 13-6 part 2) — overload selection-aware. Com
         // `selection == null` o comportamento é idêntico ao legado (a
         // sobrecarga de 4 argumentos mantém-se para os testes).
-        internal async Task ApplyAsync(MatchPlan plan, DispatcharrState existing, DispatcharrSourceSelection? selection, List<FailedReportEntry> failed, CancellationToken ct)
+        //
+        // PHASE W6b-2 — `recorder` (opcional, último para preservar as
+        // chamadas posicionais existentes) acumula evidência para os
+        // SyncRunStep; não altera a semântica de apply.
+        internal async Task ApplyAsync(MatchPlan plan, DispatcharrState existing, DispatcharrSourceSelection? selection, List<FailedReportEntry> failed, CancellationToken ct, DispatcharrApplyRecorder? recorder = null)
         {
             // PHASE 13 (Wave 13-6 audit F1) — defesa redundante: um artefacto
             // não-aplicado nunca filtra.
@@ -291,7 +482,21 @@ namespace m3uCrawler.Services.Sync
                     channel, existing, groupByName, ct, channelOwnershipById,
                     effectiveStreams: selection == null ? null : effectiveStreams,
                     selectionFiltered: selection != null,
-                    failed: failed);
+                    failed: failed,
+                    recorder: recorder);
+
+                // PHASE W6b-2 — evidência por canal para os SyncRunStep.
+                if (recorder != null)
+                {
+                    recorder.AttemptedChannels++;
+                    if (ctx.PatchFailed)
+                    {
+                        recorder.ChannelsFailed++;
+                        recorder.Errors.Add(
+                            $"{ctx.PatchException?.GetType().Name}: " +
+                            CredentialSanitizer.SanitizeText(ctx.PatchException?.Message ?? string.Empty));
+                    }
+                }
 
                 // Record stream IDs the matcher intended to keep on this channel BEFORE
                 // any DELETE happens. NewStreamIds (Phase 2) are physical creations that
@@ -390,14 +595,18 @@ namespace m3uCrawler.Services.Sync
                     // conta como failed (não é erro de aplicação,
                     // é defesa intencional).
                     Console.WriteLine($"🛡️ Ownership guard: stream {streamId} ({ownership}) mantida apesar de plano a marcar como Removed.");
+                    if (recorder != null) recorder.StreamsProtected++;
                     continue;
                 }
                 try
                 {
                     await _streams.DeleteAsync(streamId, ct);
+                    if (recorder != null) recorder.StreamsRemoved++;
                 }
                 catch (DispatcharrException dex)
                 {
+                    recorder?.Errors.Add(
+                        $"delete {streamId}: {CredentialSanitizer.SanitizeText(dex.Message)}");
                     Console.WriteLine($"⚠️ Falha a remover stream {streamId}: {dex.Message}");
                 }
             }
@@ -585,7 +794,8 @@ namespace m3uCrawler.Services.Sync
             IReadOnlyDictionary<long, ChannelOwnership>? channelOwnershipById = null,
             IReadOnlyList<StreamMatchDecision>? effectiveStreams = null,
             bool selectionFiltered = false,
-            List<FailedReportEntry>? failed = null)
+            List<FailedReportEntry>? failed = null,
+            DispatcharrApplyRecorder? recorder = null)
         {
             channelOwnershipById ??= new Dictionary<long, ChannelOwnership>();
             var streams = effectiveStreams ?? channel.Streams;
@@ -634,6 +844,7 @@ namespace m3uCrawler.Services.Sync
                         IsCustom = true,
                     }, ct);
                     ctx.NewStreamIds[s.StreamUrl] = newId;
+                    if (recorder != null) recorder.StreamsCreated++;
                 }
                 catch (DispatcharrException ex)
                 {
@@ -684,6 +895,11 @@ namespace m3uCrawler.Services.Sync
                         Streams = ctx.AllStreamIds.ToList(),
                     }, ct);
                     ctx.CreatedChannelId = createdId;
+                    if (recorder != null)
+                    {
+                        recorder.ChannelsCreated++;
+                        recorder.StreamAssociations += ctx.AllStreamIds.Count;
+                    }
 
                     // Regista ownership CrawlerManaged para o canal
                     // criado. Sem isto, o rename em runs futuros não é
@@ -725,6 +941,7 @@ namespace m3uCrawler.Services.Sync
                         if (!currentIds.SequenceEqual(ctx.AllStreamIds))
                         {
                             await _channels.UpdateStreamsAsync(channel.ExistingChannelId.Value, ctx.AllStreamIds.ToList(), ct);
+                            if (recorder != null) recorder.StreamAssociations += ctx.AllStreamIds.Count;
                         }
                     }
                     else if (channel.ExistingChannelId.HasValue && selectionFiltered)
