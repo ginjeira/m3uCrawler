@@ -623,16 +623,18 @@ public class SourceSelectionPreviewTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task Response_time_plumbing_selects_lower_value_and_emits_it_non_zero()
+    public async Task Response_time_plumbing_emits_non_zero_without_reordering()
     {
         // NOTA: a produção nunca mantém ChannelSourceEntity.LastResponseTimeMs
         // (CatalogResolver escreve sempre 0); este teste insere valores
         // não-zero directamente via DbContext para provar que o plumbing
         // do preview (ChannelSourceEntity → M3uStream → SelectionCandidate →
         // SourceSelectionPreviewCandidate) propaga o valor quando existe.
+        //
+        // O tempo de resposta NÃO é critério de DL-101: a escolha segue o
+        // fingerprint (URL), pelo que a URL lexicalmente menor é seleccionada
+        // mesmo sendo a mais lenta.
         var source = await NewSourceAsync("preview-response-time");
-        // A URL lexicalmente menor tem o response time PIOR, para que a
-        // selecção só possa ser explicada pelo critério de response time.
         var slow = await RecordAsync(_channelA, source, "http://rt.example.test/a-slow.ts");
         var fast = await RecordAsync(_channelA, source, "http://rt.example.test/z-fast.ts");
         await SetResponseTimeAsync(slow.Id, 500);
@@ -644,13 +646,13 @@ public class SourceSelectionPreviewTests : IAsyncLifetime
         var channel = Assert.Single(preview.Channels);
 
         var selected = Assert.Single(channel.Selected);
-        Assert.Equal("http://rt.example.test/z-fast.ts", selected.StreamUrlSanitized);
-        Assert.Equal(40, selected.LastResponseTimeMs);
+        Assert.Equal("http://rt.example.test/a-slow.ts", selected.StreamUrlSanitized);
+        Assert.Equal(500, selected.LastResponseTimeMs);
         Assert.Equal(SelectionReasons.Diversity, selected.Reason);
 
         var rejected = Assert.Single(channel.Rejected);
-        Assert.Equal("http://rt.example.test/a-slow.ts", rejected.StreamUrlSanitized);
-        Assert.Equal(500, rejected.LastResponseTimeMs);
+        Assert.Equal("http://rt.example.test/z-fast.ts", rejected.StreamUrlSanitized);
+        Assert.Equal(40, rejected.LastResponseTimeMs);
     }
 
     [Fact]

@@ -28,7 +28,9 @@ public class ChannelSourceSelectorTests
         AvailabilityState availability = AvailabilityState.Reachable,
         long responseTimeMs = 0,
         string? externalStreamId = null,
-        bool isWorking = true)
+        bool isWorking = true,
+        string? fingerprint = null,
+        DateTime? lastValidatedUtc = null)
         => new(
             url,
             sourceId,
@@ -39,7 +41,9 @@ public class ChannelSourceSelectorTests
             responseTimeMs,
             externalStreamId,
             ProviderIdentity.Normalize(provider),
-            isWorking);
+            isWorking,
+            fingerprint,
+            lastValidatedUtc);
 
     private static SourceSelectionPolicy Policy(
         int max = 10,
@@ -47,6 +51,12 @@ public class ChannelSourceSelectorTests
         int? maxPerProvider = null,
         bool allowFallback = true)
         => new(max, distinctProviders, maxPerProvider, allowFallback);
+
+    private static SourceSelectionCriteria Criteria(
+        ChannelSourceOverride? channelOverride = null,
+        IReadOnlyList<StreamQuality>? preferredQualities = null,
+        bool useValidationFreshness = false)
+        => new(channelOverride, preferredQualities, useValidationFreshness);
 
     private static List<SelectionCandidate> Many(int count, int providers = 1)
     {
@@ -407,7 +417,10 @@ public class ChannelSourceSelectorTests
         var result = _selector.Select(candidates, Policy(max: 2, distinctProviders: false));
 
         Assert.Equal(2, result.Selected.Count);
-        Assert.All(result.Selected, s => Assert.Equal("prov-a", s.Candidate.Provider.Key));
+        // DL-102: 1 é mais preferida que 9/10, logo b1 precede a2.
+        Assert.Equal(
+            new[] { "http://b1.example/x.ts", "http://a2.example/x.ts" },
+            result.Selected.Select(s => s.Candidate.StreamUrl));
     }
 
     // ---------------- provider limits ----------------
@@ -577,8 +590,10 @@ public class ChannelSourceSelectorTests
     // ---------------- ranking ----------------
 
     [Fact]
-    public void Validated_availability_beats_reachable()
+    public void Availability_is_eligibility_only_and_does_not_rank()
     {
+        // Validated/Reachable são ambos elegíveis; a disponibilidade não é
+        // critério de DL-101, logo a ordem decide-se pelo fingerprint (URL).
         var candidates = new List<SelectionCandidate>
         {
             Candidate("http://r.example/x.ts", 1, "prov-a", availability: AvailabilityState.Reachable),
@@ -587,21 +602,23 @@ public class ChannelSourceSelectorTests
 
         var result = _selector.Select(candidates, Policy(max: 1));
 
-        Assert.Equal("http://v.example/x.ts", result.Selected.Single().Candidate.StreamUrl);
+        Assert.Equal("http://r.example/x.ts", result.Selected.Single().Candidate.StreamUrl);
     }
 
     [Fact]
-    public void Higher_source_priority_wins()
+    public void Priority_1_beats_priority_2_ascending()
     {
+        // DL-102 (regressão): a prioridade é ordinal e 1 é mais preferida
+        // que 2. Uma ordem descendente (bug anterior) seleccionaria a 9.
         var candidates = new List<SelectionCandidate>
         {
-            Candidate("http://low.example/x.ts", 1, "prov-a", priority: 1),
-            Candidate("http://high.example/x.ts", 2, "prov-a", priority: 9),
+            Candidate("http://second.example/x.ts", 1, "prov-a", priority: 2),
+            Candidate("http://first.example/x.ts", 2, "prov-a", priority: 1),
         };
 
         var result = _selector.Select(candidates, Policy(max: 1));
 
-        Assert.Equal("http://high.example/x.ts", result.Selected.Single().Candidate.StreamUrl);
+        Assert.Equal("http://first.example/x.ts", result.Selected.Single().Candidate.StreamUrl);
     }
 
     [Fact]
@@ -619,42 +636,265 @@ public class ChannelSourceSelectorTests
     }
 
     [Fact]
-    public void Lower_response_time_wins_and_unknown_is_last()
+    public void Response_time_does_not_reorder_dl101()
     {
+        // O tempo de resposta não é critério de DL-101: o candidato
+        // lexicograficamente menor vence mesmo sendo muito mais lento.
         var candidates = new List<SelectionCandidate>
         {
-            Candidate("http://unknown-rt.example/x.ts", 1, "prov-a", responseTimeMs: 0),
-            Candidate("http://slow.example/x.ts", 2, "prov-a", responseTimeMs: 900),
-            Candidate("http://fast.example/x.ts", 3, "prov-a", responseTimeMs: 120),
+            Candidate("http://a.example/x.ts", 1, "prov-a", responseTimeMs: 900),
+            Candidate("http://z.example/x.ts", 2, "prov-a", responseTimeMs: 10),
         };
 
-        var ordered = new[]
-        {
-            _selector.Select(candidates, Policy(max: 3)).Selected[0].Candidate.StreamUrl,
-            _selector.Select(candidates, Policy(max: 3)).Selected[1].Candidate.StreamUrl,
-            _selector.Select(candidates, Policy(max: 3)).Selected[2].Candidate.StreamUrl,
-        };
+        var result = _selector.Select(candidates, Policy(max: 2));
 
-        Assert.Equal(new[]
-        {
-            "http://fast.example/x.ts",
-            "http://slow.example/x.ts",
-            "http://unknown-rt.example/x.ts",
-        }, ordered);
+        Assert.Equal(
+            new[] { "http://a.example/x.ts", "http://z.example/x.ts" },
+            result.Selected.Select(s => s.Candidate.StreamUrl));
     }
 
     [Fact]
-    public void Epg_available_wins()
+    public void Epg_available_does_not_reorder_dl101()
     {
+        // EPG não é critério de DL-101: Available perde para o fingerprint
+        // (URL) lexicograficamente menor.
         var candidates = new List<SelectionCandidate>
         {
-            Candidate("http://no-epg.example/x.ts", 1, "prov-a", epg: EpgState.Unavailable),
-            Candidate("http://epg.example/x.ts", 2, "prov-a", epg: EpgState.Available),
+            Candidate("http://a-noepg.example/x.ts", 1, "prov-a", epg: EpgState.Unavailable),
+            Candidate("http://b-epg.example/x.ts", 2, "prov-a", epg: EpgState.Available),
         };
 
         var result = _selector.Select(candidates, Policy(max: 1));
 
-        Assert.Equal("http://epg.example/x.ts", result.Selected.Single().Candidate.StreamUrl);
+        Assert.Equal("http://a-noepg.example/x.ts", result.Selected.Single().Candidate.StreamUrl);
+    }
+
+    // ---------------- DL-101 (ADR-0003) ----------------
+
+    [Fact]
+    public void Dl101_channel_override_beats_priority()
+    {
+        var candidates = new List<SelectionCandidate>
+        {
+            Candidate("http://priority.example/x.ts", 1, "prov-a", priority: 1),
+            Candidate("http://overridden.example/x.ts", 2, "prov-a", priority: 9),
+        };
+
+        var result = _selector.Select(
+            candidates,
+            Policy(max: 1),
+            Criteria(channelOverride: new ChannelSourceOverride(SourceId: 2)));
+
+        Assert.Equal("http://overridden.example/x.ts", result.Selected.Single().Candidate.StreamUrl);
+    }
+
+    [Fact]
+    public void Dl101_channel_override_without_match_is_a_noop()
+    {
+        var candidates = new List<SelectionCandidate>
+        {
+            Candidate("http://a.example/x.ts", 1, "prov-a", priority: 2),
+            Candidate("http://b.example/x.ts", 2, "prov-a", priority: 1),
+        };
+
+        var result = _selector.Select(
+            candidates,
+            Policy(max: 1),
+            Criteria(channelOverride: new ChannelSourceOverride(SourceId: 999)));
+
+        Assert.Equal("http://b.example/x.ts", result.Selected.Single().Candidate.StreamUrl);
+    }
+
+    [Fact]
+    public void Dl101_eligibility_filters_before_ranking()
+    {
+        var candidates = new List<SelectionCandidate>
+        {
+            Candidate("http://best.example/x.ts", 1, "prov-a", priority: 1,
+                quality: StreamQuality.FourK, isWorking: false),
+            Candidate("http://eligible.example/x.ts", 2, "prov-a", priority: 9,
+                quality: StreamQuality.SD),
+        };
+
+        var result = _selector.Select(candidates, Policy(max: 1));
+
+        Assert.Equal("http://eligible.example/x.ts", result.Selected.Single().Candidate.StreamUrl);
+        Assert.Equal(SelectionReasons.NotWorking, result.Rejected.Single().Reason);
+    }
+
+    [Fact]
+    public void Dl101_priority_precedes_quality()
+    {
+        var candidates = new List<SelectionCandidate>
+        {
+            Candidate("http://sd-first.example/x.ts", 1, "prov-a", priority: 1, quality: StreamQuality.SD),
+            Candidate("http://4k-second.example/x.ts", 2, "prov-a", priority: 2, quality: StreamQuality.FourK),
+        };
+
+        var result = _selector.Select(candidates, Policy(max: 1));
+
+        Assert.Equal("http://sd-first.example/x.ts", result.Selected.Single().Candidate.StreamUrl);
+    }
+
+    [Fact]
+    public void Dl101_quality_policy_overrides_natural_order()
+    {
+        var candidates = new List<SelectionCandidate>
+        {
+            Candidate("http://4k.example/x.ts", 1, "prov-a", quality: StreamQuality.FourK),
+            Candidate("http://hd.example/x.ts", 2, "prov-a", quality: StreamQuality.HD),
+        };
+
+        var withPolicy = _selector.Select(
+            candidates,
+            Policy(max: 1),
+            Criteria(preferredQualities: new[] { StreamQuality.HD, StreamQuality.FourK }));
+
+        Assert.Equal("http://hd.example/x.ts", withPolicy.Selected.Single().Candidate.StreamUrl);
+
+        var natural = _selector.Select(candidates, Policy(max: 1));
+        Assert.Equal("http://4k.example/x.ts", natural.Selected.Single().Candidate.StreamUrl);
+    }
+
+    [Fact]
+    public void Dl101_quality_precedes_freshness()
+    {
+        var fresh = new DateTime(2026, 9, 10, 0, 0, 0, DateTimeKind.Utc);
+        var stale = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        var candidates = new List<SelectionCandidate>
+        {
+            Candidate("http://hd-stale.example/x.ts", 1, "prov-a", quality: StreamQuality.HD,
+                lastValidatedUtc: stale),
+            Candidate("http://sd-fresh.example/x.ts", 2, "prov-a", quality: StreamQuality.SD,
+                lastValidatedUtc: fresh),
+        };
+
+        var result = _selector.Select(candidates, Policy(max: 1), Criteria(useValidationFreshness: true));
+
+        Assert.Equal("http://hd-stale.example/x.ts", result.Selected.Single().Candidate.StreamUrl);
+    }
+
+    [Fact]
+    public void Dl101_freshness_only_applies_when_policy_enables_it()
+    {
+        var candidates = new List<SelectionCandidate>
+        {
+            Candidate("http://a-stale.example/x.ts", 1, "prov-a",
+                lastValidatedUtc: new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc)),
+            Candidate("http://z-fresh.example/x.ts", 2, "prov-a",
+                lastValidatedUtc: new DateTime(2026, 6, 1, 0, 0, 0, DateTimeKind.Utc)),
+        };
+
+        // Desligado (default) é no-op: decide o fingerprint (URL).
+        var disabled = _selector.Select(candidates, Policy(max: 1));
+        Assert.Equal("http://a-stale.example/x.ts", disabled.Selected.Single().Candidate.StreamUrl);
+
+        // Ligado: a validação mais recente precede o fingerprint.
+        var enabled = _selector.Select(candidates, Policy(max: 1), Criteria(useValidationFreshness: true));
+        Assert.Equal("http://z-fresh.example/x.ts", enabled.Selected.Single().Candidate.StreamUrl);
+    }
+
+    [Fact]
+    public void Dl101_explicit_fingerprint_precedes_stable_id()
+    {
+        var candidates = new List<SelectionCandidate>
+        {
+            Candidate("http://b.example/x.ts", 1, "prov-a", fingerprint: "beta"),
+            Candidate("http://a.example/x.ts", 2, "prov-a", fingerprint: "alpha"),
+        };
+
+        var result = _selector.Select(candidates, Policy(max: 1));
+
+        // Fingerprint distinto precede a URL/SourceId.
+        Assert.Equal("http://a.example/x.ts", result.Selected.Single().Candidate.StreamUrl);
+    }
+
+    [Fact]
+    public void Dl101_stable_id_breaks_fingerprint_ties()
+    {
+        var candidates = new List<SelectionCandidate>
+        {
+            Candidate("http://b.example/x.ts", 2, "prov-a", fingerprint: "same"),
+            Candidate("http://a.example/x.ts", 1, "prov-a", fingerprint: "same"),
+        };
+
+        var result = _selector.Select(candidates, Policy(max: 2));
+
+        // Fingerprint igual → SourceId ascendente (ID estável).
+        Assert.Equal(
+            new[] { "http://a.example/x.ts", "http://b.example/x.ts" },
+            result.Selected.Select(s => s.Candidate.StreamUrl));
+    }
+
+    [Fact]
+    public void Dl101_stable_id_uses_external_stream_id_when_source_ids_tie()
+    {
+        var candidates = new List<SelectionCandidate>
+        {
+            Candidate("http://z.example/x.ts", 1, "prov-a", externalStreamId: "b"),
+            Candidate("http://a.example/x.ts", 1, "prov-a", externalStreamId: "a"),
+        };
+
+        var result = _selector.Select(candidates, Policy(max: 2));
+
+        Assert.Equal(
+            new[] { "http://a.example/x.ts", "http://z.example/x.ts" },
+            result.Selected.Select(s => s.Candidate.StreamUrl));
+    }
+
+    [Fact]
+    public void Dl101_combined_order_matches_hand_computed_ranking()
+    {
+        var candidates = new List<SelectionCandidate>
+        {
+            // Inelegível: nunca ganha apesar de prioridade/qualidade/override.
+            Candidate("http://dead.example/0.ts", 1, "prov-a", priority: 1,
+                quality: StreamQuality.FourK, availability: AvailabilityState.Dead,
+                fingerprint: "0000"),
+            // Elegível, prioridade 2, melhor qualidade entre os elegíveis.
+            Candidate("http://keep.example/1.ts", 2, "prov-b", priority: 2,
+                quality: StreamQuality.FHD, fingerprint: "5555"),
+            // Override explícito: precede apesar de prioridade 9 e qualidade SD.
+            Candidate("http://override.example/2.ts", 3, "prov-c", priority: 9,
+                quality: StreamQuality.SD, fingerprint: "9999"),
+        };
+
+        var result = _selector.Select(
+            candidates,
+            Policy(max: 2, distinctProviders: false),
+            Criteria(
+                channelOverride: new ChannelSourceOverride(SourceId: 3),
+                preferredQualities: new[] { StreamQuality.FHD, StreamQuality.SD, StreamQuality.FourK }));
+
+        Assert.Equal(
+            new[] { "http://override.example/2.ts", "http://keep.example/1.ts" },
+            result.Selected.Select(s => s.Candidate.StreamUrl));
+        Assert.Equal(SelectionReasons.Unavailable, result.Rejected.Single().Reason);
+    }
+
+    [Fact]
+    public void Same_input_with_criteria_is_deterministic_and_order_independent()
+    {
+        var candidates = new List<SelectionCandidate>
+        {
+            Candidate("http://a.example/1.ts", 1, "prov-a", priority: 2, quality: StreamQuality.HD,
+                fingerprint: "f2", lastValidatedUtc: new DateTime(2026, 2, 1, 0, 0, 0, DateTimeKind.Utc)),
+            Candidate("http://b.example/2.ts", 2, "prov-b", priority: 1, quality: StreamQuality.SD,
+                fingerprint: "f1", lastValidatedUtc: new DateTime(2026, 3, 1, 0, 0, 0, DateTimeKind.Utc)),
+            Candidate("http://c.example/3.ts", 3, "prov-c", priority: 1, quality: StreamQuality.HD,
+                fingerprint: "f3", lastValidatedUtc: new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc)),
+        };
+        var policy = Policy(max: 2, distinctProviders: false);
+        var criteria = Criteria(
+            preferredQualities: new[] { StreamQuality.SD, StreamQuality.HD },
+            useValidationFreshness: true);
+
+        var signatures = Permutations(candidates)
+            .Select(order => Signature(_selector.Select(order, policy, criteria)))
+            .Distinct()
+            .ToList();
+
+        Assert.Single(signatures);
     }
 
     // ---------------- reasons ----------------

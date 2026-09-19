@@ -81,7 +81,52 @@ public sealed record SelectionCandidate(
     long LastResponseTimeMs,
     string? ExternalStreamId,
     ProviderIdentity Provider,
-    bool IsWorking = true);
+    bool IsWorking = true,
+    string? StreamFingerprint = null,
+    DateTime? LastSuccessfulValidationUtc = null);
+
+/// <summary>
+/// PHASE W4a — Override explícito do canal (critério 1 de DL-101).
+///
+/// <para>
+/// Representa a escolha explícita, pelo operador, de uma origem concreta
+/// para o canal: a fonte com <see cref="SourceId"/> indicado (e, quando
+/// definido, o <see cref="ExternalStreamId"/> indicado) precede qualquer
+/// outra no ranking. Não é critério persistido: é um input do snapshot da
+/// execução (<c>09-SELECTION.md:13-21</c>).
+/// </para>
+///
+/// <para>
+/// Quando definido mas sem correspondência nos candidatos, o critério é um
+/// <b>no-op</b> documentado: o selector não reordena nem falha.
+/// </para>
+/// </summary>
+public sealed record ChannelSourceOverride(
+    long SourceId,
+    string? ExternalStreamId = null);
+
+/// <summary>
+/// PHASE W4a — Inputs activáveis do ranking DL-101 que não fazem parte do
+/// contrato de <see cref="SourceSelectionPolicy"/> (limites/diversidade).
+///
+/// <para>
+/// Os critérios fixos de DL-101 são sempre avaliados pela ordem fechada;
+/// este record apenas controla os pontos que a norma deixa à policy:
+/// <list type="bullet">
+///   <item><see cref="ChannelOverride"/> — critério 1 (override explícito);</item>
+///   <item><see cref="PreferredQualities"/> — critério 4 (media/qualidade);
+///         <c>null</c>/vazio usa a ordem natural (<c>FourK &gt; UHD &gt; FHD
+///         &gt; HD &gt; SD &gt; Unknown</c>);</item>
+///   <item><see cref="UseValidationFreshness"/> — critério 5 (frescura da
+///         última validação bem sucedida); desligado por omissão, pelo que
+///         é um <b>no-op</b> documentado quando a policy não o utiliza.</item>
+/// </list>
+/// </para>
+/// </summary>
+public sealed record SourceSelectionCriteria(
+    ChannelSourceOverride? ChannelOverride = null,
+    IReadOnlyList<StreamQuality>? PreferredQualities = null,
+    bool UseValidationFreshness = false);
 
 /// <summary>
 /// PHASE 13 (Wave 13-1) — Política de selecção de fontes por canal.

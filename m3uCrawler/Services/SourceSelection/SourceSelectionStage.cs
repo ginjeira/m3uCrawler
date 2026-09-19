@@ -296,6 +296,23 @@ public sealed class SourceSelectionStage : ISourceSelectionStage
         return host.ToLowerInvariant();
     }
 
+    /// <summary>
+    /// Critério 5 de DL-101 — timestamp da última validação bem sucedida do
+    /// candidato, quando determinável. Só uma stream funcional
+    /// (<see cref="M3uStream.IsWorking"/>) conta como validação bem sucedida;
+    /// caso contrário devolve <c>null</c> (tratado como o mais antigo pelo
+    /// selector). O critério só reordena quando a policy o activa.
+    /// </summary>
+    private static DateTime? ResolveSuccessfulValidationUtc(
+        M3uStream stream,
+        ChannelSourceEntity channelSource)
+    {
+        if (!stream.IsWorking) return null;
+        return channelSource.LastTestedAtUtc == default
+            ? null
+            : channelSource.LastTestedAtUtc;
+    }
+
     private sealed class MatchedEntry
     {
         public MatchedEntry(M3uStream stream, ChannelSourceEntity channelSource, int sourcePriority)
@@ -312,7 +329,9 @@ public sealed class SourceSelectionStage : ISourceSelectionStage
                 LastResponseTimeMs: (long)stream.ResponseTime,
                 ExternalStreamId: channelSource.ExternalStreamId,
                 Provider: ProviderIdentity.Normalize(NormalizeProviderHost(stream.Url)),
-                IsWorking: stream.IsWorking);
+                IsWorking: stream.IsWorking,
+                StreamFingerprint: null,
+                LastSuccessfulValidationUtc: ResolveSuccessfulValidationUtc(stream, channelSource));
         }
 
         public M3uStream Stream { get; }

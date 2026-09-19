@@ -14,10 +14,18 @@ public interface IChannelSourceSelector
     /// Selecciona, de forma determinística, até
     /// <see cref="SourceSelectionPolicy.MaxSourcesPerChannel"/> fontes a
     /// partir de <paramref name="candidates"/>. Não faz I/O.
+    ///
+    /// <para>
+    /// <paramref name="criteria"/> activa os pontos que a norma DL-101 deixa
+    /// à policy (override explícito, preferência de qualidade, frescura de
+    /// validação). Quando <c>null</c>, aplica os defaults documentados:
+    /// sem override, qualidade por ordem natural, frescura desligada.
+    /// </para>
     /// </summary>
     SourceSelectionResult Select(
         IReadOnlyList<SelectionCandidate> candidates,
-        SourceSelectionPolicy policy);
+        SourceSelectionPolicy policy,
+        SourceSelectionCriteria? criteria = null);
 }
 
 /// <summary>
@@ -32,26 +40,40 @@ public interface IChannelSourceSelector
 /// </para>
 ///
 /// <para>
-/// Ranking (todos os critérios já existentes no domínio, por ordem):
+/// Ranking DL-101 (ordem lexicográfica fechada; ADR-0003), por ordem:
 /// <list type="number">
-///   <item><b>Availability</b> — Validated &gt; Reachable &gt; Discovered &gt; Timeout
-///         (Dead/Unreachable são inelegíveis);</item>
-///   <item><b>SourcePriority</b> descendente;</item>
-///   <item><b>Quality</b> descendente (FourK &gt; UHD &gt; FHD &gt; HD &gt; SD &gt; Unknown);</item>
-///   <item><b>Epg</b> — Available &gt; Unknown &gt; Unavailable;</item>
-///   <item><b>LastResponseTimeMs</b> ascendente (0 = desconhecido, vai para o fim);</item>
-///   <item><b>desempate estável</b> — URL normalizada (ordinal) → SourceId →
-///         ExternalStreamId (ordinal) → <b>identidade total do candidato</b>
-///         (Provider, URL ordinal, SourceId, ExternalStreamId, prioridade,
-///         qualidade, EPG, disponibilidade, response time, IsWorking).</item>
+///   <item><b>override explícito do canal</b> (<see cref="SourceSelectionCriteria.ChannelOverride"/>)
+///         — a fonte explicitamente escolhida precede as restantes;</item>
+///   <item><b>SourcePriority</b> ascendente — <c>1</c> é mais preferida que
+///         <c>2</c> (DL-102);</item>
+///   <item><b>Eligibility = Eligible</b> — filtro: só candidatos elegíveis
+///         entram no ranking (URL http/https absoluta, <c>IsWorking</c> e
+///         Availability não-terminal); os restantes são rejeitados com
+///         motivo observável;</item>
+///   <item><b>media/qualidade</b> definida em <see cref="SourceSelectionCriteria.PreferredQualities"/>
+///         (por omissão, ordem natural <c>FourK &gt; UHD &gt; FHD &gt; HD &gt; SD &gt; Unknown</c>);</item>
+///   <item><b>frescura da última validação bem sucedida</b>, apenas quando
+///         <see cref="SourceSelectionCriteria.UseValidationFreshness"/> está
+///         activo (mais recente primeiro); desligado é um <b>no-op</b>
+///         documentado;</item>
+///   <item><b>fingerprint estável</b> — <see cref="SelectionCandidate.StreamFingerprint"/>
+///         quando disponível, caso contrário a URL normalizada (ordinal);</item>
+///   <item><b>ID estável</b> — <c>SourceId</c> ascendente → <c>ExternalStreamId</c>
+///         (ordinal) → <b>identidade total do candidato</b> (Provider, URL
+///         ordinal, SourceId, ExternalStreamId, prioridade, qualidade, EPG,
+///         disponibilidade, response time, IsWorking).</item>
 /// </list>
 /// O último critério é uma ordem total sobre todos os campos do candidato:
 /// elimina qualquer dependência da ordem de entrada, mesmo em empates
 /// extremos, sem usar hashes, referências de objecto ou aleatoriedade.
-/// A URL <b>ordinal</b> é usada apenas como critério final e só distingue
-/// candidatos que a URL normalizada não distingue (ex.: diferenças de
-/// capitalização no path). Critérios do roadmap sem campo no candidato
-/// (histórico/recência) ficam para waves seguintes.
+/// </para>
+///
+/// <para>
+/// <b>Critérios legacy não-normativos removidos:</b> a disponibilidade
+/// além do filtro de elegibilidade, o EPG e o tempo de resposta <b>não</b>
+/// são critérios de DL-101 e por isso não reordenam o resultado. Continuam
+/// a viajar no candidato (elegibilidade, projecção/diagnóstico e desempate
+/// total), mas nunca <i>antes</i> de um critério normativo.
 /// </para>
 ///
 /// <para>
@@ -98,7 +120,8 @@ public sealed class ChannelSourceSelector : IChannelSourceSelector
 
     public SourceSelectionResult Select(
         IReadOnlyList<SelectionCandidate> candidates,
-        SourceSelectionPolicy policy)
+        SourceSelectionPolicy policy,
+        SourceSelectionCriteria? criteria = null)
     {
         ArgumentNullException.ThrowIfNull(candidates);
         ArgumentNullException.ThrowIfNull(policy);
@@ -114,6 +137,8 @@ public sealed class ChannelSourceSelector : IChannelSourceSelector
         }
 
         var maxPerProvider = policy.MaxSourcesPerProvider ?? int.MaxValue;
+        var channelOverride = criteria?.ChannelOverride;
+        var useFreshness = criteria?.UseValidationFreshness == true;
 
         var prepared = candidates
             .Select(c => new Prepared(c, NormalizeUrl(c.StreamUrl)))
@@ -121,12 +146,18 @@ public sealed class ChannelSourceSelector : IChannelSourceSelector
 
         var eligible = prepared
             .Where(p => p.IneligibilityReason == null)
-            .OrderBy(p => AvailabilityRank(p.Candidate.Availability))
-            .ThenByDescending(p => p.Candidate.SourcePriority)
-            .ThenByDescending(p => (int)p.Candidate.Quality)
-            .ThenByDescending(p => EpgRank(p.Candidate.Epg))
-            .ThenBy(p => ResponseTimeKey(p.Candidate.LastResponseTimeMs))
-            .ThenBy(p => p.NormalizedUrl!, StringComparer.Ordinal)
+            // 1. Override explícito do canal (DL-101 #1).
+            .OrderBy(p => IsOverrideMatch(p.Candidate, channelOverride) ? 0 : 1)
+            // 2. SourcePriority ascendente: 1 é a mais preferida (DL-102).
+            .ThenBy(p => p.Candidate.SourcePriority)
+            // 3. Eligibility = Eligible é o filtro acima; só elegíveis rankeiam.
+            // 4. media/qualidade definida pela policy (default: ordem natural).
+            .ThenBy(p => QualityKey(p.Candidate.Quality, criteria?.PreferredQualities))
+            // 5. frescura da última validação bem sucedida (no-op se desligado).
+            .ThenBy(p => FreshnessKey(p.Candidate, useFreshness))
+            // 6. fingerprint estável (fingerprint explícito ou URL normalizada).
+            .ThenBy(p => FingerprintKey(p), StringComparer.Ordinal)
+            // 7. ID estável: SourceId → ExternalStreamId → identidade total.
             .ThenBy(p => p.Candidate.SourceId)
             .ThenBy(p => p.Candidate.ExternalStreamId ?? string.Empty, StringComparer.Ordinal)
             .ThenBy(p => p.Candidate, CandidateIdentityComparer)
@@ -241,24 +272,72 @@ public sealed class ChannelSourceSelector : IChannelSourceSelector
         return SelectionReasons.NotSelected;
     }
 
-    private static int AvailabilityRank(AvailabilityState state) => state switch
+    /// <summary>
+    /// Critério 1 — indica se o candidato corresponde ao override explícito
+    /// do canal. <paramref name="channelOverride"/> <c>null</c> é no-op.
+    /// </summary>
+    private static bool IsOverrideMatch(
+        SelectionCandidate candidate,
+        ChannelSourceOverride? channelOverride)
     {
-        AvailabilityState.Validated => 0,
-        AvailabilityState.Reachable => 1,
-        AvailabilityState.Discovered => 2,
-        AvailabilityState.Timeout => 3,
-        _ => 4, // Dead/Unreachable são inelegíveis e não chegam aqui
+        if (channelOverride is null) return false;
+        if (candidate.SourceId != channelOverride.SourceId) return false;
+        if (channelOverride.ExternalStreamId is null) return true;
+        return string.Equals(
+            candidate.ExternalStreamId ?? string.Empty,
+            channelOverride.ExternalStreamId,
+            StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Critério 4 — chave de qualidade: índice na preferência da policy;
+    /// qualidades não listadas vão para o fim. Sem preferência configurada
+    /// usa a ordem natural.
+    /// </summary>
+    private static int QualityKey(
+        StreamQuality quality,
+        IReadOnlyList<StreamQuality>? preferred)
+    {
+        if (preferred is null || preferred.Count == 0) return NaturalQualityRank(quality);
+        for (var i = 0; i < preferred.Count; i++)
+        {
+            if (preferred[i] == quality) return i;
+        }
+        return preferred.Count;
+    }
+
+    private static int NaturalQualityRank(StreamQuality quality) => quality switch
+    {
+        StreamQuality.FourK => 0,
+        StreamQuality.UHD => 1,
+        StreamQuality.FHD => 2,
+        StreamQuality.HD => 3,
+        StreamQuality.SD => 4,
+        _ => 5,
     };
 
-    private static int EpgRank(EpgState state) => state switch
+    /// <summary>
+    /// Critério 5 — frescura: validações mais recentes primeiro. Quando
+    /// desactivado pela policy devolve 0 para todos (no-op documentado);
+    /// timestamp ausente é tratado como o mais antigo.
+    /// </summary>
+    private static long FreshnessKey(SelectionCandidate candidate, bool enabled)
     {
-        EpgState.Available => 1,
-        EpgState.Unknown => 0,
-        _ => -1,
-    };
+        if (!enabled) return 0;
+        var utc = candidate.LastSuccessfulValidationUtc;
+        return utc.HasValue ? long.MaxValue - utc.Value.ToUniversalTime().Ticks : long.MaxValue;
+    }
 
-    private static long ResponseTimeKey(long responseTimeMs) =>
-        responseTimeMs <= 0 ? long.MaxValue : responseTimeMs;
+    /// <summary>
+    /// Critério 6 — fingerprint estável: usa
+    /// <see cref="SelectionCandidate.StreamFingerprint"/> quando existe;
+    /// caso contrário, a URL normalizada (a BÍBLIA ainda não persiste o
+    /// fingerprint em <c>ChannelSourceEntity</c>).
+    /// </summary>
+    private static string FingerprintKey(Prepared prepared) =>
+        !string.IsNullOrEmpty(prepared.Candidate.StreamFingerprint)
+            ? prepared.Candidate.StreamFingerprint!
+            : prepared.NormalizedUrl ?? string.Empty;
 
     /// <summary>
     /// Chave de identidade de URL para deduplicação. Remove fragmento,

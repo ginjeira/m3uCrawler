@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text.Json;
 using System.Threading.Tasks;
+using Microsoft.EntityFrameworkCore;
 using m3uCrawler.Models;
 using m3uCrawler.Services.Catalog;
 using m3uCrawler.Services.SourceSelection;
@@ -71,17 +72,19 @@ public class SourceSelectionStageTests : IAsyncLifetime
         bool allowFallback = true)
         => new(max, distinctProviders, maxPerProvider, allowFallback);
 
-    private async Task<SourceEntity> NewSourceAsync(string key = "src-test")
-        => await _resolver.EnsureSourceAsync(key, key, SourceKind.Telegram, $"telegram://{key}", 0);
+    private async Task<SourceEntity> NewSourceAsync(string key = "src-test", int priority = 0)
+        => await _resolver.EnsureSourceAsync(key, key, SourceKind.Telegram, $"telegram://{key}", priority);
 
     private async Task RecordAsync(
         CanonicalChannelEntity channel,
         SourceEntity source,
         string realUrl,
         bool isEnabled = true,
-        string method = "test")
+        string method = "test",
+        AvailabilityState availability = AvailabilityState.Discovered)
         => await _resolver.RecordChannelSourceAsync(
-            channel.Id, source.Id, realUrl, matchMethod: method, isEnabled: isEnabled);
+            channel.Id, source.Id, realUrl,
+            availability: availability, matchMethod: method, isEnabled: isEnabled);
 
     private static string[] PublishedUrls(SourceSelectionStageResult r)
         => r.Published.Select(s => s.Url).ToArray();
@@ -356,9 +359,12 @@ public class SourceSelectionStageTests : IAsyncLifetime
     [Fact]
     public async Task Published_is_selected_in_rank_order_then_unmatched_in_input_order()
     {
-        var source = await NewSourceAsync();
-        await RecordAsync(_channelA, source, "http://alpha.example/slow.ts");
-        await RecordAsync(_channelA, source, "http://beta.example/fast.ts");
+        // DL-102: beta (prioridade 1) precede alpha (prioridade 2) mesmo com
+        // fingerprint (URL) maior — o rank manda sobre a URL.
+        var alpha = await NewSourceAsync("stage-alpha", priority: 2);
+        var beta = await NewSourceAsync("stage-beta", priority: 1);
+        await RecordAsync(_channelA, alpha, "http://alpha.example/slow.ts");
+        await RecordAsync(_channelA, beta, "http://beta.example/fast.ts");
 
         var slow = Stream("http://alpha.example/slow.ts", responseTime: 900);
         var unmatched1 = Stream("http://other.example/u1.ts");
@@ -396,6 +402,92 @@ public class SourceSelectionStageTests : IAsyncLifetime
         var reference = Signature(inputs);
         Assert.Equal(reference, Signature(inputs.AsEnumerable().Reverse().ToList()));
         Assert.Equal(reference, Signature(inputs.Skip(2).Concat(inputs.Take(2)).ToList()));
+    }
+
+    // ---------------- convergência (W4a) ----------------
+    [Fact]
+    public async Task Composer_and_stage_use_the_same_single_selector_implementation()
+    {
+        // A MESMA instância de ChannelSourceSelector alimenta as duas vias.
+        var selector = new ChannelSourceSelector();
+
+        var beta = await NewSourceAsync("converge-beta", priority: 1);
+        var alpha = await NewSourceAsync("converge-alpha", priority: 2);
+        var gamma = await NewSourceAsync("converge-gamma", priority: 3);
+        await RecordAsync(_channelA, beta, "http://zeta.example/1.ts");
+        await RecordAsync(_channelA, alpha, "http://alpha.example/2.ts");
+        await RecordAsync(_channelA, gamma, "http://gamma.example/3.ts");
+
+        var list = await _resolver.CreateOrderingListAsync("converge", "Converge", "pt", null);
+        await _resolver.AddOrderingItemAsync(list.Id, _channelA.Id, 0);
+
+        // Via Telegram (stage), com os MESMOS candidatos do catálogo.
+        var channelSources = await _resolver.ListChannelSourcesAsync(_channelA.Id);
+        var streams = channelSources
+            .Select(cs => Stream(
+                cs.StreamUrl,
+                isWorking: cs.Availability
+                    is not AvailabilityState.Dead and not AvailabilityState.Unreachable))
+            .ToList();
+
+        var stage = await new SourceSelectionStage(_resolver, selector)
+            .ApplyAsync(streams, SourceSelectionDefaults.DefaultPolicy);
+        var stageWinner = stage.Channels
+            .Single(c => c.CanonicalChannelId == _channelA.Id)
+            .Selected[0].Candidate.StreamUrl;
+
+        // Via composer, com a MESMA instância de selector.
+        var composer = new PlaylistComposerService(_factory, selector);
+        var composition = await composer.ComposeAsync(list.Id);
+        var composerWinner = composition.Entries
+            .Single(e => e.CanonicalChannelId == _channelA.Id)
+            .StreamUrl;
+
+        Assert.Equal(stageWinner, composerWinner);
+        // DL-102: prioridade 1 (beta) vence apesar do fingerprint (URL) maior.
+        Assert.Equal("http://zeta.example/1.ts", composerWinner);
+    }
+
+    [Fact]
+    public async Task Composer_distinguishes_no_channel_source_from_no_eligible_source()
+    {
+        var list = await _resolver.CreateOrderingListAsync("compose-empty", "Empty", "pt", null);
+        await _resolver.AddOrderingItemAsync(list.Id, _channelB.Id, 0);
+
+        // Nenhum ChannelSource no canal → no-channel-source.
+        var none = await new PlaylistComposerService(_factory).ComposeAsync(list.Id);
+        Assert.Empty(none.Entries);
+        Assert.Equal("no-channel-source", none.MissingChannels.Single().Reason);
+
+        // ChannelSource presente mas inelegível (Dead) → no-eligible-source.
+        var dead = await NewSourceAsync("compose-dead");
+        await RecordAsync(
+            _channelB, dead, "http://dead.example/1.ts",
+            availability: AvailabilityState.Dead);
+
+        var noEligible = await new PlaylistComposerService(_factory).ComposeAsync(list.Id);
+        Assert.Empty(noEligible.Entries);
+        Assert.Equal("no-eligible-source", noEligible.MissingChannels.Single().Reason);
+    }
+
+    [Fact]
+    public async Task Catalog_read_failure_is_not_evaluated_noop_not_an_error()
+    {
+        var broken = new CatalogResolver(new ThrowingDbContextFactory(), "broken");
+        var stream = Stream("http://error.example/x.ts");
+
+        var result = await new SourceSelectionStage(broken)
+            .ApplyAsync(new[] { stream }, Policy());
+
+        Assert.False(result.Applied);
+        Assert.Empty(result.Selected);
+        Assert.Same(stream, result.Published.Single());
+    }
+
+    private sealed class ThrowingDbContextFactory : IDbContextFactory<ChannelCatalogDbContext>
+    {
+        public ChannelCatalogDbContext CreateDbContext()
+            => throw new InvalidOperationException("catalog unavailable");
     }
 
     // ---------------- security ----------------

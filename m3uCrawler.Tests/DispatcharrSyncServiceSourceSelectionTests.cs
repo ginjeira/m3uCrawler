@@ -76,9 +76,11 @@ public class DispatcharrSyncServiceSourceSelectionTests : IAsyncLifetime
         var stage = await new SourceSelectionStage(_resolver).ApplyAsync(streams, policies);
         var selection = DispatcharrSourceSelectionFactory.FromStageResult(stage, policies, DateTime.UtcNow);
 
-        // Conjunto esperado escrito à mão: as 10 prioridades mais altas
-        // (prioridade 1000-i). Independe do resultado do selector.
-        var expected = urls.Take(10).ToArray();
+        // Conjunto esperado escrito à mão: as 10 prioridades mais BAIXAS
+        // (DL-102: 1 = mais preferida). As fontes têm prioridade 1000-i, pelo
+        // que as vencedoras são i=90..99, ordenadas por prioridade ascendente.
+        // Independe do resultado do selector.
+        var expected = urls.Skip(90).Reverse().ToArray();
 
         Assert.Equal(1, selection.Counts.Channels);
         Assert.Equal(100, selection.Counts.Candidates);
@@ -98,7 +100,9 @@ public class DispatcharrSyncServiceSourceSelectionTests : IAsyncLifetime
 
         Assert.Equal(10, handler.StreamPostBodies.Count);
         var postedUrls = handler.StreamPostBodies.Select(ParseUrl).ToArray();
-        Assert.Equal(expected, postedUrls);
+        // O apply publica na ordem do plano (ProposedOrder), não na ordem de
+        // rank do selector; o conjunto é exactamente o das 10 seleccionadas.
+        Assert.Equal(urls.Skip(90), postedUrls);
         Assert.All(postedUrls, u => Assert.Contains(u, expected));
 
         // Associação = exactamente as 10 seleccionadas (nunca as 90 restantes).
@@ -135,7 +139,9 @@ public class DispatcharrSyncServiceSourceSelectionTests : IAsyncLifetime
         Assert.Equal(6, selected.Count);
         Assert.Equal(3, selected.Select(s => s.Provider).Distinct(StringComparer.Ordinal).Count());
         Assert.Equal(3, selected.Count(s => s.Reason == SelectionReasons.Diversity));
-        Assert.Equal(urls.Take(6), selected.Select(s => s.StreamUrl));
+        // DL-102: prioridade 1 é a mais preferida; com prioridade 1000-i as
+        // escolhidas são i=6..11, em ordem ascendente de prioridade.
+        Assert.Equal(urls.Skip(6).Reverse(), selected.Select(s => s.StreamUrl));
 
         var handler = new SourceSelectionRecordingHandler { NextNewStreamId = 5100 };
         var (svc, _, state) = BuildApplySvc(handler: handler);
@@ -145,7 +151,10 @@ public class DispatcharrSyncServiceSourceSelectionTests : IAsyncLifetime
         await svc.ApplyAsync(Plan(decision), state, selection, new List<FailedReportEntry>(), CancellationToken.None);
 
         Assert.Equal(6, handler.StreamPostBodies.Count);
-        Assert.Equal(selected.Select(s => s.StreamUrl), handler.StreamPostBodies.Select(ParseUrl));
+        // Comparação de conjunto: o apply publica na ordem do plano.
+        Assert.Equal(
+            selected.Select(s => s.StreamUrl).OrderBy(x => x, StringComparer.Ordinal),
+            handler.StreamPostBodies.Select(ParseUrl).OrderBy(x => x, StringComparer.Ordinal));
         Assert.Equal(6, ParseStreams(handler.ChannelPostBodies.Single()).Length);
     }
 
@@ -185,7 +194,10 @@ public class DispatcharrSyncServiceSourceSelectionTests : IAsyncLifetime
         await svc.ApplyAsync(Plan(decision), state, selection, new List<FailedReportEntry>(), CancellationToken.None);
 
         Assert.Equal(6, handler.StreamPostBodies.Count);
-        Assert.Equal(selected.Select(s => s.StreamUrl), handler.StreamPostBodies.Select(ParseUrl));
+        // Comparação de conjunto: o apply publica na ordem do plano.
+        Assert.Equal(
+            selected.Select(s => s.StreamUrl).OrderBy(x => x, StringComparer.Ordinal),
+            handler.StreamPostBodies.Select(ParseUrl).OrderBy(x => x, StringComparer.Ordinal));
     }
 
     // ---------------- cleanup (unselected crawler-managed) ----------------

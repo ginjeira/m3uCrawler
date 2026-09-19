@@ -1,12 +1,11 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Text;
-using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.EntityFrameworkCore;
 using m3uCrawler.Models;
+using m3uCrawler.Services.SourceSelection;
 
 namespace m3uCrawler.Services.Catalog;
 
@@ -17,8 +16,14 @@ namespace m3uCrawler.Services.Catalog;
 ///     <item>os <see cref="ChannelSourceEntity"/> disponíveis para cada
 ///             <see cref="CanonicalChannelEntity"/>;</item>
 ///     <item>uma <see cref="SourcePriorityPolicyEntity"/> (global ou
-///             por canal) que escolhe qual a stream a usar.</item>
+///             por canal) que define a preferência de qualidade.</item>
 ///   </list>
+///
+/// A escolha da stream concreta é delegada no <b>único</b> selector
+/// <see cref="IChannelSourceSelector"/> (DL-101 / ADR-0003), o mesmo usado
+/// pelo <see cref="SourceSelectionStage"/> do pipeline Telegram. O composer
+/// não re-rankeia nem adiciona scoring: projeta <see cref="SelectionCandidate"/>
+/// e pede uma única fonte (<c>MaxSourcesPerChannel = 1</c>).
 ///
 /// A playlist gerada preserva proveniência interna: o stream
 /// escolhido fica registado em <see cref="PlaylistEntry.ChosenChannelSourceId"/>.
@@ -26,10 +31,14 @@ namespace m3uCrawler.Services.Catalog;
 public sealed class PlaylistComposerService
 {
     private readonly IDbContextFactory<ChannelCatalogDbContext> _factory;
+    private readonly IChannelSourceSelector _selector;
 
-    public PlaylistComposerService(IDbContextFactory<ChannelCatalogDbContext> factory)
+    public PlaylistComposerService(
+        IDbContextFactory<ChannelCatalogDbContext> factory,
+        IChannelSourceSelector? selector = null)
     {
         _factory = factory;
+        _selector = selector ?? new ChannelSourceSelector();
     }
 
     /// <summary>
@@ -78,12 +87,6 @@ public sealed class PlaylistComposerService
             .GroupBy(cs => cs.CanonicalChannelId)
             .ToDictionary(g => g.Key, g => g.ToList());
 
-        var eligibleByChannel = channelSources
-            .Where(cs => cs.Availability != AvailabilityState.Dead
-                      && cs.Availability != AvailabilityState.Unreachable)
-            .GroupBy(cs => cs.CanonicalChannelId)
-            .ToDictionary(g => g.Key, g => g.ToList());
-
         var globalPolicy = await context.SourcePriorityPolicies
             .AsNoTracking()
             .FirstOrDefaultAsync(p => p.Scope == "global", cancellationToken);
@@ -94,6 +97,12 @@ public sealed class PlaylistComposerService
 
         var entries = new List<PlaylistEntry>(items.Count);
         var missing = new List<MissingChannel>();
+
+        var compositionPolicy = new SourceSelectionPolicy(
+            MaxSourcesPerChannel: 1,
+            PreferDistinctProviders: false,
+            MaxSourcesPerProvider: 1,
+            AllowFallbackToSameProvider: true);
 
         foreach (var item in items)
         {
@@ -108,20 +117,33 @@ public sealed class PlaylistComposerService
                 missing.Add(new MissingChannel(channel.Id, "no-channel-source"));
                 continue;
             }
-            if (!eligibleByChannel.TryGetValue(channel.Id, out var candidates) || candidates.Count == 0)
+
+            var priorityPolicy = perChannelPolicies.TryGetValue(channel.Id, out var p) ? p : globalPolicy;
+            var criteria = new SourceSelectionCriteria(
+                ChannelOverride: overridePolicyScopeChannelId is null
+                    ? null
+                    : new ChannelSourceOverride(overridePolicyScopeChannelId.Value),
+                PreferredQualities: ParsePreferredQualities(priorityPolicy?.PreferredQuality),
+                UseValidationFreshness: false);
+
+            var byCandidate = new Dictionary<SelectionCandidate, ChannelSourceEntity>(
+                ReferenceEqualityComparer.Instance);
+            var candidates = new List<SelectionCandidate>(allCandidates.Count);
+            foreach (var channelSource in allCandidates)
+            {
+                var candidate = ToCandidate(channelSource);
+                candidates.Add(candidate);
+                byCandidate[candidate] = channelSource;
+            }
+
+            var result = _selector.Select(candidates, compositionPolicy, criteria);
+            if (result.Selected.Count == 0)
             {
                 missing.Add(new MissingChannel(channel.Id, "no-eligible-source"));
                 continue;
             }
 
-            var policy = perChannelPolicies.TryGetValue(channel.Id, out var p) ? p : globalPolicy;
-            var chosen = SourceSelector.Select(candidates, policy, overridePolicyScopeChannelId);
-            if (chosen == null)
-            {
-                missing.Add(new MissingChannel(channel.Id, "no-eligible-source"));
-                continue;
-            }
-
+            var chosen = byCandidate[result.Selected[0].Candidate];
             entries.Add(new PlaylistEntry(
                 channel.Id,
                 channel.Key,
@@ -135,6 +157,53 @@ public sealed class PlaylistComposerService
         }
 
         return new PlaylistComposition(list.Id, list.Name, entries, missing, entries.Count);
+    }
+
+    /// <summary>
+    /// Projeta um <see cref="ChannelSourceEntity"/> para o candidato DL-101.
+    /// <c>IsWorking</c> deriva do estado de disponibilidade (o catálogo não
+    /// guarda um flag próprio) e a frescura só conta para streams funcionais.
+    /// </summary>
+    private static SelectionCandidate ToCandidate(ChannelSourceEntity channelSource)
+    {
+        var working = channelSource.Availability
+            is not AvailabilityState.Dead and not AvailabilityState.Unreachable;
+
+        return new SelectionCandidate(
+            StreamUrl: channelSource.StreamUrl,
+            SourceId: channelSource.SourceId,
+            SourcePriority: channelSource.Source?.Priority ?? 0,
+            Quality: channelSource.Quality,
+            Epg: channelSource.Epg,
+            Availability: channelSource.Availability,
+            LastResponseTimeMs: channelSource.LastResponseTimeMs,
+            ExternalStreamId: channelSource.ExternalStreamId,
+            Provider: ProviderIdentity.Normalize(
+                SourceSelectionStage.NormalizeProviderHost(channelSource.StreamUrl)),
+            IsWorking: working,
+            StreamFingerprint: null,
+            LastSuccessfulValidationUtc: working && channelSource.LastTestedAtUtc != default
+                ? channelSource.LastTestedAtUtc
+                : null);
+    }
+
+    /// <summary>
+    /// Converte a preferência de qualidade persistida (CSV, ex.
+    /// <c>"UHD,FHD,HD,SD"</c>) na ordem usada pelo critério 4 de DL-101.
+    /// Tokens desconhecidos são ignorados; vazio significa ordem natural.
+    /// </summary>
+    private static IReadOnlyList<StreamQuality>? ParsePreferredQualities(string? csv)
+    {
+        if (string.IsNullOrWhiteSpace(csv)) return null;
+        var list = new List<StreamQuality>();
+        foreach (var part in csv.Split(',', StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (Enum.TryParse<StreamQuality>(part.Trim(), true, out var quality))
+            {
+                list.Add(quality);
+            }
+        }
+        return list.Count == 0 ? null : list;
     }
 }
 
@@ -160,118 +229,3 @@ public sealed record PlaylistEntry(
     string Quality);
 
 public sealed record MissingChannel(long CanonicalChannelId, string Reason);
-
-/// <summary>
-/// Aplica a política de prioridade para escolher a melhor stream
-/// para um canal. Estratégia (PHASE 6) — pura, sem I/O.
-/// </summary>
-public static class SourceSelector
-{
-    public static ChannelSourceEntity? Select(
-        IReadOnlyList<ChannelSourceEntity> candidates,
-        SourcePriorityPolicyEntity? policy,
-        long? preferredSourceId = null)
-    {
-        if (candidates.Count == 0) return null;
-        if (candidates.Count == 1) return candidates[0];
-
-        var order = ParseCriteria(policy?.CriteriaJson);
-        var preferredQuality = ParsePreferredQualities(policy?.PreferredQuality);
-
-        // 1. Manual (preferredSourceId).
-        if (preferredSourceId.HasValue && order.Contains("Manual"))
-        {
-            var manual = candidates.FirstOrDefault(c => c.SourceId == preferredSourceId.Value);
-            if (manual != null) return manual;
-        }
-
-        IEnumerable<ChannelSourceEntity> work = candidates;
-
-        // 2. Quality (preferred order).
-        if (order.Contains("Quality") && preferredQuality.Count > 0)
-        {
-            work = work
-                .OrderBy(c => QualityRank(c.Quality, preferredQuality))
-                .ThenByDescending(c => c.Source?.Priority ?? 0);
-            var first = work.FirstOrDefault();
-            if (first != null) return first;
-        }
-
-        // 3. Reliability (channels que responderam, com menor response time).
-        if (order.Contains("Reliability"))
-        {
-            return work
-                .OrderBy(c => c.LastResponseTimeMs == 0 ? long.MaxValue : c.LastResponseTimeMs)
-                .ThenByDescending(c => c.Source?.Priority ?? 0)
-                .FirstOrDefault();
-        }
-
-        // 4. EPG preferida.
-        if (order.Contains("EPG"))
-        {
-            return work
-                .OrderBy(c => c.Epg == EpgState.Available ? 0 : 1)
-                .ThenByDescending(c => c.Source?.Priority ?? 0)
-                .FirstOrDefault();
-        }
-
-        // 5. Availability (Validated > Reachable > Discovered > Timeout > Unreachable > Dead).
-        if (order.Contains("Availability"))
-        {
-            return work
-                .OrderBy(c => AvailabilityRank(c.Availability))
-                .ThenByDescending(c => c.Source?.Priority ?? 0)
-                .FirstOrDefault();
-        }
-
-        // Default: source priority desc.
-        return candidates
-            .OrderByDescending(c => c.Source?.Priority ?? 0)
-            .ThenBy(c => c.Id)
-            .FirstOrDefault();
-    }
-
-    private static int QualityRank(StreamQuality q, List<StreamQuality> preferred)
-    {
-        var idx = preferred.IndexOf(q);
-        return idx < 0 ? preferred.Count : idx;
-    }
-
-    private static int AvailabilityRank(AvailabilityState s) => s switch
-    {
-        AvailabilityState.Validated => 0,
-        AvailabilityState.Reachable => 1,
-        AvailabilityState.Discovered => 2,
-        AvailabilityState.Timeout => 3,
-        AvailabilityState.Unreachable => 4,
-        AvailabilityState.Dead => 5,
-        _ => 6,
-    };
-
-    public static IReadOnlyList<string> ParseCriteria(string? json)
-    {
-        if (string.IsNullOrWhiteSpace(json)) return Array.Empty<string>();
-        try
-        {
-            return JsonSerializer.Deserialize<List<string>>(json) ?? new List<string>();
-        }
-        catch
-        {
-            return Array.Empty<string>();
-        }
-    }
-
-    public static List<StreamQuality> ParsePreferredQualities(string? csv)
-    {
-        var list = new List<StreamQuality>();
-        if (string.IsNullOrWhiteSpace(csv)) return list;
-        foreach (var part in csv.Split(',', StringSplitOptions.RemoveEmptyEntries))
-        {
-            if (Enum.TryParse<StreamQuality>(part.Trim(), true, out var q))
-            {
-                list.Add(q);
-            }
-        }
-        return list;
-    }
-}
