@@ -47,6 +47,7 @@ namespace m3uCrawler.Services.Sync
                     Title = title,
                     Group = group ?? string.Empty,
                     Logo = logo ?? string.Empty,
+                    OriginalTvgId = ExtractAttribute(pendingExtInf, "tvg-id") ?? string.Empty,
                     IsWorking = true,
                     OriginalExtInf = pendingExtInf ?? string.Empty,
                 };

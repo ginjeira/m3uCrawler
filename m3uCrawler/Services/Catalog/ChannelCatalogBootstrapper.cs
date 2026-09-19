@@ -166,10 +166,13 @@ public sealed class ChannelCatalogBootstrapper
             _logger.LogInformation(
                 "Baseline import: source={Source} catalogId={CatalogId} version={Version} " +
                 "channelsCreated={Created} channelsUpdated={Updated} aliasesAdded={AliasesAdded} " +
-                "aliasesSkipped={AliasesSkipped}",
+                "aliasesSkipped={AliasesSkipped} externalIdentitiesAdded={ExternalIdentitiesAdded} " +
+                "externalIdentitiesSkipped={ExternalIdentitiesSkipped} externalIdentityConflicts={ExternalIdentityConflicts}",
                 baselinePath ?? ("embedded:" + CatalogBaselineImporter.EmbeddedBaselineResourceName),
                 report.CatalogId, report.Version, report.ChannelsCreated,
-                report.ChannelsUpdated, report.AliasesAdded, report.AliasesSkipped);
+                report.ChannelsUpdated, report.AliasesAdded, report.AliasesSkipped,
+                report.ExternalIdentitiesAdded, report.ExternalIdentitiesSkipped,
+                report.ExternalIdentityConflicts);
             foreach (var warning in report.Warnings)
             {
                 _logger.LogWarning("Baseline import warning: {Warning}", warning);

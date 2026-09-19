@@ -307,6 +307,24 @@ public static class CatalogBaselineImporter
             existingChannels.SelectMany(c => c.Aliases.Select(a => a.NormalizedAlias)),
             StringComparer.Ordinal);
 
+        // Indexar identidades externas existentes por (Namespace, Value).
+        // Qualquer linha já existente é tratada como estado do
+        // runtime/operador: o import do baseline NUNCA a sobrepõe
+        // (ADR-0005 §4). O canal dono é guardado para reportar
+        // conflitos em vez de os aplicar silenciosamente.
+        var existingExternal = new Dictionary<(string Namespace, string Value), long>(
+            await context.ExternalIdentities
+                .AsNoTracking()
+                .Select(e => new { e.Namespace, e.Value, e.CanonicalChannelId })
+                .ToDictionaryAsync(
+                    e => (e.Namespace, e.Value),
+                    e => e.CanonicalChannelId,
+                    ct));
+
+        // Ownership das identidades externas criadas nesta importação
+        // (canal ainda sem Id atribuído). Mapeia para a Key do canal.
+        var externalOwnersThisImport = new Dictionary<(string Namespace, string Value), string>();
+
         foreach (var (sourceKey, channelBaseline) in baseline.Matching.Examples)
         {
             var key = CanonicalIdToKey(channelBaseline.CanonicalId);
@@ -424,10 +442,98 @@ public static class CatalogBaselineImporter
                 existingAliases.Add(normalized);
                 report.AliasesAdded++;
             }
+
+            // Identidades externas conhecidas (tvg-id / provider).
+            // Mecanismo implementado mesmo quando o baseline não as
+            // fornece (o baseline PT actual não fornece): nesse caso
+            // nada é inserido e external_identities permanece vazia.
+            // Idempotente e nunca sobrepõe linhas existentes.
+            foreach (var (extNamespace, extRawValue) in EnumerateBaselineExternalIdentities(channelBaseline))
+            {
+                var ns = extNamespace.Trim();
+                var canonicalValue = ExternalIdentityNormalizer.Normalize(extRawValue);
+                if (ns.Length == 0 || canonicalValue.Length == 0)
+                {
+                    continue;
+                }
+
+                var extKey = (Namespace: ns, Value: canonicalValue);
+
+                if (existingExternal.TryGetValue(extKey, out var existingOwnerId))
+                {
+                    if (existingOwnerId != channel.Id)
+                    {
+                        report.ExternalIdentityConflicts++;
+                        report.Warnings.Add(
+                            $"external identity '{extKey.Namespace}:{canonicalValue}' já pertence a outro canal; não sobreposta.");
+                    }
+
+                    report.ExternalIdentitiesSkipped++;
+                    continue;
+                }
+
+                if (externalOwnersThisImport.TryGetValue(extKey, out var importOwnerKey))
+                {
+                    if (!string.Equals(importOwnerKey, channel.Key, StringComparison.Ordinal))
+                    {
+                        report.ExternalIdentityConflicts++;
+                        report.Warnings.Add(
+                            $"external identity '{extKey.Namespace}:{canonicalValue}' duplicada no baseline; ignorada.");
+                    }
+
+                    report.ExternalIdentitiesSkipped++;
+                    continue;
+                }
+
+                context.ExternalIdentities.Add(new ExternalIdentityEntity
+                {
+                    CanonicalChannel = channel,
+                    CanonicalChannelId = channel.Id,
+                    Namespace = extKey.Namespace,
+                    Value = canonicalValue,
+                    Origin = "baseline",
+                    Confidence = 1.0,
+                    CreatedAtUtc = now,
+                    UpdatedAtUtc = now,
+                });
+                externalOwnersThisImport[extKey] = channel.Key;
+                report.ExternalIdentitiesAdded++;
+            }
         }
 
         await context.SaveChangesAsync(ct);
         return report;
+    }
+
+    /// <summary>
+    /// Enumera as identidades externas declaradas por um canal do
+    /// baseline como pares (Namespace, Valor). O baseline PT actual
+    /// não declara nenhumas; a função existe para baselines futuros.
+    /// </summary>
+    private static IEnumerable<(string Namespace, string Value)> EnumerateBaselineExternalIdentities(
+        ChannelBaseline channelBaseline)
+    {
+        if (channelBaseline?.TvgIds is { Count: > 0 })
+        {
+            foreach (var tvgId in channelBaseline.TvgIds)
+            {
+                if (!string.IsNullOrWhiteSpace(tvgId))
+                {
+                    yield return (ExternalIdentityNamespaces.TvgId, tvgId);
+                }
+            }
+        }
+
+        if (channelBaseline?.ExternalIds is { Count: > 0 })
+        {
+            foreach (var pair in channelBaseline.ExternalIds)
+            {
+                if (!string.IsNullOrWhiteSpace(pair.Key) && !string.IsNullOrWhiteSpace(pair.Value))
+                {
+                    yield return (pair.Key, pair.Value);
+                }
+            }
+        }
     }
 }
 
@@ -447,7 +553,16 @@ public sealed class CatalogBaselineImportReport
     public int AliasesAdded { get; set; }
     public int AliasesSkipped { get; set; }
 
+    /// <summary>Identidades externas criadas a partir do baseline.</summary>
+    public int ExternalIdentitiesAdded { get; set; }
+
+    /// <summary>Identidades externas já existentes e preservadas (não sobrepostas).</summary>
+    public int ExternalIdentitiesSkipped { get; set; }
+
+    /// <summary>Identidades externas em conflito (valor já ligado a outro canal).</summary>
+    public int ExternalIdentityConflicts { get; set; }
+
     public List<string> Warnings { get; } = new();
 
-    public int TotalChanges => ChannelsCreated + ChannelsUpdated + AliasesAdded;
+    public int TotalChanges => ChannelsCreated + ChannelsUpdated + AliasesAdded + ExternalIdentitiesAdded;
 }

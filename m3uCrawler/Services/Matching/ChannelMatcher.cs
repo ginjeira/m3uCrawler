@@ -270,7 +270,7 @@ namespace m3uCrawler.Services.Matching
                 if (_catalog != null)
                 {
                     var normalized = ChannelNormalizer.Normalize(s.Title);
-                    catalogResolution = await _catalog.ResolveAsync(normalized);
+                    catalogResolution = await _catalog.ResolveAsync(normalized, s.OriginalTvgId);
                     if (catalogResolution.HasValue && catalogResolution.Value.Kind == CatalogResolutionKind.Rule)
                     {
                         if (catalogResolution.Value.RuleDisposition == RuleDisposition.ReviewOnly)
@@ -307,6 +307,28 @@ namespace m3uCrawler.Services.Matching
                             });
                             continue;
                         }
+                    }
+                    if (catalogResolution.Value.Kind == CatalogResolutionKind.Ambiguous)
+                    {
+                        // Identidade externa ambígua (mesmo valor →
+                        // canais distintos): nunca escolher, nunca
+                        // criar. Vai para Review.
+                        await _catalog.UpsertReviewItemAsync(
+                            normalized,
+                            s.Group ?? string.Empty,
+                            "ambiguous-external-identity",
+                            catalogResolution.Value.RuleReason ?? string.Empty);
+                        dispositionCounts["unknownReviewRequired"] =
+                            dispositionCounts["unknownReviewRequired"] + 1;
+                        reviewRequired.Add(new ClassifiedExclusion
+                        {
+                            Title = s.Title ?? string.Empty,
+                            Group = s.Group ?? string.Empty,
+                            Kind = ChannelKind.Unknown,
+                            Reason = "ambiguous-external-identity",
+                            MatchingDisposition = "unknown-review-required",
+                        });
+                        continue;
                     }
                     canCreateNew = catalogResolution.Value.AllowsNewChannel;
                 }

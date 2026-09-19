@@ -58,12 +58,14 @@ namespace m3uCrawler.Services
                         stream.Title = ExtractTitle(pendingExtInf);
                         stream.Group = ExtractAttribute(pendingExtInf, "group-title");
                         stream.Logo = ExtractAttribute(pendingExtInf, "tvg-logo");
+                        stream.OriginalTvgId = ExtractAttribute(pendingExtInf, "tvg-id");
                     }
                     else if (!string.IsNullOrWhiteSpace(pendingStreamInf))
                     {
                         stream.Title = ExtractAttribute(pendingStreamInf, "tvg-name");
                         stream.Group = ExtractAttribute(pendingStreamInf, "group-title");
                         stream.Logo = ExtractAttribute(pendingStreamInf, "tvg-logo");
+                        stream.OriginalTvgId = ExtractAttribute(pendingStreamInf, "tvg-id");
                     }
 
                     if (string.IsNullOrWhiteSpace(stream.Title))

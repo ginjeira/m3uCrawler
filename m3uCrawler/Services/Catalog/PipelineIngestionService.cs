@@ -216,7 +216,8 @@ public sealed class PipelineIngestionService
             }
 
             var normalized = ChannelNormalizer.Normalize(stream.Title);
-            var resolution = await _catalog.ResolveAsync(normalized, cancellationToken);
+            var resolution = await _catalog.ResolveAsync(
+                normalized, stream.OriginalTvgId, cancellationToken);
             var auditIdentity = string.IsNullOrEmpty(normalized) ? stream.Url : normalized;
             var originalTitle = stream.Title ?? string.Empty;
 
@@ -255,6 +256,20 @@ public sealed class PipelineIngestionService
                     reasonSignature: "matched-via-pipeline",
                     cancellationToken: cancellationToken);
 
+                // Evidência externa (tvg-id) do stream, associada ao
+                // canal canónico JÁ resolvido. Idempotente por
+                // (Namespace, Value); nunca sobrepõe uma associação
+                // existente a outro canal. Não cria identidade nova
+                // (DL-002) — apenas registra evidência.
+                await _catalog.RecordExternalIdentityAsync(
+                    canonicalChannelId: canonicalId,
+                    providerId: sourceKey,
+                    @namespace: ExternalIdentityNamespaces.TvgId,
+                    rawValue: stream.OriginalTvgId,
+                    origin: "ingestion",
+                    confidence: confidence,
+                    cancellationToken: cancellationToken);
+
                 entries.Add(new IngestionEntry(
                     NormalizedIdentity: normalized,
                     CanonicalChannelId: canonicalId,
@@ -269,12 +284,16 @@ public sealed class PipelineIngestionService
             // partir de um título desconhecido, e NUNCA fabricar um
             // ChannelSource sob uma identidade inventada. O stream é
             // registado apenas como sinal de revisão/observabilidade.
-            var (auditKind, reasonSignature) = resolution.Kind == CatalogResolutionKind.Rule
-                ? (CatalogResolutionKind.Rule,
-                   resolution.RuleDisposition == RuleDisposition.Excluded
-                       ? "excluded-via-pipeline"
-                       : "review-only-via-pipeline")
-                : (CatalogResolutionKind.Unknown, "unknown-via-pipeline");
+            var (auditKind, reasonSignature) = resolution.Kind switch
+            {
+                CatalogResolutionKind.Rule => (CatalogResolutionKind.Rule,
+                    resolution.RuleDisposition == RuleDisposition.Excluded
+                        ? "excluded-via-pipeline"
+                        : "review-only-via-pipeline"),
+                CatalogResolutionKind.Ambiguous =>
+                    (CatalogResolutionKind.Unknown, "ambiguous-external-identity"),
+                _ => (CatalogResolutionKind.Unknown, "unknown-via-pipeline"),
+            };
 
             await _catalog.RecordMatchingAuditAsync(
                 normalizedIdentity: auditIdentity,

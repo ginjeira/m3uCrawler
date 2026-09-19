@@ -51,32 +51,95 @@ public sealed class CatalogResolver
     ///   <item><b>IdentityRule</b> (ReviewOnly / Excluded) tem
     ///         prioridade absoluta: a identidade é <c>ReviewOnly</c>
     ///         ou <c>Excluded</c>, sem canal canónico.</item>
-    ///   <item><b>ChannelAlias</b> resolve para o <c>CanonicalChannel</c>
-    ///         correspondente, se existir.</item>
-    ///   <item>Caso contrário, retorna <c>null</c> (Unknown sem
-    ///         canal canónico).</item>
+    ///   <item><b>ExternalIdentity</b> exacta (tvg-id/provider) —
+    ///         passo 1/2 da ordem normativa. Ambígua → Review.</item>
+    ///   <item><b>AffinityMember</b> (Kind = Channel) resolve para o
+    ///         <c>CanonicalChannel</c> via <c>CanonicalChannelKey</c>.</item>
+    ///   <item><b>ChannelAlias</b> (nome normalizado / alias conhecido)
+    ///         resolve para o <c>CanonicalChannel</c> correspondente.</item>
+    ///   <item>Caso contrário, <c>Unknown</c> (sem canal canónico).</item>
     /// </list>
     /// </summary>
-    public async Task<CatalogResolution> ResolveAsync(
+    public Task<CatalogResolution> ResolveAsync(
         string normalizedIdentity, CancellationToken cancellationToken = default)
+        => ResolveAsync(normalizedIdentity, originalTvgId: null, cancellationToken);
+
+    /// <summary>
+    /// Overload com evidência externa (tvg-id). O valor é
+    /// canonicalizado por <see cref="ExternalIdentityNormalizer"/>
+    /// antes da consulta; nulo/branco não produz passo externo. A
+    /// correspondência externa exacta (passo 1/2 da ordem normativa,
+    /// <c>05-CATALOGUE.md</c>) precede nome/alias e nenhum passo
+    /// posterior a contradiz. Ambiguidade
+    /// (mesmo valor → canais distintos) devolve
+    /// <see cref="CatalogResolutionKind.Ambiguous"/>, nunca "escolher
+    /// o primeiro".
+    /// </summary>
+    public async Task<CatalogResolution> ResolveAsync(
+        string normalizedIdentity,
+        string? originalTvgId,
+        CancellationToken cancellationToken = default)
     {
-        if (string.IsNullOrWhiteSpace(normalizedIdentity))
+        var hasNameIdentity = !string.IsNullOrWhiteSpace(normalizedIdentity);
+        var externalValue = ExternalIdentityNormalizer.Normalize(originalTvgId);
+        if (!hasNameIdentity && externalValue.Length == 0)
         {
             return CatalogResolution.Unknown();
         }
 
         await using var context = await _factory.CreateDbContextAsync(cancellationToken);
 
-        // 1. IdentityRule (priority over everything).
-        var rule = await context.IdentityRules
-            .AsNoTracking()
-            .FirstOrDefaultAsync(r => r.NormalizedIdentity == normalizedIdentity, cancellationToken);
-        if (rule != null)
+        // 0. IdentityRule (excepção explícita, prioridade absoluta).
+        if (hasNameIdentity)
         {
-            return CatalogResolution.FromRule(rule);
+            var rule = await context.IdentityRules
+                .AsNoTracking()
+                .FirstOrDefaultAsync(r => r.NormalizedIdentity == normalizedIdentity, cancellationToken);
+            if (rule != null)
+            {
+                return CatalogResolution.FromRule(rule);
+            }
         }
 
-        // 2. AffinityMember (Kind = Channel) -> AffinityGroup ->
+        // 1/2. ExternalIdentity exacta (tvg-id/provider identity).
+        if (externalValue.Length > 0)
+        {
+            var canonicalIds = await context.ExternalIdentities
+                .AsNoTracking()
+                .Where(x => x.Value == externalValue)
+                .Select(x => x.CanonicalChannelId)
+                .Distinct()
+                .ToListAsync(cancellationToken);
+
+            if (canonicalIds.Count > 1)
+            {
+                // Mesmo valor → canais distintos: ambíguo. Nunca
+                // "escolher o primeiro" (05-CATALOGUE.md §5).
+                return CatalogResolution.Ambiguous("external-identity-ambiguous");
+            }
+
+            if (canonicalIds.Count == 1)
+            {
+                var canonical = await context.CanonicalChannels
+                    .AsNoTracking()
+                    .FirstOrDefaultAsync(c => c.Id == canonicalIds[0], cancellationToken);
+                if (canonical != null && canonical.IsEnabled)
+                {
+                    return CatalogResolution.FromCanonical(canonical);
+                }
+
+                // Exacta mas sem canal activo: não contradizer a
+                // correspondência exacta caindo para nome/alias.
+                return CatalogResolution.Unknown();
+            }
+        }
+
+        if (!hasNameIdentity)
+        {
+            return CatalogResolution.Unknown();
+        }
+
+        // 3. AffinityMember (Kind = Channel) -> AffinityGroup ->
         //    CanonicalChannel. Membros Country não resolvem canal.
         //    Wave 9C.6: CanonicalChannelKey é a identidade de runtime
         //    autoritativa; CanonicalChannelId/nav é apenas fallback
@@ -112,7 +175,7 @@ public sealed class CatalogResolver
             }
         }
 
-        // 3. ChannelAlias -> CanonicalChannel.
+        // 4. ChannelAlias -> CanonicalChannel.
         var alias = await context.ChannelAliases
             .AsNoTracking()
             .Include(a => a.CanonicalChannel)
@@ -122,8 +185,93 @@ public sealed class CatalogResolver
             return CatalogResolution.FromCanonical(alias.CanonicalChannel);
         }
 
-        // 3. Unknown (no canonical channel).
+        // 5. Unknown (no canonical channel).
         return CatalogResolution.Unknown();
+    }
+
+    /// <summary>
+    /// Regista uma <see cref="ExternalIdentityEntity"/> de forma
+    /// idempotente: o par canónico (Namespace, Value) é único.
+    ///
+    /// <list type="bullet">
+    ///   <item>valor nulo/branco ou sem forma canónica → nada é
+    ///         escrito (DL-002: sem evidência não há identidade);</item>
+    ///   <item>par já existente a apontar para o mesmo canal →
+    ///         <see cref="RecordExternalIdentityOutcome.Unchanged"/>;</item>
+    ///   <item>par existente a apontar para outro canal → NÃO
+    ///         sobrepõe (edição do operador/runtime preservada) e
+    ///         devolve <see cref="RecordExternalIdentityOutcome.Conflict"/>.</item>
+    /// </list>
+    /// </summary>
+    public async Task<RecordExternalIdentityOutcome> RecordExternalIdentityAsync(
+        long canonicalChannelId,
+        string? providerId,
+        string @namespace,
+        string? rawValue,
+        string origin,
+        double confidence,
+        CancellationToken cancellationToken = default)
+    {
+        if (canonicalChannelId <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(canonicalChannelId));
+        }
+
+        if (string.IsNullOrWhiteSpace(@namespace))
+        {
+            throw new ArgumentException("namespace required", nameof(@namespace));
+        }
+
+        var value = ExternalIdentityNormalizer.Normalize(rawValue);
+        if (value.Length == 0)
+        {
+            return RecordExternalIdentityOutcome.Ignored;
+        }
+
+        var ns = @namespace.Trim();
+        var now = DateTime.UtcNow;
+
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var existing = await context.ExternalIdentities
+            .FirstOrDefaultAsync(
+                e => e.Namespace == ns && e.Value == value,
+                cancellationToken);
+
+        if (existing != null)
+        {
+            if (existing.CanonicalChannelId == canonicalChannelId)
+            {
+                return RecordExternalIdentityOutcome.Unchanged;
+            }
+
+            // Nunca sobrepõe uma associação existente (preserva
+            // edições do operador/runtime). O conflito é reportado.
+            return RecordExternalIdentityOutcome.Conflict;
+        }
+
+        context.ExternalIdentities.Add(new ExternalIdentityEntity
+        {
+            CanonicalChannelId = canonicalChannelId,
+            ProviderId = string.IsNullOrWhiteSpace(providerId) ? null : providerId.Trim(),
+            Namespace = ns,
+            Value = value,
+            Origin = string.IsNullOrWhiteSpace(origin) ? "ingestion" : origin.Trim(),
+            Confidence = Math.Clamp(confidence, 0.0, 1.0),
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+        });
+
+        try
+        {
+            await context.SaveChangesAsync(cancellationToken);
+            return RecordExternalIdentityOutcome.Created;
+        }
+        catch (DbUpdateException)
+        {
+            // Corrida: outro writer inseriu o mesmo (Namespace, Value).
+            // O invariante de unicidade manda; não duplicar.
+            return RecordExternalIdentityOutcome.Unchanged;
+        }
     }
 
     /// <summary>
@@ -2754,6 +2902,16 @@ public readonly record struct CatalogResolution(
         rule.Disposition, rule.Reason);
 
     /// <summary>
+    /// Resultado ambíguo (ex.: a mesma identidade externa aponta
+    /// para canais distintos). Nunca resolve canal e nunca cria
+    /// identidade; o caller deve conduzir a Review.
+    /// </summary>
+    public static CatalogResolution Ambiguous(string reason) => new(
+        CatalogResolutionKind.Ambiguous,
+        null, null, null, null, null,
+        PublicationPolicy.ReviewOnly, null, reason);
+
+    /// <summary>
     /// Verdadeiro se o matcher pode criar um canal novo no
     /// Dispatcharr a partir desta entrada. Só <c>Canonical</c> com
     /// <see cref="PublicationPolicy.CreateEligible"/> permite
@@ -2769,6 +2927,26 @@ public enum CatalogResolutionKind
     Unknown = 0,
     Canonical = 1,
     Rule = 2,
+    /// <summary>Evidência suficiente mas conflituosa (sem desempate) → Review.</summary>
+    Ambiguous = 3,
+}
+
+/// <summary>
+/// Resultado de <see cref="CatalogResolver.RecordExternalIdentityAsync"/>.
+/// </summary>
+public enum RecordExternalIdentityOutcome
+{
+    /// <summary>Nada escrito (valor sem forma canónica).</summary>
+    Ignored = 0,
+
+    /// <summary>Nova associação criada.</summary>
+    Created = 1,
+
+    /// <summary>Já existia a associação idêntica (idempotente).</summary>
+    Unchanged = 2,
+
+    /// <summary>Já existia o par (Namespace, Value) para outro canal; não sobreposto.</summary>
+    Conflict = 3,
 }
 
 /// <summary>

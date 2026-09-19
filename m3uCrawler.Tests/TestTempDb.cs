@@ -107,6 +107,8 @@ internal static class TestTempDb
         "source-selection-stage-", "source-selection-policy-", "source-selection-preview-",
         // Phase 9C.6 — identidade canónica (Key autoritativa).
         "phase9c6-",
+        // Wave W4b — identidade externa (tvg-id).
+        "wave-w4b-",
         // Out dir.
         "out_",
     };
@@ -139,6 +141,8 @@ internal static class TestTempDb
         "source_selection_stage-", "source_selection_policy-", "source_selection_preview-",
         // Phase 9C.6 — identidade canónica (Key autoritativa).
         "phase9c6-", "phase9c6_",
+        // Wave W4b — identidade externa (tvg-id).
+        "wave_w4b-", "wave-w4b-",
         // Auditoria / validação live (timestamped).
         "bundle_guard_validation_", "content_type_distribution_",
         "country_opcao_c_live_validation_", "country_opcao_c_validation_",

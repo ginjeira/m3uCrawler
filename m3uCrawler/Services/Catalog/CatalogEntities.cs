@@ -91,6 +91,64 @@ public sealed class ChannelAliasEntity
 }
 
 /// <summary>
+/// Identidade externa conhecida de um <see cref="CanonicalChannelEntity"/>
+/// (e.g. um <c>tvg-id</c> de um provider, um id de canal de um
+/// operador). Normativa em <c>docs/Reestructure/32-DOMAIN-SCHEMA.md</c>.
+///
+/// <para>
+/// É <b>evidência</b> de matching no passo 1/2 da ordem de
+/// reconhecimento (<c>docs/Reestructure/05-CATALOGUE.md</c>) e nunca
+/// cria identidade por si só (DL-002). O par
+/// <see cref="Namespace"/>+<see cref="Value"/> é único: o mesmo valor
+/// canónico não pode apontar para dois canais no mesmo namespace. A
+/// diferença de canais entre namespaces é detectada em resolução e
+/// tratada como ambígua (Review), nunca "escolher o primeiro".
+/// </para>
+///
+/// <para>
+/// <see cref="Value"/> é sempre a forma canónica produzida por
+/// <see cref="ExternalIdentityNormalizer.Normalize"/> (ADR-0002 §5).
+/// O valor original não é persistido aqui.
+/// </para>
+/// </summary>
+public sealed class ExternalIdentityEntity
+{
+    public long Id { get; set; }
+
+    public long CanonicalChannelId { get; set; }
+    public CanonicalChannelEntity? CanonicalChannel { get; set; }
+
+    /// <summary>
+    /// Identificador do provider (ex.: chave da source). <c>null</c>
+    /// quando a identidade não é específica de um provider.
+    /// </summary>
+    public string? ProviderId { get; set; }
+
+    /// <summary>
+    /// Namespace da identidade (ex.: "tvg-id", "provider:meo").
+    /// </summary>
+    public string Namespace { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Valor canónico (ver <see cref="ExternalIdentityNormalizer"/>).
+    /// </summary>
+    public string Value { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Proveniência: "baseline", "ingestion", "operator", …
+    /// </summary>
+    public string Origin { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Força/confiança da associação (0..1).
+    /// </summary>
+    public double Confidence { get; set; } = 1.0;
+
+    public DateTime CreatedAtUtc { get; set; }
+    public DateTime UpdatedAtUtc { get; set; }
+}
+
+/// <summary>
 /// Regra explícita de identidade que NÃO resolve para um canal
 /// publicável (e.g. "Sport TV NBA" → review, não criar). Usado
 /// para títulos de bundle/canal de PPV/evento que não devem gerar

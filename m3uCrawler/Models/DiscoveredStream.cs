@@ -22,6 +22,7 @@ namespace m3uCrawler.Models
         public string Title => Original.Title;
         public string Url => Original.Url;
         public string Group => Original.Group;
+        public string OriginalTvgId => Original.OriginalTvgId;
         public bool IsWorking => Original.IsWorking;
         public double ResponseTime => Original.ResponseTime;
     }

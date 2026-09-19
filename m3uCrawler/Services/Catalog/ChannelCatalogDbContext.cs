@@ -13,6 +13,7 @@ public sealed class ChannelCatalogDbContext : DbContext
 
     public DbSet<CanonicalChannelEntity> CanonicalChannels => Set<CanonicalChannelEntity>();
     public DbSet<ChannelAliasEntity> ChannelAliases => Set<ChannelAliasEntity>();
+    public DbSet<ExternalIdentityEntity> ExternalIdentities => Set<ExternalIdentityEntity>();
     public DbSet<IdentityRuleEntity> IdentityRules => Set<IdentityRuleEntity>();
     public DbSet<AffinityGroupEntity> AffinityGroups => Set<AffinityGroupEntity>();
     public DbSet<AffinityMemberEntity> AffinityMembers => Set<AffinityMemberEntity>();
@@ -73,6 +74,32 @@ public sealed class ChannelCatalogDbContext : DbContext
             e.Property(x => x.CanonicalChannelId).IsRequired();
             e.Property(x => x.CreatedAtUtc).IsRequired();
             e.HasIndex(x => x.NormalizedAlias).IsUnique();
+        });
+
+        // ExternalIdentity — evidência de identidade externa (tvg-id,
+        // ids de provider). Único por (Namespace, Value): um valor
+        // canónico não pode apontar para dois canais no mesmo
+        // namespace. Ver ADR-0002 §5 e 32-DOMAIN-SCHEMA.md.
+        modelBuilder.Entity<ExternalIdentityEntity>(e =>
+        {
+            e.ToTable("external_identities");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Id).ValueGeneratedOnAdd();
+            e.Property(x => x.CanonicalChannelId).IsRequired();
+            e.Property(x => x.ProviderId).HasMaxLength(160);
+            e.Property(x => x.Namespace).IsRequired().HasMaxLength(80);
+            e.Property(x => x.Value).IsRequired().HasMaxLength(400);
+            e.Property(x => x.Origin).IsRequired().HasMaxLength(120);
+            e.Property(x => x.Confidence).IsRequired();
+            e.Property(x => x.CreatedAtUtc).IsRequired();
+            e.Property(x => x.UpdatedAtUtc).IsRequired();
+            e.HasIndex(x => new { x.Namespace, x.Value }).IsUnique();
+            e.HasIndex(x => x.CanonicalChannelId);
+            e.HasIndex(x => x.Value);
+            e.HasOne(x => x.CanonicalChannel)
+                .WithMany()
+                .HasForeignKey(x => x.CanonicalChannelId)
+                .OnDelete(DeleteBehavior.Cascade);
         });
 
         // IdentityRule
