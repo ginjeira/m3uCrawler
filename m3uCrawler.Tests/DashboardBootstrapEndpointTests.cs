@@ -754,7 +754,8 @@ public class DashboardBootstrapEndpointTests : IAsyncLifetime
             DispatcharrConfigurationService? dispatcharrConfig = null,
             DispatcharrConnectionTester? dispatcharrTester = null,
             OperationalReadinessService? readiness = null,
-            IAuditService? auditService = null)
+            IAuditService? auditService = null,
+            DispatcharrConnectionTestStore? dispatcharrTestStore = null)
         {
             var port = GetFreePort();
             var listener = new HttpListener();
@@ -792,7 +793,7 @@ public class DashboardBootstrapEndpointTests : IAsyncLifetime
                                 context, outputDir, resolver, composer, history,
                                 lifecycle, auth, bootstrap, webToken,
                                 telegramAuth, dispatcharrConfig, dispatcharrTester, readiness,
-                                auditService);
+                                auditService, dispatcharrTestStore);
                         }
                     }
                     catch

@@ -151,6 +151,10 @@ namespace m3uCrawler
                     // adoptadas como legacy ficam grandfathered (ver
                     // OperationalReadinessService).
                     var wtelegramStore = new WtelegramConfigStore();
+                    // W6c — o resultado do último teste Dispatcharr é persistido
+                    // no settings store único (runtime-data/app_settings.json) e
+                    // consumido pela prontidão operacional.
+                    var dispatcharrTestStore = new DispatcharrConnectionTestStore(appSettingsStore);
                     var telegramAuth = new TelegramAuthService(wtelegramStore);
                     // Wave W5 — expor o serviço ao bloco --telegram (abaixo)
                     // para partilha do cliente autenticado.
@@ -188,7 +192,8 @@ namespace m3uCrawler
                             Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries"),
                             countryCode)),
                         () => IsOutputWritable(dashboardOutputDir),
-                        ct => CountChannelSourcesAsync(webCatalogResolver, ct));
+                        ct => CountChannelSourcesAsync(webCatalogResolver, ct),
+                        dispatcharrTestStore.Load);
 
                     // Wave 5 (PHASE 9C) — Expor os serviços de setup/config
                     // à API do dashboard (Telegram config/login, Dispatcharr
@@ -198,7 +203,8 @@ namespace m3uCrawler
                         telegramAuth,
                         dispatcharrService,
                         new DispatcharrConnectionTester(),
-                        operationalReadiness);
+                        operationalReadiness,
+                        dispatcharrTestStore);
 
                     try
                     {

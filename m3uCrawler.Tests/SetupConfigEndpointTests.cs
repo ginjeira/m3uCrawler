@@ -37,6 +37,7 @@ public class SetupConfigEndpointTests : IAsyncLifetime
     private readonly string _outputDir;
     private readonly string _storePath;
     private readonly string _wtelegramPath;
+    private readonly string _appSettingsDir;
 
     private TestDbContextFactory _factory = null!;
     private CatalogResolver _resolver = null!;
@@ -48,6 +49,7 @@ public class SetupConfigEndpointTests : IAsyncLifetime
     private WtelegramConfigStore _wtelegramStore = null!;
     private TelegramAuthService _telegramAuth = null!;
     private DispatcharrConfigurationService _dispatcharrConfig = null!;
+    private DispatcharrConnectionTestStore _dispatcharrTestStore = null!;
     private DashboardBootstrapEndpointTests.DashboardHarness? _harness;
 
     public SetupConfigEndpointTests()
@@ -57,6 +59,7 @@ public class SetupConfigEndpointTests : IAsyncLifetime
         _outputDir = Path.Combine(_root, "output");
         _storePath = Path.Combine(_root, ConfigurationLifecycleStore.FileName);
         _wtelegramPath = Path.Combine(_root, "wtelegram.config");
+        _appSettingsDir = Path.Combine(_root, "runtime-data");
     }
 
     public async Task InitializeAsync()
@@ -85,6 +88,7 @@ public class SetupConfigEndpointTests : IAsyncLifetime
             _ => new FakeTelegramBackend(),
             sessionFileExists: _ => false);
         _dispatcharrConfig = new DispatcharrConfigurationService(_wtelegramStore);
+        _dispatcharrTestStore = new DispatcharrConnectionTestStore(new AppSettingsStore(_appSettingsDir));
     }
 
     public async Task DisposeAsync()
@@ -111,7 +115,8 @@ public class SetupConfigEndpointTests : IAsyncLifetime
             telegramAuth: _telegramAuth,
             dispatcharrConfig: _dispatcharrConfig,
             dispatcharrTester: dispatcharrTester,
-            readiness: readiness);
+            readiness: readiness,
+            dispatcharrTestStore: _dispatcharrTestStore);
         return _harness;
     }
 
@@ -387,6 +392,108 @@ public class SetupConfigEndpointTests : IAsyncLifetime
         Assert.DoesNotContain(HttpMethod.Post, methods);
         Assert.DoesNotContain(HttpMethod.Patch, methods);
         Assert.DoesNotContain(HttpMethod.Delete, methods);
+    }
+
+    [Fact]
+    public async Task Dispatcharr_config_round_trips_all_keys_and_masks_secrets()
+    {
+        var harness = StartHarness();
+        await ReachReadyAsync(harness);
+        var csrf = await LoginAsync(harness);
+
+        const string apiKey = "SECRET-DISPATCHARR-KEY";
+        const string password = "super-secret-password";
+        var post = await PostJsonAsync(
+            harness,
+            "/api/dispatcharr/config",
+            JsonSerializer.Serialize(new
+            {
+                enabled = true,
+                baseUrl = "http://dispatcharr.example.test",
+                dryRun = false,
+                apiKey,
+                username = "operator",
+                password,
+                matchThreshold = 85,
+                targetGroupName = "IPTV",
+                providerPriority = new[] { "provider-b", "provider-a" },
+                aliasFile = "aliases.json",
+                autoCreateGroups = false,
+            }),
+            csrf);
+
+        Assert.Equal(HttpStatusCode.OK, post.StatusCode);
+        var postBody = await post.Content.ReadAsStringAsync();
+        Assert.DoesNotContain(apiKey, postBody);
+        Assert.DoesNotContain(password, postBody);
+
+        var get = await harness.Client.GetAsync("/api/dispatcharr/config");
+        Assert.Equal(HttpStatusCode.OK, get.StatusCode);
+        var getBody = await get.Content.ReadAsStringAsync();
+        Assert.DoesNotContain(apiKey, getBody);
+        Assert.DoesNotContain(password, getBody);
+        using (var doc = JsonDocument.Parse(getBody))
+        {
+            var root = doc.RootElement;
+            Assert.True(root.GetProperty("enabled").GetBoolean());
+            Assert.False(root.GetProperty("dryRun").GetBoolean());
+            Assert.True(root.GetProperty("hasApiKey").GetBoolean());
+            Assert.True(root.GetProperty("hasUsername").GetBoolean());
+            Assert.True(root.GetProperty("hasPassword").GetBoolean());
+            Assert.Equal("85", root.GetProperty("matchThreshold").GetString());
+            Assert.Equal("IPTV", root.GetProperty("targetGroupName").GetString());
+            Assert.Equal("aliases.json", root.GetProperty("aliasFile").GetString());
+            Assert.False(root.GetProperty("autoCreateGroups").GetBoolean());
+            Assert.Equal(
+                new[] { "provider-b", "provider-a" },
+                root.GetProperty("providerPriority").EnumerateArray().Select(e => e.GetString()).ToArray());
+        }
+
+        // Patch parcial: só o threshold; as restantes chaves são preservadas.
+        var patch = await PostJsonAsync(
+            harness,
+            "/api/dispatcharr/config",
+            JsonSerializer.Serialize(new { matchThreshold = 60 }),
+            csrf);
+        Assert.Equal(HttpStatusCode.OK, patch.StatusCode);
+        using var patchDoc = JsonDocument.Parse(await patch.Content.ReadAsStringAsync());
+        Assert.Equal("60", patchDoc.RootElement.GetProperty("matchThreshold").GetString());
+        Assert.True(patchDoc.RootElement.GetProperty("enabled").GetBoolean());
+        Assert.Equal("http://dispatcharr.example.test", patchDoc.RootElement.GetProperty("baseUrl").GetString());
+        Assert.Equal("IPTV", patchDoc.RootElement.GetProperty("targetGroupName").GetString());
+    }
+
+    [Fact]
+    public async Task Dispatcharr_test_persists_result_for_readiness()
+    {
+        var methods = new List<HttpMethod>();
+        var tester = new DispatcharrConnectionTester(
+            () => new RecordingHandler(
+                methods,
+                _ => Json(HttpStatusCode.OK, "{\"version\":\"9.9.9\"}")));
+
+        _dispatcharrConfig.Save(new DispatcharrConfigurationWrite(
+            Enabled: true,
+            BaseUrl: "http://dispatcharr.example.test",
+            ApiKey: "SECRET-API-KEY"));
+
+        var harness = StartHarness(dispatcharrTester: tester);
+        await ReachReadyAsync(harness);
+        var csrf = await LoginAsync(harness);
+
+        Assert.Null(_dispatcharrTestStore.Load());
+
+        var response = await PostJsonAsync(harness, "/api/dispatcharr/test", "{}", csrf);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync();
+        Assert.DoesNotContain("SECRET-API-KEY", body);
+
+        var record = _dispatcharrTestStore.Load();
+        Assert.NotNull(record);
+        Assert.Equal(DispatcharrConnectionStatus.Connected, record!.Status);
+        Assert.Equal("9.9.9", record.Version);
+        Assert.True(record.IsConnected);
     }
 
     [Fact]

@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
@@ -8,6 +10,7 @@ using m3uCrawler.Services.Catalog;
 using m3uCrawler.Services.Dispatcharr;
 using m3uCrawler.Services.Matching;
 using m3uCrawler.Services.SourceOrdering;
+using m3uCrawler.Services.SourceSelection;
 using m3uCrawler.Services.Sync;
 
 namespace m3uCrawler.Services.Automation;
@@ -161,10 +164,73 @@ public sealed class ScheduledDispatcharrSyncAction : IScheduledAction
                 catalog: _catalog);
         }
 
-        // Legacy scheduled path: sem artefacto de selecção, selection null
-        // (sem correlação heurística com a playlist).
-        var result = await sync.RunAsync(playlistPath, cancellationToken);
+        // W6c — paridade com o caminho manual (RunPublicationService): a
+        // selecção de fontes é resolvida a partir da política persistida e
+        // aplicada com o mesmo selector (SourceSelectionStage). Quando não há
+        // catálogo/política aplicável, a ausência é registada explicitamente
+        // (token `selection=none` e step `selection/skipped` da SyncRun), em
+        // vez de ser silenciosamente ignorada.
+        var selection = await BuildDispatcharrSelectionAsync(playlistPath, cancellationToken);
+        if (selection is null)
+        {
+            Console.WriteLine(
+                "ℹ️ Dispatcharr sync agendado: selecção de fontes não aplicada " +
+                "(sem catálogo/política aplicável); apply em modo legacy.");
+        }
+
+        var result = await sync.RunAsync(playlistPath, selection, cancellationToken);
         var counts = result.Report?.Counts;
-        return $"newChannels={counts?.NewChannels ?? 0} newStreams={counts?.NewStreams ?? 0} matched={counts?.Matched ?? 0} ambiguous={counts?.Ambiguous ?? 0} dryRun={result.DryRun}";
+        var selectionToken = selection is null ? "none" : "applied";
+        return $"newChannels={counts?.NewChannels ?? 0} newStreams={counts?.NewStreams ?? 0} matched={counts?.Matched ?? 0} ambiguous={counts?.Ambiguous ?? 0} dryRun={result.DryRun} selection={selectionToken}";
+    }
+
+    /// <summary>
+    /// Constrói o artefacto <see cref="DispatcharrSourceSelection"/> a partir
+    /// da playlist funcional, usando a política persistida e o selector único
+    /// (<see cref="SourceSelectionStage"/>). Devolve <c>null</c> quando não há
+    /// selecção aplicável (sem catálogo, leitura falhada ou stage no-op), o
+    /// que corresponde exactamente ao contrato do caminho manual.
+    /// </summary>
+    private async Task<DispatcharrSourceSelection?> BuildDispatcharrSelectionAsync(
+        string playlistPath,
+        CancellationToken cancellationToken)
+    {
+        if (_catalog is null)
+        {
+            return null;
+        }
+
+        IReadOnlyList<M3uStream> streams;
+        try
+        {
+            var discovered = await PlaylistReader
+                .ReadAsync(playlistPath, defaultProvider: null, ct: cancellationToken)
+                .ConfigureAwait(false);
+            streams = discovered.Select(d => d.Original).ToList();
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+
+        try
+        {
+            var policies = await new SourceSelectionPolicyResolver(_catalog)
+                .LoadEffectivePoliciesAsync(cancellationToken)
+                .ConfigureAwait(false);
+            var stage = await new SourceSelectionStage(_catalog)
+                .ApplyAsync(streams, policies, cancellationToken)
+                .ConfigureAwait(false);
+            if (!stage.Applied)
+            {
+                return null;
+            }
+
+            return DispatcharrSourceSelectionFactory.FromStageResult(stage, policies, DateTime.UtcNow);
+        }
+        catch (Exception)
+        {
+            return null;
+        }
     }
 }

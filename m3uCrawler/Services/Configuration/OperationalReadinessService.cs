@@ -114,6 +114,14 @@ public sealed class OperationalReadinessService : IOperationalReadinessGate
     private readonly Func<CancellationToken, Task<bool>> _countryDataAvailable;
     private readonly Func<bool> _outputWritable;
     private readonly Func<CancellationToken, Task<int>> _channelSourceCount;
+    private readonly Func<DispatcharrTestRecord?> _dispatcharrLastTest;
+    private readonly Func<DateTimeOffset> _utcNow;
+
+    /// <summary>
+    /// W6c — Idade máxima de um teste de ligação bem sucedido para que a
+    /// prontidão o considere actual. Um teste mais antigo é "stale".
+    /// </summary>
+    public static readonly TimeSpan DispatcharrTestMaxAge = TimeSpan.FromHours(24);
 
     public OperationalReadinessService(
         ConfigurationLifecycleService lifecycle,
@@ -123,7 +131,9 @@ public sealed class OperationalReadinessService : IOperationalReadinessGate
         Func<CancellationToken, Task<bool>> catalogHasCanonicalChannels,
         Func<CancellationToken, Task<bool>> countryDataAvailable,
         Func<bool> outputWritable,
-        Func<CancellationToken, Task<int>> channelSourceCount)
+        Func<CancellationToken, Task<int>> channelSourceCount,
+        Func<DispatcharrTestRecord?>? dispatcharrLastTest = null,
+        Func<DateTimeOffset>? utcNow = null)
     {
         _lifecycle = lifecycle ?? throw new ArgumentNullException(nameof(lifecycle));
         _hasActiveAdmin = hasActiveAdmin ?? throw new ArgumentNullException(nameof(hasActiveAdmin));
@@ -135,6 +145,8 @@ public sealed class OperationalReadinessService : IOperationalReadinessGate
             ?? throw new ArgumentNullException(nameof(countryDataAvailable));
         _outputWritable = outputWritable ?? throw new ArgumentNullException(nameof(outputWritable));
         _channelSourceCount = channelSourceCount ?? throw new ArgumentNullException(nameof(channelSourceCount));
+        _dispatcharrLastTest = dispatcharrLastTest ?? (() => null);
+        _utcNow = utcNow ?? (() => DateTimeOffset.UtcNow);
     }
 
     public async Task<OperationalReadinessSnapshot> EvaluateAsync(CancellationToken ct = default)
@@ -162,7 +174,16 @@ public sealed class OperationalReadinessService : IOperationalReadinessGate
         var sourcesCount = await SafeCountAsync(_channelSourceCount, ct).ConfigureAwait(false);
 
         var dispatcharrEnabled = dispatcharr.Enabled;
-        var dispatcharrValid = !dispatcharrEnabled || IsDispatcharrValid(dispatcharr);
+        var dispatcharrCredentialsValid = HasDispatcharrCredentials(dispatcharr);
+        // Só lê o último teste quando a integração está activada: evita
+        // efeitos laterais no settings store para instalações que não usam
+        // Dispatcharr.
+        var lastTest = dispatcharrEnabled ? SafeLastTest(_dispatcharrLastTest) : null;
+        var dispatcharrTestFresh = lastTest is not null
+            && lastTest.IsConnected
+            && (_utcNow() - lastTest.TestedAtUtc) <= DispatcharrTestMaxAge;
+        var dispatcharrValid = !dispatcharrEnabled
+            || (dispatcharrCredentialsValid && dispatcharrTestFresh);
 
         var items = new List<OperationalReadinessItem>
         {
@@ -185,7 +206,8 @@ public sealed class OperationalReadinessService : IOperationalReadinessGate
                 KeyDispatcharr,
                 Required: dispatcharrEnabled,
                 Satisfied: dispatcharrValid,
-                Detail: DescribeDispatcharr(dispatcharrEnabled, dispatcharrValid)),
+                Detail: DescribeDispatcharr(
+                    dispatcharrEnabled, dispatcharrCredentialsValid, lastTest, dispatcharrTestFresh)),
             new(
                 KeyCatalog,
                 Required: true,
@@ -256,10 +278,11 @@ public sealed class OperationalReadinessService : IOperationalReadinessGate
     }
 
     /// <summary>
-    /// Dispatcharr só é obrigatório quando activado; nesse caso exige
-    /// <c>BaseUrl</c> e (<c>ApiKey</c> OU <c>Username</c>+<c>Password</c>).
+    /// Credenciais Dispatcharr: exige <c>BaseUrl</c> e (<c>ApiKey</c> OU
+    /// <c>Username</c>+<c>Password</c>). A validade operacional exige ainda
+    /// um teste de ligação bem sucedido (ver <see cref="EvaluateAsync"/>).
     /// </summary>
-    private static bool IsDispatcharrValid(DispatcharrConfig config)
+    private static bool HasDispatcharrCredentials(DispatcharrConfig config)
     {
         if (string.IsNullOrWhiteSpace(config.BaseUrl))
         {
@@ -275,16 +298,47 @@ public sealed class OperationalReadinessService : IOperationalReadinessGate
             && !string.IsNullOrWhiteSpace(config.Password);
     }
 
-    private static string DescribeDispatcharr(bool enabled, bool valid)
+    private static string DescribeDispatcharr(
+        bool enabled,
+        bool credentialsValid,
+        DispatcharrTestRecord? lastTest,
+        bool testFresh)
     {
         if (!enabled)
         {
             return "Dispatcharr não activado.";
         }
 
-        return valid
-            ? "Dispatcharr activado e com credenciais válidas."
-            : "Dispatcharr activado sem credenciais válidas.";
+        if (!credentialsValid)
+        {
+            return "Dispatcharr activado sem credenciais válidas.";
+        }
+
+        if (lastTest is null)
+        {
+            return "Dispatcharr activado; ligação ainda não testada.";
+        }
+
+        if (!lastTest.IsConnected)
+        {
+            return "Dispatcharr activado; o último teste de ligação falhou.";
+        }
+
+        return testFresh
+            ? "Dispatcharr activado, credenciais válidas e teste de ligação OK."
+            : "Dispatcharr activado; o último teste de ligação expirou.";
+    }
+
+    private static DispatcharrTestRecord? SafeLastTest(Func<DispatcharrTestRecord?> probe)
+    {
+        try
+        {
+            return probe();
+        }
+        catch (Exception)
+        {
+            return null;
+        }
     }
 
     private static async Task<bool> SafeBoolAsync(

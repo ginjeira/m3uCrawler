@@ -43,6 +43,7 @@ namespace m3uCrawler.Services
         private static DispatcharrConfigurationService? _dispatcharrConfigurationService;
         private static DispatcharrConnectionTester? _dispatcharrConnectionTester;
         private static OperationalReadinessService? _operationalReadinessService;
+        private static DispatcharrConnectionTestStore? _dispatcharrConnectionTestStore;
 
         // W6a — Serviço de auditoria administrativa. Opcional: quando ausente
         // (ex.: testes que não o injectam) as mutações correm normalmente sem
@@ -135,12 +136,14 @@ namespace m3uCrawler.Services
             TelegramAuthService? telegramAuth,
             DispatcharrConfigurationService? dispatcharrConfig,
             DispatcharrConnectionTester? dispatcharrTester,
-            OperationalReadinessService? readiness)
+            OperationalReadinessService? readiness,
+            DispatcharrConnectionTestStore? dispatcharrTestStore = null)
         {
             _telegramAuthService = telegramAuth;
             _dispatcharrConfigurationService = dispatcharrConfig;
             _dispatcharrConnectionTester = dispatcharrTester;
             _operationalReadinessService = readiness;
+            _dispatcharrConnectionTestStore = dispatcharrTestStore;
         }
 
         /// <summary>
@@ -241,12 +244,13 @@ namespace m3uCrawler.Services
             DispatcharrConfigurationService? dispatcharrConfig = null,
             DispatcharrConnectionTester? dispatcharrTester = null,
             OperationalReadinessService? readiness = null,
-            IAuditService? auditService = null)
+            IAuditService? auditService = null,
+            DispatcharrConnectionTestStore? dispatcharrTestStore = null)
         {
             using var scope = new StaticResolverScope(resolver);
             using var authScope = new StaticAuthScope(lifecycle, authService, bootstrapService);
             using var setupScope = new StaticSetupScope(
-                telegramAuth, dispatcharrConfig, dispatcharrTester, readiness);
+                telegramAuth, dispatcharrConfig, dispatcharrTester, readiness, dispatcharrTestStore);
             using var auditScope = new StaticAuditScope(auditService);
             await HandleRequestAsync(context, outputDir, historyService, webToken);
         }
@@ -262,22 +266,26 @@ namespace m3uCrawler.Services
             private readonly DispatcharrConfigurationService? _previousDispatcharrConfig;
             private readonly DispatcharrConnectionTester? _previousDispatcharrTester;
             private readonly OperationalReadinessService? _previousReadiness;
+            private readonly DispatcharrConnectionTestStore? _previousDispatcharrTestStore;
 
             public StaticSetupScope(
                 TelegramAuthService? telegramAuth,
                 DispatcharrConfigurationService? dispatcharrConfig,
                 DispatcharrConnectionTester? dispatcharrTester,
-                OperationalReadinessService? readiness)
+                OperationalReadinessService? readiness,
+                DispatcharrConnectionTestStore? dispatcharrTestStore = null)
             {
                 _previousTelegram = _telegramAuthService;
                 _previousDispatcharrConfig = _dispatcharrConfigurationService;
                 _previousDispatcharrTester = _dispatcharrConnectionTester;
                 _previousReadiness = _operationalReadinessService;
+                _previousDispatcharrTestStore = _dispatcharrConnectionTestStore;
 
                 _telegramAuthService = telegramAuth;
                 _dispatcharrConfigurationService = dispatcharrConfig;
                 _dispatcharrConnectionTester = dispatcharrTester;
                 _operationalReadinessService = readiness;
+                _dispatcharrConnectionTestStore = dispatcharrTestStore;
             }
 
             public void Dispose()
@@ -286,6 +294,7 @@ namespace m3uCrawler.Services
                 _dispatcharrConfigurationService = _previousDispatcharrConfig;
                 _dispatcharrConnectionTester = _previousDispatcharrTester;
                 _operationalReadinessService = _previousReadiness;
+                _dispatcharrConnectionTestStore = _previousDispatcharrTestStore;
             }
         }
 
@@ -8903,12 +8912,19 @@ fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
 
         private sealed class DispatcharrConfigWritePayload
         {
-            public bool Enabled { get; set; }
+            // W6c — todos os campos são opcionais: um campo ausente no JSON
+            // (null) preserva o valor persistido (patch semantics).
+            public bool? Enabled { get; set; }
             public string? BaseUrl { get; set; }
-            public bool DryRun { get; set; }
+            public bool? DryRun { get; set; }
             public string? ApiKey { get; set; }
             public string? Username { get; set; }
             public string? Password { get; set; }
+            public int? MatchThreshold { get; set; }
+            public string? TargetGroupName { get; set; }
+            public IReadOnlyList<string>? ProviderPriority { get; set; }
+            public string? AliasFile { get; set; }
+            public bool? AutoCreateGroups { get; set; }
         }
 
         private static bool IsSetupPath(string requestPath)
@@ -9088,13 +9104,27 @@ fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
                     }
 
                     var beforeDispatcharr = _dispatcharrConfigurationService.GetForDisplay();
-                    _dispatcharrConfigurationService.Save(new DispatcharrConfigurationWrite(
-                        payload.Enabled,
-                        payload.BaseUrl ?? string.Empty,
-                        payload.DryRun,
-                        payload.ApiKey,
-                        payload.Username,
-                        payload.Password));
+                    try
+                    {
+                        _dispatcharrConfigurationService.Save(new DispatcharrConfigurationWrite(
+                            Enabled: payload.Enabled,
+                            BaseUrl: payload.BaseUrl,
+                            DryRun: payload.DryRun,
+                            ApiKey: payload.ApiKey,
+                            Username: payload.Username,
+                            Password: payload.Password,
+                            MatchThreshold: payload.MatchThreshold,
+                            TargetGroupName: payload.TargetGroupName,
+                            ProviderPriority: payload.ProviderPriority,
+                            AliasFile: payload.AliasFile,
+                            AutoCreateGroups: payload.AutoCreateGroups));
+                    }
+                    catch (ArgumentOutOfRangeException)
+                    {
+                        await WriteJsonAsync(
+                            context.Response, new { error = "invalid-payload" }, HttpStatusCode.BadRequest);
+                        return;
+                    }
 
                     var afterDispatcharr = _dispatcharrConfigurationService.GetForDisplay();
                     await RecordAuditAsync(auditActor, "dispatcharr.config.update", "dispatcharr-config", "global",
@@ -9127,6 +9157,26 @@ fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
 
                 var result = await _dispatcharrConnectionTester.TestAsync(
                     _dispatcharrConfigurationService.Get());
+                // W6c — persiste o resultado no settings store existente para
+                // que a prontidão possa exigir um teste bem sucedido. Falha de
+                // persistência é best-effort (a prontidão fica fail-safe).
+                DispatcharrTestRecord? persistedTest = null;
+                if (_dispatcharrConnectionTestStore is not null)
+                {
+                    try
+                    {
+                        persistedTest = new DispatcharrTestRecord(
+                            result.Status, result.Version, DateTimeOffset.UtcNow);
+                        _dispatcharrConnectionTestStore.Save(persistedTest);
+                    }
+                    catch (Exception persistEx)
+                    {
+                        persistedTest = null;
+                        Console.WriteLine(
+                            $"⚠️ Não foi possível persistir o teste Dispatcharr: {persistEx.GetType().Name}");
+                    }
+                }
+
                 await RecordAuditAsync(auditActor, "dispatcharr.test", "dispatcharr-config", "global",
                     null, new { status = result.Status.ToString() },
                     result.Status == DispatcharrConnectionStatus.Connected ? AuditResult.Success : AuditResult.Failure,
@@ -9137,6 +9187,7 @@ fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
                     version = result.Version,
                     httpStatusCode = result.HttpStatusCode,
                     detail = result.SanitizedDetail,
+                    testedAtUtc = persistedTest?.TestedAtUtc,
                 });
                 return;
             }
@@ -9253,8 +9304,12 @@ fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
                 dryRun = display.DryRun,
                 hasApiKey = display.HasApiKey,
                 hasUsername = display.HasUsername,
+                hasPassword = display.HasPassword,
                 matchThreshold = display.MatchThreshold,
                 targetGroupName = display.TargetGroupName,
+                aliasFile = display.AliasFile,
+                providerPriority = display.ProviderPriority,
+                autoCreateGroups = display.AutoCreateGroups,
             };
 
         private static async Task<T?> TryReadJsonAsync<T>(HttpListenerRequest request) where T : class

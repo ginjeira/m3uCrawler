@@ -5,6 +5,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using m3uCrawler.Models;
 using m3uCrawler.Services.Configuration;
+using m3uCrawler.Services.Dispatcharr;
 using Xunit;
 
 namespace m3uCrawler.Tests;
@@ -47,6 +48,9 @@ public sealed class OperationalReadinessServiceTests : IDisposable
         return new ConfigurationLifecycleService(store, null, null);
     }
 
+    private static readonly DateTimeOffset FixedNow =
+        new(2026, 9, 19, 12, 0, 0, TimeSpan.Zero);
+
     private static OperationalReadinessService Build(
         ConfigurationLifecycleService lifecycle,
         bool hasAdmin = true,
@@ -55,7 +59,9 @@ public sealed class OperationalReadinessServiceTests : IDisposable
         bool catalogOk = true,
         bool countryDataOk = true,
         bool outputOk = true,
-        int sources = 1)
+        int sources = 1,
+        DispatcharrTestRecord? lastDispatcharrTest = null,
+        DateTimeOffset? now = null)
         => new(
             lifecycle,
             _ => Task.FromResult(hasAdmin),
@@ -64,7 +70,14 @@ public sealed class OperationalReadinessServiceTests : IDisposable
             _ => Task.FromResult(catalogOk),
             _ => Task.FromResult(countryDataOk),
             () => outputOk,
-            _ => Task.FromResult(sources));
+            _ => Task.FromResult(sources),
+            () => lastDispatcharrTest,
+            () => now ?? FixedNow);
+
+    private static DispatcharrTestRecord ConnectedTest(
+        string? version = "0.30.0",
+        DateTimeOffset? testedAt = null)
+        => new(DispatcharrConnectionStatus.Connected, version, testedAt ?? FixedNow);
 
     [Fact]
     public async Task All_components_satisfied_yields_setup_and_operational_ready()
@@ -134,7 +147,47 @@ public sealed class OperationalReadinessServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task Dispatcharr_enabled_with_api_key_is_valid()
+    public async Task Dispatcharr_enabled_with_api_key_and_successful_test_is_valid()
+    {
+        var config = new DispatcharrConfig
+        {
+            Enabled = true,
+            BaseUrl = "http://dispatcharr.local",
+            ApiKey = "SECRET-API-KEY",
+        };
+
+        var snapshot = await Build(
+            NewLifecycle(),
+            dispatcharr: config,
+            lastDispatcharrTest: ConnectedTest()).EvaluateAsync();
+
+        Assert.True(snapshot.DispatcharrValid);
+        Assert.True(snapshot.SetupComplete);
+        Assert.DoesNotContain("dispatcharr", snapshot.MissingRequired);
+    }
+
+    [Fact]
+    public async Task Dispatcharr_enabled_with_user_password_and_successful_test_is_valid()
+    {
+        var config = new DispatcharrConfig
+        {
+            Enabled = true,
+            BaseUrl = "http://dispatcharr.local",
+            Username = "operator",
+            Password = "SECRET-PASSWORD",
+        };
+
+        var snapshot = await Build(
+            NewLifecycle(),
+            dispatcharr: config,
+            lastDispatcharrTest: ConnectedTest()).EvaluateAsync();
+
+        Assert.True(snapshot.DispatcharrValid);
+        Assert.True(snapshot.SetupComplete);
+    }
+
+    [Fact]
+    public async Task Dispatcharr_enabled_with_credentials_but_never_tested_blocks_setup()
     {
         var config = new DispatcharrConfig
         {
@@ -145,26 +198,63 @@ public sealed class OperationalReadinessServiceTests : IDisposable
 
         var snapshot = await Build(NewLifecycle(), dispatcharr: config).EvaluateAsync();
 
-        Assert.True(snapshot.DispatcharrValid);
-        Assert.True(snapshot.SetupComplete);
-        Assert.DoesNotContain("dispatcharr", snapshot.MissingRequired);
+        Assert.True(snapshot.DispatcharrEnabled);
+        Assert.False(snapshot.DispatcharrValid);
+        Assert.False(snapshot.SetupComplete);
+        Assert.Contains("dispatcharr", snapshot.MissingRequired);
+
+        var item = snapshot.Items.Single(i => i.Key == OperationalReadinessService.KeyDispatcharr);
+        Assert.True(item.Required);
+        Assert.False(item.Satisfied);
+        Assert.Contains("não testada", item.Detail);
     }
 
     [Fact]
-    public async Task Dispatcharr_enabled_with_user_password_is_valid()
+    public async Task Dispatcharr_enabled_with_failed_last_test_blocks_setup()
     {
         var config = new DispatcharrConfig
         {
             Enabled = true,
             BaseUrl = "http://dispatcharr.local",
-            Username = "operator",
-            Password = "SECRET-PASSWORD",
+            ApiKey = "SECRET-API-KEY",
         };
 
-        var snapshot = await Build(NewLifecycle(), dispatcharr: config).EvaluateAsync();
+        var snapshot = await Build(
+            NewLifecycle(),
+            dispatcharr: config,
+            lastDispatcharrTest: new DispatcharrTestRecord(
+                DispatcharrConnectionStatus.Unreachable, null, FixedNow)).EvaluateAsync();
 
-        Assert.True(snapshot.DispatcharrValid);
-        Assert.True(snapshot.SetupComplete);
+        Assert.False(snapshot.DispatcharrValid);
+        Assert.False(snapshot.SetupComplete);
+        Assert.Contains("dispatcharr", snapshot.MissingRequired);
+
+        var item = snapshot.Items.Single(i => i.Key == OperationalReadinessService.KeyDispatcharr);
+        Assert.Contains("último teste de ligação falhou", item.Detail);
+    }
+
+    [Fact]
+    public async Task Dispatcharr_enabled_with_stale_successful_test_blocks_setup()
+    {
+        var config = new DispatcharrConfig
+        {
+            Enabled = true,
+            BaseUrl = "http://dispatcharr.local",
+            ApiKey = "SECRET-API-KEY",
+        };
+
+        var snapshot = await Build(
+            NewLifecycle(),
+            dispatcharr: config,
+            lastDispatcharrTest: ConnectedTest(
+                testedAt: FixedNow - OperationalReadinessService.DispatcharrTestMaxAge - TimeSpan.FromMinutes(1)),
+            now: FixedNow).EvaluateAsync();
+
+        Assert.False(snapshot.DispatcharrValid);
+        Assert.False(snapshot.SetupComplete);
+
+        var item = snapshot.Items.Single(i => i.Key == OperationalReadinessService.KeyDispatcharr);
+        Assert.Contains("expirou", item.Detail);
     }
 
     [Fact]

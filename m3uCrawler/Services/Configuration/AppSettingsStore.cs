@@ -29,6 +29,13 @@ public sealed class AppSettings
     public DiscoverySettings Discovery { get; set; } = new();
 
     /// <summary>
+    /// W6c — Último teste de ligação ao Dispatcharr (status, versão,
+    /// timestamp UTC). Nunca contém segredos. Persistido no mesmo
+    /// ficheiro, sob a chave <c>dispatcharrTest</c>.
+    /// </summary>
+    public DispatcharrConnectionTestState? DispatcharrTest { get; set; }
+
+    /// <summary>
     /// Normaliza o delimiter: trim, vazio/inválido → default. Aceita
     /// apenas 1..3 caracteres sem quebras de linha. Normaliza também
     /// os parâmetros de discovery.
