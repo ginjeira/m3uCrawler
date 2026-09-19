@@ -90,6 +90,12 @@ public class ObservabilityTests : IDisposable
         _ => "Status"
     };
 
+    // W2: os listeners de teste vivem em loopback, que a política SSRF de
+    // produção bloqueia. Estes testes exercitam transporte/observabilidade,
+    // por isso optam explicitamente pelo guard permissivo de testes.
+    private static M3uTesterService NewLocalTester(StreamValidationOptions options)
+        => new(options, SsrfGuard.CreatePermissiveForLocalTests());
+
     // BLACKHOLE: aceita TCP mas nunca responde.
     private int StartBlackhole()
     {
@@ -219,7 +225,7 @@ public class ObservabilityTests : IDisposable
     {
         var port = StartListener((client, ct) => Reply(client, 200, "text/plain", "OK"));
         var trace = new PipelineTrace();
-        var tester = new M3uTesterService(new StreamValidationOptions
+        var tester = NewLocalTester(new StreamValidationOptions
         {
             ConnectionTimeoutSeconds = 2,
             OverallTimeoutSeconds = 5,
@@ -243,7 +249,7 @@ public class ObservabilityTests : IDisposable
     {
         var port = StartListener((client, ct) => Reply(client, 404, "text/plain", "Not Found"));
         var trace = new PipelineTrace();
-        var tester = new M3uTesterService(new StreamValidationOptions
+        var tester = NewLocalTester(new StreamValidationOptions
         {
             ConnectionTimeoutSeconds = 2,
             OverallTimeoutSeconds = 5,
@@ -275,10 +281,11 @@ public class ObservabilityTests : IDisposable
         // Apos observability: Http5xx e HttpRequestEnd explicitos.
         var port = StartListener((client, ct) => Reply(client, 503, "text/plain", "Service Unavailable"));
         var trace = new PipelineTrace();
-        var tester = new M3uTesterService(new StreamValidationOptions
+        var tester = NewLocalTester(new StreamValidationOptions
         {
             ConnectionTimeoutSeconds = 2,
             OverallTimeoutSeconds = 5,
+            MaxRetries = 0,
         });
         var setTrace = typeof(M3uTesterService).GetMethod("SetTrace",
             System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public);
@@ -306,7 +313,7 @@ public class ObservabilityTests : IDisposable
         // succeeded immediately).
         var port = StartBlackhole();
         var trace = new PipelineTrace();
-        var tester = new M3uTesterService(new StreamValidationOptions
+        var tester = NewLocalTester(new StreamValidationOptions
         {
             ConnectionTimeoutSeconds = 10, // maior que OverallTimeout
             OverallTimeoutSeconds = 1,
@@ -346,10 +353,11 @@ public class ObservabilityTests : IDisposable
         listener.Stop(); // fechar imediatamente: connect refused
 
         var trace = new PipelineTrace();
-        var tester = new M3uTesterService(new StreamValidationOptions
+        var tester = NewLocalTester(new StreamValidationOptions
         {
             ConnectionTimeoutSeconds = 2,
             OverallTimeoutSeconds = 5,
+            MaxRetries = 0,
         });
         var setTrace = typeof(M3uTesterService).GetMethod("SetTrace",
             System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public);
@@ -380,7 +388,7 @@ public class ObservabilityTests : IDisposable
     {
         var port = StartListener((client, ct) => Reply(client, 200, "text/plain", "OK"));
         var trace = new PipelineTrace();
-        var tester = new M3uTesterService(new StreamValidationOptions
+        var tester = NewLocalTester(new StreamValidationOptions
         {
             ConnectionTimeoutSeconds = 2,
             OverallTimeoutSeconds = 5,

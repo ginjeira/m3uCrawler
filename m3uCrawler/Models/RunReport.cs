@@ -87,6 +87,10 @@ namespace m3uCrawler.Models
         public int PlaylistsDownloaded { get => _PlaylistsDownloaded; set => _PlaylistsDownloaded = value; }
         internal int _PlaylistsInvalid;
         public int PlaylistsInvalid { get => _PlaylistsInvalid; set => _PlaylistsInvalid = value; }
+        // W3 — playlists com resultado de parsing Partial (>=1 entrada válida e
+        // >=1 malformada/inutilizável). Aditivo; Partial nunca conta como Success.
+        internal int _PlaylistsPartial;
+        public int PlaylistsPartial { get => _PlaylistsPartial; set => _PlaylistsPartial = value; }
         internal int _CountryMatches;
         public int CountryMatches { get => _CountryMatches; set => _CountryMatches = value; }
         internal int _PlaylistsRejected;
@@ -222,8 +226,17 @@ namespace m3uCrawler.Models
         public int TraceEventsXtreamAccount { get; set; }
         public int TraceEventsCandidatePromoted { get; set; }
 
-        // === PHASE 13 (Wave 13-3) — Source Selection ===
-        // Diagnóstico agregado da aplicação da política de selecção de
+        // === W2 (2026-09-19) — falhas de aquisição ===
+        // Classificação técnica (19-FAILURE-MODEL §6). Escritos por até
+        // `maxConcurrency` tasks; usam Interlocked.* (fields com wrappers).
+        internal int _AcquisitionFailures;
+        public int AcquisitionFailures { get => _AcquisitionFailures; set => _AcquisitionFailures = value; }
+        internal int _AcquisitionRetryableFailures;
+        public int AcquisitionRetryableFailures { get => _AcquisitionRetryableFailures; set => _AcquisitionRetryableFailures = value; }
+        internal int _AcquisitionTerminalFailures;
+        public int AcquisitionTerminalFailures { get => _AcquisitionTerminalFailures; set => _AcquisitionTerminalFailures = value; }
+
+        // === PHASE 13 (Wave 13-3) — Source Selection ===        // Diagnóstico agregado da aplicação da política de selecção de
         // fontes ao pipeline Telegram. Só contagens; nunca URLs nem
         // credenciais. Null quando o estágio não correu (ex.: pipeline
         // sem catálogo).

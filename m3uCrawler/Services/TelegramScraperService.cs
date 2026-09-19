@@ -446,6 +446,12 @@ namespace m3uCrawler.Services
             // Producer: arranca a enumearacao Telegram com callback de emissao.
             int messagesAnalyzed = 0;
             Exception? enumEx = null;
+            // W1 — dedup por identidade funcional no mesmo Run: a mesma
+            // conta funcional não origina processamento equivalente
+            // duplicado. Candidatos sem identidade estável passam intactos.
+            var discoveryRunId = (_trace as m3uCrawler.Services.Validation.PipelineTrace)?.RunId;
+            var seenDiscoveryAccounts =
+                new System.Collections.Concurrent.ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
             try
             {
                 messagesAnalyzed = await SearchM3UInTelegramInternal(
@@ -455,6 +461,28 @@ namespace m3uCrawler.Services
                     {
                         // PHASE-OBSERVABILITY: ChannelEnqueue event.
                         var enqueueTrace = _trace ?? m3uCrawler.Services.Validation.NullTraceSink.Instance;
+
+                        // W1 — duas ocorrências da mesma conta funcional no
+                        // mesmo Run são a mesma unidade: não enfileirar a
+                        // segunda (nunca dedup quando não há identidade).
+                        var candidateAccountKey = AccountIdentity.ComputeXtreamAccountKey(c.Url);
+                        if (candidateAccountKey != null
+                            && !string.IsNullOrEmpty(discoveryRunId)
+                            && !seenDiscoveryAccounts.TryAdd(candidateAccountKey, 0))
+                        {
+                            rep.RejectionReasons.Add(
+                                $"{Display(c)}: duplicate functional account in same run");
+                            enqueueTrace.Warning(
+                                m3uCrawler.Services.Validation.TraceCategory.CandidateRejected,
+                                new m3uCrawler.Services.Validation.TraceContext
+                                {
+                                    CandidateId = c.Id,
+                                    ChatTitle = c.Source,
+                                },
+                                "reason=duplicate-functional-account");
+                            return;
+                        }
+
                         enqueueTrace.Information(m3uCrawler.Services.Validation.TraceCategory.ChannelEnqueue, new m3uCrawler.Services.Validation.TraceContext
                         {
                             CandidateId = c.Id,
@@ -527,8 +555,13 @@ namespace m3uCrawler.Services
                     ?? $"telegram-{Slugify(keyword)}";
                 try
                 {
+                    // W1 — a ocorrência de descoberta é atribuída ao Run
+                    // efectivo (RunId opaco), quando disponível.
+                    var discoveryRunIdForIngestion =
+                        (_trace as m3uCrawler.Services.Validation.PipelineTrace)?.RunId;
                     var ingestionResult = await pipelineIngestor.IngestAsync(
-                        working, sourceKey, "Telegram", countryCode, cancellationToken);
+                        working, sourceKey, "Telegram", countryCode, cancellationToken,
+                        discoveryRunIdForIngestion);
                     Console.WriteLine(
                         $"📥 Ingestão no catálogo: {ingestionResult.IngestedCount}/{ingestionResult.ReceivedCount} " +
                         $"streams → source='{sourceKey}', matched={ingestionResult.MatchedCount}, " +
@@ -741,7 +774,35 @@ namespace m3uCrawler.Services
                 return;
             }
 
+            // Contrato W3 — parsing M3U consistente para TODOS os candidates
+            // (não apenas RequiresContentVerification): a primeira linha não
+            // vazia tem de ser #EXTM3U. Um resultado Failed não é contado como
+            // playlist descarregada/válida nem entrega streams; Partial entrega
+            // as entradas válidas e é contabilizado como Partial.
+            var parseResult = parser.ParseDetailed(content, cancellationToken);
+            if (parseResult.Status == M3uPlaylistStatus.Failed)
+            {
+                Interlocked.Increment(ref rep._PlaylistsInvalid);
+                var diagnostic = parseResult.Diagnostics.FirstOrDefault();
+                var reason = diagnostic is null
+                    ? "playlist M3U inválida"
+                    : $"playlist M3U inválida ({diagnostic.Kind} linha {diagnostic.LineNumber}): {diagnostic.Reason}";
+                AddRejection(rep, $"{Display(candidate)}: {reason}");
+                if (liveRunProgress is not null)
+                {
+                    liveRunProgress.ReportActivity(
+                        LiveRunActivityCategory.Playlist,
+                        LiveRunActivityLevel.Warning,
+                        $"{reason} ({Display(candidate)})");
+                }
+                return;
+            }
+
             Interlocked.Increment(ref rep._PlaylistsDownloaded);
+            if (parseResult.Status == M3uPlaylistStatus.Partial)
+            {
+                Interlocked.Increment(ref rep._PlaylistsPartial);
+            }
 
             // PHASE 9C.4 — Analyzing: análise de conteúdo da playlist
             // (deteccao de país + parsing M3U). VALIDATING cobre o gate
@@ -776,7 +837,7 @@ namespace m3uCrawler.Services
             Interlocked.Increment(ref rep._CountryMatches);
             Interlocked.Add(ref rep._ChannelsRecognized, analysis.RecognizedChannelCount);
 
-            var streams = parser.Parse(content);
+            var streams = parseResult.Streams.ToList();
             discovered.StreamCount = streams.Count;
             Interlocked.Add(ref rep._StreamsExtracted, streams.Count);
 

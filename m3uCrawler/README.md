@@ -143,6 +143,21 @@ O pipeline reconhece candidatos Xtream Codes sem depender de keyword:
 
 Estes candidatos são tratados exactamente como os outros: passam pelo mesmo gate de verificação de conteúdo (`#EXTM3U`), validação por país, extracção e teste de streams — **não há uma segunda pipeline paralela**. A descoberta permanece independente de keyword.
 
+## Parsing M3U (contrato W3)
+
+O parsing de playlists está centralizado em `m3uCrawler/Services/M3uParserService.cs`, com o contrato normativo em `docs/Reestructure/04-PLAYLIST-STREAM.md` §7. Todos os consumidores (pipeline Telegram, `PlaylistReader`, `PlaylistManagerService`) convergem neste contrato.
+
+- **`ParseDetailed(string? content, CancellationToken ct = default)`** devolve `M3uParseResult` com `Streams`, `Status` (`Success`/`Partial`/`Failed`), `Diagnostics` e contadores (`ValidCount`, `MalformedCount`, `UnusableTargetCount`, `BenignMetadataCount`, `IgnoredCount`).
+- **Input mínimo:** a primeira linha não vazia/não-BOM tem de ser `#EXTM3U` (case-insensitive). Sem cabeçalho → `Failed`, 0 streams e nenhuma entrada ingerida.
+- **Entrada válida:** `#EXTINF` seguido do próximo conteúdo não vazio, um URL absoluto `http`/`https`. Extraem-se título, `group-title`, `tvg-logo`, `tvg-id` e `OriginalExtInf`.
+- **Malformado:** URL `http(s)` sem `#EXTINF` precedente, `#EXTINF` sem URL (EOF ou substituído), ou entrada estruturalmente incompleta. É registado em `Diagnostics`, excluído de `Streams` e o parsing continua.
+- **Alvo não utilizável:** entrada estruturalmente válida com esquema diferente de `http`/`https` (ex.: `rtmp://`). Não é malformada; é excluída e registada como `UnusableTarget`.
+- **Metadados benignos:** linhas `#...` que não são `#EXTINF` (versão, comentários, `#EXTGRP`, `#EXTVLCOPT`, `#KODIPROP`). Não são streams, não geram malformados e não alteram o estado. As variantes HLS `#EXT-X-STREAM-INF` continuam a produzir stream com os seus atributos (metadados, `OriginalExtInf` vazio).
+- **Status:** `Success` = ≥1 entrada válida e 0 malformadas/inutilizáveis; `Partial` = ≥1 válida e ≥1 malformada/inutilizável; `Failed` = 0 válidas ou falha de parsing. `Partial` nunca equivale a sucesso.
+- **Segurança:** cada diagnóstico passa por `CredentialSanitizer` — passwords/tokens de URLs nunca aparecem em relatórios ou logs.
+- **Limites:** `M3uParserOptions` (tamanho de documento, nº máximo de entradas, comprimento de campo, tempo máximo, cancelamento) são mecanismo. Os valores concretos continuam `PARAMETER_GAP` (`DG-04d`).
+- `Parse(string?)` mantém-se como conveniência retro-compatível e devolve `ParseDetailed(...).Streams`.
+
 ### Publicações HTML com cards Xtream
 
 Uma mensagem Telegram pode conter um URL `http(s)` genérico (sem pista `playlist|m3u|iptv|list|xtream|channel|canal|live|getplaylist` no path/query) que aponta para uma página HTML com uma ou várias "cards" Xtream — listas visuais do tipo:

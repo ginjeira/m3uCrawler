@@ -705,6 +705,174 @@ public enum PendingApprovalState
 }
 
 /// <summary>
+/// W1 (2026-09-19) — ecossistema técnico de origem. Normativo em
+/// <c>docs/Reestructure/32-DOMAIN-SCHEMA.md</c> (Provider) e
+/// <c>07-SOURCES.md §1</c>. A <see cref="Key"/> é o namespace que
+/// entra na composição de <c>ProviderAccount.AccountKey</c>.
+/// </summary>
+public sealed class ProviderEntity
+{
+    public long Id { get; set; }
+
+    /// <summary>
+    /// Namespace estável do provider (ex.: "xtream", "telegram").
+    /// Único. Entra na composição de <c>AccountKey</c>.
+    /// </summary>
+    public string Key { get; set; } = string.Empty;
+
+    public string Name { get; set; } = string.Empty;
+
+    public ProviderType Type { get; set; } = ProviderType.Unknown;
+
+    /// <summary>
+    /// Capacidades do provider (JSON). Sem segredos.
+    /// </summary>
+    public string Capabilities { get; set; } = "{}";
+
+    public bool IsEnabled { get; set; } = true;
+
+    public DateTime CreatedAtUtc { get; set; }
+    public DateTime UpdatedAtUtc { get; set; }
+
+    public List<ProviderAccountEntity> Accounts { get; set; } = new();
+}
+
+public enum ProviderType
+{
+    Unknown = 0,
+    Xtream = 1,
+    M3u = 2,
+    Telegram = 3,
+    Http = 4,
+    File = 5,
+    Manual = 6,
+}
+
+/// <summary>
+/// W1 (2026-09-19) — conta concreta dentro de um <see cref="ProviderEntity"/>.
+///
+/// <para>
+/// <see cref="AccountKey"/> é a identidade funcional canónica
+/// (<c>Provider namespace + external functional identity</c>) e é
+/// distinta do identificador técnico <see cref="Id"/> (<c>ProviderAccountId</c>).
+/// Único por <c>(ProviderId, AccountKey)</c>.
+/// </para>
+/// </summary>
+public sealed class ProviderAccountEntity
+{
+    public long Id { get; set; }
+
+    public long ProviderId { get; set; }
+    public ProviderEntity? Provider { get; set; }
+
+    /// <summary>
+    /// Identidade funcional canónica: namespace do provider + identidade
+    /// externa funcional normalizada (NFKC + trim). Não é um id técnico.
+    /// </summary>
+    public string AccountKey { get; set; } = string.Empty;
+
+    public string DisplayName { get; set; } = string.Empty;
+
+    public ProviderAccountStatus Status { get; set; } = ProviderAccountStatus.Discovered;
+
+    /// <summary>
+    /// Referência a credenciais (secret store). Nunca contém a credencial
+    /// em claro (<c>docs/Reestructure/32-DOMAIN-SCHEMA.md</c>).
+    /// </summary>
+    public string? CredentialsReference { get; set; }
+
+    public DateTime CreatedAtUtc { get; set; }
+    public DateTime UpdatedAtUtc { get; set; }
+}
+
+public enum ProviderAccountStatus
+{
+    Unknown = 0,
+    Discovered = 1,
+    Active = 2,
+    Disabled = 3,
+    Error = 4,
+}
+
+/// <summary>
+/// W1 (2026-09-19) — ocorrência de descoberta associada a um Run.
+///
+/// <para>
+/// Não é uma entidade viva persistente entre execuções: o histórico
+/// obtém-se através do <c>Run</c>/<c>Observation</c>. Não mantém
+/// <c>FirstSeen</c>/<c>LastSeen</c> (<c>32-DOMAIN-SCHEMA.md</c> e A5).
+/// </para>
+///
+/// <para>
+/// A deduplicação por identidade funcional é garantida por
+/// <c>(RunId, ProviderAccountId)</c>: duas ocorrências do mesmo Run
+/// para a mesma conta funcional são a mesma unidade e não originam
+/// processamento equivalente duplicado. Quando não há identidade
+/// funcional estável, <see cref="ProviderAccountId"/> é <c>null</c> e
+/// a ocorrência é preservada sem dedup (comportamento conservador).
+/// </para>
+/// </summary>
+public sealed class DiscoveryCandidateEntity
+{
+    public long Id { get; set; }
+
+    public long? ProviderId { get; set; }
+    public ProviderEntity? Provider { get; set; }
+
+    /// <summary>
+    /// Conta funcional associada. <c>null</c> quando a evidência não
+    /// permite derivar identidade estável.
+    /// </summary>
+    public long? ProviderAccountId { get; set; }
+    public ProviderAccountEntity? ProviderAccount { get; set; }
+
+    /// <summary>
+    /// Evidência externa observada (ex.: token funcional do provider).
+    /// Sanitizada — nunca contém password.
+    /// </summary>
+    public string ExternalIdentity { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Identidade externa funcional normalizada (NFKC + trim).
+    /// </summary>
+    public string NormalizedIdentity { get; set; } = string.Empty;
+
+    /// <summary>Evidência sanitizada da descoberta (sem credenciais).</summary>
+    public string Evidence { get; set; } = string.Empty;
+
+    public DiscoveryCandidateStatus Status { get; set; } = DiscoveryCandidateStatus.Discovered;
+
+    /// <summary>
+    /// Identificador opaco do Run a que esta ocorrência pertence.
+    /// </summary>
+    public string? RunId { get; set; }
+
+    /// <summary>
+    /// Source resultante/associada, quando a passagem Candidate→Source
+    /// foi explicitada.
+    /// </summary>
+    public long? SourceId { get; set; }
+    public SourceEntity? Source { get; set; }
+
+    public DateTime CreatedAtUtc { get; set; }
+    public DateTime UpdatedAtUtc { get; set; }
+}
+
+/// <summary>
+/// Estados da ocorrência de descoberta (<c>docs/Reestructure/33-STATE-MACHINES.md</c>):
+/// <c>Discovered → Normalized → Deduplicated → Accepted | Rejected | Expired</c>.
+/// </summary>
+public enum DiscoveryCandidateStatus
+{
+    Discovered = 0,
+    Normalized = 1,
+    Deduplicated = 2,
+    Accepted = 3,
+    Rejected = 4,
+    Expired = 5,
+}
+
+/// <summary>
 /// PHASE 4 — Source externa que alimenta o catálogo.
 /// Pode ser Telegram, M3U, Xtream, HTTP, ficheiro local, ou manual.
 /// Cada source tem 0..N <see cref="ChannelSourceEntity"/>.
@@ -728,8 +896,30 @@ public sealed class SourceEntity
 
     public int Priority { get; set; }
 
+    /// <summary>
+    /// W1 (2026-09-19) — conta funcional (ProviderAccount) a que esta
+    /// Source pertence. <c>null</c> quando a origem não expõe uma
+    /// identidade funcional estável. Uma conta pode suportar várias
+    /// Sources (<c>docs/Reestructure/07-SOURCES.md §2</c>).
+    /// </summary>
+    public long? ProviderAccountId { get; set; }
+    public ProviderAccountEntity? ProviderAccount { get; set; }
+
     public DateTime? LastDiscoveryAtUtc { get; set; }
     public DateTime? LastValidationAtUtc { get; set; }
+
+    /// <summary>
+    /// W2 (2026-09-19) — última falha de aquisição persistente desta Source
+    /// (<c>docs/Reestructure/19-FAILURE-MODEL.md §6</c>). Só é escrita após
+    /// retry técnico esgotado ou falha terminal. Representa exactamente a
+    /// mesma falha agregada na Run.
+    /// </summary>
+    public string? LastAcquisitionFailureKind { get; set; }
+    public DateTime? LastAcquisitionFailureAtUtc { get; set; }
+    public int? LastAcquisitionHttpStatus { get; set; }
+
+    /// <summary>Detalhe sanitizado; nunca contém credenciais/tokens/URLs com credenciais.</summary>
+    public string? LastAcquisitionFailureDetail { get; set; }
 
     public DateTime CreatedAtUtc { get; set; }
     public DateTime UpdatedAtUtc { get; set; }

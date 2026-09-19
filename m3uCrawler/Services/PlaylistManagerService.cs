@@ -164,56 +164,22 @@ namespace m3uCrawler.Services
 
         public async Task<List<M3uStream>> LoadFromM3uPlaylist(string filePath)
         {
-            var streams = new List<M3uStream>();
-            if (!File.Exists(filePath)) return streams;
+            if (!File.Exists(filePath)) return new List<M3uStream>();
 
-            var lines = await File.ReadAllLinesAsync(filePath, Encoding.UTF8);
-            string pendingExtInf = string.Empty;
+            var content = await File.ReadAllTextAsync(filePath, Encoding.UTF8);
 
-            foreach (var rawLine in lines)
+            // Contrato único de parsing (W3): cabeçalho #EXTM3U obrigatório,
+            // entradas #EXTINF+URL http/https e metadados benignos ignorados.
+            // Uma playlist Failed não devolve streams.
+            var parsed = new M3uParserService().ParseDetailed(content);
+            if (parsed.Status == M3uPlaylistStatus.Failed) return new List<M3uStream>();
+
+            var streams = new List<M3uStream>(parsed.Streams.Count);
+            foreach (var stream in parsed.Streams)
             {
-                var line = rawLine.Trim();
-                if (string.IsNullOrWhiteSpace(line)) continue;
-
-                if (line.StartsWith("#EXTINF", StringComparison.OrdinalIgnoreCase))
-                {
-                    pendingExtInf = line;
-                    continue;
-                }
-
-                if (line.StartsWith("#", StringComparison.Ordinal))
-                {
-                    continue;
-                }
-
-                if (line.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
-                    line.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
-                {
-                    var stream = new M3uStream
-                    {
-                        Url = line,
-                        IsWorking = true,
-                        LastTested = DateTime.Now,
-                        OriginalExtInf = pendingExtInf
-                    };
-
-                    if (!string.IsNullOrWhiteSpace(pendingExtInf))
-                    {
-                        int commaIndex = pendingExtInf.LastIndexOf(',');
-                        if (commaIndex >= 0 && commaIndex < pendingExtInf.Length - 1)
-                        {
-                            stream.Title = pendingExtInf[(commaIndex + 1)..].Trim();
-                        }
-                    }
-
-                    if (string.IsNullOrWhiteSpace(stream.Title))
-                    {
-                        stream.Title = line;
-                    }
-
-                    streams.Add(stream);
-                    pendingExtInf = string.Empty;
-                }
+                stream.IsWorking = true;
+                stream.LastTested = DateTime.Now;
+                streams.Add(stream);
             }
 
             return streams;

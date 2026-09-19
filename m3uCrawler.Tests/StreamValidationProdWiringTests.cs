@@ -218,7 +218,10 @@ public class StreamValidationProdWiringTests : IDisposable
         state.Options.MaxConcurrency = MaxConcurrency;
         state.Options.OverallTimeoutSeconds = 30;
         state.Options.MaxRetries = 0;
-        var tester = StreamValidationTesterFactory.CreateTester(state);
+        // W2: o listener de teste vive em loopback (bloqueado pela política
+        // SSRF de produção); este teste exercita bounded concurrency, por
+        // isso opta pelo guard permissivo de testes.
+        var tester = new M3uTesterService(state, SsrfGuard.CreatePermissiveForLocalTests());
 
         var requests = Enumerable.Range(0, StreamCount)
             .Select(i => (Url: $"{server.BaseUrl}/stream-{i}", Title: $"T{i}", Group: "PT"))

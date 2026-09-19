@@ -111,6 +111,10 @@ internal static class TestTempDb
         "wave-w4b-",
         // Wave W5 — arranque seguro e reutilização do cliente Telegram.
         "wave-w5-",
+        // Wave W1 (2026-09-19) — Provider/ProviderAccount/DiscoveryCandidate.
+        "wave-w1-",
+        // Wave W2 (2026-09-19) — SSRF guard, aquisição protegida, falhas.
+        "wave-w2-",
         // Out dir.
         "out_",
     };
@@ -147,6 +151,10 @@ internal static class TestTempDb
         "wave_w4b-", "wave-w4b-",
         // Wave W5 — arranque seguro e reutilização do cliente Telegram.
         "wave_w5-", "wave-w5-",
+        // Wave W1 (2026-09-19) — Provider/ProviderAccount/DiscoveryCandidate.
+        "wave_w1-", "wave-w1-",
+        // Wave W2 (2026-09-19) — SSRF guard, aquisição protegida, falhas.
+        "wave_w2-", "wave-w2-",
         // Auditoria / validação live (timestamped).
         "bundle_guard_validation_", "content_type_distribution_",
         "country_opcao_c_live_validation_", "country_opcao_c_validation_",

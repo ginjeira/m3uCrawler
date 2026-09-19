@@ -44,6 +44,13 @@ namespace m3uCrawler.Services
             @"\b(password|passwd|pwd|api[_-]?hash|api[_-]?key|token|secret|session[_-]?id|csrf[_-]?token|authorization|auth[_-]?code|login[_-]?code|code)\b\s*[:=]\s*[^\s,;&""'}]+",
             RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
+        // W2 — Redacção de credenciais Bearer (Authorization: Bearer <token>),
+        // que o regex de pares chave=valor não cobre porque o valor não é um
+        // par único. Nunca persistir/logar o token.
+        private static readonly Regex _bearerTokenRegex = new(
+            @"\b(Bearer)\s+[A-Za-z0-9\-\._~\+/=]+",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
         public static string SanitizeUrl(string? url)
         {
             if (string.IsNullOrWhiteSpace(url)) return url ?? string.Empty;
@@ -143,6 +150,7 @@ namespace m3uCrawler.Services
         {
             if (string.IsNullOrEmpty(text)) return string.Empty;
             var sanitized = SanitizeText(text);
+            sanitized = _bearerTokenRegex.Replace(sanitized, "$1 ***");
             return _sensitiveKeyValueRegex.Replace(sanitized, match => match.Groups[1].Value + "=***");
         }
 

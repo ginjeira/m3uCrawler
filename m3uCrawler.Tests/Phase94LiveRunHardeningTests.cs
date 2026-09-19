@@ -40,6 +40,9 @@ public class Phase94LiveRunHardeningTests : IAsyncLifetime
     /// </summary>
     private static readonly string[] FrozenRunReportProperties =
     {
+        "AcquisitionFailures",
+        "AcquisitionRetryableFailures",
+        "AcquisitionTerminalFailures",
         "CandidatesFound",
         "ChannelsRecognized",
         "CountryMatches",
@@ -60,6 +63,7 @@ public class Phase94LiveRunHardeningTests : IAsyncLifetime
         "MessagesWithPhotoMedia",
         "PlaylistsDownloaded",
         "PlaylistsInvalid",
+        "PlaylistsPartial",
         "PlaylistsRejected",
         "PublicationsDiscovered",
         "PublicationsRequiresReview",
@@ -144,7 +148,7 @@ public class Phase94LiveRunHardeningTests : IAsyncLifetime
             .OrderBy(x => x, StringComparer.Ordinal)
             .ToArray();
 
-        Assert.Equal(56, actual.Length);
+        Assert.Equal(60, actual.Length);
         Assert.Equal(expected, actual);
     }
 

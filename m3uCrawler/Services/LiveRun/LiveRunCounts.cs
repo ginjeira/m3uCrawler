@@ -50,8 +50,22 @@ public sealed class LiveRunCounts
     public int CandidatesFound { get; set; }
     public int PlaylistsDownloaded { get; set; }
     public int PlaylistsInvalid { get; set; }
+    // W3 — playlists com parsing Partial (>=1 entrada válida e >=1 malformada/
+    // inutilizável). Aditivo; Partial nunca é contado como Success.
+    public int PlaylistsPartial { get; set; }
     public int PlaylistsRejected { get; set; }
     public int CountryMatches { get; set; }
+
+    // ===================== Aquisição (W2) =====================
+
+    /// <summary>Total de falhas de aquisição persistentes (terminal ou retry esgotado).</summary>
+    public int AcquisitionFailures { get; set; }
+
+    /// <summary>Falhas de aquisição em que o retry técnico foi esgotado.</summary>
+    public int AcquisitionRetryableFailures { get; set; }
+
+    /// <summary>Falhas de aquisição terminais (sem retry).</summary>
+    public int AcquisitionTerminalFailures { get; set; }
 
     // ===================== Xtream (publicações -> contas) =====================
 
@@ -120,8 +134,13 @@ public sealed class LiveRunCounts
         CandidatesFound = report.CandidatesFound;
         PlaylistsDownloaded = report.PlaylistsDownloaded;
         PlaylistsInvalid = report.PlaylistsInvalid;
+        PlaylistsPartial = report.PlaylistsPartial;
         PlaylistsRejected = report.PlaylistsRejected;
         CountryMatches = report.CountryMatches;
+
+        AcquisitionFailures = report.AcquisitionFailures;
+        AcquisitionRetryableFailures = report.AcquisitionRetryableFailures;
+        AcquisitionTerminalFailures = report.AcquisitionTerminalFailures;
 
         PublicationsDiscovered = report.PublicationsDiscovered;
         PublicationsResolved = report.PublicationsResolved;

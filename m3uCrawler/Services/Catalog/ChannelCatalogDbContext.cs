@@ -24,6 +24,9 @@ public sealed class ChannelCatalogDbContext : DbContext
     public DbSet<PendingCountryApprovalEntity> PendingCountryApprovals => Set<PendingCountryApprovalEntity>();
     public DbSet<SourceEntity> Sources => Set<SourceEntity>();
     public DbSet<ChannelSourceEntity> ChannelSources => Set<ChannelSourceEntity>();
+    public DbSet<ProviderEntity> Providers => Set<ProviderEntity>();
+    public DbSet<ProviderAccountEntity> ProviderAccounts => Set<ProviderAccountEntity>();
+    public DbSet<DiscoveryCandidateEntity> DiscoveryCandidates => Set<DiscoveryCandidateEntity>();
     public DbSet<OrderingListEntity> OrderingLists => Set<OrderingListEntity>();
     public DbSet<OrderingItemEntity> OrderingItems => Set<OrderingItemEntity>();
     public DbSet<SourcePriorityPolicyEntity> SourcePriorityPolicies => Set<SourcePriorityPolicyEntity>();
@@ -271,13 +274,98 @@ public sealed class ChannelCatalogDbContext : DbContext
             e.Property(x => x.Priority).IsRequired();
             e.Property(x => x.LastDiscoveryAtUtc);
             e.Property(x => x.LastValidationAtUtc);
+            e.Property(x => x.LastAcquisitionFailureKind).HasMaxLength(40);
+            e.Property(x => x.LastAcquisitionFailureAtUtc);
+            e.Property(x => x.LastAcquisitionHttpStatus);
+            e.Property(x => x.LastAcquisitionFailureDetail).HasMaxLength(500);
             e.Property(x => x.CreatedAtUtc).IsRequired();
             e.Property(x => x.UpdatedAtUtc).IsRequired();
             e.HasIndex(x => x.Key).IsUnique();
+            e.HasIndex(x => x.ProviderAccountId);
+            e.HasOne(x => x.ProviderAccount)
+                .WithMany()
+                .HasForeignKey(x => x.ProviderAccountId)
+                .OnDelete(DeleteBehavior.SetNull);
             e.HasMany(x => x.ChannelSources)
                 .WithOne(cs => cs.Source)
                 .HasForeignKey(cs => cs.SourceId)
                 .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        // W1 (2026-09-19) — Provider (namespace do ecossistema).
+        modelBuilder.Entity<ProviderEntity>(e =>
+        {
+            e.ToTable("providers");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Id).ValueGeneratedOnAdd();
+            e.Property(x => x.Key).IsRequired().HasMaxLength(80);
+            e.Property(x => x.Name).IsRequired().HasMaxLength(200);
+            e.Property(x => x.Type).HasConversion<int>();
+            e.Property(x => x.Capabilities).IsRequired().HasMaxLength(2000);
+            e.Property(x => x.IsEnabled).IsRequired();
+            e.Property(x => x.CreatedAtUtc).IsRequired();
+            e.Property(x => x.UpdatedAtUtc).IsRequired();
+            e.HasIndex(x => x.Key).IsUnique();
+            e.HasMany(x => x.Accounts)
+                .WithOne(a => a.Provider)
+                .HasForeignKey(a => a.ProviderId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        // W1 (2026-09-19) — ProviderAccount (identidade funcional
+        // canónica distinta do id técnico). `AccountKey` é único
+        // dentro do namespace do provider.
+        modelBuilder.Entity<ProviderAccountEntity>(e =>
+        {
+            e.ToTable("provider_accounts");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Id).ValueGeneratedOnAdd();
+            e.Property(x => x.ProviderId).IsRequired();
+            e.Property(x => x.AccountKey).IsRequired().HasMaxLength(200);
+            e.Property(x => x.DisplayName).IsRequired().HasMaxLength(200);
+            e.Property(x => x.Status).HasConversion<int>();
+            e.Property(x => x.CredentialsReference).HasMaxLength(400);
+            e.Property(x => x.CreatedAtUtc).IsRequired();
+            e.Property(x => x.UpdatedAtUtc).IsRequired();
+            e.HasIndex(x => new { x.ProviderId, x.AccountKey }).IsUnique();
+        });
+
+        // W1 (2026-09-19) — DiscoveryCandidate (ocorrência por Run).
+        // Sem FirstSeen/LastSeen. A unicidade (RunId, ProviderAccountId)
+        // impede processamento equivalente duplicado no mesmo Run quando
+        // existe identidade funcional. Sem conta (identidade instável)
+        // não há dedup: a ocorrência é preservada.
+        modelBuilder.Entity<DiscoveryCandidateEntity>(e =>
+        {
+            e.ToTable("discovery_candidates");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Id).ValueGeneratedOnAdd();
+            e.Property(x => x.ExternalIdentity).IsRequired().HasMaxLength(400);
+            e.Property(x => x.NormalizedIdentity).IsRequired().HasMaxLength(400);
+            e.Property(x => x.Evidence).IsRequired().HasMaxLength(1000);
+            e.Property(x => x.Status).HasConversion<int>();
+            e.Property(x => x.RunId).HasMaxLength(64);
+            e.Property(x => x.CreatedAtUtc).IsRequired();
+            e.Property(x => x.UpdatedAtUtc).IsRequired();
+            e.HasIndex(x => x.RunId);
+            e.HasIndex(x => x.NormalizedIdentity);
+            e.HasIndex(x => x.ProviderAccountId);
+            e.HasIndex(x => new { x.RunId, x.ProviderAccountId })
+                .IsUnique()
+                .HasDatabaseName("IX_discovery_candidates_RunId_ProviderAccountId")
+                .HasFilter("\"ProviderAccountId\" IS NOT NULL");
+            e.HasOne(x => x.Provider)
+                .WithMany()
+                .HasForeignKey(x => x.ProviderId)
+                .OnDelete(DeleteBehavior.SetNull);
+            e.HasOne(x => x.ProviderAccount)
+                .WithMany()
+                .HasForeignKey(x => x.ProviderAccountId)
+                .OnDelete(DeleteBehavior.SetNull);
+            e.HasOne(x => x.Source)
+                .WithMany()
+                .HasForeignKey(x => x.SourceId)
+                .OnDelete(DeleteBehavior.SetNull);
         });
 
         // PHASE 4 — ChannelSource

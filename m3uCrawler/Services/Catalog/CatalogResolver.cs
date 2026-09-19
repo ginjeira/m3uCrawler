@@ -5,6 +5,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.EntityFrameworkCore;
 using m3uCrawler.Services.Matching;
+using m3uCrawler.Services.Validation;
 
 namespace m3uCrawler.Services.Catalog;
 
@@ -1892,7 +1893,7 @@ public sealed class CatalogResolver
     public async Task<SourceEntity> EnsureSourceAsync(
         string key, string name, SourceKind kind, string origin, int priority,
         bool isEnabled = true, CancellationToken cancellationToken = default,
-        bool updatePriority = true)
+        bool updatePriority = true, long? providerAccountId = null)
     {
         if (string.IsNullOrWhiteSpace(key)) throw new ArgumentException("Key é obrigatória.", nameof(key));
         if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Name é obrigatório.", nameof(name));
@@ -1918,6 +1919,13 @@ public sealed class CatalogResolver
                 existing.Priority = priority;
             }
             existing.IsEnabled = isEnabled;
+            // A conta funcional só é (re)associada quando explicitamente
+            // fornecida; nunca é apagada implicitamente por uma chamada
+            // sem identidade.
+            if (providerAccountId.HasValue && providerAccountId.Value > 0)
+            {
+                existing.ProviderAccountId = providerAccountId.Value;
+            }
             existing.UpdatedAtUtc = now;
             await context.SaveChangesAsync(cancellationToken);
             return existing;
@@ -1931,6 +1939,9 @@ public sealed class CatalogResolver
             Origin = sanitizedOrigin,
             Priority = priority,
             IsEnabled = isEnabled,
+            ProviderAccountId = providerAccountId.HasValue && providerAccountId.Value > 0
+                ? providerAccountId.Value
+                : null,
             CreatedAtUtc = now,
             UpdatedAtUtc = now,
         };
@@ -1938,6 +1949,293 @@ public sealed class CatalogResolver
         await context.SaveChangesAsync(cancellationToken);
         return entity;
     }
+
+    // ============================================================================
+    // W1 (2026-09-19) — Provider / ProviderAccount / DiscoveryCandidate
+    // ============================================================================
+
+    /// <summary>
+    /// Cria ou reutiliza um <see cref="ProviderEntity"/> pela
+    /// <see cref="ProviderEntity.Key"/> (namespace). Idempotente: a
+    /// mesma key devolve sempre a mesma row; nunca cria duplicados.
+    /// </summary>
+    public async Task<ProviderEntity> EnsureProviderAsync(
+        string key,
+        string name,
+        ProviderType type,
+        string capabilities = "{}",
+        bool isEnabled = true,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(key)) throw new ArgumentException("Provider key é obrigatória.", nameof(key));
+        if (key.Length > 80) throw new ArgumentException("Provider key excede 80 caracteres.", nameof(key));
+        if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Provider name é obrigatório.", nameof(name));
+        if (name.Length > 200) throw new ArgumentException("Provider name excede 200 caracteres.", nameof(name));
+
+        var normalizedKey = key.Trim();
+        var now = DateTime.UtcNow;
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var existing = await context.Providers
+            .FirstOrDefaultAsync(p => p.Key == normalizedKey, cancellationToken);
+        if (existing != null)
+        {
+            existing.Name = name.Trim();
+            existing.Type = type;
+            existing.Capabilities = string.IsNullOrWhiteSpace(capabilities) ? "{}" : capabilities;
+            existing.UpdatedAtUtc = now;
+            await context.SaveChangesAsync(cancellationToken);
+            return existing;
+        }
+
+        var entity = new ProviderEntity
+        {
+            Key = normalizedKey,
+            Name = name.Trim(),
+            Type = type,
+            Capabilities = string.IsNullOrWhiteSpace(capabilities) ? "{}" : capabilities,
+            IsEnabled = isEnabled,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+        };
+        context.Providers.Add(entity);
+        try
+        {
+            await context.SaveChangesAsync(cancellationToken);
+        }
+        catch (DbUpdateException)
+        {
+            // Corrida: outro writer criou o mesmo namespace. O
+            // invariante de unicidade manda; reutilizar.
+            context.ChangeTracker.Clear();
+            return await context.Providers.FirstAsync(p => p.Key == normalizedKey, cancellationToken);
+        }
+        return entity;
+    }
+
+    /// <summary>
+    /// Cria ou reutiliza um <see cref="ProviderAccountEntity"/> pela
+    /// identidade funcional canónica <paramref name="accountKey"/>, que
+    /// é única dentro do namespace do provider. Nunca cria uma conta
+    /// nova para a mesma identidade funcional (T7).
+    /// </summary>
+    public async Task<ProviderAccountEntity> EnsureProviderAccountAsync(
+        long providerId,
+        string accountKey,
+        string displayName,
+        ProviderAccountStatus status = ProviderAccountStatus.Discovered,
+        string? credentialsReference = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (providerId <= 0) throw new ArgumentOutOfRangeException(nameof(providerId));
+        if (string.IsNullOrWhiteSpace(accountKey)) throw new ArgumentException("AccountKey é obrigatória.", nameof(accountKey));
+        if (accountKey.Length > 200) throw new ArgumentException("AccountKey excede 200 caracteres.", nameof(accountKey));
+
+        var normalizedKey = accountKey.Trim();
+        var now = DateTime.UtcNow;
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var existing = await context.ProviderAccounts
+            .FirstOrDefaultAsync(a => a.ProviderId == providerId && a.AccountKey == normalizedKey, cancellationToken);
+        if (existing != null)
+        {
+            if (!string.IsNullOrWhiteSpace(displayName)) existing.DisplayName = displayName.Trim();
+            existing.Status = status;
+            if (!string.IsNullOrWhiteSpace(credentialsReference))
+            {
+                existing.CredentialsReference = credentialsReference.Trim();
+            }
+            existing.UpdatedAtUtc = now;
+            await context.SaveChangesAsync(cancellationToken);
+            return existing;
+        }
+
+        var entity = new ProviderAccountEntity
+        {
+            ProviderId = providerId,
+            AccountKey = normalizedKey,
+            DisplayName = string.IsNullOrWhiteSpace(displayName) ? normalizedKey : displayName.Trim(),
+            Status = status,
+            CredentialsReference = string.IsNullOrWhiteSpace(credentialsReference) ? null : credentialsReference.Trim(),
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+        };
+        context.ProviderAccounts.Add(entity);
+        try
+        {
+            await context.SaveChangesAsync(cancellationToken);
+        }
+        catch (DbUpdateException)
+        {
+            context.ChangeTracker.Clear();
+            return await context.ProviderAccounts.FirstAsync(
+                a => a.ProviderId == providerId && a.AccountKey == normalizedKey, cancellationToken);
+        }
+        return entity;
+    }
+
+    /// <summary>
+    /// Resultado do registo de uma ocorrência de descoberta.
+    /// <see cref="Created"/> é <c>false</c> quando a ocorrência foi
+    /// deduplicada para uma já existente no mesmo Run.
+    /// </summary>
+    public sealed record DiscoveryCandidateRecord(
+        DiscoveryCandidateEntity Candidate,
+        bool Created,
+        ProviderAccountEntity? Account);
+
+    /// <summary>
+    /// W1 — persiste uma ocorrência de descoberta associada a um Run.
+    ///
+    /// <para>
+    /// <b>Dedup por identidade funcional.</b> Quando existe
+    /// <paramref name="providerAccountId"/> e um <paramref name="runId"/>
+    /// não vazio, duas ocorrências do mesmo Run para a mesma conta
+    /// funcional são a mesma unidade: a segunda devolve a row existente
+    /// (<see cref="DiscoveryCandidateRecord.Created"/> = <c>false</c>) e
+    /// não cria processamento equivalente.
+    /// </para>
+    ///
+    /// <para>
+    /// <b>Sem identidade → sem dedup.</b> Quando não há conta funcional
+    /// (<paramref name="providerAccountId"/> nulo) ou não há Run
+    /// atribuível, a ocorrência é sempre preservada como distinta. Nunca
+    /// se inventa identidade para poder deduplicar.
+    /// </para>
+    /// </summary>
+    public async Task<DiscoveryCandidateRecord> RecordDiscoveryCandidateAsync(
+        string? runId,
+        long? providerId,
+        long? providerAccountId,
+        string? externalIdentity,
+        string? normalizedIdentity,
+        string evidence,
+        DiscoveryCandidateStatus status = DiscoveryCandidateStatus.Discovered,
+        long? sourceId = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (providerId.HasValue && providerId.Value <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(providerId));
+        }
+
+        var external = TrimTo(externalIdentity ?? string.Empty, 400);
+        var normalized = TrimTo(
+            AccountKey.NormalizeExternalIdentity(normalizedIdentity ?? externalIdentity), 400);
+        var sanitizedEvidence = TrimTo(
+            CredentialSanitizer.SanitizeText(
+                CredentialSanitizer.SanitizeUrl(evidence ?? string.Empty)),
+            1000);
+        var effectiveRunId = string.IsNullOrWhiteSpace(runId) ? null : runId.Trim();
+        if (effectiveRunId != null && effectiveRunId.Length > 64) effectiveRunId = effectiveRunId[..64];
+
+        var now = DateTime.UtcNow;
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+
+        ProviderAccountEntity? account = null;
+        if (providerAccountId.HasValue && providerAccountId.Value > 0)
+        {
+            account = await context.ProviderAccounts
+                .FirstOrDefaultAsync(a => a.Id == providerAccountId.Value, cancellationToken);
+        }
+
+        // Dedup apenas com conta funcional E Run atribuível.
+        if (account != null && effectiveRunId != null)
+        {
+            var existing = await context.DiscoveryCandidates
+                .FirstOrDefaultAsync(
+                    c => c.RunId == effectiveRunId && c.ProviderAccountId == account.Id,
+                    cancellationToken);
+            if (existing != null)
+            {
+                existing.Status = DiscoveryCandidateStatus.Deduplicated;
+                existing.UpdatedAtUtc = now;
+                if (sourceId.HasValue && sourceId.Value > 0)
+                {
+                    existing.SourceId = sourceId.Value;
+                }
+                await context.SaveChangesAsync(cancellationToken);
+                return new DiscoveryCandidateRecord(existing, Created: false, account);
+            }
+        }
+
+        var entity = new DiscoveryCandidateEntity
+        {
+            ProviderId = providerId,
+            ProviderAccountId = account?.Id,
+            ExternalIdentity = external,
+            NormalizedIdentity = normalized,
+            Evidence = sanitizedEvidence,
+            Status = status,
+            RunId = effectiveRunId,
+            SourceId = sourceId.HasValue && sourceId.Value > 0 ? sourceId.Value : null,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+        };
+        context.DiscoveryCandidates.Add(entity);
+        try
+        {
+            await context.SaveChangesAsync(cancellationToken);
+        }
+        catch (DbUpdateException)
+        {
+            // Corrida no índice único (RunId, ProviderAccountId).
+            context.ChangeTracker.Clear();
+            var existing = await context.DiscoveryCandidates
+                .FirstAsync(c => c.RunId == effectiveRunId && c.ProviderAccountId == account!.Id, cancellationToken);
+            return new DiscoveryCandidateRecord(existing, Created: false, account);
+        }
+        return new DiscoveryCandidateRecord(entity, Created: true, account);
+    }
+
+    /// <summary>
+    /// Associa explicitamente uma <see cref="DiscoveryCandidateEntity"/>
+    /// a uma <see cref="SourceEntity"/> (passagem Candidate→Source
+    /// rastreável). Idempotente.
+    /// </summary>
+    public async Task<bool> LinkDiscoveryCandidateToSourceAsync(
+        long candidateId, long sourceId, CancellationToken cancellationToken = default)
+    {
+        if (candidateId <= 0) throw new ArgumentOutOfRangeException(nameof(candidateId));
+        if (sourceId <= 0) throw new ArgumentOutOfRangeException(nameof(sourceId));
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var candidate = await context.DiscoveryCandidates
+            .FirstOrDefaultAsync(c => c.Id == candidateId, cancellationToken);
+        if (candidate == null) return false;
+        candidate.SourceId = sourceId;
+        candidate.UpdatedAtUtc = DateTime.UtcNow;
+        await context.SaveChangesAsync(cancellationToken);
+        return true;
+    }
+
+    public async Task<IReadOnlyList<ProviderEntity>> ListProvidersAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.Providers
+            .AsNoTracking()
+            .OrderBy(p => p.Key)
+            .ToListAsync(cancellationToken);
+    }
+
+    public async Task<IReadOnlyList<ProviderAccountEntity>> ListProviderAccountsAsync(
+        long? providerId = null, CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var query = context.ProviderAccounts.AsNoTracking().AsQueryable();
+        if (providerId.HasValue) query = query.Where(a => a.ProviderId == providerId.Value);
+        return await query.OrderBy(a => a.AccountKey).ToListAsync(cancellationToken);
+    }
+
+    public async Task<IReadOnlyList<DiscoveryCandidateEntity>> ListDiscoveryCandidatesAsync(
+        string? runId = null, CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var query = context.DiscoveryCandidates.AsNoTracking().AsQueryable();
+        if (!string.IsNullOrWhiteSpace(runId)) query = query.Where(c => c.RunId == runId);
+        return await query.OrderBy(c => c.Id).ToListAsync(cancellationToken);
+    }
+
+    private static string TrimTo(string value, int max)
+        => value.Length <= max ? value : value[..max];
 
     public async Task<bool> DeleteSourceAsync(long id, CancellationToken cancellationToken = default)
     {
@@ -1966,6 +2264,40 @@ public sealed class CatalogResolver
         var entity = await context.Sources.FirstOrDefaultAsync(s => s.Id == id, cancellationToken);
         if (entity == null) return false;
         entity.LastValidationAtUtc = whenUtc;
+        entity.UpdatedAtUtc = DateTime.UtcNow;
+        await context.SaveChangesAsync(cancellationToken);
+        return true;
+    }
+
+    /// <summary>
+    /// W2 (2026-09-19) — regista a última falha de aquisição persistente de
+    /// uma <see cref="SourceEntity"/> (<c>19-FAILURE-MODEL.md §6</c>).
+    ///
+    /// <para>
+    /// O detalhe é sanitizado (<see cref="CredentialSanitizer.SanitizeSensitiveText"/>)
+    /// antes de persistir: nunca são guardadas credenciais, tokens,
+    /// Authorization nem URLs com credenciais. A operação é aditiva — não
+    /// apaga nem altera outros dados da Source.
+    /// </para>
+    /// </summary>
+    public async Task<bool> MarkSourceAcquisitionFailureAsync(
+        long id,
+        string failureKind,
+        DateTime whenUtc,
+        int? httpStatus,
+        string? detail,
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var entity = await context.Sources.FirstOrDefaultAsync(s => s.Id == id, cancellationToken);
+        if (entity == null) return false;
+
+        entity.LastAcquisitionFailureKind = TrimTo(failureKind ?? string.Empty, 40);
+        entity.LastAcquisitionFailureAtUtc = whenUtc;
+        entity.LastAcquisitionHttpStatus = httpStatus;
+        entity.LastAcquisitionFailureDetail = detail is null
+            ? null
+            : TrimTo(CredentialSanitizer.SanitizeSensitiveText(detail), 500);
         entity.UpdatedAtUtc = DateTime.UtcNow;
         await context.SaveChangesAsync(cancellationToken);
         return true;

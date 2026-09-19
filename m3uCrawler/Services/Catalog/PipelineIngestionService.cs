@@ -6,6 +6,7 @@ using System.Threading.Tasks;
 using m3uCrawler.Models;
 using m3uCrawler.Services.Catalog;
 using m3uCrawler.Services.Matching;
+using m3uCrawler.Services.Validation;
 
 namespace m3uCrawler.Services.Catalog;
 
@@ -146,7 +147,8 @@ public sealed class PipelineIngestionService
         string sourceKey,
         string sourceKindName,
         string countryCode,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string? runId = null)
     {
         if (streams == null) throw new ArgumentNullException(nameof(streams));
         if (string.IsNullOrWhiteSpace(sourceKey))
@@ -184,6 +186,14 @@ public sealed class PipelineIngestionService
         var kind = ParseKind(sourceKindName);
         var origin = BuildOrigin(sourceKey, sourceKindName, countryCode);
 
+        // W1 (2026-09-19) — identidade funcional das contas presentes no
+        // lote. A identidade é derivada da evidência funcional estável já
+        // usada pelo pipeline Xtream (endpoint + username; password nunca
+        // participa). Sem identidade estável NÃO se inventa conta: o
+        // candidato é preservado como ocorrência distinta.
+        var accounts = await ResolveFunctionalAccountsAsync(streams, cancellationToken);
+        long? singleAccountId = accounts.Count == 1 ? accounts.Values.First().AccountId : null;
+
         // A prioridade de uma Source existente é estado do operador
         // (Dashboard/ordenação) e NÃO deve ser reescrita pela ingestion.
         // A prioridade 0 só se aplica quando a Source é criada agora.
@@ -194,8 +204,50 @@ public sealed class PipelineIngestionService
             origin: origin,
             priority: 0,
             updatePriority: false,
-            cancellationToken: cancellationToken);
+            cancellationToken: cancellationToken,
+            providerAccountId: singleAccountId);
         await _catalog.MarkSourceDiscoveryAsync(source.Id, DateTime.UtcNow, cancellationToken);
+
+        // W1 — persistir as ocorrências de descoberta associadas ao Run.
+        // Com conta funcional, a dedup por (RunId, ProviderAccountId)
+        // garante uma única ocorrência por conta no mesmo Run. Sem conta,
+        // a ocorrência é sempre preservada (nunca dedup silenciosa).
+        var evidence = BuildDiscoveryEvidence(sourceKey, sourceKindName, countryCode);
+        if (accounts.Count > 0)
+        {
+            var xtreamProvider = await _catalog.EnsureProviderAsync(
+                ProviderNamespaces.Xtream,
+                "Xtream Codes",
+                ProviderType.Xtream,
+                cancellationToken: cancellationToken);
+
+            foreach (var account in accounts.Values)
+            {
+                await _catalog.RecordDiscoveryCandidateAsync(
+                    runId: runId,
+                    providerId: xtreamProvider.Id,
+                    providerAccountId: account.AccountId,
+                    externalIdentity: account.ExternalIdentity,
+                    normalizedIdentity: account.ExternalIdentity,
+                    evidence: evidence,
+                    status: DiscoveryCandidateStatus.Normalized,
+                    sourceId: source.Id,
+                    cancellationToken: cancellationToken);
+            }
+        }
+        else
+        {
+            await _catalog.RecordDiscoveryCandidateAsync(
+                runId: runId,
+                providerId: null,
+                providerAccountId: null,
+                externalIdentity: null,
+                normalizedIdentity: null,
+                evidence: evidence,
+                status: DiscoveryCandidateStatus.Discovered,
+                sourceId: source.Id,
+                cancellationToken: cancellationToken);
+        }
 
         var entries = new List<IngestionEntry>(streams.Count);
         int matched = 0;
@@ -371,4 +423,53 @@ public sealed class PipelineIngestionService
 
     private static string BuildOrigin(string sourceKey, string sourceKindName, string countryCode) =>
         $"{sourceKindName}://{sourceKey}?country={countryCode}";
+
+    /// <summary>
+    /// W1 — resolve as contas funcionais distintas presentes num lote de
+    /// streams. Reutiliza a identidade funcional Xtream existente
+    /// (<see cref="AccountIdentity.TryComputeXtreamExternalIdentity"/>):
+    /// endpoint + username, password excluída. Streams sem identidade
+    /// funcional estável não contribuem para nenhuma conta.
+    /// </summary>
+    private sealed record FunctionalAccount(string ExternalIdentity, long AccountId);
+
+    private async Task<Dictionary<string, FunctionalAccount>> ResolveFunctionalAccountsAsync(
+        IReadOnlyList<M3uStream> streams, CancellationToken cancellationToken)
+    {
+        var result = new Dictionary<string, FunctionalAccount>(StringComparer.Ordinal);
+        ProviderEntity? xtreamProvider = null;
+        foreach (var stream in streams)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (stream == null || string.IsNullOrWhiteSpace(stream.Url)) continue;
+            if (!AccountIdentity.TryComputeXtreamExternalIdentity(stream.Url, out var external)
+                || string.IsNullOrEmpty(external))
+            {
+                continue;
+            }
+
+            var accountKey = AccountKey.Compose(ProviderNamespaces.Xtream, external);
+            if (accountKey is null || result.ContainsKey(accountKey)) continue;
+
+            xtreamProvider ??= await _catalog.EnsureProviderAsync(
+                ProviderNamespaces.Xtream,
+                "Xtream Codes",
+                ProviderType.Xtream,
+                cancellationToken: cancellationToken);
+            var account = await _catalog.EnsureProviderAccountAsync(
+                xtreamProvider.Id,
+                accountKey,
+                accountKey,
+                ProviderAccountStatus.Discovered,
+                cancellationToken: cancellationToken);
+            result[accountKey] = new FunctionalAccount(external, account.Id);
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Evidência sanitizada da descoberta. Nunca contém credenciais.
+    /// </summary>
+    private static string BuildDiscoveryEvidence(string sourceKey, string sourceKindName, string countryCode)
+        => CredentialSanitizer.SanitizeText($"{sourceKindName}:{sourceKey}:country={countryCode}");
 }

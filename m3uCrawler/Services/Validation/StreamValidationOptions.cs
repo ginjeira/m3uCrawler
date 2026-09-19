@@ -32,6 +32,14 @@ public sealed class StreamValidationOptions
     public const int DefaultFailureCacheTtlSeconds = 60;
     public const int DefaultEarlyExitThreshold = 0;
     public const int DefaultHostFailureThreshold = 3;
+
+    // W2 — parâmetros técnicos (PARAMETER_GAP; valores apenas operacionais).
+    // MaxRedirects: tecto finito de saltos manuais de redirect (terminação).
+    // MaxResponseBytes: tecto de resposta; acima deste valor a falha é
+    // terminal (Oversized).
+    public const int DefaultMaxRedirects = 5;
+    public const long DefaultMaxResponseBytes = 10L * 1024 * 1024;
+
     public const string DefaultUserAgent =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
 
@@ -53,6 +61,12 @@ public sealed class StreamValidationOptions
     public int HostFailureThreshold { get; set; } = DefaultHostFailureThreshold;
     public string UserAgent { get; set; } = DefaultUserAgent;
 
+    /// <summary>W2 — tecto finito de redirects seguidos manualmente (PARAMETER_GAP).</summary>
+    public int MaxRedirects { get; set; } = DefaultMaxRedirects;
+
+    /// <summary>W2 — tamanho máximo da resposta em bytes; exceder é terminal (PARAMETER_GAP).</summary>
+    public long MaxResponseBytes { get; set; } = DefaultMaxResponseBytes;
+
     public StreamValidationOptions Clone() => new()
     {
         MaxConcurrency = MaxConcurrency,
@@ -69,6 +83,8 @@ public sealed class StreamValidationOptions
         HostFailure = HostFailure,
         HostFailureThreshold = HostFailureThreshold,
         UserAgent = UserAgent,
+        MaxRedirects = MaxRedirects,
+        MaxResponseBytes = MaxResponseBytes,
     };
 
     public TimeSpan ConnectionTimeout => TimeSpan.FromSeconds(Math.Max(1, ConnectionTimeoutSeconds));
@@ -91,6 +107,8 @@ public sealed class StreamValidationOptions
         FailureCacheTtlSeconds = Math.Clamp(FailureCacheTtlSeconds, 0, 24 * 60 * 60);
         EarlyExitThreshold = Math.Clamp(EarlyExitThreshold, 0, 10_000);
         HostFailureThreshold = Math.Clamp(HostFailureThreshold, 1, 100);
+        MaxRedirects = Math.Clamp(MaxRedirects, 0, 20);
+        MaxResponseBytes = Math.Clamp(MaxResponseBytes, 1024, 512L * 1024 * 1024);
         if (string.IsNullOrWhiteSpace(UserAgent)) UserAgent = DefaultUserAgent;
     }
 

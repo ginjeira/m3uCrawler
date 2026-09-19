@@ -204,7 +204,17 @@ namespace m3uCrawler.Services
             var matchedAliases = new List<string>();
             var recognizedChannels = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-            foreach (var stream in parser.Parse(playlistContent))
+            // Contrato W3: uma playlist Failed (sem #EXTM3U ou sem entradas
+            // válidas) não é ingerida — não produz canais reconhecidos nem
+            // confunde falha de parsing com validação/eligibility de país.
+            // Partial ingere apenas as entradas válidas.
+            var parseResult = parser.ParseDetailed(playlistContent);
+            if (parseResult.Status == M3uPlaylistStatus.Failed)
+            {
+                return result;
+            }
+
+            foreach (var stream in parseResult.Streams)
             {
                 var titleTokens = Tokenize(NormalizeText(stream.Title));
                 if (titleTokens.Count == 0) continue;
