@@ -872,6 +872,360 @@ public sealed class CatalogResolver
         return item;
     }
 
+    private const string DefaultExclusionReason = "excluído por decisão administrativa";
+
+    /// <summary>
+    /// W6b-1 — Aplica uma aprovação/exclusão de Review com mudança de
+    /// catálogo EXPLÍCITA e auditável (<c>05-CATALOGUE.md §9</c>).
+    /// Devolve <c>null</c> se o fingerprint não existir.
+    ///
+    /// <list type="bullet">
+    ///   <item><see cref="ReviewApprovalAction.AddAlias"/> — exige
+    ///         <c>CanonicalChannelKey</c>; adiciona o valor observado
+    ///         (ou <c>Alias</c> explícito) como alias normalizado do
+    ///         canal existente;</item>
+    ///   <item><see cref="ReviewApprovalAction.CreateChannel"/> — exige
+    ///         <c>Channel.Key</c> e <c>Channel.Name</c>; cria o canal
+    ///         canónico declarado pelo administrador e adiciona o
+    ///         alias — é o único caminho de criação a partir de uma
+    ///         Review (nunca implícito, DL-002);</item>
+    ///   <item><see cref="ReviewApprovalAction.Exclude"/> — marca a
+    ///         Review como excluída com uma razão; não altera o
+    ///         catálogo.</item>
+    /// </list>
+    ///
+    /// <para>
+    /// Idempotência/conflictos: reaplicar a MESMA mudança declarada
+    /// não duplica alias/canais nem reabre a decisão; uma mudança
+    /// declarada diferente sobre uma Review já resolvida levanta
+    /// <see cref="ChannelAdministrationError.ReviewConflict"/>.
+    /// </para>
+    /// </summary>
+    public async Task<ReviewApprovalResult?> ApplyReviewApprovalAsync(
+        string fingerprint,
+        ReviewApprovalDecision decision,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(fingerprint))
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.InvalidInput,
+                "Fingerprint é obrigatório.");
+        }
+        if (decision is null)
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.InvalidInput,
+                "Decisão de aprovação é obrigatória.");
+        }
+
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var item = await context.ReviewItems
+            .FirstOrDefaultAsync(r => r.Fingerprint == fingerprint, cancellationToken);
+        if (item == null) return null;
+
+        return decision.Action switch
+        {
+            ReviewApprovalAction.AddAlias =>
+                await ApplyAddAliasAsync(context, item, decision, cancellationToken),
+            ReviewApprovalAction.CreateChannel =>
+                await ApplyCreateChannelAsync(context, item, decision, cancellationToken),
+            ReviewApprovalAction.Exclude =>
+                await ApplyExcludeAsync(context, item, decision, cancellationToken),
+            _ => throw new ChannelAdministrationException(
+                ChannelAdministrationError.InvalidInput,
+                "Acção de aprovação desconhecida."),
+        };
+    }
+
+    private async Task<ReviewApprovalResult> ApplyAddAliasAsync(
+        ChannelCatalogDbContext context,
+        ReviewItemEntity item,
+        ReviewApprovalDecision decision,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(decision.CanonicalChannelKey))
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.InvalidInput,
+                "canonicalChannelKey é obrigatório para action=add-alias.");
+        }
+
+        var key = decision.CanonicalChannelKey!.Trim();
+        var alias = NormalizeReviewAlias(decision.Alias, item.NormalizedIdentity);
+        var priorState = item.State;
+        var priorApprovedId = item.ApprovedCanonicalChannelId;
+
+        var channel = await context.CanonicalChannels
+            .FirstOrDefaultAsync(c => c.Key == key, cancellationToken);
+        if (channel == null)
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.ChannelNotFound,
+                $"Canal canónico '{key}' não encontrado.");
+        }
+
+        var existing = await context.ChannelAliases
+            .FirstOrDefaultAsync(a => a.NormalizedAlias == alias, cancellationToken);
+        if (existing != null && existing.CanonicalChannelId != channel.Id)
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.AliasConflict,
+                $"Alias '{alias}' já pertence ao canal #{existing.CanonicalChannelId}.");
+        }
+
+        EnsureOpenOrSameApproval(item, channel.Id);
+
+        var now = DateTime.UtcNow;
+        ChannelAliasEntity aliasEntity;
+        var catalogueChanged = false;
+        if (existing != null)
+        {
+            aliasEntity = existing;
+        }
+        else
+        {
+            aliasEntity = new ChannelAliasEntity
+            {
+                NormalizedAlias = alias,
+                CanonicalChannelId = channel.Id,
+                CreatedAtUtc = now,
+            };
+            context.ChannelAliases.Add(aliasEntity);
+            channel.UpdatedAtUtc = now;
+            catalogueChanged = true;
+        }
+
+        ResolveReview(item, ReviewItemState.Approved, channel.Id, now);
+        await SaveReviewApprovalAsync(context, alias, cancellationToken);
+
+        return new ReviewApprovalResult(
+            item, priorState, priorApprovedId, channel, aliasEntity,
+            Idempotent: !catalogueChanged,
+            CatalogueChanged: catalogueChanged,
+            Action: "add-alias");
+    }
+
+    private async Task<ReviewApprovalResult> ApplyCreateChannelAsync(
+        ChannelCatalogDbContext context,
+        ReviewItemEntity item,
+        ReviewApprovalDecision decision,
+        CancellationToken cancellationToken)
+    {
+        var spec = decision.Channel;
+        if (spec == null || string.IsNullOrWhiteSpace(spec.Key) || string.IsNullOrWhiteSpace(spec.Name))
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.InvalidInput,
+                "channel.key e channel.name são obrigatórios para action=create-channel.");
+        }
+
+        ValidateKey(spec.Key);
+        ValidateDisplayName(spec.Name);
+        var key = spec.Key.Trim();
+        var alias = NormalizeReviewAlias(decision.Alias, item.NormalizedIdentity);
+        var priorState = item.State;
+        var priorApprovedId = item.ApprovedCanonicalChannelId;
+
+        CanonicalChannelEntity channel;
+        var channelCreated = false;
+
+        if (item.State == ReviewItemState.Approved)
+        {
+            var approved = item.ApprovedCanonicalChannelId.HasValue
+                ? await context.CanonicalChannels.FirstOrDefaultAsync(
+                    c => c.Id == item.ApprovedCanonicalChannelId!.Value, cancellationToken)
+                : null;
+            if (approved == null || !string.Equals(approved.Key, key, StringComparison.Ordinal))
+            {
+                throw new ChannelAdministrationException(
+                    ChannelAdministrationError.ReviewConflict,
+                    "O item de revisão já foi aprovado com outra mudança de catálogo.");
+            }
+            channel = approved;
+        }
+        else if (item.State == ReviewItemState.Excluded)
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.ReviewConflict,
+                "O item de revisão já foi excluído; uma decisão resolvida não é reaberta.");
+        }
+        else
+        {
+            var byKey = await context.CanonicalChannels
+                .FirstOrDefaultAsync(c => c.Key == key, cancellationToken);
+            if (byKey != null)
+            {
+                throw new ChannelAdministrationException(
+                    ChannelAdministrationError.DuplicateKey,
+                    $"Já existe um canal canónico com a key '{key}' (id={byKey.Id}).");
+            }
+
+            var createdNow = DateTime.UtcNow;
+            channel = new CanonicalChannelEntity
+            {
+                Key = key,
+                DisplayName = spec.Name.Trim(),
+                Country = NormalizeCountry(spec.Country),
+                EditorialCategory = spec.EditorialCategory ?? EditorialCategory.Live,
+                EditorialGroup = spec.EditorialGroup ?? CanonicalEditorialGroup.Other,
+                PublicationPolicy = spec.PublicationPolicy ?? PublicationPolicy.CreateEligible,
+                IsEnabled = true,
+                CreatedAtUtc = createdNow,
+                UpdatedAtUtc = createdNow,
+            };
+            context.CanonicalChannels.Add(channel);
+            await context.SaveChangesAsync(cancellationToken);
+            channelCreated = true;
+        }
+
+        var existing = await context.ChannelAliases
+            .FirstOrDefaultAsync(a => a.NormalizedAlias == alias, cancellationToken);
+        if (existing != null && existing.CanonicalChannelId != channel.Id)
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.AliasConflict,
+                $"Alias '{alias}' já pertence ao canal #{existing.CanonicalChannelId}.");
+        }
+
+        var now = DateTime.UtcNow;
+        ChannelAliasEntity aliasEntity;
+        var aliasCreated = false;
+        if (existing != null)
+        {
+            aliasEntity = existing;
+        }
+        else
+        {
+            aliasEntity = new ChannelAliasEntity
+            {
+                NormalizedAlias = alias,
+                CanonicalChannelId = channel.Id,
+                CreatedAtUtc = now,
+            };
+            context.ChannelAliases.Add(aliasEntity);
+            channel.UpdatedAtUtc = now;
+            aliasCreated = true;
+        }
+
+        ResolveReview(item, ReviewItemState.Approved, channel.Id, now);
+        await SaveReviewApprovalAsync(context, alias, cancellationToken);
+
+        var changed = channelCreated || aliasCreated;
+        return new ReviewApprovalResult(
+            item, priorState, priorApprovedId, channel, aliasEntity,
+            Idempotent: !changed,
+            CatalogueChanged: changed,
+            Action: "create-channel");
+    }
+
+    private static async Task<ReviewApprovalResult> ApplyExcludeAsync(
+        ChannelCatalogDbContext context,
+        ReviewItemEntity item,
+        ReviewApprovalDecision decision,
+        CancellationToken cancellationToken)
+    {
+        var reason = string.IsNullOrWhiteSpace(decision.Reason)
+            ? DefaultExclusionReason
+            : decision.Reason!.Trim();
+        var priorState = item.State;
+        var priorApprovedId = item.ApprovedCanonicalChannelId;
+
+        if (item.State == ReviewItemState.Approved)
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.ReviewConflict,
+                "O item de revisão já foi aprovado; uma decisão resolvida não é reaberta.");
+        }
+
+        if (item.State == ReviewItemState.Excluded)
+        {
+            return new ReviewApprovalResult(
+                item, priorState, priorApprovedId, null, null,
+                Idempotent: true, CatalogueChanged: false, Action: "exclude");
+        }
+
+        var now = DateTime.UtcNow;
+        item.State = ReviewItemState.Excluded;
+        item.ResolvedAtUtc = now;
+        item.UpdatedAtUtc = now;
+        item.ApprovedCanonicalChannelId = null;
+        // A razão da decisão é persistida (a Nota tem limite de 500).
+        item.Note = reason.Length > 500 ? reason.Substring(0, 500) : reason;
+        await context.SaveChangesAsync(cancellationToken);
+
+        return new ReviewApprovalResult(
+            item, priorState, priorApprovedId, null, null,
+            Idempotent: false, CatalogueChanged: false, Action: "exclude");
+    }
+
+    private static void EnsureOpenOrSameApproval(ReviewItemEntity item, long channelId)
+    {
+        if (item.State == ReviewItemState.Excluded)
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.ReviewConflict,
+                "O item de revisão já foi excluído; uma decisão resolvida não é reaberta.");
+        }
+        if (item.State == ReviewItemState.Approved
+            && item.ApprovedCanonicalChannelId.HasValue
+            && item.ApprovedCanonicalChannelId.Value != channelId)
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.ReviewConflict,
+                "O item de revisão já foi aprovado com outro canal canónico.");
+        }
+    }
+
+    private static void ResolveReview(
+        ReviewItemEntity item, ReviewItemState state, long? channelId, DateTime now)
+    {
+        if (item.State == ReviewItemState.Open)
+        {
+            item.State = state;
+            item.ResolvedAtUtc = now;
+        }
+        item.UpdatedAtUtc = now;
+        item.ApprovedCanonicalChannelId = channelId;
+    }
+
+    private static string NormalizeReviewAlias(string? explicitAlias, string observed)
+    {
+        var raw = string.IsNullOrWhiteSpace(explicitAlias) ? observed : explicitAlias;
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.InvalidInput,
+                "Alias é obrigatório (nem o valor observado nem alias explícito fornecidos).");
+        }
+        var normalized = ChannelNormalizer.Normalize(raw);
+        if (normalized.Length == 0)
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.InvalidInput,
+                $"Alias '{raw}' normaliza para vazio e não é matchable.");
+        }
+        return normalized;
+    }
+
+    private static async Task SaveReviewApprovalAsync(
+        ChannelCatalogDbContext context, string? alias, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await context.SaveChangesAsync(cancellationToken);
+        }
+        catch (DbUpdateException)
+        {
+            // Corrida: unicidade de alias/canal manda; não duplicar.
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.AliasConflict,
+                alias is null
+                    ? "Conflito de unicidade ao resolver a Review."
+                    : $"Alias '{alias}' já existe (corrida concorrente).");
+        }
+    }
+
     /// <summary>
     /// Lista todos os SyncRun ordenados por StartedAtUtc
     /// (mais recentes primeiro).

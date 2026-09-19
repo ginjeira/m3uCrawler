@@ -1289,64 +1289,186 @@ namespace m3uCrawler.Services
 
             if (requestPath.StartsWith("/api/catalog/reviews/", StringComparison.OrdinalIgnoreCase))
             {
-                var fingerprint = requestPath.Substring("/api/catalog/reviews/".Length);
-                if (string.IsNullOrWhiteSpace(fingerprint))
+                var tail = requestPath.Substring("/api/catalog/reviews/".Length);
+                var segments = tail.Split('/', StringSplitOptions.RemoveEmptyEntries);
+                if (segments.Length == 0)
                 {
-                    context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
-                    await WriteJsonAsync(context.Response, new { error = "Fingerprint é obrigatório." });
+                    await WriteJsonAsync(context.Response, new { error = "Fingerprint é obrigatório." },
+                        HttpStatusCode.BadRequest);
+                    return;
+                }
+                if (segments.Length != 2)
+                {
+                    await WriteJsonAsync(context.Response, new { error = "Sub-path de review desconhecido." },
+                        HttpStatusCode.NotFound);
                     return;
                 }
 
-                if (requestPath.EndsWith("/approve", StringComparison.OrdinalIgnoreCase))
+                var fingerprint = Uri.UnescapeDataString(segments[0]);
+                var isApprove = segments[1].Equals("approve", StringComparison.OrdinalIgnoreCase);
+                var isExclude = segments[1].Equals("exclude", StringComparison.OrdinalIgnoreCase);
+                if (!isApprove && !isExclude)
                 {
-                    long? approvedId = null;
-                    if (context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                    await WriteJsonAsync(context.Response, new { error = "Sub-path de review desconhecido." },
+                        HttpStatusCode.NotFound);
+                    return;
+                }
+
+                if (!context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    context.Response.Headers["Allow"] = "POST";
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = "Método não permitido." },
+                        HttpStatusCode.MethodNotAllowed);
+                    return;
+                }
+
+                // W6b-1 — A aprovação declara explicitamente a mudança de
+                // catálogo que produz (05-CATALOGUE.md §9). Corpo opcional
+                // apenas no endpoint /exclude (assume a acção de exclusão).
+                ReviewDecisionPayload? payload = null;
+                using (var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8))
+                {
+                    var body = await reader.ReadToEndAsync();
+                    if (!string.IsNullOrWhiteSpace(body))
                     {
                         try
                         {
-                            using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
-                            var body = await reader.ReadToEndAsync();
-                            var payload = JsonSerializer.Deserialize<ApproveReviewPayload>(body, JsonOptions);
-                            approvedId = payload?.ApprovedCanonicalChannelId;
+                            payload = JsonSerializer.Deserialize<ReviewDecisionPayload>(body, JsonOptions);
                         }
-                        catch { }
+                        catch (JsonException)
+                        {
+                            payload = null;
+                        }
                     }
-
-                    var approved = await _catalogResolver.ApproveReviewAsync(fingerprint, approvedId);
-                    if (approved == null)
-                    {
-                        context.Response.StatusCode = (int)HttpStatusCode.NotFound;
-                        await WriteJsonAsync(context.Response, new { error = "Review item não encontrado." });
-                        return;
-                    }
-                    await WriteJsonAsync(context.Response, new
-                    {
-                        fingerprint = approved.Fingerprint,
-                        state = approved.State.ToString(),
-                        resolvedAtUtc = approved.ResolvedAtUtc?.ToString("o"),
-                    });
-                    return;
                 }
 
-                if (requestPath.EndsWith("/exclude", StringComparison.OrdinalIgnoreCase))
+                var actionRaw = payload?.Action?.Trim();
+                ReviewApprovalAction? action = actionRaw?.ToLowerInvariant() switch
                 {
-                    var excluded = await _catalogResolver.ExcludeReviewAsync(fingerprint);
-                    if (excluded == null)
-                    {
-                        context.Response.StatusCode = (int)HttpStatusCode.NotFound;
-                        await WriteJsonAsync(context.Response, new { error = "Review item não encontrado." });
-                        return;
-                    }
+                    "add-alias" or "add_alias" or "addalias" => ReviewApprovalAction.AddAlias,
+                    "create-channel" or "create_channel" or "createchannel" => ReviewApprovalAction.CreateChannel,
+                    "exclude" or "ignore" or "ignored" => ReviewApprovalAction.Exclude,
+                    _ => null,
+                };
+                if (action == null && isExclude)
+                {
+                    action = ReviewApprovalAction.Exclude;
+                }
+                if (action == null)
+                {
                     await WriteJsonAsync(context.Response, new
                     {
-                        fingerprint = excluded.Fingerprint,
-                        state = excluded.State.ToString(),
-                        resolvedAtUtc = excluded.ResolvedAtUtc?.ToString("o"),
-                    });
+                        error = "Campo 'action' é obrigatório e deve ser 'add-alias', 'create-channel' ou 'exclude'.",
+                    }, HttpStatusCode.BadRequest);
+                    return;
+                }
+                if (isExclude && action != ReviewApprovalAction.Exclude)
+                {
+                    await WriteJsonAsync(context.Response, new
+                    {
+                        error = "O endpoint /exclude só aceita action='exclude'.",
+                    }, HttpStatusCode.BadRequest);
                     return;
                 }
 
-                context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                ReviewChannelSpec? channelSpec = null;
+                if (action == ReviewApprovalAction.CreateChannel)
+                {
+                    var ch = payload?.Channel;
+                    if (ch == null || string.IsNullOrWhiteSpace(ch.Key) || string.IsNullOrWhiteSpace(ch.Name))
+                    {
+                        await WriteJsonAsync(context.Response, new
+                        {
+                            error = "channel.key e channel.name são obrigatórios para action='create-channel'.",
+                        }, HttpStatusCode.BadRequest);
+                        return;
+                    }
+                    if (!TryParseOptionalEnum(ch.EditorialCategory, out EditorialCategory? editorialCategory)
+                        || !TryParseOptionalEnum(ch.EditorialGroup, out CanonicalEditorialGroup? editorialGroup)
+                        || !TryParseOptionalEnum(ch.PublicationPolicy, out PublicationPolicy? publicationPolicy))
+                    {
+                        await WriteJsonAsync(context.Response, new { error = "Valor editorial inválido em channel." },
+                            HttpStatusCode.BadRequest);
+                        return;
+                    }
+                    channelSpec = new ReviewChannelSpec(
+                        ch.Key!, ch.Name!, ch.Country, editorialCategory, editorialGroup, publicationPolicy);
+                }
+                else if (action == ReviewApprovalAction.AddAlias
+                    && string.IsNullOrWhiteSpace(payload?.CanonicalChannelKey))
+                {
+                    await WriteJsonAsync(context.Response, new
+                    {
+                        error = "canonicalChannelKey é obrigatório para action='add-alias'.",
+                    }, HttpStatusCode.BadRequest);
+                    return;
+                }
+
+                var reason = CredentialSanitizer.SanitizeSensitiveText(payload?.Reason);
+                var decision = new ReviewApprovalDecision(
+                    action.Value,
+                    payload?.CanonicalChannelKey,
+                    payload?.Alias,
+                    reason,
+                    channelSpec);
+
+                var auditOperation = action.Value switch
+                {
+                    ReviewApprovalAction.AddAlias => "catalog.review.approve.add-alias",
+                    ReviewApprovalAction.CreateChannel => "catalog.review.approve.create-channel",
+                    _ => "catalog.review.exclude",
+                };
+
+                ReviewApprovalResult? result;
+                try
+                {
+                    result = await _catalogResolver.ApplyReviewApprovalAsync(fingerprint, decision);
+                }
+                catch (ChannelAdministrationException ex)
+                {
+                    await RecordAuditAsync(auditActor, auditOperation, "review-item", fingerprint,
+                        new { fingerprint }, null, AuditResult.Failure,
+                        ex.Error.ToString());
+                    await WriteChannelAdminError(context.Response, ex);
+                    return;
+                }
+
+                if (result == null)
+                {
+                    await WriteJsonAsync(context.Response, new { error = "Review item não encontrado." },
+                        HttpStatusCode.NotFound);
+                    return;
+                }
+
+                var after = new
+                {
+                    action = result.Action,
+                    state = result.Review.State.ToString(),
+                    idempotent = result.Idempotent,
+                    catalogueChanged = result.CatalogueChanged,
+                    canonicalChannelId = result.Channel?.Id,
+                    canonicalChannelKey = result.Channel?.Key,
+                    alias = result.Alias?.NormalizedAlias,
+                    reason = result.Action == "exclude" ? result.Review.Note : null,
+                };
+                await RecordAuditAsync(auditActor, auditOperation, "review-item", fingerprint,
+                    new { state = result.PriorState.ToString(), approvedCanonicalChannelId = result.PriorApprovedCanonicalChannelId },
+                    after, AuditResult.Success);
+
+                await WriteJsonAsync(context.Response, new
+                {
+                    fingerprint = result.Review.Fingerprint,
+                    state = result.Review.State.ToString(),
+                    action = result.Action,
+                    idempotent = result.Idempotent,
+                    catalogueChanged = result.CatalogueChanged,
+                    canonicalChannelId = result.Channel?.Id,
+                    canonicalChannelKey = result.Channel?.Key,
+                    alias = result.Alias?.NormalizedAlias,
+                    resolvedAtUtc = result.Review.ResolvedAtUtc?.ToString("o"),
+                });
                 return;
             }
 
@@ -3114,10 +3236,12 @@ namespace m3uCrawler.Services
                 ChannelAdministrationError.AlreadyExists => HttpStatusCode.Conflict,
                 ChannelAdministrationError.ChannelNotFound => HttpStatusCode.NotFound,
                 ChannelAdministrationError.HasOwnership => HttpStatusCode.Conflict,
+                ChannelAdministrationError.ReviewConflict => HttpStatusCode.Conflict,
                 _ => HttpStatusCode.BadRequest,
             };
-            response.StatusCode = (int)status;
-            await WriteJsonAsync(response, new { error = ex.Message, code = ex.Error.ToString() });
+            // Nota: WriteJsonAsync repõe sempre o status; o código tem de
+            // ser passado explicitamente (senão o erro sairia como 200).
+            await WriteJsonAsync(response, new { error = ex.Message, code = ex.Error.ToString() }, status);
         }
 
         // Opções JSON partilhadas por todos os endpoints do dashboard: serializam
@@ -3383,10 +3507,66 @@ namespace m3uCrawler.Services
         return (kind.Value, key.Length > 0 ? key : null, payload.CountryCode, null);
     }
 
-    private sealed class ApproveReviewPayload
+    /// <summary>
+    /// W6b-1 — corpo explícito de uma aprovação/exclusão de Review. A
+    /// mudança de catálogo é declarada em <c>action</c> e nos campos
+    /// correspondentes; a ausência de declaração é 400 (nunca um flip
+    /// silencioso de estado).
+    /// </summary>
+    private sealed class ReviewDecisionPayload
     {
-        [JsonPropertyName("approvedCanonicalChannelId")]
-        public long? ApprovedCanonicalChannelId { get; set; }
+        [JsonPropertyName("action")]
+        public string? Action { get; set; }
+
+        [JsonPropertyName("canonicalChannelKey")]
+        public string? CanonicalChannelKey { get; set; }
+
+        [JsonPropertyName("alias")]
+        public string? Alias { get; set; }
+
+        [JsonPropertyName("reason")]
+        public string? Reason { get; set; }
+
+        [JsonPropertyName("channel")]
+        public ReviewChannelPayload? Channel { get; set; }
+    }
+
+    private sealed class ReviewChannelPayload
+    {
+        [JsonPropertyName("key")]
+        public string? Key { get; set; }
+
+        [JsonPropertyName("name")]
+        public string? Name { get; set; }
+
+        [JsonPropertyName("country")]
+        public string? Country { get; set; }
+
+        [JsonPropertyName("editorialCategory")]
+        public string? EditorialCategory { get; set; }
+
+        [JsonPropertyName("editorialGroup")]
+        public string? EditorialGroup { get; set; }
+
+        [JsonPropertyName("publicationPolicy")]
+        public string? PublicationPolicy { get; set; }
+    }
+
+    private static bool TryParseOptionalEnum<TEnum>(string? raw, out TEnum? value)
+        where TEnum : struct, Enum
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            value = null;
+            return true;
+        }
+        if (Enum.TryParse<TEnum>(raw, ignoreCase: true, out var parsed))
+        {
+            value = parsed;
+            return true;
+        }
+        value = null;
+        return false;
     }
 
     private sealed class CreateChannelPayload
@@ -5821,7 +6001,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
           : r.state === 'Approved' ? '<span class="badge ok">Approved</span>'
           : '<span class="badge err">Excluded</span>';
         const actions = r.state === 'Open'
-          ? `<button style='padding:4px 8px;' onclick='approveReview("${r.fingerprint.replace(/"/g, '\\"')}")'>Approve</button>
+          ? `<button style='padding:4px 8px;' onclick='approveReview("${r.fingerprint.replace(/"/g, '\\"')}","${(r.normalizedIdentity || '').replace(/"/g, '\\"')}")'>Approve</button>
              <button class='secondary' style='padding:4px 8px;' onclick='excludeReview("${r.fingerprint.replace(/"/g, '\\"')}")'>Exclude</button>`
           : '—';
         return `<tr>
@@ -7048,16 +7228,44 @@ const rows = Object.entries(inv).map(([k, v]) => {
       else { alert('Erro: ' + r.status); }
     }
 
-    async function approveReview(fingerprint) {
-      const r = await fetch('/api/catalog/reviews/' + encodeURIComponent(fingerprint) + '/approve', { method: 'POST' });
+    async function approveReview(fingerprint, normalizedIdentity) {
+      // W6b-1 — a aprovação declara explicitamente a mudança de catálogo.
+      const action = prompt("Acção de catálogo: 'add-alias' (canal existente) ou 'create-channel' (novo canal canónico).", "add-alias");
+      if (!action) return;
+      const body = { action: action.trim() };
+      if (body.action === 'add-alias') {
+        const key = prompt("Key do canal canónico existente:");
+        if (!key) return;
+        body.canonicalChannelKey = key.trim();
+      } else if (body.action === 'create-channel') {
+        const key = prompt("Key do novo canal canónico:");
+        if (!key) return;
+        const name = prompt("Nome do novo canal canónico:", normalizedIdentity || key);
+        if (!name) return;
+        body.channel = { key: key.trim(), name: name.trim() };
+      } else {
+        alert('Acção desconhecida: ' + action);
+        return;
+      }
+      const r = await fetch('/api/catalog/reviews/' + encodeURIComponent(fingerprint) + '/approve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
       if (r.ok) { loadCatalogReviews(); loadCatalog(); }
-      else { alert('Erro: ' + r.status); }
+      else { const t = await r.text(); alert('Erro: ' + r.status + ' ' + t); }
     }
 
     async function excludeReview(fingerprint) {
-      const r = await fetch('/api/catalog/reviews/' + encodeURIComponent(fingerprint) + '/exclude', { method: 'POST' });
+      const reason = prompt("Razão da exclusão:", "excluído por decisão administrativa");
+      if (reason === null) return;
+      const r = await fetch('/api/catalog/reviews/' + encodeURIComponent(fingerprint) + '/exclude', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'exclude', reason: reason })
+      });
       if (r.ok) { loadCatalogReviews(); loadCatalog(); }
-      else { alert('Erro: ' + r.status); }
+      else { const t = await r.text(); alert('Erro: ' + r.status + ' ' + t); }
     }
 
     document.querySelectorAll('#catalogTabs button').forEach(b => b.addEventListener('click', () => loadCatalogTab(b.dataset.ctab)));
