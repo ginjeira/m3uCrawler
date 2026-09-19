@@ -986,3 +986,69 @@ M3uParserOptions.MaxDocumentLength, MaxEntries, MaxFieldLength, MaxParsingTime
 
 W3 é implementação, não abre nem fecha novos `DG-*`. `DG-03a`/`DG-03b` permanecem como já registado em Round 1/Q4 (Anexo D). `DG-04d` (valores de limites) permanece `PARAMETER_GAP`.
 
+
+---
+
+## Anexo J — Wave W4: normalização e fingerprint de stream
+
+Implementação do fingerprint canónico versionado e da dedup intra-Source
+(`docs/Reestructure/04-PLAYLIST-STREAM.md` §4/§4.1, `32-DOMAIN-SCHEMA.md`,
+DL-108). A BÍBLIA foi reconciliada nos documentos indicados; a versão inicial
+`sfp1` fica registada. Nenhum ADR foi tratado como autoridade (ADR-0002
+permanece `Proposed`).
+
+### J.1 Implementado
+
+- `m3uCrawler/Services/Matching/StreamFingerprint.cs` — canonicalização
+  determinística do URL (`sfp1`) e
+  `Fingerprint = hex minúsculo de SHA-256(UTF-8("sfp1\n" + canonicalUrl))`.
+- `ChannelSourceEntity.Fingerprint` / `FingerprintVersion` (nullable) com
+  mapeamento EF; migração
+  `20260919152739_AddChannelSourceStreamFingerprint` — 2 colunas nullable +
+  1 índice não único; **aditiva** (sem drop/delete/update de dados válidos).
+- `CatalogResolver.RecordChannelSourceAsync` — dedup intra-Source por
+  `(CanonicalChannelId, SourceId, Fingerprint, FingerprintVersion)`, com
+  consolidação de LastSeen/LastTested/metadados; fallback legacy por
+  `(CanonicalChannelId, SourceId, StreamUrl sanitizado)` quando o fingerprint
+  é nulo. Nunca consolida entre Sources.
+- `SourceSelectionStage` e `PlaylistComposerService` — critério 6 de DL-101
+  alimentado por `ChannelSource.Fingerprint`; fallback à URL normalizada
+  mantido para rows legacy.
+
+### J.2 Contrato e política de credenciais
+
+Representação canónica e política de credenciais fixadas em
+`04-PLAYLIST-STREAM.md §4.1`. Em resumo: UTF-8; `scheme`/`host` minúsculos;
+ponto final do host removido; porta por omissão removida; fragmento removido;
+userinfo nunca incluído; path case-sensitive sem descodificar percent-encoding
+(`%2F` ≠ `/`); path Xtream `/live|movie|series/<USER>/<PASS>/<ID>` preserva
+`<ID>` e mascara `<USER>`/`<PASS>` como `***`; query remove apenas
+`username`/`password`/`token`/`authorization`, preservando os restantes
+parâmetros verbatim e pela ordem original. Só o hash e a versão são
+persistidos; o URL canónico nunca é persistido.
+
+### J.3 Quality gates
+
+```text
+dotnet build m3uCrawler.sln --configuration Release --no-restore --no-incremental → PASS (0 errors, 52 warnings; igual ao baseline)
+dotnet test  m3uCrawler.Tests ... --no-build --nologo                              → PASS (2365 passed, 1 skipped, 0 failed; baseline 2302/1/0 → +63)
+WaveW4 filter                                                                      → PASS (63 passed, 0 failed)
+```
+
+### J.4 Fora de scope / residual
+
+```text
+Backfill em massa de rows legacy — permanecem null; fallback na selecção.
+Reordenação de query params — não nesta versão (ordem preservada).
+Dedup cross-provider/cross-Source — fora de scope por decisão D1.
+ADR-0002 continua Proposed; a BÍBLIA é a autoridade normativa.
+```
+
+### J.5 Contagens do Manifest
+
+W4 é implementação; reconcilia um conflito documental anteriormente semântico
+(`16:27`/`32:207` vs `07:48`) e não abre nem fecha novos `DG-*`.
+
+```text
+DG-* (73): CLOSED = 66, PARAMETER_GAP = 6, OPEN-HUMAN = 0, BLOCKED = 1, FALSE_GAP = 0
+```

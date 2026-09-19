@@ -158,6 +158,18 @@ O parsing de playlists está centralizado em `m3uCrawler/Services/M3uParserServi
 - **Limites:** `M3uParserOptions` (tamanho de documento, nº máximo de entradas, comprimento de campo, tempo máximo, cancelamento) são mecanismo. Os valores concretos continuam `PARAMETER_GAP` (`DG-04d`).
 - `Parse(string?)` mantém-se como conveniência retro-compatível e devolve `ParseDetailed(...).Streams`.
 
+## Fingerprint canónico de stream (W4)
+
+O fingerprint de stream é calculado por `m3uCrawler/Services/Matching/StreamFingerprint.cs`, com o contrato normativo em `docs/Reestructure/04-PLAYLIST-STREAM.md` §4/§4.1 e DL-108. Versão inicial: **`sfp1`**.
+
+- **Fórmula:** `hex minúsculo de SHA-256(UTF-8("sfp1\n" + canonicalUrl))`. Só o hash e a versão (`FingerprintVersion`) são persistidos; o URL canónico nunca é persistido.
+- **Canonicalização:** apenas `http`/`https` absolutos são fingerprintáveis; `scheme`/`host` em minúsculas; ponto final do host removido; porta por omissão removida (80/443); fragmento removido; **userinfo nunca incluído**; `path` preservado case-sensitive sem descodificar percent-encoding (`%2F` ≠ `/`); `path` Xtream `/live|movie|series/<USER>/<PASS>/<ID>` preserva `<ID>` e mascara `<USER>`/`<PASS>` (ex.: `/live/***/***/<ID>`); query remove apenas `username`/`password`/`token`/`authorization`, preservando os restantes parâmetros pela ordem original.
+- **Persistência:** `ChannelSource.Fingerprint` + `FingerprintVersion` (nullable, migração aditiva `20260919152739_AddChannelSourceStreamFingerprint`). Rows legacy ficam `null` (sem backfill).
+- **Dedup intra-Source:** mesma Source + canal + fingerprint + versão consolidam na mesma row; Sources diferentes nunca são consolidadas. Múltiplas streams por `(canal, source)` continuam suportadas.
+- **Selection:** o critério 6 de DL-101 usa o fingerprint persistido; para rows legacy sem fingerprint usa a URL normalizada como fallback.
+- **Segurança:** password, token, `Authorization` e username de credencial nunca aparecem na representação canónica, no valor persistido, em logs, diagnósticos ou excepções.
+- **Testes:** `WaveW4StreamFingerprintTests` (golden vectors calculados independentemente) e `WaveW4ChannelSourceFingerprintTests` (dedup, migração aditiva, selection).
+
 ### Publicações HTML com cards Xtream
 
 Uma mensagem Telegram pode conter um URL `http(s)` genérico (sem pista `playlist|m3u|iptv|list|xtream|channel|canal|live|getplaylist` no path/query) que aponta para uma página HTML com uma ou várias "cards" Xtream — listas visuais do tipo:

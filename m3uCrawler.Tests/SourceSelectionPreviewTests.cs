@@ -6,6 +6,7 @@ using System.Threading.Tasks;
 using m3uCrawler.Models;
 using m3uCrawler.Services;
 using m3uCrawler.Services.Catalog;
+using m3uCrawler.Services.Matching;
 using m3uCrawler.Services.SourceSelection;
 using Microsoft.EntityFrameworkCore;
 using Xunit;
@@ -808,9 +809,16 @@ public class SourceSelectionPreviewTests : IAsyncLifetime
     public async Task Prefer_distinct_providers_false_selects_fill_only_and_zero_diversity()
     {
         var source = await NewSourceAsync("preview-no-diversity");
-        await RecordAsync(_channelA, source, "http://nodiv-a.example.test/1.ts");
-        await RecordAsync(_channelA, source, "http://nodiv-a.example.test/2.ts");
-        await RecordAsync(_channelA, source, "http://nodiv-b.example.test/1.ts");
+        var urls = new[]
+        {
+            "http://nodiv-a.example.test/1.ts",
+            "http://nodiv-a.example.test/2.ts",
+            "http://nodiv-b.example.test/1.ts",
+        };
+        foreach (var url in urls)
+        {
+            await RecordAsync(_channelA, source, url);
+        }
         await _resolver.UpsertGlobalSourceSelectionPolicyAsync(2, false, null, true);
 
         var preview = await Preview().PreviewAsync(_channelA.Key);
@@ -819,22 +827,48 @@ public class SourceSelectionPreviewTests : IAsyncLifetime
         Assert.Equal(2, channel.SelectedCount);
         Assert.Equal(1, channel.RejectedCount);
         Assert.All(channel.Selected, c => Assert.Equal(SelectionReasons.Fill, c.Reason));
+
+        // W4: o critério 6 de DL-101 usa o fingerprint persistido (não a URL
+        // lexical). A ordem é determinística, mas pode não coincidir com a
+        // ordem das strings; o conjunto esperado deriva do contrato de
+        // fingerprint, mantendo o foco do teste (fill-only, zero diversidade).
+        var expectedSelected = urls
+            .OrderBy(StreamFingerprint.TryComputeFingerprint, StringComparer.Ordinal)
+            .Take(2)
+            .ToArray();
         Assert.Equal(
-            new[] { "http://nodiv-a.example.test/1.ts", "http://nodiv-a.example.test/2.ts" },
+            expectedSelected,
             channel.Selected.Select(c => c.StreamUrlSanitized).ToArray());
 
+        var expectedRejected = urls.Except(expectedSelected).Single();
         var rejected = Assert.Single(channel.Rejected);
         Assert.Equal(SelectionReasons.LimitReached, rejected.Reason);
-        Assert.Equal("http://nodiv-b.example.test/1.ts", rejected.StreamUrlSanitized);
+        Assert.Equal(expectedRejected, rejected.StreamUrlSanitized);
 
         Assert.Equal(0, preview.Metrics.DiversitySelectionCount);
         Assert.Equal(2, preview.Metrics.FillSelectionCount);
-        Assert.Equal(1, preview.Metrics.DistinctProviderCount);
-        var provider = Assert.Single(preview.Metrics.ProviderDistribution);
-        Assert.Equal("nodiv-a.example.test", provider.Provider);
-        Assert.Equal(2, provider.SelectedCount);
-        Assert.Equal(1, provider.ChannelCount);
+        Assert.Equal(
+            expectedSelected.Select(ProviderOf).Distinct(StringComparer.Ordinal).Count(),
+            preview.Metrics.DistinctProviderCount);
+
+        var expectedDistribution = expectedSelected
+            .GroupBy(ProviderOf)
+            .Select(g => (Provider: g.Key, Count: g.Count()))
+            .OrderBy(x => x.Provider, StringComparer.Ordinal)
+            .ToArray();
+        var distribution = preview.Metrics.ProviderDistribution
+            .OrderBy(p => p.Provider, StringComparer.Ordinal)
+            .ToArray();
+        Assert.Equal(expectedDistribution.Length, distribution.Length);
+        for (var i = 0; i < distribution.Length; i++)
+        {
+            Assert.Equal(expectedDistribution[i].Provider, distribution[i].Provider);
+            Assert.Equal(expectedDistribution[i].Count, distribution[i].SelectedCount);
+            Assert.Equal(1, distribution[i].ChannelCount);
+        }
     }
+
+    private static string ProviderOf(string url) => new Uri(url).Host;
 
     // ---------------- Wave 13-5 final hardening — MAJOR-1 status precedence ----------------
 

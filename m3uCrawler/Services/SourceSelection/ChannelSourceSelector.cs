@@ -330,9 +330,9 @@ public sealed class ChannelSourceSelector : IChannelSourceSelector
 
     /// <summary>
     /// Critério 6 — fingerprint estável: usa
-    /// <see cref="SelectionCandidate.StreamFingerprint"/> quando existe;
-    /// caso contrário, a URL normalizada (a BÍBLIA ainda não persiste o
-    /// fingerprint em <c>ChannelSourceEntity</c>).
+    /// <see cref="SelectionCandidate.StreamFingerprint"/> (persistido em
+    /// <c>ChannelSourceEntity.Fingerprint</c>) quando existe; caso contrário,
+    /// a URL normalizada (fallback legacy para rows sem fingerprint).
     /// </summary>
     private static string FingerprintKey(Prepared prepared) =>
         !string.IsNullOrEmpty(prepared.Candidate.StreamFingerprint)

@@ -181,7 +181,7 @@ public sealed class PlaylistComposerService
             Provider: ProviderIdentity.Normalize(
                 SourceSelectionStage.NormalizeProviderHost(channelSource.StreamUrl)),
             IsWorking: working,
-            StreamFingerprint: null,
+            StreamFingerprint: channelSource.Fingerprint,
             LastSuccessfulValidationUtc: working && channelSource.LastTestedAtUtc != default
                 ? channelSource.LastTestedAtUtc
                 : null);

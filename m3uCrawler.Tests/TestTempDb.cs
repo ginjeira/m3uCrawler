@@ -115,6 +115,8 @@ internal static class TestTempDb
         "wave-w1-",
         // Wave W2 (2026-09-19) — SSRF guard, aquisição protegida, falhas.
         "wave-w2-",
+        // Wave W4 (2026-09-19) — fingerprint canónico de stream.
+        "wave-w4-",
         // Out dir.
         "out_",
     };
@@ -155,6 +157,8 @@ internal static class TestTempDb
         "wave_w1-", "wave-w1-",
         // Wave W2 (2026-09-19) — SSRF guard, aquisição protegida, falhas.
         "wave_w2-", "wave-w2-",
+        // Wave W4 (2026-09-19) — fingerprint canónico de stream.
+        "wave_w4-", "wave-w4-",
         // Auditoria / validação live (timestamped).
         "bundle_guard_validation_", "content_type_distribution_",
         "country_opcao_c_live_validation_", "country_opcao_c_validation_",

@@ -2307,6 +2307,18 @@ public sealed class CatalogResolver
     /// Regista (ou actualiza) um <see cref="ChannelSourceEntity"/> —
     /// a associação entre um canal canónico e uma stream concreta de
     /// uma source. A URL é sanitizada antes de persistir.
+    ///
+    /// <para>
+    /// <b>W4 — fingerprint e dedup intra-Source.</b> O fingerprint
+    /// (<c>docs/Reestructure/04-PLAYLIST-STREAM.md §4</c>) é calculado
+    /// deterministicamente a partir do <paramref name="streamUrl"/> original.
+    /// Mesma Source + mesmo canal + mesmo fingerprint (+versão) consolidam
+    /// numa única row (actualização de LastSeen/LastTested/metadados). Quando
+    /// o fingerprint não é computável (URL não-http/https) mantém-se o
+    /// comportamento anterior por
+    /// <c>(CanonicalChannelId, SourceId, StreamUrl sanitizado)</c>. Sources
+    /// diferentes nunca são consolidadas.
+    /// </para>
     /// </summary>
     public async Task<ChannelSourceEntity> RecordChannelSourceAsync(
         long canonicalChannelId,
@@ -2327,9 +2339,27 @@ public sealed class CatalogResolver
         if (matchMethod.Length > 80) throw new ArgumentException("MatchMethod excede 80 caracteres.", nameof(matchMethod));
 
         var sanitizedUrl = CredentialSanitizer.SanitizeUrl(streamUrl);
+        var hasFingerprint = StreamFingerprint.TryCreate(streamUrl, out _, out var fingerprint);
+        var fingerprintVersion = hasFingerprint ? StreamFingerprint.Version : null;
+
         await using var context = await _factory.CreateDbContextAsync(cancellationToken);
 
-        var existing = await context.ChannelSources
+        // 1. Dedup canónico intra-Source: mesma Source + canal + fingerprint
+        //    + versão consolidam na mesma row.
+        ChannelSourceEntity? existing = null;
+        if (hasFingerprint)
+        {
+            existing = await context.ChannelSources
+                .FirstOrDefaultAsync(cs => cs.CanonicalChannelId == canonicalChannelId
+                                        && cs.SourceId == sourceId
+                                        && cs.Fingerprint == fingerprint
+                                        && cs.FingerprintVersion == fingerprintVersion,
+                    cancellationToken);
+        }
+
+        // 2. Fallback (legacy/não-fingerprintável): comportamento anterior por
+        //    URL sanitizada. Também enriquece uma row legacy sem fingerprint.
+        existing ??= await context.ChannelSources
             .FirstOrDefaultAsync(cs => cs.CanonicalChannelId == canonicalChannelId
                                     && cs.SourceId == sourceId
                                     && cs.StreamUrl == sanitizedUrl,
@@ -2348,6 +2378,11 @@ public sealed class CatalogResolver
             existing.LastSeenAtUtc = now;
             existing.LastTestedAtUtc = now;
             existing.UpdatedAtUtc = now;
+            if (hasFingerprint && string.IsNullOrEmpty(existing.Fingerprint))
+            {
+                existing.Fingerprint = fingerprint;
+                existing.FingerprintVersion = fingerprintVersion;
+            }
             await context.SaveChangesAsync(cancellationToken);
             return existing;
         }
@@ -2358,6 +2393,8 @@ public sealed class CatalogResolver
             SourceId = sourceId,
             StreamUrl = sanitizedUrl,
             ExternalStreamId = externalStreamId,
+            Fingerprint = hasFingerprint ? fingerprint : null,
+            FingerprintVersion = fingerprintVersion,
             Quality = quality,
             Epg = epg,
             Availability = availability,

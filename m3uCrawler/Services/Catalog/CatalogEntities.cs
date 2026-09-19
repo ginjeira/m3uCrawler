@@ -960,6 +960,23 @@ public sealed class ChannelSourceEntity
     /// <summary>Identificador opaco do stream dentro da source.</summary>
     public string? ExternalStreamId { get; set; }
 
+    /// <summary>
+    /// W4 (2026-09-19) — fingerprint canónico do URL do stream
+    /// (<c>docs/Reestructure/04-PLAYLIST-STREAM.md §4</c>): hex minúsculo
+    /// SHA-256 de <c>version + "\n" + canonicalUrl</c>. Só o hash e a versão
+    /// são persistidos; o URL canónico nunca é guardado. <c>null</c> para
+    /// rows legacy ou quando o URL não é <c>http</c>/<c>https</c>
+    /// fingerprintável.
+    /// </summary>
+    public string? Fingerprint { get; set; }
+
+    /// <summary>
+    /// W4 (2026-09-19) — versão do algoritmo de fingerprint (DL-108;
+    /// actualmente <c>"sfp1"</c>). <c>null</c> quando <see cref="Fingerprint"/>
+    /// é <c>null</c>.
+    /// </summary>
+    public string? FingerprintVersion { get; set; }
+
     public StreamQuality Quality { get; set; } = StreamQuality.Unknown;
     public EpgState Epg { get; set; } = EpgState.Unknown;
     public AvailabilityState Availability { get; set; } = AvailabilityState.Discovered;

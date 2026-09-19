@@ -111,7 +111,7 @@ dotnet test m3uCrawler.Tests --configuration Release --no-build    → PASS (218
 | `Playlist.Status` tri-state | 04 §7, 32 | `Models/M3uPlaylistStatus.cs`; `M3uParseResult.Status`; consumidores adaptados (`CountryChannelValidator`, `TelegramScraperService`, `PlaylistReader`, `PlaylistManagerService`) | `WaveW3M3uParsingContractTests.cs` | COMPLIANT (modelo in-memory; sem persistência inventada) |
 | Estrutura vs validade do alvo | 04 §7 | `M3uParserService.ParseDetailed` (`UnusableTarget` ≠ `Malformed`); `M3uParseResult.UnusableTargetCount` | `WaveW3M3uParsingContractTests.cs` | COMPLIANT |
 | Normalização por campo | 04 §3 | `Matching/ChannelNormalizer.cs:20-65`; `GroupNormalizer.cs:48-54`; `Catalog/ExternalIdentityNormalizer.cs:54-64` | `ChannelNormalizerTests.cs:19-62` | PARTIAL/DIVERGENT |
-| Stream fingerprint UTF-8/SHA-256/versionado | 04 §4, 32 | (inexistente) | MISSING | MISSING |
+| Stream fingerprint UTF-8/SHA-256/versionado | 04 §4/§4.1, 32 | `Matching/StreamFingerprint.cs` (`sfp1`; canonicalização + política de credenciais); `ChannelSourceEntity.Fingerprint`/`FingerprintVersion`; migração `20260919152739_AddChannelSourceStreamFingerprint` | `WaveW4StreamFingerprintTests.cs`; `WaveW4ChannelSourceFingerprintTests.cs` | COMPLIANT |
 | Falha de aquisição: mapping + Source + Run | 19 §6 | `AcquisitionFailure.cs`; `AcquisitionFailureObserver.cs`; `CatalogResolver.MarkSourceAcquisitionFailureAsync`; `SourceEntity:917-922`; `RunReport:228-233` | `WaveW2AcquisitionRetryTests.cs`; `WaveW2AcquisitionPersistenceTests.cs` | COMPLIANT |
 | Retry técnico vs reexecução | 13 §8, 19 §4 | `M3uTesterService.cs` (retry download + probe); `LiveRun/RunCoordinator.cs:118` | `Phase94RunCoordinatorTests.cs:128`; `WaveW2AcquisitionRetryTests.cs` | COMPLIANT |
 | SSRF (protocolo/IP/DNS/redirect/fail-closed) | 17 §2 | `Validation/SsrfGuard.cs`; `AddressClassifier.cs`; `SafeConnector.cs`; `GuardedHttpRequest.cs`; `HttpClientFactory.cs:83-86` | `WaveW2SsrfGuardTests.cs` | COMPLIANT |
@@ -123,7 +123,7 @@ dotnet test m3uCrawler.Tests --configuration Release --no-build    → PASS (218
 | Review Ignore exige motivo | 05 §4, 22 §7 | `CatalogResolver.cs:1161-1199` (motivo default) | MISSING | PARTIAL |
 | ReviewItem estados Open/InReview/Resolved/Ignored | 33, DL-105 | `CatalogEntities.cs:401-406` (`Open/Approved/Excluded`) | MISSING | DIVERGENT |
 | Reopen auditado (DL-105) | DL-105, 22 §7 | `CatalogResolver.cs:311-320` (proíbe reabrir) | `ReviewApprovalEndpointTests.cs:494-521` | MISSING |
-| ChannelSource único (CanonicalChannelId, SourceId) | 32, 16, 07 | `ChannelCatalogDbContext.cs:305` (índice não único) | MISSING | DIVERGENT |
+| Múltiplas streams por (canal, source); identidade = canal+source+fingerprint+versão | 07 §5, 32, 16 | `ChannelCatalogDbContext.cs` (índice não único em `(CanonicalChannelId, SourceId)`; índice não único por fingerprint); dedup por fingerprint em `CatalogResolver.RecordChannelSourceAsync` | `WaveW4ChannelSourceFingerprintTests.cs` | COMPLIANT (reconciliado em W4; conflito `16:27`/`32:207` vs `07:48` preservado nas notas) |
 | Observation factual/append + Run | 08 §1, 32 | `CatalogEntities.cs:1000-1012` (sem RunId) | `WaveW6b2ObservabilityTests.cs:213-252` | PARTIAL |
 | Eligibility `Eligible/Ineligible/Unknown` derivada | 08 §3, 33, DL-009 | `ChannelSourceSelector.cs:382-391` (filtro ad-hoc) | MISSING | MISSING |
 | Sem fonte elegível: omitir + registar | DG-11, 09, 11 | `PlaylistComposerService.cs:115-144` (em memória) | `SourceSelectionStageTests.cs:451-471` | PARTIAL |
@@ -226,6 +226,34 @@ Limites (`M3uParserOptions`: tamanho de documento, nº de entradas, comprimento 
 
 Quality gate W3: `dotnet build` 0 erros/52 avisos (pré-existentes, nenhum de ficheiros W3); `dotnet test` 0 failed / 2302 passed / 1 skipped.
 
+
+## W4 — Normalização e fingerprint de stream (estado real)
+
+Implementação do fingerprint canónico versionado e da dedup intra-Source
+(`04-PLAYLIST-STREAM.md §4/§4.1`, `32-DOMAIN-SCHEMA.md` Stream/ChannelSource,
+DL-108). A BÍBLIA foi reconciliada nos documentos indicados. O ADR-0002
+permanece `Proposed` e **não** foi tratado como autoridade.
+
+| Mecanismo | Implementação | Testes | Estado |
+|---|---|---|---|
+| Canonicalização de URL `sfp1` (scheme/host/porta/fragmento/percent-encoding) | `Matching/StreamFingerprint.cs` | `WaveW4StreamFingerprintTests.cs` | COMPLIANT |
+| Política de credenciais (userinfo excluído; query `username`/`password`/`token`/`authorization` removidos; path Xtream mascarado com `<ID>` preservado) | `Matching/StreamFingerprint.cs` (`MaskXtreamPath`, `RemoveCredentialParameters`) | `WaveW4StreamFingerprintTests.cs` (segurança) | COMPLIANT |
+| Serialização `version + "\n" + canonical` + SHA-256 hex minúsculo | `Matching/StreamFingerprint.cs` (`Version = "sfp1"`) | `WaveW4StreamFingerprintTests.cs` (golden vectors independentes) | COMPLIANT |
+| Persistência `Fingerprint`/`FingerprintVersion` em `ChannelSource` (aditiva) | `CatalogEntities.cs`; `ChannelCatalogDbContext.cs`; migração `20260919152739_AddChannelSourceStreamFingerprint` | `WaveW4ChannelSourceFingerprintTests.cs` (migração aditiva) | COMPLIANT |
+| Dedup intra-Source (canal+source+fingerprint+versão); fallback legacy por URL sanitizada; sem cross-Source | `CatalogResolver.RecordChannelSourceAsync` | `WaveW4ChannelSourceFingerprintTests.cs` | COMPLIANT |
+| Critério 6 de Selection alimentado pelo fingerprint persistido (fallback para URL normalizada) | `SourceSelectionStage.cs`; `PlaylistComposerService.cs` | `WaveW4ChannelSourceFingerprintTests.cs`; `SourceSelectionPreviewTests` (adaptado) | COMPLIANT |
+| Conflito `16:27`/`32:207` vs `07:48` reconciliado (múltiplas streams; fingerprint distingue) | `04` §4.1/§5, `32` Stream/ChannelSource, `16` §3, `05` §4, `31` DL-108 | `WaveW4ChannelSourceFingerprintTests.cs` (múltiplas streams) | COMPLIANT |
+
+Golden vectors computados **independentemente** (script Python isolado,
+`hashlib.sha256("sfp1\n" + canonical)`) e congelados no teste; não derivados
+do código sob teste. Query preservada por ordem nesta versão.
+
+Limitações: sem backfill em massa de rows legacy (permanecem `null`, com
+fallback na selecção); ADR-0002 não foi promovido nem usado como autoridade.
+
+Quality gate W4: `dotnet build` 0 erros / 52 avisos (iguais ao baseline);
+`dotnet test` 0 failed / 2365 passed / 1 skipped (baseline 2302/1/0; +63
+testes W4).
 
 ## Cobertura de requisitos
 

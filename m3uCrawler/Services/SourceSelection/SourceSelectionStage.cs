@@ -330,7 +330,7 @@ public sealed class SourceSelectionStage : ISourceSelectionStage
                 ExternalStreamId: channelSource.ExternalStreamId,
                 Provider: ProviderIdentity.Normalize(NormalizeProviderHost(stream.Url)),
                 IsWorking: stream.IsWorking,
-                StreamFingerprint: null,
+                StreamFingerprint: channelSource.Fingerprint,
                 LastSuccessfulValidationUtc: ResolveSuccessfulValidationUtc(stream, channelSource));
         }
 

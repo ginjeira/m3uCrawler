@@ -378,6 +378,11 @@ public sealed class ChannelCatalogDbContext : DbContext
             e.Property(x => x.SourceId).IsRequired();
             e.Property(x => x.StreamUrl).IsRequired().HasMaxLength(1000);
             e.Property(x => x.ExternalStreamId).HasMaxLength(200);
+            // W4 (2026-09-19) — fingerprint canónico versionado do stream
+            // (04-PLAYLIST-STREAM.md §4 / DL-108). Nullable: rows legacy e
+            // streams não fingerprintáveis mantêm-se sem fingerprint.
+            e.Property(x => x.Fingerprint).HasMaxLength(64);
+            e.Property(x => x.FingerprintVersion).HasMaxLength(16);
             e.Property(x => x.Quality).HasConversion<int>();
             e.Property(x => x.Epg).HasConversion<int>();
             e.Property(x => x.Availability).HasConversion<int>();
@@ -392,6 +397,13 @@ public sealed class ChannelCatalogDbContext : DbContext
             e.Property(x => x.UpdatedAtUtc).IsRequired();
             e.HasIndex(x => new { x.CanonicalChannelId, x.SourceId });
             e.HasIndex(x => x.SourceId);
+            // W4 — suporta a dedup intra-Source por fingerprint
+            // (CanonicalChannel + Source + Fingerprint + versão). Não é
+            // único: múltiplas streams por (canal, source) são suportadas
+            // (07-SOURCES.md §5; D2). Não impor unicidade em
+            // (CanonicalChannelId, SourceId).
+            e.HasIndex(x => new { x.CanonicalChannelId, x.SourceId, x.Fingerprint })
+                .HasDatabaseName("IX_channel_sources_Channel_Source_Fingerprint");
             e.HasOne(x => x.CanonicalChannel)
                 .WithMany()
                 .HasForeignKey(x => x.CanonicalChannelId)
