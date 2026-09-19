@@ -47,6 +47,8 @@
 | Secret store isolado conforme ADR-0004 | ADR-0004 | Aprovação do ADR | Pendente |
 | Seeding de `tvg-id` no baseline (`ExternalIdentity`) | W4b / ADR-0002 | Fonte de mapeamento tvg-id→canal + ADR-0002 | Pendente |
 | Estabilizar testes flaky de timing (`XtreamAccountLockManagerTests`, `Phase93AccountGateCoordinatorTests`) | Dívida de testes | — | Pendente |
+| Re-auditar ADR-0001 (e demais `Proposed`) contra a Regra de Completude reforçada; completar ADR-0001 (schema JSON, versionamento, migração/merge, contratos de API de país). | Governação BÍBLIA §5/§6 | — | Pendente |
+| Definir IDs de requisitos e preencher a matriz de rastreabilidade (`46-REQUIREMENT-TRACEABILITY.md`). | `46-REQUIREMENT-TRACEABILITY.md` | — | Pendente |
 
 ## Known Gaps / Divergences
 IDs da auditoria transversal (`docs/project/waves/2026-09-18-audit-transversal-findings.md`).
@@ -103,6 +105,8 @@ ADRs (`docs/adr/README.md`):
 - ADR-0004 secret-storage-lifecycle — Proposed
 - ADR-0005 catalog-baseline-vs-runtime — Proposed
 - ADR-0006 sqlite-migration-rollback — Proposed
+
+Nota de governação (BÍBLIA §5/§6): a BÍBLIA passa a exigir que os ADRs sejam **COMPLETOS** (`00-BIBLE.md` §5/§6); um ADR `Proposed` não é normativo e não deve ser implementado. O ADR-0001 está **incompleto** e deve ser re-auditado, marcado como `BIBLE_GAP` até cobrir schema/versionamento/migração/API.
 
 Recalibrações normativas (não alteram a BÍBLIA; clarificam leitura):
 - `OrderingItem` referencia `CanonicalChannelId` é normativo (`32-DOMAIN-SCHEMA.md:203-209`); não é divergência (D-F1).
