@@ -3,15 +3,17 @@
 > Ponto de entrada para o estado corrente da implementação (`docs/Reestructure/00-BIBLE.md:30-41`, `:105-128`).
 > Documento derivado: descreve o que foi construído e validado; não redefine conceitos da BÍBLIA.
 > Registos históricos das waves: `docs/project/waves/`.
+> Reconciliação documental: 2026-09-20 — HEAD `780fa01`; ver `BIBLE_IMPLEMENTABILITY_GAP_MANIFEST_1.0.md` Anexos G–T e `docs/Reestructure/46-REQUIREMENT-TRACEABILITY.md`.
 
 ## Current State
 - Branch: `feature/phase-9c-first-run-dashboard`
-- HEAD: `b19d95b99b35590d7f6b9b64f34076effaa47831`
+- HEAD: `780fa0148617c9074146f028cd2fcb61b3a9b50d` (2026-09-20)
 - Phase: 9C / 13 — implementação das waves da BÍBLIA (reconstrução)
-- Wave: W6a/W6b-1/W6b-2/W6c concluídas; W6b-3 definida e pendente
-- Status: PARCIALMENTE CONFORME — waves A/B, Onboarding, Admin Password, W1/W2/W3s/W4a/W4b/W5, ADR-0001 (completo — pendente de aprovação) e W6a/W6b-1/W6b-2/W6c concluídas; W6b-3+ pendentes
-- Last validated commit: `b19d95b` (2026-09-19)
-- Last validation: build 0 errors / 51 warnings; suite 2186 passed / 0 failed / 1 skipped (total 2187)
+- Wave: waves de reconstrução `W1–W5.6` implementadas; `M.4` (snapshot→Run/pipeline) OPEN, sem wave atribuída; `W6b-3` definida e pendente; dívida funcional de reconstrução em aberto (ver `## Functional Debt (reconstruction)`)
+- Status: PARCIALMENTE CONFORME — waves A/B, Onboarding, Admin Password, W1/W2/W3s/W4a/W4b/W5, ADR-0001 (completo — pendente de aprovação), W6a/W6b-1/W6b-2/W6c e waves de reconstrução W1–W5.6 concluídas; `M.4`, W2-FU, C7, Review→Output, gap de `resolve` W5.5 e matriz de rastreabilidade pendentes
+- Last validated commit (histórico, wave 9c): `b19d95b` (2026-09-19)
+- Last commit coberto por validação registada: `780fa01` (W5.6 follow-up; gates registados em `46-REQUIREMENT-TRACEABILITY.md` e `BIBLE_IMPLEMENTABILITY_GAP_MANIFEST_1.0.md`, **não re-executados nesta reconciliação documental**)
+- Last validation: build 0 errors / 51 warnings; suite 2186 passed / 0 failed / 1 skipped (total 2187) — registo histórico da wave 9c, anterior às waves de reconstrução
 
 ## Completed
 | Phase | Wave | Result | Commit | Validation |
@@ -36,10 +38,31 @@
 | 9C / 13 | W6b-2 | `SyncRun`+steps emitidos pelo sync Dispatcharr; `ChannelSourceObservation` por stream validado | ee7baab | 2170/0/1; 51 warn |
 | 9C / 13 | W6c | Config Dispatcharr completa (patch/mascarada), teste de ligação persistido exigido pela readiness (≤24h, Connected); sync agendado aplica a selection | b19d95b | 2186/0/1; 51 warn |
 
+## Reconstruction Waves (W1–W5.6)
+Waves de reconstrução posteriores ao estado 9c registado acima. Gates registados em `docs/Reestructure/46-REQUIREMENT-TRACEABILITY.md` e `BIBLE_IMPLEMENTABILITY_GAP_MANIFEST_1.0.md` (Anexos G–S); **não re-executados nesta reconciliação documental**. `Estado` reflecte conformidade real, incluindo dívida funcional visível.
+
+| Wave | Scope | Commit | Recorded gate | State |
+|---|---|---|---|---|
+| W1 | Identidade de discovery; resíduo de identidade de conta | `ab3f817` | n/d | Implementado; resíduo W1 (sem `FirstSeen`/`LastSeen`; `AccountIdentity.Compute` legado) — ver dívida 1 |
+| W2 | Segurança de aquisição (SSRF/redirect/retry) | `ab3f817` | n/d | Testes de unidade verdes; W2-FU: observer de falhas de aquisição não ligado em produção — ver dívida 2 |
+| W3 | Contrato de parsing M3U | `ab3f817` | 2302 passed / 1 skipped / 0 failed | Implementado |
+| W4 | Normalização e fingerprinting de streams | `c73e134` | 2365 / 1 / 0 | Implementado; divergências de composição a jusante — ver dívida 4 |
+| W4.1 | `SourceSelectionStage` ciente de fingerprint | `8142c0d` | 2377 / 1 / 0 | Implementado; divergências de output/selection a jusante — ver dívida 4 |
+| W5.0 | Decisões normativas de Recognition/Fuzzy/Review (documental) | n/d | Documental, sem build/test (nenhuma alteração de código) | Baseline de decisões registada (`46-REQUIREMENT-TRACEABILITY.md` §W5.0) |
+| W5.1 | `RecognitionPolicy` com resolução com escopo e snapshot de run | `5236364` | 2394 / 1 / 0 | Schema/snapshot implementados; sem integração de autoria/consumo em produção — ver dívida 5 |
+| W5.2 | Ordem de reconhecimento determinística | `4721dc3` | 2413 / 1 / 0 | Implementado |
+| W5.3 | Reconhecimento fuzzy e lifecycle de review | `84b35f5` | 2448 / 1 / 0 | Implementado, mas fuzzy depende de `RecognitionPolicy`; em produção `policy: null` → inalcançável (dependência M.4) — ver dívida 6 |
+| W5.4 | Lifecycle de review | `84b35f5` | 2490 / 1 / 0 | Implementado; Review→Output não ligado — ver dívida 9 |
+| W5.5 | API HTTP de review | `b8c9cda` | 2532 / 1 / 0 | Implementado; gap em `resolve` para `change.type` — ver dívida 8 |
+| W5.6 | Semântica de confiança de matching | `b613502` | 2570 / 1 / 0 | Implementado |
+| W5.6 follow-up (F7-B/F8-B/F9) | Follow-up de confiança de matching | `780fa01` | 2577 / 1 / 0 | Implementado |
+
 ## In Progress
 | Wave | Objective | Status | Branch | Commit |
 |---|---|---|---|---|
 | W6b-3 | Ligar/esconder funcionalidades inertes decididas: `import-policies`, `canonical-groups`/`group-mappings`, `pending-country-approvals` | Definida / pendente (a decidir quando ligar vs. esconder) | feature/phase-9c-first-run-dashboard | n/d |
+| M.4 | Ligar o snapshot de `RecognitionPolicy` ao Run/pipeline (desbloqueia o fuzzy W5.3 em produção) | **OPEN** — sem wave atribuída; Decision Pack em preparação/ratificação; snapshot→Run/pipeline não wired. Implementação não decidida | feature/phase-9c-first-run-dashboard | n/d |
+| W2-FU | Ligar `CatalogAcquisitionFailureObserver`/`IAcquisitionFailureObserver` em produção | Pendente — observer nunca ligado em produção; persistência de falhas de aquisição parcial em runtime | feature/phase-9c-first-run-dashboard | n/d |
 
 ## Pending
 | Item | Origin | Dependency | Status |
@@ -53,7 +76,12 @@
 | Seeding de `tvg-id` no baseline (`ExternalIdentity`) | W4b / ADR-0002 | Fonte de mapeamento tvg-id→canal + ADR-0002 | Pendente |
 | Estabilizar testes flaky de timing (`XtreamAccountLockManagerTests`, `Phase93AccountGateCoordinatorTests`) | Dívida de testes | — | Pendente |
 | Re-auditar os restantes ADRs `Proposed` (ADR-0002/0004/0005/0006) contra a Regra de Completude reforçada (`00-BIBLE.md` §5/§6). ADR-0001 re-auditado: **completo — pendente de aprovação**. | Governação BÍBLIA §5/§6 | Aprovação do proprietário | Em curso |
-| Definir IDs de requisitos e preencher a matriz de rastreabilidade (`46-REQUIREMENT-TRACEABILITY.md`). IDs candidatos `CD-01`..`CD-16` introduzidos em `ADR-0001` §10. | `46-REQUIREMENT-TRACEABILITY.md` | — | Pendente (IDs semeados) |
+| Definir IDs de requisitos e preencher a matriz de rastreabilidade (`46-REQUIREMENT-TRACEABILITY.md`). IDs candidatos `CD-01`..`CD-16` introduzidos em `ADR-0001` §10. Linhas `TBD`/`UNMAPPED` (famílias de API) por preencher. | `46-REQUIREMENT-TRACEABILITY.md` | — | Pendente (IDs semeados; `TBD`/`UNMAPPED` por preencher) |
+| M.4 — wiring do snapshot de `RecognitionPolicy` ao Run/pipeline (desbloqueia fuzzy W5.3 em produção) | Dívida de reconstrução 6/7 | Decision Pack (em preparação/ratificação) — implementação não decidida | **OPEN** (sem wave atribuída) |
+| W2-FU — ligar `CatalogAcquisitionFailureObserver` em produção | Dívida de reconstrução 2 | Wiring do observer em `StreamValidationTesterFactory`/`WebDashboardService` | Pendente |
+| C7 — `ReviewItem` com `RunId`/`StreamId`/`Actor`/`Evidence`/`Candidates`/`Decision` | Dívida de reconstrução 10 | — | **OPEN** — não implementado |
+| Review→Output — resolver Review deve produzir/seleccionar `ChannelSource`/output e re-publicar | Dívida de reconstrução 9 | M.4 / composição de output | Pendente (não ligado) |
+| Gap de `resolve` W5.5 — suportar `change.type` `externalIdentity`/`channelSource`/`none` | Dívida de reconstrução 8 | Contrato de `resolve` | Pendente (`422 declared-change-invalid`) |
 
 ## Known Gaps / Divergences
 IDs da auditoria transversal (`docs/project/waves/2026-09-18-audit-transversal-findings.md`).
@@ -104,6 +132,25 @@ IDs da auditoria transversal (`docs/project/waves/2026-09-18-audit-transversal-f
 | Doc | Documentação derivada reflecte a BÍBLIA (`00-BIBLE.md:39-41`) | README/roadmap ainda descrevem país como fonte de aliases e ordem de matching inexistente | Documentação divergente | Pendente |
 | Testes | Quality gates (`44-QUALITY-GATES.md`) | Flaky de timing; cobertura de endpoints esparsa | Regressões difíceis de isolar | Pendente |
 
+## Functional Debt (reconstruction)
+Dívida funcional verificada no código após as waves de reconstrução. Cada item tem um ponteiro de evidência de uma linha. Esta secção não decide nem ratifica `M.4`.
+
+| # | Item | Evidência |
+|---|---|---|
+| 1 | W1 residual: `DiscoveryCandidateEntity` persistido (tabela `discovery_candidates`) sem `FirstSeen`/`LastSeen` (by design); `AccountIdentity.Compute` legado (URL-sem-password + username) mantido para serialização de trabalho ao lado de `AccountKey.Compose` (namespace + identidade externa) | `ChannelCatalogDbContext.cs:336`; `AccountIdentity.Compute` |
+| 2 | W2-FU: `CatalogAcquisitionFailureObserver`/`IAcquisitionFailureObserver` nunca ligado em produção → `Source.LastAcquisitionFailure*` e `RunReport.AcquisitionFailures` só preenchidos em testes; persistência de falhas de aquisição é PARCIAL em runtime | `StreamValidationTesterFactory.cs:32`; `WebDashboardService.cs:3290` |
+| 3 | W2 testado verde em unidade (SSRF/redirect/retry) — mantém-se implementado; a dívida é apenas o wiring do observer em produção | testes de unidade W2 |
+| 4 | W4/W4.1: fingerprint + `SourceSelectionStage` ciente de fingerprint implementados; composição de output/selection mantém divergências documentadas a jusante | `c73e134`, `8142c0d` |
+| 5 | W5.1: schema/snapshot de `RecognitionPolicy` implementado, mas sem integração de autoria/consumo em produção | `5236364` |
+| 6 | W5.3: fuzzy depende de `RecognitionPolicy`; em produção `CatalogResolver.ResolveAsync` é sempre chamado com `policy: null`, logo fuzzy é inalcançável em runs reais (dependência M.4) | `84b35f5`; `CatalogResolver.ResolveAsync(policy: null)` |
+| 7 | M.4 = wiring do snapshot de política ao Run/pipeline. Estado: **OPEN**, sem wave atribuída, Decision Pack em preparação/ratificação (como/quando implementar não está decidido) | — |
+| 8 | W5.5 gap de `resolve`: `change.type` `externalIdentity`/`channelSource`/`none` devolve `422 declared-change-invalid`; apenas `channelAlias`/`canonicalChannel` suportados | `b8c9cda`; handler de `resolve` |
+| 9 | Review→Output não ligado: resolver um Review aplica efeitos laterais de catálogo (alias/channel) mas não produz/selecciona `ChannelSource` nem output; sem trigger de re-publicação | `b8c9cda`; `84b35f5` |
+| 10 | C7 (`ReviewItem` com `RunId`/`StreamId`/`Actor`/`Evidence`/`Candidates`/`Decision`) permanece **OPEN** — não implementado, não inventado | modelo `ReviewItem` |
+| 11 | Rastreabilidade: matriz de requisitos com linhas `TBD`/`UNMAPPED` (famílias de API) ainda por preencher | `docs/Reestructure/46-REQUIREMENT-TRACEABILITY.md` |
+| 12 | Matcher legado (`ChannelMatcher`/`MatchScorer`/`MatchingOptions`) ainda usado pelo caminho de sync Dispatcharr; permanece divergente | `ChannelMatcher`, `MatchScorer`, `MatchingOptions` |
+| 13 | Reabertura automática de Review (`Resolved`/`Ignored`→`Open` em "evidência materialmente incompatível") permanece **OPEN** — critério de "evidência materialmente incompatível" não definido; distinto da reabertura manual já implementada | `UpsertReviewItemAsync` (manual); critério automático não definido |
+
 ## Decisions Since Last Status
 ADRs (`docs/adr/README.md`):
 - ADR-0001 country-data-ownership — Proposed (completo — pendente de aprovação; completude em 4de2773)
@@ -122,10 +169,19 @@ Recalibrações normativas (não alteram a BÍBLIA; clarificam leitura):
 - Ordem de Selection lexicográfica fechada em DL-101 (`31-DECISION-LOCK.md:86-98`), documentada por ADR-0003.
 
 ## Latest Validation
+
+**Coverage actual (registada, não re-executada):** último commit coberto por validação registada — `780fa01` (W5.6 follow-up); suite `2577 passed / 1 skipped / 0 failed`, conforme registado em `docs/Reestructure/46-REQUIREMENT-TRACEABILITY.md` e no manifest. **Não re-executado nesta wave documental** (nenhum build/run fabricado).
+
+**Histórico (fase 9c, commit `b19d95b`):**
 - Build Release (`--no-incremental`): 0 errors / 51 warnings.
 - Suite completa: 2186 passed / 0 failed / 1 skipped (total 2187).
 - Skipped (by design): `HttpTimeoutAutopsyTests.LEGACY_PATTERN_blackhole_blocks_until_30s_HttpClient_timeout`.
 - Flaky conhecidos que passam isoladamente (28/28): `XtreamAccountLockManagerTests`, `Phase93AccountGateCoordinatorTests`.
 
 ## Next Executable Step
-W6b-3 (ligar/esconder funcionalidades inertes: `import-policies`, `canonical-groups`/`group-mappings`, `pending-country-approvals`), seguida do E2E de dois ciclos: deploy do HEAD para o runtime fresco e execução Discovery→Selection→Playlist→Dispatcharr duas vezes, com verificação de idempotência (sem duplicar channels/streams/sources/ownership; sem apagar externos).
+Não existe passo único: os próximos passos são independentes e nenhum deve iniciar implementação de `M.4` sem Decision Pack ratificado.
+
+1. `M.4` — **OPEN**: ratificar o Decision Pack do wiring do snapshot de `RecognitionPolicy` ao Run/pipeline (desbloqueia o fuzzy W5.3 em produção). Não existe desenho de implementação decidido.
+2. Dívida funcional de reconstrução: W2-FU (ligar `CatalogAcquisitionFailureObserver` em produção); C7 (campos de `ReviewItem`); Review→Output (produzir/seleccionar `ChannelSource`/output e re-publicar); gap de `resolve` W5.5 (`externalIdentity`/`channelSource`/`none`); preencher linhas `TBD`/`UNMAPPED` da matriz de rastreabilidade.
+3. W6b-3 (ligar/esconder funcionalidades inertes: `import-policies`, `canonical-groups`/`group-mappings`, `pending-country-approvals`).
+4. E2E de dois ciclos: deploy do HEAD para o runtime fresco e execução Discovery→Selection→Playlist→Dispatcharr duas vezes, com verificação de idempotência (sem duplicar channels/streams/sources/ownership; sem apagar externos).

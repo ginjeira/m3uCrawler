@@ -28,3 +28,36 @@ normativos (`docs/Reestructure/00-BIBLE.md:30-41`, `:105-128`).
 
 W6b-3 (import-policies, canonical-groups/group-mappings, pending-country-approvals) está definida e pendente — ver `docs/PROJECT_STATUS.md`.
 O E2E de dois ciclos (idempotência Discovery→…→Dispatcharr) é o próximo passo executável.
+
+> **Nota (2026-09-20).** O índice acima cobre apenas as waves da fase 9c e termina em `W6c`
+> (`b19d95b`, 2026-09-19); está correcto enquanto histórico dessa fase e não é reescrito.
+> O `HEAD` real do repositório é agora `780fa0148617c9074146f028cd2fcb61b3a9b50d` (`780fa01`,
+> 2026-09-20); as waves de reconstrução `W1–W5.6` foram implementadas depois do conjunto indexado
+> e estão registadas na secção seguinte. `docs/PROJECT_STATUS.md` foi reconciliado com este estado.
+
+## Reconstruction waves (W1–W5.6) — 2026-09-20
+
+Evidência detalhada: `docs/Reestructure/46-REQUIREMENT-TRACEABILITY.md` (secções W2–W5.6) e
+`BIBLE_IMPLEMENTABILITY_GAP_MANIFEST_1.0.md` (Anexos G–S.2). Esta secção é registo documental;
+não ratifica decisões — `M.4` permanece **OPEN**.
+
+| Wave | Scope | Commit | Evidence/Notes |
+|---|---|---|---|
+| W1 | Discovery identity | `ab3f817` | Identidade de discovery no pipeline. |
+| W2 | Acquisition security | `ab3f817` | **Debt W2-FU:** o observer não está ligado em produção. |
+| W3 | M3U parsing contract | `ab3f817` | Contrato de parsing M3U. |
+| W4 | Stream normalization + `sfp1` fingerprint | `c73e134` | Normalização de streams e fingerprint `sfp1`. |
+| W4.1 | Fingerprint-aware source selection resolution | `8142c0d` | Resolução de selecção de fonte ciente do fingerprint (fix 13). |
+| W5.0 | Base das waves 5.x (scoping/ordenação) | (ver W5.1) | Sem commit isolado; coberta pela evidência em `46`. |
+| W5.1 | RecognitionPolicy (scoped resolution + run snapshot) | `5236364` | **Debt:** sem integração em produção. |
+| W5.2 | Deterministic recognition order | `4721dc3` | Ordem de reconhecimento determinística. |
+| W5.3 | Fuzzy recognition | `84b35f5` | **Dependente de `M.4`:** produção chama `ResolveAsync` com `policy: null`. |
+| W5.4 | Review lifecycle | `84b35f5` | Ciclo de vida de Review. **Debt:** Review→Output não ligado. |
+| W5.5 | Review HTTP API | `b8c9cda` | **Resolve gap:** `externalIdentity`/`channelSource`/`none` → 422. |
+| W5.6 | MatchMethod/MatchConfidence | `b613502` | Semântica de match method/confidence. |
+| W5.6-FU | Follow-up F7-B/F8-B/F9 | `780fa01` | `HEAD` actual; follow-up da W5.6. |
+
+**Debt funcional a manter visível:** W2-FU (observer não ligado em produção); W5.1 sem integração
+em produção; W5.3 dependente de `M.4` (produção chama `ResolveAsync` com `policy: null`); W5.5
+resolve gap (`externalIdentity`/`channelSource`/`none` → 422); Review→Output não ligado;
+`C7` **OPEN**; `M.4` **OPEN**.

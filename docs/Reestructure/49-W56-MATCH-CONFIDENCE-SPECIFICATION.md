@@ -1,6 +1,6 @@
 # 49 — W5.6: Especificação normativa de MatchMethod/MatchConfidence
 
-**Estado:** RATIFICADO (especificação normativa); implementação **concluída** — evidência: `WaveW56MatchConfidenceTests` (38); migration `AddMatchSemanticsVersionAndNullableMatchConfidence`; rastreio em `46` (W5.6 = IMPLEMENTED) e manifest Anexo R/S.
+**Estado:** RATIFICADO (especificação normativa); implementação **concluída** — evidência: `WaveW56MatchConfidenceTests` (45/45, incl. follow-up F7-B/F8-B/F9); migration `AddMatchSemanticsVersionAndNullableMatchConfidence`; commits `b613502` (W5.6) e `780fa01` (follow-up W5.6, rastreio em `46`); rastreio em `46` (W5.6 = IMPLEMENTED) e manifest Anexo R/S.
 
 Este documento é a especificação normativa de `MatchMethod`/`MatchConfidence` (W5.6),
 derivada da proposta `.kilo/plans/w56-specification.md` e das decisões humanas ratificadas
@@ -295,9 +295,15 @@ producer/transporte/persistência; valores concretos dos 8 métodos; versão `ms
 política do endpoint manual; C6; fronteira C7; testes.
 
 **Abertos/limitações:** C7 `OPEN` (campos sem contrato — **não** pertencem a W5.6); M.4 `OUT`
-(sem wave atribuída). A implementação de W5.6 (incluindo a coluna/migration para
-`MatchSemanticsVersion` e o fim do `const 1.0`) pertence à **wave de implementação seguinte**;
-esta especificação não altera código, testes, schema ou migrations.
+(sem wave atribuída). A implementação de W5.6 foi **concluída** no commit `b613502` (semântica
+method-specific de `MatchMethod`/`MatchConfidence`, `MatchConfidence` nullable, migration
+`20260920200933_AddMatchSemanticsVersionAndNullableMatchConfidence` para `MatchSemanticsVersion`
+e fim do `const 1.0`), com follow-up no commit `780fa01` (F7-B/F8-B/F9); esta especificação fixa o
+contrato e a implementação realiza-o. C7 permanece `OPEN` e M.4 permanece `OUT`.
+
+> Nota de reconciliação (2026-09-20): correcção documental de estado — o cabeçalho já declarava a
+> implementação concluída, mas §18 mantinha linguagem pré-implementação. Não é uma nova decisão:
+> OD-A..OD-E e DL-121/DL-122/DL-123 permanecem inalteradas, C7 continua `OPEN` e M.4 continua `OUT`.
 
 ```text
 W5.6 SPECIFICATION: RATIFIED (normative) — implementation complete

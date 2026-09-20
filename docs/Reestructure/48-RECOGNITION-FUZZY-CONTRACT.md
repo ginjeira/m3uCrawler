@@ -1,7 +1,8 @@
-# 48 — Contrato de Reconhecimento Fuzzy (W5.3 — DESIGN)
+# 48 — Contrato de Reconhecimento Fuzzy (W5.3 — IMPLEMENTADO; origem DESIGN)
 
-**Estado:** IMPLEMENTADO (W5.3)  
-**Baseline de design:** `4721dc3` — W5.2 `feat(5.2): enforce deterministic recognition order`  
+**Estado:** IMPLEMENTADO (W5.3) — ratificado por `DL-118` (`31-DECISION-LOCK.md`); ver §17
+**Baseline de design (pré-implementação):** `4721dc3` — W5.2 `feat(5.2): enforce deterministic recognition order`
+**Implementação:** `84b35f5` — `feat(5.3-5.4): implement fuzzy recognition and review lifecycle`
 **Âmbito:** fechar a semântica do passo 6 (fuzzy) de Recognition deixada como
 `PARAMETER_GAP` por W5.0/W5.1/W5.2.
 
@@ -19,6 +20,15 @@
 > `DECISION REOPEN REQUIRED`. A ratificação deste documento nos documentos
 > normativos (`05`, `32`, `38`, `31`, `46`) é uma proposta, não uma alteração
 > silenciosa da BÍBLIA.
+
+> **Reconciliação documental (2026-09-20):** W5.3 foi ratificado por `DL-118`
+> (`31-DECISION-LOCK.md`) e implementado em `84b35f5`
+> (`feat(5.3-5.4): implement fuzzy recognition and review lifecycle`);
+> traceability em `46 §W5.3` (`COMPLIANT`, `WaveW53FuzzyRecognitionTests`, 35).
+> O texto de design pré-implementação (baseline `4721dc3`) é mantido como
+> histórico e anotado onde relevante (§1.5, §15); não é reescrito. A `OPEN-D2`
+> (motor legacy hardcoded) permanece `DIVERGENT`/fora de scope e M.4/C7
+> permanecem `OUT`/abertos — esta nota não os fecha.
 
 ---
 
@@ -105,6 +115,12 @@
 - Ordem implementada: `IdentityRule → identidade externa exacta →
   CanonicalExact → NormalizedName → KnownAlias → ExplicitHeuristic →
   gate fuzzy (no-op) → Unknown`.
+
+> **Nota (reconciliação 2026-09-20):** este parágrafo descreve o baseline
+> histórico **pré-W5.3** (`4721dc3`), quando o passo 6 era um placeholder vazio.
+> Está substituído pelo passo fuzzy implementado (`84b35f5`; diagnóstico em
+> §14/`OPEN-D3`; ratificação `DL-118`). Mantido como registo do estado de design,
+> não do estado actual.
 
 ### 1.6 `RecognitionPolicy` — `Services/Recognition/RecognitionPolicy.cs`
 
@@ -499,7 +515,7 @@ Casos que `WaveW53FuzzyRecognitionTests` deve cobrir após implementação:
 
 ---
 
-## 15. Alterações documentais propostas (para ratificação)
+## 15. Alterações documentais propostas (para ratificação) — histórico pré-ratificação
 
 1. `05-CATALOGUE.md §4.1` — adicionar a semântica fuzzy de §5–§9 deste
    documento (referência a `48`).
@@ -507,12 +523,19 @@ Casos que `WaveW53FuzzyRecognitionTests` deve cobrir após implementação:
    de threshold/margem/pesos por `PARAMETER` com semântica definida (F6/F7/F8)
    e schema de `Fuzzy.Weights` (F5/F13).
 3. `31-DECISION-LOCK.md` — novo DL (ex.: `DL-118`) a fixar métrica base,
-   campos, universo e desempate.
+   campos, universo e desempate. **[histórico — ratificado como `DL-118`]**
 4. `46-REQUIREMENT-TRACEABILITY.md` / `BIBLE_IMPLEMENTABILITY_GAP_MANIFEST`
    (Anexo O) — registar W5.3 como design e a wave de implementação.
 
 Estas alterações **não** são feitas nesta wave sem ratificação; `48` é a
-proposta.
+proposta. **[histórico — pré-ratificação]**
+
+> **Reconciliação documental (2026-09-20):** a ratificação ocorreu via `DL-118`
+> (`31-DECISION-LOCK.md`) e W5.3 foi implementado em `84b35f5`. As alterações de
+> §15 (itens 1–4) estão reflectidas em `05`, `32`, `38`, `31` e `46`. Os
+> enunciados relativos a `OPEN-D2` (motor legacy `ChannelMatcher`/`MatchScorer`
+> hardcoded, `DIVERGENT`, fora de scope) e a M.4/C7 (`OUT`/aberto) mantêm-se
+> válidos; esta nota não os altera nem fecha.
 
 ---
 

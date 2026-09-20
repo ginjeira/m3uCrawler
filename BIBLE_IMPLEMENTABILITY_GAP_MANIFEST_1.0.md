@@ -4,6 +4,7 @@
 > **Data:** 2026-09-19
 > **Estado:** `AUDIT COMPLETE` + `GAP MANIFEST COMPLETE` + `DECISIONS REQUIRED IDENTIFIED`.
 > **Revisão:** 1.0-reconciliado — auditoria interna de consistência do próprio manifesto (contagens, IDs, agrupamento, separação funcional/documental). Nenhuma decisão nova foi introduzida.
+> **Nota de estado (2026-09-20):** HEAD real actual `780fa01`; W5.1–W5.6 (Anexos M–S.2) implementadas. O Anexo A é um snapshot histórico e as afirmações históricas de L.5/R foram subsequentemente ultrapassadas (ver Anexo T). Nenhuma decisão nova foi introduzida; `M.4` e `C7` permanecem `OPEN`.
 > **Não** é uma proposta de BÍBLIA 1.3. Nenhum documento normativo, ADR, código ou teste foi alterado.
 > Todas as referências `file:line` foram verificadas nos ficheiros reais do repositório.
 
@@ -599,6 +600,8 @@ novo/alvo desta auditoria:
    ?? BIBLE_IMPLEMENTABILITY_GAP_MANIFEST_1.0.md
 ```
 
+> **Nota de estado (2026-09-20):** este anexo é um snapshot histórico point-in-time (à data da auditoria). O HEAD real actual é `780fa0148617c9074146f028cd2fcb61b3a9b50d`, na branch `feature/phase-9c-first-run-dashboard`; W5.1–W5.6 e o follow-up foram subsequentemente implementados (Anexos M–S.2). O bloco acima preserva-se verbatim como registo histórico.
+
 > Verificação por comandos read-only de Git. As modificações rastreadas (`AGENTS.md`, `CONTRIBUTING.md`, `README.md`, `ROADMAP.md`) e os restantes ficheiros `??` já existiam no working tree antes desta auditoria. Esta auditoria não alterou nenhum ficheiro rastreado, nenhum documento em `docs/Reestructure/`, nenhum ADR, código ou teste, e não criou commits. O único artefacto tocado é este manifesto, na raiz do repositório. O HEAD real (`bde0612`) difere do registado em `docs/PROJECT_STATUS.md:9` (`a2c2eae`); é uma divergência de estado de documentação derivada, fora do scope.
 
 ## Anexo B — Resumo quantitativo final
@@ -816,6 +819,8 @@ O build e o teste passam (2186/2187; 1 skip), mas a conformidade com a BÍBLIA �
 ### F.3 Primeira divergência
 
 **Discovery — identidade/dedup (`AccountKey`).** `AccountIdentity.cs:11,29-31` deriva `AccountId` de URL com credenciais + username; não existe `DiscoveryCandidate` persistido nem dedup por conta. Contraria `03-DISCOVERY.md:28,30` e `32-DOMAIN-SCHEMA.md:33`. Primeira divergência de segurança imediatamente a seguir: SSRF em aquisição (`HttpClientFactory.cs:67-82`, sem protocolo/IP/DNS/redirect/fail-closed).
+
+> **Reconciliação (2026-09-20):** este parágrafo é o snapshot histórico da BIBLE AUDIT (pré-W1). W1 (commit `ab3f817`; migration `AddProviderAccountAndDiscoveryCandidate`) implementou o `DiscoveryCandidate` persistido (tabela `discovery_candidates`) e a dedup por `(RunId, ProviderAccountId)`; a identidade funcional é `AccountKey.Compose` (namespace + identidade externa). O legado `AccountIdentity.Compute` (URL+username) permanece apenas para serialização de trabalho. Ver Anexo G e Anexo T.
 
 ### F.4 ADR audit
 
@@ -1156,7 +1161,7 @@ W5.7 Traceability/gates/docs (44, 46, manifest)
 
 ### L.5 Contagens do Manifest
 
-W5.0 é decisão documental; não abre nem fecha `DG-*`. As linhas de implementação (`46:118-125,159`) permanecem `DIVERGENT`/`PARTIAL`/`MISSING` até W5.1–W5.6.
+W5.0 é decisão documental; não abre nem fecha `DG-*`. As linhas de implementação (`46:118-125,159`) permanecem `DIVERGENT`/`PARTIAL`/`MISSING` até W5.1–W5.6. (histórico — W5.1–W5.6 foram implementadas; ver Anexos M–S.2)
 
 ```text
 DG-* (73): CLOSED = 66, PARAMETER_GAP = 6, OPEN-HUMAN = 0, BLOCKED = 1, FALSE_GAP = 0
@@ -1535,7 +1540,7 @@ W5.6: Contract + Specification ratified / Implementation complete
 | ID | Decisão | Contrato |
 |---|---|---|
 | D-W56-01 | Semântica de `MatchMethod`/`MatchConfidence` **versionada**; a versão identifica as regras/algoritmo e não é propriedade arbitrária por `ChannelSource`; mecanismo físico na especificação W5.6 (precedentes `sfp1`/DL-108, policy `Version`/DL-110). | DL-121 |
-| D-W56-02 | `MatchConfidence` `double 0..1` **method-specific**; sem escala global; regra normativa própria por método (8 valores); valores concretos `OPEN`. | `05 §4.1`; `32:218`; DL-121 |
+| D-W56-02 | `MatchConfidence` `double 0..1` **method-specific**; sem escala global; regra normativa própria por método (8 valores); valores concretos `OPEN` (superseded pelo Anexo S — valores ratificados/implementados). | `05 §4.1`; `32:218`; DL-121 |
 | D-W56-03 | `FuzzyScore ≠ MatchConfidence`; proibida a conversão `0..100 → 0..1`. | DL-119; `48`; `43 #24` |
 | D-W56-04 | `Unknown`/`Ambiguous` → `MatchConfidence = null` (nunca `0`/melhor `FuzzyScore`). | DL-121 |
 | D-W56-05 | Producer = Recognition; `CatalogResolution` transporta `MatchMethod`+`MatchConfidence`; pipeline persiste sem recalcular; `const 1.0` = divergência a corrigir. | DL-121 |
@@ -1618,3 +1623,39 @@ Evidência: `WebDashboardService` (F7-B, validação antes de `RecordChannelSour
 
 Sem migration/schema novo; C7 `OPEN`; M.4 `OUT`; motor legacy inalterado. W5.6 principal committed
 em `b6135023365654b08c850a531c9c0300427945fc`.
+
+---
+
+## Anexo T — Reconciliação documental (2026-09-20)
+
+Reconciliação de estado deste manifesto com o repositório real. **Não** introduz decisões novas, não altera
+classificações `DG-*`, não fecha `M.4` nem `C7`, e não altera a BÍBLIA, ADRs, código ou testes. As
+afirmações históricas do corpo do manifesto preservam-se; as divergências de estado foram apenas anotadas.
+
+```text
+Branch:    feature/phase-9c-first-run-dashboard
+HEAD real: 780fa0148617c9074146f028cd2fcb61b3a9b50d
+Estado:    W1–W5.6 implementadas (Anexos M–S.2)
+Commits:   ab3f817, c73e134, 8142c0d, 5236364, 4721dc3, 84b35f5, b8c9cda, b613502, 780fa01
+```
+
+Anotações de estado aplicadas (aditivas; o corpo histórico não foi reescrito):
+
+| Ponto | Estado histórico | Estado reconciliado |
+|---|---|---|
+| `## Anexo A` | Snapshot `HEAD: bde0612` e working tree à data da auditoria | Snapshot histórico point-in-time; HEAD real `780fa01`, branch `feature/phase-9c-first-run-dashboard` |
+| `### L.5` | Linhas `DIVERGENT`/`PARTIAL`/`MISSING` "até W5.1–W5.6" | W5.1–W5.6 implementadas (Anexos M–S.2) |
+| `D-W56-02` (Anexo R) | Valores concretos `OPEN` | Superseded pelo Anexo S (valores ratificados/implementados) |
+| `### F.3` (Anexo F) / `### E.4` | Primeira divergência (pré-W1) sem `DiscoveryCandidate` persistido; bloco E.4 com linha de contagem removida | `### F.3` anotado como superseded pela W1 (nota de reconciliação no corpo); linha `§4 afirmações (23): CLOSED = 10, FALSE_GAP = 13` restaurada em `### E.4` |
+
+Permanece em aberto (sem alteração):
+
+```text
+M.4: Status OPEN — Wave não atribuída (D-W54-03). O snapshot é criado quando
+     CreateSnapshotAsync é invocado; o wiring ao RunCoordinator/pipeline não está
+     feito e a produção continua a invocar ResolveAsync com `policy: null`.
+C7:  OPEN — schema completo do ReviewItem (RunId/StreamId/Actor/Evidence/
+     Candidates/Decision) não inventado sem contrato implementável.
+```
+
+Este anexo é uma reconciliação de estado, não uma decisão, uma nova wave nem uma revisão da auditoria.
