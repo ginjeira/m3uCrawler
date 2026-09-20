@@ -255,6 +255,28 @@ Quality gate W4: `dotnet build` 0 erros / 52 avisos (iguais ao baseline);
 `dotnet test` 0 failed / 2365 passed / 1 skipped (baseline 2302/1/0; +63
 testes W4).
 
+## W4.1 — Resolução fingerprint-aware no SourceSelectionStage (correcção)
+
+Corrige a divergência entre a identidade de consolidação (fingerprint, na persistência) e a identidade de junção (`CredentialSanitizer.SanitizeUrl`, no stage). Um URL fingerprint-equivalente com representação sanitizada diferente era classificado como `Unmatched` artificial.
+
+Contrato de resolução (precedência):
+
+1. **fingerprint** — `StreamFingerprint.TryComputeFingerprint(runtime.Url)` contra `(FingerprintVersion, Fingerprint)` persistidos;
+2. **legacy sanitized-URL** — `CredentialSanitizer.SanitizeUrl(runtime.Url)` contra `ChannelSource.StreamUrl` (rows sem fingerprint);
+3. **unmatched** — pass-through, sem associação.
+
+Regras mantidas: correspondência com `>1 CanonicalChannelId` distinto ⇒ `Ambiguous` + `Unmatched`; empate ⇒ menor `Id`; `SourceId` permanece parte da identidade persistente; nenhuma credencial em diagnostics; `CredentialSanitizer` continua apenas para exposição segura.
+
+| Requirement | Bible/contrato | Implementação | Teste | Estado |
+|---|---|---|---|---|
+| Precedência fingerprint > URL sanitizada na junção do stage | DL-101 crit. 6, 09 §3, 04 §4.1/§5, 16 §3 | `SourceSelectionStage.ResolveHits` (fingerprint-first, fallback legacy) | `WaveW4p1SourceSelectionFingerprintResolutionTests.cs` | COMPLIANT |
+| URLs fingerprint-equivalentes com sanitized diferente resolvem a mesma `ChannelSource` | 04 §5, 32 ChannelSource | `SourceSelectionStage.cs` (`byFingerprint`) | idem (Test 1, scheme case, default port, fragment, query creds) | COMPLIANT |
+| Fallback legacy sem fingerprint | 16 §3 | `SourceSelectionStage.cs` (índice por URL sanitizada) | idem (Test 6) | COMPLIANT |
+| Isolamento de Source / não escolha arbitrária em colisão entre canais | 07 §5 | regra de ambiguidade existente + índice por fingerprint | idem (Test 8) | COMPLIANT |
+| Determinismo da resolução | DL-101 | índices por execução | idem (Test 10) | COMPLIANT |
+
+Quality gate W4.1: `dotnet build` 0 erros (52 avisos, iguais ao baseline); `dotnet test` 0 failed / 2377 passed / 1 skipped (baseline W4 2365/1/0; +12 testes W4.1).
+
 ## Cobertura de requisitos
 
 Todo o requisito/contrato da BÍBLIA deve ter um ID único e constar da matriz de rastreabilidade. A matriz DEVE incluir explicitamente os requisitos de delegação/completude (`00-BIBLE.md` §5/§6) e de contratos (`22`, `23`). Um requisito sem implementação é uma wave futura; um requisito com implementação contraditória é uma divergência a analisar antes de avançar downstream.

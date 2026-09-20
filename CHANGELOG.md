@@ -7,6 +7,12 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Unreleased]
 
+### 🔧 Corrigido
+- **Wave W4.1 — resolução fingerprint-aware no `SourceSelectionStage` (2026-09-20).**
+  - **Problema:** a persistência consolida `ChannelSource` por fingerprint, mas a selecção fazia o join apenas por `CredentialSanitizer.SanitizeUrl`. URLs fingerprint-equivalentes com representação sanitizada diferente (casing do host, porta default, fragmento, credenciais em query) eram classificadas como `Unmatched` artificial.
+  - **Correcção:** `SourceSelectionStage` resolve por precedência — (1) fingerprint canónico (`FingerprintVersion`+`Fingerprint` persistidos), (2) fallback por URL sanitizada (rows legacy sem fingerprint), (3) `Unmatched`/pass-through. `SourceId` permanece parte da identidade persistente; a regra de ambiguidade existente (`>1 CanonicalChannelId` ⇒ `Ambiguous`) e o desempate por menor `Id` foram preservados. Sem alterações a `StreamFingerprint`, `CredentialSanitizer`, W2/W3 ou ao ranking.
+  - **Testes:** `WaveW4p1SourceSelectionFingerprintResolutionTests` (12) — equivalente com sanitized diferente, scheme case, porta default, fragmento, query credentials (sem exposição de segredos), legacy null, fingerprints distintos, colisão entre canais/sources (ambíguo, não arbitrário), unmatched/pass-through, determinismo, precedência fingerprint>URL e candidato com fingerprint persistido. Suite: 2377 passed / 1 skipped / 0 failed.
+
 ### ✨ Adicionado
 - **Wave W4 — normalização e fingerprint canónico de stream (2026-09-19).**
   - **Serviço novo:** `Services/Matching/StreamFingerprint.cs` — canonicalização determinística (`sfp1`) e `Fingerprint = hex minúsculo de SHA-256(UTF-8("sfp1\n" + canonicalUrl))`.

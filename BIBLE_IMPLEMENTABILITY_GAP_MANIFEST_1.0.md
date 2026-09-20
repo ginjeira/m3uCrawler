@@ -1052,3 +1052,39 @@ W4 é implementação; reconcilia um conflito documental anteriormente semântic
 ```text
 DG-* (73): CLOSED = 66, PARAMETER_GAP = 6, OPEN-HUMAN = 0, BLOCKED = 1, FALSE_GAP = 0
 ```
+
+---
+
+## Anexo K — Wave W4.1: resolução fingerprint-aware no SourceSelectionStage
+
+Correcção do bloqueador identificado na revisão pós-W4. Código alterado; BÍBLIA não alterada; nenhum ADR.
+
+### K.1 Problema
+
+A persistência consolida `ChannelSource` por fingerprint (`CatalogResolver.RecordChannelSourceAsync`), mas `SourceSelectionStage` fazia o join apenas por `CredentialSanitizer.SanitizeUrl`. `StreamFingerprint` elimina casing do host, porta default, fragmento e credenciais em query; `SanitizeUrl` preserva-os. Logo `Fingerprint(A)==Fingerprint(B)` com `SanitizeUrl(A)!=SanitizeUrl(B)` produzia `Unmatched` artificial para uma das variantes.
+
+### K.2 Correcção
+
+- `SourceSelectionStage.ApplyAsync` constrói, por execução, um índice adicional `(FingerprintVersion, Fingerprint) → List<ChannelSource>` e resolve cada stream por **precedência**: (1) fingerprint, (2) URL sanitizada (fallback legacy), (3) `Unmatched`/pass-through (`ResolveHits`).
+- Mantidos: ambiguidade quando hits têm `>1 CanonicalChannelId` distinto; desempate por menor `Id`; `SourceId` parte da identidade persistente; taxonomia `Matched/Unmatched/Ambiguous/Selected/Published` inalterada; `CredentialSanitizer` continua só para exposição; nenhuma credencial em diagnostics; `StreamFingerprint`/canonicalização/W2/W3 intactos.
+- Âmbito: o runtime `M3uStream` não transporta `SourceId`, pelo que o stage permanece source-agnostic como antes; o isolamento entre Sources é garantido na persistência (chave inclui `SourceId`) e a colisão de fingerprint entre canais distintos é `Ambiguous`, não escolha arbitrária.
+
+### K.3 Testes
+
+`WaveW4p1SourceSelectionFingerprintResolutionTests.cs` (12): equivalente com sanitized diferente (A/B), scheme case, porta default, fragmento, query credentials (sem expor segredos), legacy null, fingerprints distintos, colisão entre canais/sources (ambíguo), unmatched/pass-through, determinismo, precedência fingerprint>URL, e candidato com fingerprint persistido.
+
+### K.4 Quality gates
+
+```text
+dotnet build → 0 errors (52 warnings, iguais ao baseline)
+dotnet test  → 2377 passed, 1 skipped, 0 failed (baseline W4 2365/1/0; +12)
+git diff --check → clean (apenas avisos LF→CRLF)
+```
+
+### K.5 Contagens do Manifest
+
+W4.1 é correcção de implementação; não abre nem fecha `DG-*`.
+
+```text
+DG-* (73): CLOSED = 66, PARAMETER_GAP = 6, OPEN-HUMAN = 0, BLOCKED = 1, FALSE_GAP = 0
+```

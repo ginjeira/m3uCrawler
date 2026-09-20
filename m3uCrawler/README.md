@@ -168,6 +168,7 @@ O fingerprint de stream é calculado por `m3uCrawler/Services/Matching/StreamFin
 - **Dedup intra-Source:** mesma Source + canal + fingerprint + versão consolidam na mesma row; Sources diferentes nunca são consolidadas. Múltiplas streams por `(canal, source)` continuam suportadas.
 - **Selection:** o critério 6 de DL-101 usa o fingerprint persistido; para rows legacy sem fingerprint usa a URL normalizada como fallback.
 - **Segurança:** password, token, `Authorization` e username de credencial nunca aparecem na representação canónica, no valor persistido, em logs, diagnósticos ou excepções.
+- **Resolução de identidade na selecção (W4.1):** o `SourceSelectionStage` resolve por fingerprint canónico (versão actual) e só depois por URL sanitizada (rows legacy); `SourceId` permanece parte da identidade persistente; sem correspondência ⇒ `Unmatched`/pass-through. Cobre o caso fingerprint-equivalente com representação sanitizada diferente (casing do host, porta default, fragmento, credenciais em query). Ver `WaveW4p1SourceSelectionFingerprintResolutionTests`.
 - **Testes:** `WaveW4StreamFingerprintTests` (golden vectors calculados independentemente) e `WaveW4ChannelSourceFingerprintTests` (dedup, migração aditiva, selection).
 
 ### Publicações HTML com cards Xtream

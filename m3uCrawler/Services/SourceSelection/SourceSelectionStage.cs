@@ -5,6 +5,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using m3uCrawler.Models;
 using m3uCrawler.Services.Catalog;
+using m3uCrawler.Services.Matching;
 
 namespace m3uCrawler.Services.SourceSelection;
 
@@ -56,9 +57,14 @@ public interface ISourceSelectionStage
 /// </para>
 ///
 /// <para>
-/// <b>Junção exacta</b> por <c>CredentialSanitizer.SanitizeUrl(realUrl)</c>,
-/// que é a chave de unicidade usada pelo próprio catálogo
-/// (<c>CatalogResolver.RecordChannelSourceAsync</c>). Sem matching
+/// <b>Resolução de identidade (W4.1).</b> A junção é <b>fingerprint-first</b>:
+/// (1) fingerprint canónico do URL de runtime
+/// (<see cref="StreamFingerprint.TryComputeFingerprint"/>, versão actual) contra
+/// o fingerprint/versão persistidos em <c>ChannelSource</c>; (2) fallback para
+/// <c>CredentialSanitizer.SanitizeUrl(realUrl)</c>, que cobre rows legacy sem
+/// fingerprint. O fingerprint tem precedência porque a persistência consolida
+/// por fingerprint, enquanto a URL sanitizada preserva diferenças (casing do
+/// host, porta default, fragmento) que o fingerprint elimina. Sem matching
 /// aproximado, por título ou por host.
 /// </para>
 ///
@@ -142,15 +148,34 @@ public sealed class SourceSelectionStage : ISourceSelectionStage
         }
 
         var bySanitizedUrl = new Dictionary<string, List<ChannelSourceEntity>>(StringComparer.Ordinal);
+        // W4.1 — índice por fingerprint (versão + hash). A identidade de
+        // persistência consolida por fingerprint, pelo que a junção tem de
+        // preferir o fingerprint à URL sanitizada (que preserva diferenças
+        // que o fingerprint elimina, ex.: casing do host e porta default).
+        var byFingerprint = new Dictionary<(string Version, string Fingerprint), List<ChannelSourceEntity>>();
         foreach (var channelSource in channelSources)
         {
-            if (string.IsNullOrEmpty(channelSource.StreamUrl)) continue;
-            if (!bySanitizedUrl.TryGetValue(channelSource.StreamUrl, out var list))
+            if (!string.IsNullOrEmpty(channelSource.StreamUrl))
             {
-                list = new List<ChannelSourceEntity>();
-                bySanitizedUrl[channelSource.StreamUrl] = list;
+                if (!bySanitizedUrl.TryGetValue(channelSource.StreamUrl, out var urlList))
+                {
+                    urlList = new List<ChannelSourceEntity>();
+                    bySanitizedUrl[channelSource.StreamUrl] = urlList;
+                }
+                urlList.Add(channelSource);
             }
-            list.Add(channelSource);
+
+            if (!string.IsNullOrEmpty(channelSource.Fingerprint)
+                && !string.IsNullOrEmpty(channelSource.FingerprintVersion))
+            {
+                var fpKey = (channelSource.FingerprintVersion, channelSource.Fingerprint);
+                if (!byFingerprint.TryGetValue(fpKey, out var fpList))
+                {
+                    fpList = new List<ChannelSourceEntity>();
+                    byFingerprint[fpKey] = fpList;
+                }
+                fpList.Add(channelSource);
+            }
         }
 
         var matched = new List<MatchedEntry>();
@@ -162,10 +187,8 @@ public sealed class SourceSelectionStage : ISourceSelectionStage
 
         foreach (var stream in streams)
         {
-            var key = CredentialSanitizer.SanitizeUrl(stream.Url);
-            if (string.IsNullOrEmpty(key)
-                || !bySanitizedUrl.TryGetValue(key, out var hits)
-                || hits.Count == 0)
+            var hits = ResolveHits(stream.Url, byFingerprint, bySanitizedUrl);
+            if (hits is null || hits.Count == 0)
             {
                 unmatched.Add(stream);
                 continue;
@@ -311,6 +334,36 @@ public sealed class SourceSelectionStage : ISourceSelectionStage
         return channelSource.LastTestedAtUtc == default
             ? null
             : channelSource.LastTestedAtUtc;
+    }
+
+    /// <summary>
+    /// W4.1 — resolve as <c>ChannelSource</c> candidatas para uma URL de
+    /// runtime. Precedência: (1) fingerprint canónico (versão actual);
+    /// (2) URL sanitizada (fallback legacy, incluindo rows sem fingerprint).
+    /// Devolve <c>null</c> quando não há correspondência.
+    /// </summary>
+    private static List<ChannelSourceEntity>? ResolveHits(
+        string? url,
+        Dictionary<(string Version, string Fingerprint), List<ChannelSourceEntity>> byFingerprint,
+        Dictionary<string, List<ChannelSourceEntity>> bySanitizedUrl)
+    {
+        var fingerprint = StreamFingerprint.TryComputeFingerprint(url);
+        if (!string.IsNullOrEmpty(fingerprint)
+            && byFingerprint.TryGetValue((StreamFingerprint.Version, fingerprint), out var fpHits)
+            && fpHits.Count > 0)
+        {
+            return fpHits;
+        }
+
+        var key = CredentialSanitizer.SanitizeUrl(url);
+        if (!string.IsNullOrEmpty(key)
+            && bySanitizedUrl.TryGetValue(key, out var urlHits)
+            && urlHits.Count > 0)
+        {
+            return urlHits;
+        }
+
+        return null;
     }
 
     private sealed class MatchedEntry
