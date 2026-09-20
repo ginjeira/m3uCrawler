@@ -2805,6 +2805,19 @@ public sealed class CatalogResolver
         if (string.IsNullOrWhiteSpace(streamUrl)) throw new ArgumentException("StreamUrl é obrigatória.", nameof(streamUrl));
         if (matchMethod.Length > 80) throw new ArgumentException("MatchMethod excede 80 caracteres.", nameof(matchMethod));
 
+        // W5.6 F8-B (DL-123) — MatchSemanticsVersion = "msm1" identifica apenas
+        // pares produzidos sob a semântica W5.6: método normativo + confidence
+        // validada + igual à tabela §7. Qualquer outro caminho (legacy
+        // "unknown"/0, método arbitrário, confidence nula ou par divergente)
+        // fica com versão nula; nunca se cria um valor "legacy".
+        string? matchSemanticsVersion = null;
+        if (RecognitionMatchMethods.TryGetMatchConfidence(matchMethod, out var expectedConfidence)
+            && matchConfidence.HasValue
+            && Math.Abs(matchConfidence.Value - expectedConfidence) < 1e-9)
+        {
+            matchSemanticsVersion = RecognitionMatchMethods.MatchSemanticsVersion;
+        }
+
         var sanitizedUrl = CredentialSanitizer.SanitizeUrl(streamUrl);
         var hasFingerprint = StreamFingerprint.TryCreate(streamUrl, out _, out var fingerprint);
         var fingerprintVersion = hasFingerprint ? StreamFingerprint.Version : null;
@@ -2840,7 +2853,7 @@ public sealed class CatalogResolver
             existing.Availability = availability;
             existing.MatchConfidence = matchConfidence;
             existing.MatchMethod = matchMethod;
-            existing.MatchSemanticsVersion = RecognitionMatchMethods.MatchSemanticsVersion;
+            existing.MatchSemanticsVersion = matchSemanticsVersion;
             existing.ExternalStreamId = externalStreamId;
             existing.IsEnabled = isEnabled;
             existing.LastSeenAtUtc = now;
@@ -2868,7 +2881,7 @@ public sealed class CatalogResolver
             Availability = availability,
             MatchConfidence = matchConfidence,
             MatchMethod = matchMethod,
-            MatchSemanticsVersion = RecognitionMatchMethods.MatchSemanticsVersion,
+            MatchSemanticsVersion = matchSemanticsVersion,
             FirstSeenAtUtc = now,
             LastSeenAtUtc = now,
             LastTestedAtUtc = now,

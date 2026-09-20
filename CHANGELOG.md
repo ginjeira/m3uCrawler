@@ -15,6 +15,11 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
   - **Pipeline:** `PipelineIngestionService` remove o `const double confidence = 1.0`; transporta `resolution.MatchConfidence`/`MatchMethod` sem recalcular nem inferir (`IngestionEntry.MatchConfidence` passa a `double?`).
   - **Endpoint manual (OD-E):** validação HTTP em `WebDashboardService` (rota legacy `POST /api/catalog/sources/{id}/streams`): omissão de `MatchMethod` preserva comportamento; se fornecido, só os 8 valores; `MatchConfidence` só `0..1`; ambos → combinação válida; inválidos → `400 {error}` sem persistência. `RecordChannelSourceAsync` mantém defaults legacy (`0`/`"unknown"`) e valida só comprimento.
   - **Testes:** `WaveW56MatchConfidenceTests` (38). Suite: 2570 passed / 1 skipped / 0 failed.
+- **W5.6 follow-up — F7-B/F8-B implementados (2026-09-20).** Implementa DL-123 / `49 §10/§12` no fluxo manual de `ChannelSource`; sem migration/schema novo.
+  - **F7-B (endpoint):** `WebDashboardService` (`POST /api/catalog/sources/{id}/streams`) — `MatchMethod` presente exige `MatchConfidence`: ausente → `400 { error }` **sem persistência**; nunca auto-preencher o valor do método. A validação existente (8 métodos, domínio `0..1`, combinação da tabela) mantém-se antes de `RecordChannelSourceAsync`.
+  - **F8-B (versão):** `CatalogResolver.RecordChannelSourceAsync` carimba `MatchSemanticsVersion="msm1"` apenas quando o par é normativo (`RecognitionMatchMethods.TryGetMatchConfidence` + `matchConfidence.HasValue` + igualdade à tabela §7); legacy (`"unknown"`/`0`, métodos arbitrários, confidence nula ou par divergente) → `null` (nunca `"legacy"`).
+  - Legacy sem `MatchMethod` preservado: `"unknown"` + `0` + versão `null`. Coluna já nullable `TEXT(32)`.
+  - **Testes:** `WaveW56MatchConfidenceTests` 45/45 (combinações normativas com `msm1`, divergentes rejeitadas sem persistência, método sem confidence → `400`, legacy com versão `null`). Suite: 2577 passed / 1 skipped / 0 failed.
 - **W5.5 — API HTTP de Review (2026-09-20).** Implementa o contrato ratificado (DL-120; `22 §7`) no handler manual de `WebDashboardService.cs`. Sem migration, sem novas dependências, sem alteração das rotas legacy.
   - **Rotas:** `GET /api/reviews` (filtro `state` Open|InReview|Resolved|Ignored, `limit`/`offset`, ordem `CreatedAtUtc DESC, Id DESC`, `subject = NormalizedIdentity`, `runId = null` como limitação C7/W5.6); `GET /api/review?id`; `POST /api/review/ignore` (motivo obrigatório); `POST /api/review/reopen` (justificação obrigatória, manual); `POST /api/review/resolve` (declaração explícita + `Resolved`).
   - **Identidade:** `ReviewItem.Id` (`id`/`reviewItemId`); novo `CatalogResolver.GetReviewItemAsync`. `Fingerprint` fica só nas rotas legacy.
@@ -55,6 +60,11 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
   - Testes `WaveW51RecognitionPolicyTests` (17): defaults, global/group/channel, fallback, determinismo, fuzzy off, round-trip, snapshot estável, versões coexistentes, auditoria, migração Up/Down e preservação de dados, isolamento. Suite: 2394 passed / 1 skipped / 0 failed.
 
 ### 📝 Documentação
+- **W5.6 follow-up — F7-B/F8-B/F9 ratificados (2026-09-20).** Documentação + implementação concluídas na mesma data (ver `✨ Adicionado`). DL-123 e `49 §10/§12`:
+  - **F7-B:** no endpoint manual, `MatchMethod` presente ⇒ `MatchConfidence` **obrigatória** (ausente → `400`, sem persistência); proibido auto-preencher o valor do método ou persistir método normativo com `null`; combinações fornecidas continuam validadas pela tabela.
+  - **F8-B:** `MatchSemanticsVersion="msm1"` só identifica pares W5.6 (método ∈ 8 + confidence validada + tabela); payload legacy (`"unknown"`+`0`) → versão **`null`**; proibido `"legacy"`.
+  - **F9:** alinhamento documental da rota real (`POST /api/catalog/sources/{id}/streams`) e de `MatchConfidence` (`double?`) em `49`.
+  - Legacy vs W5.6: legacy (sem método) → `"unknown"`+`0`+versão `null`; explícito W5.6 (com método) → confidence obrigatória+validada+`msm1`. Sem migration/schema; C7 `OPEN`; M.4 `OUT`.
 - **W5.6 — especificação de MatchMethod/MatchConfidence ratificada (2026-09-20).** Documentação-only; implementação concluída na wave W5.6 (ver entrada em `[Unreleased]` `✨ Adicionado`). Fecha as decisões `OPEN` de DL-121 (OD-A..OD-E) numa especificação normativa:
   - **OD-A:** `ExplicitHeuristic` → `MatchConfidence = 0.80`.
   - **OD-B:** `Fuzzy` → `MatchConfidence = 0.60`, **sem** cálculo a partir de `FuzzyScore` (proibido `FuzzyScore/100` ou equivalente); `FuzzyScore` permanece `0..100` diagnóstico; `Ambiguous`/`Unknown` → `null`.

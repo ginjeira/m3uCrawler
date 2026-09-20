@@ -1597,3 +1597,24 @@ ordenar métodos pelo número); `Unknown`/`Ambiguous → null`; `FuzzyScore != M
 permanece `OPEN`/limitado e M.4 permanece `OUT`. `44` Q4 passa a **satisfeito** para a semântica de
 matching de W5.6 (evidência: `WaveW56MatchConfidenceTests`, migration
 `AddMatchSemanticsVersionAndNullableMatchConfidence`).
+
+### Anexo S.2 — Follow-up W5.6: F7-B/F8-B/F9 implementado
+
+Implementação das decisões de compatibilidade pós-W5.6 (DL-123; `49 §10/§12`) no fluxo manual `ChannelSource`; sem migration/schema novo.
+
+```text
+F7-B: MatchMethod presente ⇒ MatchConfidence obrigatória (ausente → 400, sem persistência;
+      proibido auto-preencher/normalizar no endpoint; produção semântica continua em Recognition)
+F8-B: MatchSemanticsVersion = "msm1" só para pares W5.6 (método ∈ 8 + confidence validada + tabela);
+      payload legacy ("unknown"+0) → MatchSemanticsVersion = null; proibido "legacy"
+F9:   rota real = POST /api/catalog/sources/{id}/streams; MatchConfidence = double? (docs alinhados)
+Legacy vs W5.6: legacy (sem método) → "unknown"+0+versão null;
+                explícito W5.6 (com método) → confidence obrigatória+validada+versão msm1
+```
+
+Evidência: `WebDashboardService` (F7-B, validação antes de `RecordChannelSourceAsync`);
+`CatalogResolver.RecordChannelSourceAsync` (F8-B, derivação via `RecognitionMatchMethods.TryGetMatchConfidence`);
+`WaveW56MatchConfidenceTests` (45/45). Suite: 2577 passed / 1 skipped / 0 failed; `dotnet ef migrations has-pending-model-changes` = sem alterações pendentes.
+
+Sem migration/schema novo; C7 `OPEN`; M.4 `OUT`; motor legacy inalterado. W5.6 principal committed
+em `b6135023365654b08c850a531c9c0300427945fc`.

@@ -50,13 +50,15 @@ Esta especificação (`49`) é o contrato normativo de implementação de W5.6.
 |---|---|---|
 | 1 | `MatchMethod` produzido | `CatalogResolver.ResolveAsync` `:192-193` (TvgIdExact/ExternalIdentityExact), `:236` (CanonicalExact), `:260` (NormalizedName), `:272` (KnownAlias), `:298,309` (ExplicitHeuristic), `:357` (Fuzzy); `FromCanonical`/`FromRule` (ManualReview). `null` em `Ambiguous`/`Unknown`. |
 | 2 | `MatchConfidence` produzido | **Não existe em `CatalogResolution`.** Só o pipeline usa `const double confidence = 1.0` (`PipelineIngestionService.cs:284`). |
-| 3 | `MatchConfidence` persistido | `RecordChannelSourceAsync(matchConfidence: confidence)`; `ChannelSourceEntity.MatchConfidence` (required). |
+| 3 | `MatchConfidence` persistido | `RecordChannelSourceAsync(matchConfidence: confidence)`; `ChannelSourceEntity.MatchConfidence` (`double?`, **nullable** desde a migration `AddMatchSemanticsVersionAndNullableMatchConfidence`). |
 | 4 | `MatchMethod` persistido | idem; `ChannelSourceEntity.MatchMethod` (string required, max 80). |
 | 5 | hardcoded | `const double confidence = 1.0` (`PipelineIngestionService.cs:284`); `IngestionEntry.MatchConfidence`. |
 | 6 | versão implícita | **Nenhuma** para match semantics. Precedente: `StreamFingerprint.Version="sfp1"` (const) + `ChannelSourceEntity.FingerprintVersion` (persistida) — DL-108. |
-| 7 | endpoint manual | `POST /api/catalog/sources/{sourceId}/channel-sources`; payload `ChannelSourcePayload { matchConfidence (double), matchMethod (string?) }`; `payload.MatchMethod ?? "unknown"`. |
+| 7 | endpoint manual | `POST /api/catalog/sources/{sourceId}/streams`; payload `ChannelSourcePayload { matchConfidence (double?), matchMethod (string?) }`; `payload.MatchMethod ?? "unknown"`. |
 | 8 | persistência manual | `RecordChannelSourceAsync` → defaults `matchConfidence=0`, `matchMethod="unknown"`; valida apenas `matchMethod.Length <= 80`, sem enum/domínio nem clamp de confidence. |
 | 9 | legado a preservar | Testes usam métodos arbitrários (`matchMethod: "test"`, `"legacy"`, `"test-raw"`, `"canonical-alias"`) e `MatchConfidence = 0`; `PipelineIngestionBridgeTests` só exige método não-vazio e `0 <= confidence <= 1`. O motor legacy (`ChannelMatcher`) **não** escreve estes campos. |
+
+> **Nota (pós-implementação W5.6).** Os itens 2 e 5 descrevem a **baseline pré-W5.6** (histórica). Após a implementação: `CatalogResolution.MatchConfidence` existe (`double?`), o pipeline transporta o valor de Recognition e o `const 1.0` foi removido. O item 3 foi alinhado para `double?` (F9). Alinhamento documental F9: a rota real é `POST /api/catalog/sources/{sourceId}/streams`.
 
 **Precedentes de valor:** `ExternalIdentityEntity.Confidence` clampada `0..1`, default 1.0;
 `CatalogBaselineImporter` usa `Confidence = 1.0`.
@@ -146,15 +148,19 @@ A semântica de `MatchMethod`/`MatchConfidence` é **versionada**. A decisão ra
 - Identifica as **regras/algoritmo** que produziram o par `MatchMethod`+`MatchConfidence`:
   é **proveniência derivada do algoritmo**, **não** uma propriedade arbitrária introduzida
   individualmente pelo operador num `ChannelSource`.
-- Rows novas de `ChannelSource` recebem `"msm1"`. **Não** é exigido de clientes legacy do
-  endpoint manual: o servidor atribui a versão corrente a novos registos (§12).
+- Rows novas de `ChannelSource` produzidas por um par normativo W5.6 recebem `"msm1"`.
+  **Não** é exigido de clientes legacy do endpoint manual: o servidor carimba a versão
+  corrente apenas quando o par é normativo (§12, F8-B).
 - **Proibido** usar `RecognitionPolicy` (ou `RecognitionPolicy.Version`) como substituto da
   versão da semântica de matching: são conceitos distintos.
 - **Não confundir** com `FingerprintVersion` (DL-108): são versões independentes de conceitos
   independentes (fingerprint de stream vs. semântica de matching).
 
-`msm1` fica invisível ao consumidor de leitura até a implementação persistir a coluna; esta
-especificação **não** cria a coluna nem migration (implementação é a wave seguinte).
+**F8-B ratificado (atribuição de versão).** `MatchSemanticsVersion` só identifica pares produzidos sob a semântica W5.6, isto é, quando **todas** as condições se verificam: `MatchMethod` é um dos 8 métodos normativos; `MatchConfidence` foi validado; e o par corresponde à tabela normativa (§7).
+- **Payload legacy sem `MatchMethod`** (caminho manual) → `MatchMethod="unknown"`, `MatchConfidence=0`, **`MatchSemanticsVersion=null`** (nunca `"msm1"`).
+- **Não** criar valores de compatibilidade como `"legacy"` ou outros.
+- Caminhos normativos (Recognition/pipeline e endpoint manual explícito validado) → `"msm1"`.
+- Consequência: rows históricas (anteriores a W5.6) e rows produzidas por payload legacy ficam com versão `null`; uma futura `msm2` distingue-se por valor. **Implementado** na wave de follow-up (F8-B; `CatalogResolver.RecordChannelSourceAsync` deriva a versão do par via `RecognitionMatchMethods.TryGetMatchConfidence`).
 
 ---
 
@@ -192,14 +198,22 @@ não quebrar consumidores legados internos):
 - **`MatchConfidence` fornecido** → aceitar **apenas** `double` em `0..1`; fora do domínio →
   erro de validação.
 - **Ambos fornecidos** → validar a combinação segundo a semântica W5.6 (§6/§7).
-- **`MatchSemanticsVersion` não é exigido no payload**; o servidor atribui `"msm1"` aos
-  registos novos.
+- **`MatchSemanticsVersion` não é exigido no payload**; o servidor carimba `"msm1"` apenas nos registos cujo par `MatchMethod`+`MatchConfidence` é normativo (F8-B).
 - Valores explicitamente inválidos → **erro de validação, sem persistência parcial**,
   mantendo o contrato de erro da API onde compatível com W5.5 (`22 §2`; envelope
   `{error,message,correlationId}` nas rotas que já o usam).
 - **Não** remover nem alterar endpoints legacy nesta wave. A validação **não** é feita em
   `RecordChannelSourceAsync` (serviço), para preservar testes/consumidores legados com
   métodos arbitrários (`"test"`/`"legacy"`/`"canonical-alias"`).
+
+**F7-B ratificado (método sem confidence) — implementado.** Quando `MatchMethod` é fornecido explicitamente, `MatchConfidence` passa a ser **obrigatório**:
+- `MatchMethod` presente **e** `MatchConfidence` ausente → **HTTP 400**, sem persistência.
+- **Não** auto-preencher o valor do método (não fabricar `Fuzzy→0.60` etc.).
+- **Não** persistir `MatchMethod` normativo com `MatchConfidence = null`.
+- A produção semântica de `MatchConfidence` continua a pertencer a **Recognition**; no endpoint manual, o operador que declara o método declara também a confidence.
+- Combinações fornecidas mantêm a validação normativa: `Fuzzy+0.60` válido; `Fuzzy+0.80`/`Fuzzy+1.0` → 400; `ExplicitHeuristic+0.80` válido; `CanonicalExact+1.0` válido; `CanonicalExact+0.80` → 400; `ManualReview+1.0` válido; `ManualReview+0.0` → 400.
+- **Legacy** (payload sem `MatchMethod`) permanece inalterado: `"unknown"` + `0` + versão `null` (§10, F8-B).
+- **Implementado** na wave de follow-up (F7-B; validação em `WebDashboardService`, antes de `RecordChannelSourceAsync`; sem migration/schema).
 
 ---
 
@@ -247,8 +261,7 @@ M.4 permanece `OUT` (`W5.6 ≠ M.4`).
 - **`Fuzzy`:** asserção negativa de que `MatchConfidence` **não** depende de `FuzzyScore`
   (nunca `score/100` nem transformação equivalente); alterar `FuzzyScore` não altera o
   `MatchConfidence` `0.60`.
-- **Versionamento:** `MatchSemanticsVersion == "msm1"` em `ChannelSource` novo;
-  consistência/snapshot; ausência no payload manual não é erro (servidor atribui `"msm1"`).
+- **Versionamento:** `MatchSemanticsVersion == "msm1"` em `ChannelSource` novo apenas quando o par é normativo; legacy (`"unknown"`+`0`) → `null` (§10, F8-B); o campo não é exigido no payload manual, pelo que a ausência não é erro.
 - **Persistência:** `ChannelSource.MatchConfidence`/`MatchMethod`/`MatchSemanticsVersion`
   iguais aos de `CatalogResolution`; o pipeline **não** recalcula.
 - **Endpoint manual:** válido → 200/201; método inválido → erro; confidence fora de `0..1` →

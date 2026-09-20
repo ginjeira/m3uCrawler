@@ -2755,12 +2755,16 @@ namespace m3uCrawler.Services
                             if (!Enum.TryParse<EpgState>(payload.Epg, true, out var epg)) epg = EpgState.Unknown;
                             if (!Enum.TryParse<AvailabilityState>(payload.Availability, true, out var availability)) availability = AvailabilityState.Discovered;
 
-                            // W5.6 §12 (OD-E) — validação de MatchMethod/MatchConfidence
-                            // apenas na camada HTTP (nunca em RecordChannelSourceAsync,
-                            // para preservar consumidores/testes legacy que usam métodos
-                            // arbitrários). MatchMethod ausente preserva o comportamento
-                            // legacy (persistido como "unknown"). MatchSemanticsVersion
-                            // não é exigida ao cliente: o servidor atribui "msm1".
+                            // W5.6 §12 (OD-E) + F7-B (DL-123) — validação de
+                            // MatchMethod/MatchConfidence apenas na camada HTTP
+                            // (nunca em RecordChannelSourceAsync, para preservar
+                            // consumidores/testes legacy que usam métodos
+                            // arbitrários). MatchMethod ausente preserva o
+                            // comportamento legacy (persistido como "unknown").
+                            // MatchMethod presente torna MatchConfidence obrigatória:
+                            // ausência → 400 sem persistência; nunca auto-preencher.
+                            // MatchSemanticsVersion não é exigida ao cliente: o
+                            // servidor só carimba "msm1" quando o par é normativo.
                             if (payload.MatchMethod is not null)
                             {
                                 if (!RecognitionMatchMethods.TryGetMatchConfidence(
@@ -2776,29 +2780,36 @@ namespace m3uCrawler.Services
                                     return;
                                 }
 
-                                if (payload.MatchConfidence is double providedWithMethod)
+                                if (payload.MatchConfidence is not double providedWithMethod)
                                 {
-                                    if (providedWithMethod < 0 || providedWithMethod > 1)
+                                    context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                                    await WriteJsonAsync(context.Response, new
                                     {
-                                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
-                                        await WriteJsonAsync(context.Response, new
-                                        {
-                                            error = "MatchConfidence fora do domínio 0..1.",
-                                        }, HttpStatusCode.BadRequest);
-                                        return;
-                                    }
+                                        error = "MatchConfidence é obrigatória quando MatchMethod é fornecido.",
+                                    }, HttpStatusCode.BadRequest);
+                                    return;
+                                }
 
-                                    if (Math.Abs(providedWithMethod - expectedConfidence) > 1e-9)
+                                if (providedWithMethod < 0 || providedWithMethod > 1)
+                                {
+                                    context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                                    await WriteJsonAsync(context.Response, new
                                     {
-                                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
-                                        await WriteJsonAsync(context.Response, new
-                                        {
-                                            error = $"Combinação MatchMethod/MatchConfidence inválida: " +
-                                                $"'{payload.MatchMethod}' exige MatchConfidence " +
-                                                $"{expectedConfidence.ToString(System.Globalization.CultureInfo.InvariantCulture)}.",
-                                        }, HttpStatusCode.BadRequest);
-                                        return;
-                                    }
+                                        error = "MatchConfidence fora do domínio 0..1.",
+                                    }, HttpStatusCode.BadRequest);
+                                    return;
+                                }
+
+                                if (Math.Abs(providedWithMethod - expectedConfidence) > 1e-9)
+                                {
+                                    context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                                    await WriteJsonAsync(context.Response, new
+                                    {
+                                        error = $"Combinação MatchMethod/MatchConfidence inválida: " +
+                                            $"'{payload.MatchMethod}' exige MatchConfidence " +
+                                            $"{expectedConfidence.ToString(System.Globalization.CultureInfo.InvariantCulture)}.",
+                                    }, HttpStatusCode.BadRequest);
+                                    return;
                                 }
                             }
                             else if (payload.MatchConfidence is double providedWithoutMethod

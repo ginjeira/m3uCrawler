@@ -27,6 +27,9 @@ namespace m3uCrawler.Tests;
 /// transporte aditivo em <c>CatalogResolution</c>, persistência
 /// nullable + <c>MatchSemanticsVersion="msm1"</c> pelo pipeline (sem
 /// recálculo nem 1.0 fixo) e validação OD-E do endpoint manual.
+/// Follow-up F7-B/F8-B (DL-123): método explícito exige confidence (ausente →
+/// 400 sem persistência) e <c>msm1</c> é carimbado só em pares normativos
+/// (legacy → <c>null</c>).
 /// </para>
 /// </summary>
 [Collection("DashboardStaticState")]
@@ -310,21 +313,39 @@ public class WaveW56MatchConfidenceTests : IAsyncLifetime
     // ────────────────────────────────────────────────────────────────
 
     [Fact]
-    public async Task RecordChannelSource_persists_nullable_confidence_and_msm1()
+    public async Task RecordChannelSource_stamps_msm1_only_for_normative_pairs()
     {
         var ch = await Ch("w56-persist", "W56 Persist");
         var sourceId = await SeedSourceAsync("w56-persist-src");
 
+        // F8-B: par normativo (método ∈ 8 + confidence da tabela) → "msm1".
+        var normative = await _resolver.RecordChannelSourceAsync(
+            ch.Id, sourceId, "http://host/w56-normative",
+            matchMethod: RecognitionMatchMethods.Fuzzy, matchConfidence: 0.60);
+        Assert.Equal(0.60, normative.MatchConfidence);
+        Assert.Equal("msm1", normative.MatchSemanticsVersion);
+
+        // F8-B: a actualização de uma row existente também deriva a versão
+        // (o mesmo caminho de escrita, não só a criação).
+        var updatedToLegacy = await _resolver.RecordChannelSourceAsync(
+            ch.Id, sourceId, "http://host/w56-normative", matchMethod: "legacy", matchConfidence: null);
+        Assert.Null(updatedToLegacy.MatchSemanticsVersion);
+        var updatedToNormative = await _resolver.RecordChannelSourceAsync(
+            ch.Id, sourceId, "http://host/w56-normative",
+            matchMethod: RecognitionMatchMethods.Fuzzy, matchConfidence: 0.60);
+        Assert.Equal("msm1", updatedToNormative.MatchSemanticsVersion);
+
+        // F8-B: método arbitrário + confidence null → versão null (nunca "msm1").
         var withNull = await _resolver.RecordChannelSourceAsync(
             ch.Id, sourceId, "http://host/w56-null", matchMethod: "legacy", matchConfidence: null);
         Assert.Null(withNull.MatchConfidence);
-        Assert.Equal("msm1", withNull.MatchSemanticsVersion);
+        Assert.Null(withNull.MatchSemanticsVersion);
 
-        // Legacy: default 0 preservado (não convertido em null).
+        // Legacy: default 0 preservado (não convertido em null); versão null.
         var legacyDefault = await _resolver.RecordChannelSourceAsync(
             ch.Id, sourceId, "http://host/w56-legacy", matchMethod: "test");
         Assert.Equal(0.0, legacyDefault.MatchConfidence);
-        Assert.Equal("msm1", legacyDefault.MatchSemanticsVersion);
+        Assert.Null(legacyDefault.MatchSemanticsVersion);
     }
 
     // ────────────────────────────────────────────────────────────────
@@ -410,40 +431,50 @@ public class WaveW56MatchConfidenceTests : IAsyncLifetime
         Assert.Equal("msm1", stored.MatchSemanticsVersion);
     }
 
-    [Fact]
-    public async Task Manual_endpoint_accepts_valid_combination_fuzzy_060()
+    [Theory]
+    [InlineData(RecognitionMatchMethods.Fuzzy, 0.60)]
+    [InlineData(RecognitionMatchMethods.ExplicitHeuristic, 0.80)]
+    [InlineData(RecognitionMatchMethods.CanonicalExact, 1.0)]
+    [InlineData(RecognitionMatchMethods.ManualReview, 1.0)]
+    public async Task Manual_endpoint_accepts_valid_normative_combination_with_msm1(string method, double confidence)
     {
         var harness = StartHarness();
-        var ch = await Ch("w56-ep-fuzzy", "W56 Ep Fuzzy");
-        var sourceId = await SeedSourceAsync("w56-ep-fuzzy-src");
+        var ch = await Ch($"w56-ep-ok-{method}", $"W56 Ep Ok {method}");
+        var sourceId = await SeedSourceAsync($"w56-ep-ok-src-{method}");
 
         var resp = await harness.Client.PostAsync(ChannelSourcesRoute(sourceId), Json(new
         {
             canonicalChannelId = ch.Id,
-            streamUrl = "http://host/w56-ep-fuzzy",
-            matchMethod = RecognitionMatchMethods.Fuzzy,
-            matchConfidence = 0.60,
+            streamUrl = $"http://host/w56-ep-ok-{method}",
+            matchMethod = method,
+            matchConfidence = confidence,
         }));
 
         Assert.Equal(HttpStatusCode.Created, resp.StatusCode);
         var stored = Assert.Single(await _resolver.ListChannelSourcesAsync(sourceId: sourceId));
-        Assert.Equal(RecognitionMatchMethods.Fuzzy, stored.MatchMethod);
-        Assert.Equal(0.60, stored.MatchConfidence);
+        Assert.Equal(method, stored.MatchMethod);
+        Assert.Equal(confidence, stored.MatchConfidence);
+        Assert.Equal("msm1", stored.MatchSemanticsVersion);
     }
 
-    [Fact]
-    public async Task Manual_endpoint_rejects_invalid_combination_without_persistence()
+    [Theory]
+    [InlineData(RecognitionMatchMethods.Fuzzy, 0.80)]
+    [InlineData(RecognitionMatchMethods.Fuzzy, 1.0)]
+    [InlineData(RecognitionMatchMethods.Fuzzy, 0.90)]
+    [InlineData(RecognitionMatchMethods.CanonicalExact, 0.80)]
+    [InlineData(RecognitionMatchMethods.ManualReview, 0.0)]
+    public async Task Manual_endpoint_rejects_divergent_combination_without_persistence(string method, double confidence)
     {
         var harness = StartHarness();
-        var ch = await Ch("w56-ep-badcombo", "W56 Ep BadCombo");
-        var sourceId = await SeedSourceAsync("w56-ep-badcombo-src");
+        var ch = await Ch($"w56-ep-badcombo-{method}", $"W56 Ep BadCombo {method}");
+        var sourceId = await SeedSourceAsync($"w56-ep-badcombo-src-{method}");
 
         var resp = await harness.Client.PostAsync(ChannelSourcesRoute(sourceId), Json(new
         {
             canonicalChannelId = ch.Id,
-            streamUrl = "http://host/w56-ep-badcombo",
-            matchMethod = RecognitionMatchMethods.Fuzzy,
-            matchConfidence = 0.90,
+            streamUrl = $"http://host/w56-ep-badcombo-{method}",
+            matchMethod = method,
+            matchConfidence = confidence,
         }));
 
         Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
@@ -507,7 +538,7 @@ public class WaveW56MatchConfidenceTests : IAsyncLifetime
         var stored = Assert.Single(await _resolver.ListChannelSourcesAsync(sourceId: sourceId));
         Assert.Equal("unknown", stored.MatchMethod);
         Assert.Equal(0.0, stored.MatchConfidence);
-        Assert.Equal("msm1", stored.MatchSemanticsVersion);
+        Assert.Null(stored.MatchSemanticsVersion);
     }
 
     [Fact]
@@ -528,11 +559,11 @@ public class WaveW56MatchConfidenceTests : IAsyncLifetime
         var stored = Assert.Single(await _resolver.ListChannelSourcesAsync(sourceId: sourceId));
         Assert.Equal("unknown", stored.MatchMethod);
         Assert.Equal(0.5, stored.MatchConfidence);
-        Assert.Equal("msm1", stored.MatchSemanticsVersion);
+        Assert.Null(stored.MatchSemanticsVersion);
     }
 
     [Fact]
-    public async Task Manual_endpoint_method_without_confidence_uses_legacy_default_zero()
+    public async Task Manual_endpoint_method_without_confidence_is_rejected_without_persistence()
     {
         var harness = StartHarness();
         var ch = await Ch("w56-ep-methodonly", "W56 Ep MethodOnly");
@@ -545,10 +576,10 @@ public class WaveW56MatchConfidenceTests : IAsyncLifetime
             matchMethod = RecognitionMatchMethods.ManualReview,
         }));
 
-        Assert.Equal(HttpStatusCode.Created, resp.StatusCode);
-        var stored = Assert.Single(await _resolver.ListChannelSourcesAsync(sourceId: sourceId));
-        Assert.Equal(RecognitionMatchMethods.ManualReview, stored.MatchMethod);
-        Assert.Equal(0.0, stored.MatchConfidence);
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+        using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+        Assert.True(doc.RootElement.TryGetProperty("error", out _));
+        Assert.Equal(0, await ChannelSourceCountAsync(sourceId));
     }
 
     [Fact]

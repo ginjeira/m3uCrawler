@@ -357,17 +357,29 @@ Implementação da especificação normativa `49-W56-MATCH-CONFIDENCE-SPECIFICAT
 |---|---|---|---|---|---|
 | W56-METHODS | `49 §5/§7`; DL-122 | Conjunto fechado de 8 `MatchMethod` | `RecognitionMatchMethods` (8 constantes + `IsKnownMethod`) | `WaveW52...`/`WaveW53...`; `WaveW56MatchConfidenceTests` | COMPLIANT |
 | W56-TABLE | `49 §7`; DL-122; `05 §4.1` | Tabela normativa método→confidence (`1.0`/`0.80`/`0.60`/`1.0`) | `RecognitionMatchMethods.ConfidenceByMethod` + `TryGetMatchConfidence`; `CatalogResolution.FromCanonical`/`FromRule` | `WaveW56MatchConfidenceTests` (tabela + 8 métodos) | COMPLIANT |
-| W56-VERSION | `49 §10`; DL-122; DL-108 | `MatchSemanticsVersion="msm1"` persistida em `ChannelSource` | `RecognitionMatchMethods.MatchSemanticsVersion`; `ChannelSourceEntity.MatchSemanticsVersion`; `ChannelCatalogDbContext`; migration `20260920200933_AddMatchSemanticsVersionAndNullableMatchConfidence` | `WaveW56MatchConfidenceTests` (persistência/versão) | COMPLIANT |
+| W56-VERSION | `49 §10`; DL-122/DL-123; DL-108 | `MatchSemanticsVersion="msm1"` só em pares normativos (método ∈ 8 + confidence igual à tabela); legacy → `null` | `RecognitionMatchMethods.MatchSemanticsVersion`; `CatalogResolver.RecordChannelSourceAsync` (F8-B); `ChannelSourceEntity.MatchSemanticsVersion`; migration `20260920200933_AddMatchSemanticsVersionAndNullableMatchConfidence` | `WaveW56MatchConfidenceTests` (persistência/versão normativa e legacy) | COMPLIANT (F8-B) |
 | W56-PRODUCER | `49 §11`; DL-121/DL-122 | Recognition produz; `CatalogResolution` transporta `MatchMethod`+`MatchConfidence`; pipeline persiste sem recalcular | `CatalogResolution.MatchConfidence` (init-only); `PipelineIngestionService` transporta `resolution.MatchConfidence` (sem `const 1.0`) | `WaveW56MatchConfidenceTests` (pipeline exact/heuristic) | COMPLIANT |
 | W56-NULL | `49 §9`; DL-121 | `Unknown`/`Ambiguous` → `null` | `CatalogResolution.FromCanonical` (método desconhecido→null); `Unknown()`/`Ambiguous()` sem confiança | `WaveW56MatchConfidenceTests` | COMPLIANT |
 | W56-FUZZY-SEP | `49 §8`; `48 §5`; DL-119 | `FuzzyScore != MatchConfidence`; proibido `score/100`; `Fuzzy`=`0.60` independente | `RecognitionMatchMethods.TryGetMatchConfidence` (constante `0.60`) | `WaveW56MatchConfidenceTests` (0.60 vs `FuzzyScore=95`) | COMPLIANT |
-| W56-ENDPOINT | `49 §12`; DL-122; `22 §2` | OD-E: omissão preserva; se fornecido só 8 valores e `0..1`; versão não exigida; inválidos→erro sem persistência parcial; legacy inalterado | `WebDashboardService` handler `POST /api/catalog/sources/{id}/streams` (validação HTTP, antes de `RecordChannelSourceAsync`) | `WaveW56MatchConfidenceTests` (válido/inválido/legacy) | COMPLIANT |
+| W56-ENDPOINT | `49 §12`; DL-122/DL-123; `22 §2` | OD-E + F7-B: omissão preserva; se `MatchMethod` fornecido, só os 8 valores **e** `MatchConfidence` obrigatória (ausente→400), só `0..1`, combinação validada; versão não exigida; inválidos→erro sem persistência parcial; legacy inalterado | `WebDashboardService` handler `POST /api/catalog/sources/{id}/streams` (validação HTTP, antes de `RecordChannelSourceAsync`) | `WaveW56MatchConfidenceTests` (normativo/divergente/método sem confidence/legacy) | COMPLIANT (F7-B) |
 | W56-C7 | `32:163`; `49 §14`; DL-121 | C7 sem contrato **não** é inventado | inalterado | — | OPEN (OUT de W5.6) |
 | W56-M4 | `49 §14`; DL-119 | M.4 (wiring snapshot→Run/pipeline) | inalterado | — | OUT (`W5.6 ≠ M.4`) |
 
 Testes criados: `m3uCrawler.Tests/WaveW56MatchConfidenceTests.cs` — tabela dos 8 métodos; `Unknown`/`Ambiguous → null`; separação `FuzzyScore`/`MatchConfidence` (sem `/100`); transporte aditivo em `CatalogResolution`; persistência nullable + `msm1`; pipeline transporta sem recalcular; validação OD-E do endpoint manual (válido, método inválido, confidence fora de `0..1`, combinação inválida, método ausente, confidence ausente, legacy). Dependência de M.4 marcada como tal (não requisito W5.6).
 
 Quality gate W5.6: `dotnet build` 0 erros / 0 warnings novos; `WaveW56MatchConfidenceTests` 38/38; suite completa 2570 passed / 1 skipped / 0 failed (baseline W5.5 2532/1/0; +38); `dotnet ef migrations has-pending-model-changes` = sem alterações pendentes; `git diff --check` clean. Q4 (`44`) passa a satisfeito para a semântica de matching de W5.6.
+
+### W5.6 follow-up (F7-B/F8-B/F9): IMPLEMENTED
+
+Revisão pós-implementação registou F7/F8/F9 (não bloqueantes). Ratificado em DL-123 e implementado sem migration/schema:
+
+| Item | Decisão ratificada | Estado |
+|---|---|---|
+| F7-B | `MatchMethod` presente ⇒ `MatchConfidence` obrigatória; ausente → `400`, sem persistência; proibido auto-preencher/normalizar no endpoint | IMPLEMENTED (`WebDashboardService`; testes `Manual_endpoint_method_without_confidence_is_rejected_without_persistence`) |
+| F8-B | `msm1` só para pares W5.6 (método ∈ 8 + confidence validada + tabela); legacy (`"unknown"`+`0`) → `MatchSemanticsVersion = null`; proibido `"legacy"` | IMPLEMENTED (`CatalogResolver.RecordChannelSourceAsync`; testes `RecordChannelSource_stamps_msm1_only_for_normative_pairs`, legacy/manual com versão `null`) |
+| F9 | Alinhamento documental: rota real `POST /api/catalog/sources/{id}/streams`; `MatchConfidence` `double?` | APLICADO (docs) |
+
+Quality gate do follow-up: `dotnet build` 0 erros / 0 warnings novos (52 avisos = baseline); `WaveW56MatchConfidenceTests` 45/45; suite completa 2577 passed / 1 skipped / 0 failed (baseline W5.6 2570/1/0; +7); `dotnet ef migrations has-pending-model-changes` = sem alterações pendentes; `git diff --check` clean. Sem migration/schema; C7 `OPEN`; M.4 `OUT`.
 
 ## Cobertura de requisitos
 
