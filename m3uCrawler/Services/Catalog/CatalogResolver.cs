@@ -5,6 +5,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.EntityFrameworkCore;
 using m3uCrawler.Services.Matching;
+using m3uCrawler.Services.Recognition;
 using m3uCrawler.Services.Validation;
 
 namespace m3uCrawler.Services.Catalog;
@@ -76,16 +77,57 @@ public sealed class CatalogResolver
     /// <see cref="CatalogResolutionKind.Ambiguous"/>, nunca "escolher
     /// o primeiro".
     /// </summary>
-    public async Task<CatalogResolution> ResolveAsync(
+    public Task<CatalogResolution> ResolveAsync(
         string normalizedIdentity,
         string? originalTvgId,
         CancellationToken cancellationToken = default)
+        => ResolveAsync(normalizedIdentity, originalTvgId, policy: null, cancellationToken);
+
+    /// <summary>
+    /// Núcleo determinístico de Recognition (W5.2). Aplica a ordem
+    /// normativa de <c>05-CATALOGUE.md §4/§4.1</c> e
+    /// <c>34-PIPELINE-CONTRACTS.md</c> P6:
+    /// </summary>
+    /// <list type="number">
+    ///   <item><b>IdentityRule</b> (ReviewOnly/Excluded) — prioridade
+    ///         absoluta; regra explícita, nunca cria identidade.</item>
+    ///   <item><b>Identidade externa exacta</b> (tvg-id/provider) —
+    ///         passo 1/2. Mesmo valor em canais distintos (incluindo
+    ///         namespaces diferentes) → <c>Ambiguous</c>, nunca
+    ///         "escolher o primeiro".</item>
+    ///   <item><b>CanonicalExact</b> — Key normalizada de canais
+    ///         activos igual à identidade (passo 2).</item>
+    ///   <item><b>NormalizedName</b> — <c>DisplayName</c> normalizado
+    ///         (passo 3), distinto de alias.</item>
+    ///   <item><b>KnownAlias</b> — <c>ChannelAlias</c> (passo 4).</item>
+    ///   <item><b>ExplicitHeuristic</b> — <c>AffinityMember</c>
+    ///         (Kind=Channel) → <c>AffinityGroup.CanonicalChannelKey</c>
+    ///         (passo 5). Key é autoritativa; uma Key presente mas
+    ///         irresolúvel não cai para o FK obsoleto.</item>
+    ///   <item><b>Fuzzy</b> — apenas opt-in via
+    ///         <see cref="RecognitionPolicy.FuzzyEnabled"/>. Não é
+    ///         executado nesta wave.</item>
+    /// </list>
+    /// <para>
+    /// Ties em qualquer passo produzem <c>Ambiguous</c> (nunca por ordem
+    /// de BD/Id/inserção). <see cref="CatalogResolution.PolicyVersion"/>
+    /// é preenchido em todos os resultados. Este caminho nunca consulta
+    /// as tabelas <c>recognition_policies</c>/<c>recognition_policy_snapshots</c>.
+    /// </para>
+    public async Task<CatalogResolution> ResolveAsync(
+        string normalizedIdentity,
+        string? originalTvgId,
+        RecognitionPolicy? policy,
+        CancellationToken cancellationToken = default)
     {
+        CatalogResolution Stamp(CatalogResolution resolution)
+            => resolution with { PolicyVersion = policy?.Version };
+
         var hasNameIdentity = !string.IsNullOrWhiteSpace(normalizedIdentity);
         var externalValue = ExternalIdentityNormalizer.Normalize(originalTvgId);
         if (!hasNameIdentity && externalValue.Length == 0)
         {
-            return CatalogResolution.Unknown();
+            return Stamp(CatalogResolution.Unknown());
         }
 
         await using var context = await _factory.CreateDbContextAsync(cancellationToken);
@@ -98,53 +140,132 @@ public sealed class CatalogResolver
                 .FirstOrDefaultAsync(r => r.NormalizedIdentity == normalizedIdentity, cancellationToken);
             if (rule != null)
             {
-                return CatalogResolution.FromRule(rule);
+                return Stamp(CatalogResolution.FromRule(rule));
             }
         }
 
-        // 1/2. ExternalIdentity exacta (tvg-id/provider identity).
+        // 1. Identidade externa exacta (tvg-id/canonical/provider identity).
         if (externalValue.Length > 0)
         {
-            var canonicalIds = await context.ExternalIdentities
+            var externalMatches = await context.ExternalIdentities
                 .AsNoTracking()
                 .Where(x => x.Value == externalValue)
-                .Select(x => x.CanonicalChannelId)
-                .Distinct()
+                .Select(x => new { x.CanonicalChannelId, x.Namespace })
                 .ToListAsync(cancellationToken);
 
-            if (canonicalIds.Count > 1)
+            var distinctChannelIds = externalMatches
+                .Select(x => x.CanonicalChannelId)
+                .Distinct()
+                .ToList();
+
+            if (distinctChannelIds.Count > 1)
             {
-                // Mesmo valor → canais distintos: ambíguo. Nunca
-                // "escolher o primeiro" (05-CATALOGUE.md §5).
-                return CatalogResolution.Ambiguous("external-identity-ambiguous");
+                // Mesmo valor → canais distintos (mesmo namespace ou
+                // namespaces diferentes): ambíguo. Nunca "escolher o
+                // primeiro" (05-CATALOGUE.md §5).
+                return Stamp(CatalogResolution.Ambiguous("external-identity-ambiguous"));
             }
 
-            if (canonicalIds.Count == 1)
+            if (distinctChannelIds.Count == 1)
             {
+                var matchedNamespace = externalMatches
+                    .First(x => x.CanonicalChannelId == distinctChannelIds[0])
+                    .Namespace;
                 var canonical = await context.CanonicalChannels
                     .AsNoTracking()
-                    .FirstOrDefaultAsync(c => c.Id == canonicalIds[0], cancellationToken);
+                    .FirstOrDefaultAsync(c => c.Id == distinctChannelIds[0], cancellationToken);
                 if (canonical != null && canonical.IsEnabled)
                 {
-                    return CatalogResolution.FromCanonical(canonical);
+                    var method = string.Equals(
+                        matchedNamespace, ExternalIdentityNamespaces.TvgId, StringComparison.Ordinal)
+                        ? RecognitionMatchMethods.TvgIdExact
+                        : RecognitionMatchMethods.ExternalIdentityExact;
+                    return Stamp(CatalogResolution.FromCanonical(canonical, method));
                 }
 
                 // Exacta mas sem canal activo: não contradizer a
                 // correspondência exacta caindo para nome/alias.
-                return CatalogResolution.Unknown();
+                return Stamp(CatalogResolution.Unknown());
             }
         }
 
         if (!hasNameIdentity)
         {
-            return CatalogResolution.Unknown();
+            return Stamp(CatalogResolution.Unknown());
         }
 
-        // 3. AffinityMember (Kind = Channel) -> AffinityGroup ->
-        //    CanonicalChannel. Membros Country não resolvem canal.
-        //    Wave 9C.6: CanonicalChannelKey é a identidade de runtime
-        //    autoritativa; CanonicalChannelId/nav é apenas fallback
-        //    legado quando a Key está ausente.
+        // Candidatos para os passos 2/3: apenas canais activos. A
+        // projecção evita carregar entidades completas; o canal
+        // escolhido é re-obtido individualmente.
+        var enabledChannels = await context.CanonicalChannels
+            .AsNoTracking()
+            .Where(c => c.IsEnabled)
+            .Select(c => new { c.Id, c.Key, c.DisplayName })
+            .ToListAsync(cancellationToken);
+
+        // 2. CanonicalExact — Key normalizada.
+        var canonicalMatches = enabledChannels
+            .Where(c => ChannelNormalizer.Normalize(c.Key) == normalizedIdentity)
+            .Select(c => c.Id)
+            .Distinct()
+            .ToList();
+        if (canonicalMatches.Count > 1)
+        {
+            return Stamp(CatalogResolution.Ambiguous("canonical-identity-ambiguous"));
+        }
+
+        if (canonicalMatches.Count == 1)
+        {
+            var canonical = await context.CanonicalChannels
+                .AsNoTracking()
+                .FirstOrDefaultAsync(c => c.Id == canonicalMatches[0], cancellationToken);
+            if (canonical != null)
+            {
+                return Stamp(CatalogResolution.FromCanonical(
+                    canonical, RecognitionMatchMethods.CanonicalExact));
+            }
+        }
+
+        // 3. NormalizedName — DisplayName normalizado (passo próprio,
+        //    distinto do alias conhecido do passo 4).
+        var nameMatches = enabledChannels
+            .Where(c => ChannelNormalizer.Normalize(c.DisplayName) == normalizedIdentity)
+            .Select(c => c.Id)
+            .Distinct()
+            .ToList();
+        if (nameMatches.Count > 1)
+        {
+            return Stamp(CatalogResolution.Ambiguous("normalized-name-ambiguous"));
+        }
+
+        if (nameMatches.Count == 1)
+        {
+            var canonical = await context.CanonicalChannels
+                .AsNoTracking()
+                .FirstOrDefaultAsync(c => c.Id == nameMatches[0], cancellationToken);
+            if (canonical != null)
+            {
+                return Stamp(CatalogResolution.FromCanonical(
+                    canonical, RecognitionMatchMethods.NormalizedName));
+            }
+        }
+
+        // 4. ChannelAlias -> CanonicalChannel (alias conhecido).
+        var alias = await context.ChannelAliases
+            .AsNoTracking()
+            .Include(a => a.CanonicalChannel)
+            .FirstOrDefaultAsync(a => a.NormalizedAlias == normalizedIdentity, cancellationToken);
+        if (alias?.CanonicalChannel != null && alias.CanonicalChannel.IsEnabled)
+        {
+            return Stamp(CatalogResolution.FromCanonical(
+                alias.CanonicalChannel, RecognitionMatchMethods.KnownAlias));
+        }
+
+        // 5. ExplicitHeuristic — AffinityMember (Kind = Channel) ->
+        //    AffinityGroup -> CanonicalChannel. Membros Country não
+        //    resolvem canal. Wave 9C.6: CanonicalChannelKey é a
+        //    identidade de runtime autoritativa; CanonicalChannelId/nav
+        //    é apenas fallback legado quando a Key está ausente.
         var member = await context.AffinityMembers
             .AsNoTracking()
             .Include(m => m.AffinityGroup)
@@ -162,32 +283,35 @@ public sealed class CatalogResolver
                     .FirstOrDefaultAsync(c => c.Key == affinityKey, cancellationToken);
                 if (canonicalByKey != null && canonicalByKey.IsEnabled)
                 {
-                    return CatalogResolution.FromCanonical(canonicalByKey);
+                    return Stamp(CatalogResolution.FromCanonical(
+                        canonicalByKey, RecognitionMatchMethods.ExplicitHeuristic));
                 }
 
                 // Key presente mas sem resolução (inexistente/desactivada):
                 // a Key é autoritativa, logo não cair no CanonicalChannelId
-                // obsoleto. Prossegue para o passo de alias.
+                // obsoleto.
             }
             else if (member.AffinityGroup.CanonicalChannel != null
                 && member.AffinityGroup.CanonicalChannel.IsEnabled)
             {
-                return CatalogResolution.FromCanonical(member.AffinityGroup.CanonicalChannel);
+                return Stamp(CatalogResolution.FromCanonical(
+                    member.AffinityGroup.CanonicalChannel, RecognitionMatchMethods.ExplicitHeuristic));
             }
         }
 
-        // 4. ChannelAlias -> CanonicalChannel.
-        var alias = await context.ChannelAliases
-            .AsNoTracking()
-            .Include(a => a.CanonicalChannel)
-            .FirstOrDefaultAsync(a => a.NormalizedAlias == normalizedIdentity, cancellationToken);
-        if (alias?.CanonicalChannel != null && alias.CanonicalChannel.IsEnabled)
+        // 6. Fuzzy — opt-in. W5.2 NÃO executa o passo fuzzy e não
+        //    consulta o FuzzyMatcher. Sem policy explícita com
+        //    FuzzyEnabled=true, o passo não corre. Threshold/weights são
+        //    PARAMETER_GAP e não são inventados aqui.
+        if (policy?.FuzzyEnabled == true)
         {
-            return CatalogResolution.FromCanonical(alias.CanonicalChannel);
+            // Placeholder deliberado: a implementação fuzzy pertence a
+            // W5.3 e exige thresholds/desempate definidos pela policy.
+            // Nunca chamar FuzzyMatcher neste caminho nesta wave.
         }
 
-        // 5. Unknown (no canonical channel).
-        return CatalogResolution.Unknown();
+        // 7. Unknown (sem canal canónico).
+        return Stamp(CatalogResolution.Unknown());
     }
 
     /// <summary>
@@ -3931,16 +4055,44 @@ public readonly record struct CatalogResolution(
     RuleDisposition? RuleDisposition,
     string? RuleReason)
 {
+    public string? MatchMethod { get; init; }
+
+    /// <summary>
+    /// Versão da <c>RecognitionPolicy</c> consumida (snapshot) quando o
+    /// resultado foi produzido. <c>null</c> quando não foi fornecida
+    /// policy explícita. Registo, não autoridade.
+    /// </summary>
+    public int? PolicyVersion { get; init; }
+
+    /// <summary>
+    /// Resultado P6 de Recognition (W5.2) derivado do caminho:
+    /// <c>Canonical</c>, <c>Ambiguous</c>, <c>Excluded</c> (regra
+    /// determinística), <c>Review</c> (IdentityRule não-exclusiva) ou
+    /// <c>Unknown</c>.
+    /// </summary>
+    public RecognitionOutcome Outcome => Kind switch
+    {
+        CatalogResolutionKind.Canonical => RecognitionOutcome.Canonical,
+        CatalogResolutionKind.Ambiguous => RecognitionOutcome.Ambiguous,
+        CatalogResolutionKind.Rule when RuleDisposition
+            == global::m3uCrawler.Services.Catalog.RuleDisposition.Excluded => RecognitionOutcome.Excluded,
+        CatalogResolutionKind.Rule => RecognitionOutcome.Review,
+        _ => RecognitionOutcome.Unknown,
+    };
+
     public static CatalogResolution Unknown() => new(
         CatalogResolutionKind.Unknown,
         null, null, null, null, null,
         PublicationPolicy.Excluded, null, null);
 
-    public static CatalogResolution FromCanonical(CanonicalChannelEntity ch) => new(
+    public static CatalogResolution FromCanonical(CanonicalChannelEntity ch, string? matchMethod = null) => new(
         CatalogResolutionKind.Canonical,
         ch.Id, ch.Key, ch.DisplayName,
         ch.EditorialCategory, ch.EditorialGroup,
-        ch.PublicationPolicy, null, null);
+        ch.PublicationPolicy, null, null)
+    {
+        MatchMethod = matchMethod,
+    };
 
     public static CatalogResolution FromRule(IdentityRuleEntity rule) => new(
         CatalogResolutionKind.Rule,
@@ -3948,7 +4100,10 @@ public readonly record struct CatalogResolution(
         rule.Disposition == global::m3uCrawler.Services.Catalog.RuleDisposition.Excluded
             ? PublicationPolicy.Excluded
             : PublicationPolicy.ReviewOnly,
-        rule.Disposition, rule.Reason);
+        rule.Disposition, rule.Reason)
+    {
+        MatchMethod = RecognitionMatchMethods.ManualReview,
+    };
 
     /// <summary>
     /// Resultado ambíguo (ex.: a mesma identidade externa aponta

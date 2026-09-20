@@ -78,8 +78,10 @@ namespace m3uCrawler.Services.Catalog;
 /// <list type="bullet">
 ///   <item><c>SourceEntity.Origin</c> = chave da source + origem
 ///         legível (sanitizada);</item>
-///   <item><c>ChannelSourceEntity.MatchMethod</c> =
-///         "canonical-alias" (canal canónico existente);</item>
+    ///   <item><c>ChannelSourceEntity.MatchMethod</c> =
+    ///         método efectivo de <c>CatalogResolution.MatchMethod</c>
+    ///         (ex.: <c>NormalizedName</c>, <c>KnownAlias</c>); fallback
+    ///         historico <c>"canonical-alias"</c> quando ausente;</item>
 ///   <item><c>ChannelSourceEntity.MatchConfidence</c> = 1.0 (canonical
 ///         existente).</item>
 /// </list>
@@ -278,7 +280,7 @@ public sealed class PipelineIngestionService
                 && resolution.CanonicalChannelId.Value > 0)
             {
                 var canonicalId = resolution.CanonicalChannelId.Value;
-                const string matchMethod = "canonical-alias";
+                var matchMethod = resolution.MatchMethod ?? "canonical-alias";
                 const double confidence = 1.0;
                 matched++;
 

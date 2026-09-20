@@ -1199,3 +1199,91 @@ W5.1 é implementação; não abre nem fecha `DG-*`.
 ```text
 DG-* (73): CLOSED = 66, PARAMETER_GAP = 6, OPEN-HUMAN = 0, BLOCKED = 1, FALSE_GAP = 0
 ```
+
+---
+
+## Anexo N — Wave W5.2: ordem de reconhecimento implementada
+
+Implementação de D7/D8/D9/D10/D11 (ordem P6, nome normalizado como passo
+próprio, `IdentityRule` explícita, namespace de identidade externa e
+`Ambiguous` de Recognition). Fuzzy continua inactivo; Review lifecycle e
+Selection não foram tocados.
+
+### N.1 Entregue
+
+- `Services/Recognition/RecognitionOutcome.cs`: `Canonical | Unknown |
+  Ambiguous | Excluded | Review` (P6 + decisão de regra).
+- `Services/Recognition/RecognitionMatchMethods.cs`: conjunto mínimo e
+  versionado `ExternalIdentityExact`, `TvgIdExact`, `CanonicalExact`,
+  `NormalizedName`, `KnownAlias`, `ExplicitHeuristic`, `Fuzzy`,
+  `ManualReview` (registo, não autoridade).
+- `CatalogResolver.ResolveAsync` ganhou o núcleo determinístico
+  `(normalizedIdentity, originalTvgId, RecognitionPolicy? policy, ct)`.
+  Os overloads anteriores mantêm-se e delegam com `policy: null`.
+  Ordem: `IdentityRule` → identidade externa exacta (namespace respeitado;
+  conflito global → `Ambiguous`, nunca "primeiro") → `CanonicalExact`
+  (Key normalizada) → `NormalizedName` (DisplayName normalizado) →
+  `KnownAlias` → `ExplicitHeuristic` (AffinityMember Kind=Channel,
+  Key autoritativa) → gate fuzzy (não executado) → `Unknown`.
+  Ties em cada passo → `Ambiguous`.
+- `CatalogResolution`: `MatchMethod` e `PolicyVersion` (init-only) e
+  `Outcome` derivado do caminho. `FromCanonical` aceita método;
+  `FromRule` marca `ManualReview`. `PolicyVersion` preenchido em todos os
+  resultados.
+- `RecognitionPolicyResolver`: `GetSnapshotSetAsync` /
+  `GetSnapshotPolicyAsync` + `DeserializeSnapshot` (`System.Text.Json`),
+  que consomem o snapshot **persistido** (formato inalterado).
+- `PipelineIngestionService`: `MatchMethod` efectivo de
+  `resolution.MatchMethod` (fallback histórico `canonical-alias`).
+
+### N.2 Contrato de ordem (mapeamento MatchMethod)
+
+```text
+1. identidade externa exacta      → TvgIdExact | ExternalIdentityExact
+2. tvg-id/canonical/provider      → idem (namespace decide o método)
+3. nome normalizado (passo próprio)→ NormalizedName
+4. alias conhecido                → KnownAlias
+5. heurística explícita           → ExplicitHeuristic
+6. fuzzy (opt-in)                 → Fuzzy (NÃO executado em W5.2)
+7. Review (IdentityRule)          → ManualReview
+   ambíguo                        → Ambiguous (sem MatchMethod)
+   sem evidência                  → Unknown
+```
+
+### N.3 PARAMETER_GAP / OPEN
+
+```text
+PARAMETER_GAP: Fuzzy.Threshold, Fuzzy.AmbiguityMargin, Fuzzy.Weights e
+               desempate fuzzy (pertence a W5.3). Não inventados em W5.2.
+OPEN / INFERENCE: passo ExplicitHeuristic mapeia para AffinityMember
+                  (Kind=Channel) → AffinityGroup → CanonicalChannelKey;
+                  é a heurística explícita existente. A BÍBLIA não nomeia
+                  o mecanismo concreto.
+OPEN (custo): NormalizedName/CanonicalExact fazem scan em memória dos
+              canais activos (Id/Key/DisplayName) por não existir coluna
+              persistida normalizada; candidato escolhido é re-obtido.
+CONFLITO resolvido: teste existente `Existing_raw_alias_becomes_matchable...`
+              assumia pré-W5.2 (só alias resolvia); adaptado preservando o
+              intent (alias cujo valor normalizado não colide com Key/DisplayName).
+```
+
+### N.4 Evidência
+
+```text
+dotnet build → 0 erros (52 avisos = baseline)
+dotnet test  → 2413 passed, 1 skipped, 0 failed (baseline W5.1 2394; +19 W5.2)
+git diff --check → clean (apenas avisos LF→CRLF)
+WaveW52RecognitionOrderTests: 19 testes (ordem, MatchMethod, Ambiguous
+nunca-primeiro, IdentityRule Excluded, namespace, snapshot persistido,
+fuzzy off).
+```
+
+### N.5 Contagens do Manifest
+
+W5.2 é implementação; não abre nem fecha `DG-*`. Fuzzy (W5.3), Review
+(W5.4/W5.5) e `MatchMethod`/`MatchConfidence` versionados (W5.6) mantêm-se
+como waves seguintes.
+
+```text
+DG-* (73): CLOSED = 66, PARAMETER_GAP = 6, OPEN-HUMAN = 0, BLOCKED = 1, FALSE_GAP = 0
+```

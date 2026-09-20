@@ -109,6 +109,149 @@ public sealed class RecognitionPolicyResolver
         CancellationToken cancellationToken = default)
         => _catalog.GetRecognitionPolicySnapshotAsync(runId, cancellationToken);
 
+    /// <summary>
+    /// W5.2 — Materializa o snapshot <b>persistido</b> de um Run num
+    /// <see cref="RecognitionPolicySet"/> imutável. Devolve <c>null</c>
+    /// quando o Run não tem snapshot. Não lê as políticas mutáveis: o
+    /// conjunto é reconstruído exclusivamente a partir de
+    /// <see cref="RecognitionPolicySnapshotEntity.PoliciesJson"/>.
+    /// </summary>
+    public async Task<RecognitionPolicySet?> GetSnapshotSetAsync(
+        string runId,
+        CancellationToken cancellationToken = default)
+    {
+        var snapshot = await GetSnapshotAsync(runId, cancellationToken).ConfigureAwait(false);
+        if (snapshot is null || string.IsNullOrWhiteSpace(snapshot.PoliciesJson))
+        {
+            return null;
+        }
+
+        return DeserializeSnapshot(snapshot.PoliciesJson);
+    }
+
+    /// <summary>
+    /// W5.2 — Resolve a política efectiva do snapshot persistido de um
+    /// Run. Consome o snapshot (não a policy mutável) e aplica a mesma
+    /// precedência <c>channel → group → global → system/default</c>.
+    /// Devolve <c>null</c> se o Run não tiver snapshot.
+    /// </summary>
+    public async Task<RecognitionPolicy?> GetSnapshotPolicyAsync(
+        string runId,
+        string? canonicalChannelKey,
+        string? groupKey,
+        CancellationToken cancellationToken = default)
+    {
+        var set = await GetSnapshotSetAsync(runId, cancellationToken).ConfigureAwait(false);
+        return set?.Resolve(canonicalChannelKey, groupKey);
+    }
+
+    /// <summary>
+    /// Reconstrói um <see cref="RecognitionPolicySet"/> a partir do
+    /// payload JSON escrito por <see cref="Serialize"/>. Não altera o
+    /// formato persistido.
+    /// </summary>
+    private static RecognitionPolicySet DeserializeSnapshot(string json)
+    {
+        using var document = JsonDocument.Parse(json);
+        var root = document.RootElement;
+
+        RecognitionPolicy? systemDefault = null;
+        if (root.TryGetProperty("system", out var system)
+            && system.ValueKind == JsonValueKind.Object)
+        {
+            systemDefault = ReadPolicy(system);
+        }
+
+        RecognitionPolicy? global = null;
+        if (root.TryGetProperty("global", out var globalElement)
+            && globalElement.ValueKind == JsonValueKind.Object)
+        {
+            global = ReadPolicy(globalElement);
+        }
+
+        var groups = new Dictionary<string, RecognitionPolicy>(StringComparer.Ordinal);
+        ReadScoped(root, "groups", groups);
+
+        var channels = new Dictionary<string, RecognitionPolicy>(StringComparer.Ordinal);
+        ReadScoped(root, "channels", channels);
+
+        return new RecognitionPolicySet(global, groups, channels, systemDefault);
+    }
+
+    private static void ReadScoped(
+        JsonElement root,
+        string propertyName,
+        Dictionary<string, RecognitionPolicy> target)
+    {
+        if (!root.TryGetProperty(propertyName, out var array)
+            || array.ValueKind != JsonValueKind.Array)
+        {
+            return;
+        }
+
+        foreach (var item in array.EnumerateArray())
+        {
+            if (item.ValueKind != JsonValueKind.Object) continue;
+            if (!item.TryGetProperty("key", out var keyElement)
+                || keyElement.ValueKind != JsonValueKind.String)
+            {
+                continue;
+            }
+
+            var key = keyElement.GetString();
+            if (string.IsNullOrEmpty(key)) continue;
+            if (!item.TryGetProperty("policy", out var policyElement)
+                || policyElement.ValueKind != JsonValueKind.Object)
+            {
+                continue;
+            }
+
+            if (!target.ContainsKey(key)) target[key] = ReadPolicy(policyElement);
+        }
+    }
+
+    private static RecognitionPolicy ReadPolicy(JsonElement element)
+        => new(
+            Enabled: ReadBool(element, "enabled", fallback: true),
+            FuzzyEnabled: ReadBool(element, "fuzzyEnabled", fallback: false),
+            FuzzyThreshold: ReadNullableInt(element, "fuzzyThreshold"),
+            FuzzyAmbiguityMargin: ReadNullableInt(element, "fuzzyAmbiguityMargin"),
+            FuzzyWeightsJson: ReadNullableString(element, "fuzzyWeights"),
+            Version: ReadInt(element, "version", fallback: 1));
+
+    private static bool ReadBool(JsonElement element, string property, bool fallback)
+    {
+        if (!element.TryGetProperty(property, out var value)) return fallback;
+        return value.ValueKind switch
+        {
+            JsonValueKind.True => true,
+            JsonValueKind.False => false,
+            _ => fallback,
+        };
+    }
+
+    private static int ReadInt(JsonElement element, string property, int fallback)
+    {
+        if (!element.TryGetProperty(property, out var value)) return fallback;
+        return value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out var parsed)
+            ? parsed
+            : fallback;
+    }
+
+    private static int? ReadNullableInt(JsonElement element, string property)
+    {
+        if (!element.TryGetProperty(property, out var value)) return null;
+        return value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out var parsed)
+            ? parsed
+            : null;
+    }
+
+    private static string? ReadNullableString(JsonElement element, string property)
+    {
+        if (!element.TryGetProperty(property, out var value)) return null;
+        return value.ValueKind == JsonValueKind.String ? value.GetString() : null;
+    }
+
     private static RecognitionPolicySet BuildSet(IReadOnlyList<RecognitionPolicyEntity> entities)
     {
         RecognitionPolicy? global = null;

@@ -197,7 +197,13 @@ public class CatalogAliasNormalizationTests : IAsyncLifetime
             channelId = ch.Id;
             ctx.ChannelAliases.Add(new ChannelAliasEntity
             {
-                NormalizedAlias = "LEGACY RAW HD",
+                // W5.2: usa-se um alias cujo valor normalizado ("legacy
+                // alternativa") não coincide com a Key/DisplayName do
+                // canal. Caso contrário os passos CanonicalExact /
+                // NormalizedName introduzidos em W5.2 resolveriam o
+                // canal antes de o alias ser normalizado, mascarando o
+                // objecto do teste (normalização de alias cru).
+                NormalizedAlias = "LEGACY ALTERNATIVA HD",
                 CanonicalChannelId = channelId,
                 CreatedAtUtc = now,
             });
@@ -205,19 +211,19 @@ public class CatalogAliasNormalizationTests : IAsyncLifetime
         }
 
         // Antes da normalização o alias bruto não é matchable.
-        var before = await _resolver.ResolveAsync("legacy raw");
+        var before = await _resolver.ResolveAsync("legacy alternativa");
         Assert.Equal(CatalogResolutionKind.Unknown, before.Kind);
 
         var ctx2 = await _bootstrapper.InitializeAsync();
         await ctx2.DisposeAsync();
 
-        var after = await _resolver.ResolveAsync("legacy raw");
+        var after = await _resolver.ResolveAsync("legacy alternativa");
         Assert.Equal(CatalogResolutionKind.Canonical, after.Kind);
         Assert.Equal(channelId, after.CanonicalChannelId);
 
         var aliases = await AliasesOfAsync(channelId);
-        Assert.Contains("legacy raw", aliases);
-        Assert.DoesNotContain("LEGACY RAW HD", aliases);
+        Assert.Contains("legacy alternativa", aliases);
+        Assert.DoesNotContain("LEGACY ALTERNATIVA HD", aliases);
 
         // Segundo arranque é idempotente.
         var ctx3 = await _bootstrapper.InitializeAsync();
