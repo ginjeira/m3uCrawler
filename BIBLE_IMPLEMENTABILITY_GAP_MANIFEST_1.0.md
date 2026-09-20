@@ -1088,3 +1088,114 @@ W4.1 é correcção de implementação; não abre nem fecha `DG-*`.
 ```text
 DG-* (73): CLOSED = 66, PARAMETER_GAP = 6, OPEN-HUMAN = 0, BLOCKED = 1, FALSE_GAP = 0
 ```
+
+---
+
+## Anexo L — Wave W5.0: decisões normativas de Recognition / Fuzzy / Review
+
+Wave **documental/design**. Nenhum código, schema, migration, API ou teste de comportamento alterado; nenhum commit. Baseline `8142c0d` (W4.1).
+
+### L.1 Decisões fechadas (D1–D11)
+
+| ID | Decisão | Documentos | Wave de implementação |
+|---|---|---|---|
+| D1 | `RecognitionPolicy`: scopes `system/default|global|group|channel`, precedência `channel>group>global>default`, snapshot imutável por Run, schema `Enabled`/`Fuzzy.Enabled`/`Fuzzy.Threshold`/`Fuzzy.AmbiguityMargin`/`Fuzzy.Weights` | `38 §5.1`, `32` | W5.1 |
+| D2 | Fuzzy **opt-in**; sem candidato→`UNKNOWN`; plausíveis→`AMBIGUOUS`; único acima do threshold pode→`CANONICAL` | `05 §4`, **DL-117** | W5.3 |
+| D3 | Threshold/margem/pesos = `PARAMETER_GAP` (não fixar valores) | `38 §5.1`, `32` | W5.3 |
+| D4 | Review `Open→InReview→Resolved`, `Open→Ignored`, `Open→InReview→Ignored`; reopen `Resolved/Ignored→Open` auditado; `InReview` = início de tratamento | `33`, DL-105 | W5.4 |
+| D5 | API Review normativa = `22 §7`; `Ignore` exige motivo; auditoria before/after; `/api/catalog/reviews/...` é divergência histórica | `22 §7` | W5.5 |
+| D6 | `MatchMethod` (método efectivo) e `MatchConfidence` (`0..1`, não é score de fuzzy, não comparável entre métodos sem semântica) normativos, versionados, registo não autoridade | `05 §4.1`, `32` | W5.6 |
+| D7 | Nome normalizado = passo próprio (3), distinto de alias (4) | `05 §4/§4.1`, `34` | W5.2 |
+| D8 | `IdentityRule` explícita (`Review`/`Excluded`), não excepção silenciosa | `05 §4.1`, `34` | W5.2 |
+| D9 | Namespace de provider respeitado na comparação de identidade externa; sem novo scope | `05 §4.1`, `32` | W5.2 |
+| D10 | P6 = `Canonical|Unknown|Ambiguous|Excluded`; `Rejected` não é P6; `Excluded ≠ Unknown/Ambiguous` | `34`, `05 §4.1` | W5.2 |
+| D11 | `Ambiguous` qualificado por `Stage` (Recognition vs Selection) | `05 §4.1`, `34` | W5.2 |
+
+### L.2 Conflitos C1–C11 reconciliados
+
+```text
+C1  fuzzy default-active → BÍBLIA fixa opt-in (D2, DL-117). Código DIVERGENT (W5.3).
+C2  thresholds hardcoded → PARAMETER_GAP (D3). Código DIVERGENT (W5.3).
+C3  curated ambiguity sem ReviewItem → BÍBLIA mantém Review (W5.3).
+C4  Review states sem InReview/reopen → BÍBLIA fixa lifecycle (D4, DL-105). Código DIVERGENT (W5.4).
+C5  rotas Review divergentes → 22 §7 normativa; alinhar em W5.5.
+C6  MatchConfidence/MatchMethod sem base → normativizados (D6) em 05/32.
+C7  ReviewItem schema divergente → reconciliar em W5.4 (mantendo 32 como autoridade).
+C8  IdentityRule/nome normalizado → documentados (D7/D8) em 05/34.
+C9  roadmap auto-create → marcado SUPERSEDED em docs/IMPLEMENTATION_ROADMAP.md.
+C10 gates Q3/Q4 sobrestimados → estado ajustado em 44.
+C11 Open→Ignored directo → explicitado em 33/DL-105 (InReview não obrigatório).
+```
+
+### L.3 PARAMETER_GAP restantes
+
+```text
+- RecognitionPolicy.Fuzzy.Threshold
+- RecognitionPolicy.Fuzzy.AmbiguityMargin
+- RecognitionPolicy.Fuzzy.Weights (métrica/pesos)
+- defaults por campo (excepto Fuzzy.Enabled=false fixo)
+```
+
+### L.4 Deliberadamente fora desta wave (W5.1–W5.7)
+
+```text
+W5.1 RecognitionPolicy (entidade/schema/snapshot/persistência)
+W5.2 Ordem de reconhecimento (namespace, nome normalizado, IdentityRule, Excluded, Ambiguous por Stage)
+W5.3 Fuzzy gate + below-threshold + ReviewItem de ambiguidade
+W5.4 Review lifecycle (InReview/Resolved/Ignored + reopen) + migração
+W5.5 Review API (22 §7) + motivo obrigatório + auditoria
+W5.6 MatchMethod/MatchConfidence (semântica versionada) e reconciliação C6/C7
+W5.7 Traceability/gates/docs (44, 46, manifest)
+```
+
+### L.5 Contagens do Manifest
+
+W5.0 é decisão documental; não abre nem fecha `DG-*`. As linhas de implementação (`46:118-125,159`) permanecem `DIVERGENT`/`PARTIAL`/`MISSING` até W5.1–W5.6.
+
+```text
+DG-* (73): CLOSED = 66, PARAMETER_GAP = 6, OPEN-HUMAN = 0, BLOCKED = 1, FALSE_GAP = 0
+```
+
+---
+
+## Anexo M — Wave W5.1: RecognitionPolicy implementada
+
+Implementação de D1 (policy + resolução + snapshot). Nenhum comportamento de reconhecimento, fuzzy, Review, SourceSelection, fingerprint, Eligibility, Ordering, Output ou Dispatcharr foi alterado.
+
+### M.1 Entregue
+
+- `RecognitionPolicyEntity` (`recognition_policies`): `ScopeKey` único (`system`/`global`/`group:{key}`/`channel:{key}`), `CanonicalChannelKey`, `GroupKey`, `Enabled`, `FuzzyEnabled` (default `false`), `FuzzyThreshold?`, `FuzzyAmbiguityMargin?`, `FuzzyWeightsJson?`, `Version`, timestamps.
+- `RecognitionPolicySnapshotEntity` (`recognition_policy_snapshots`): `RunId` único, `ResolverVersion`, `PoliciesJson`, `ResolvedAtUtc`; imutável (create-if-absent).
+- `Services/Recognition/`: `RecognitionPolicy.cs` (modelo + defaults + scopes), `RecognitionPolicySet.cs` (resolução `channel → group → global → system/default`), `RecognitionPolicyResolver.cs` (`LoadEffectivePoliciesAsync`, `ResolveEffectiveAsync`, `CreateSnapshotAsync`, `GetSnapshotAsync`; `ResolverVersion = rp1`).
+- `CatalogResolver`: `List/Get/Upsert/DeleteRecognitionPolicyAsync` (+ conveniências global/group/channel), `Get/SaveRecognitionPolicySnapshotAsync`; upsert incrementa `Version` e escreve `AuditRecordEntity` (`catalog.recognition-policy.upsert|delete`) na mesma transacção.
+- Migração aditiva/reversível `20260920093237_AddRecognitionPolicy` (2 `CreateTable` + 2 índices únicos; `Down` remove as tabelas).
+
+### M.2 Testes
+
+`WaveW51RecognitionPolicyTests.cs` (17): system default; global; group>global; channel>group; fallback; determinismo; fuzzy off; round-trip de parâmetros; snapshot estável após alteração; versões coexistentes; auditoria; migração Up/Down; preservação de dados; isolamento channel/group; global não sobrepõe channel; snapshot não mutado por policy posterior.
+
+### M.3 Quality gates
+
+```text
+dotnet build → 0 erros (52 avisos = baseline)
+dotnet test  → 2394 passed, 1 skipped, 0 failed (baseline 2377/1/0; +17)
+git diff --check → clean (apenas avisos LF→CRLF)
+```
+
+### M.4 PARAMETER_GAP / limitações
+
+```text
+PARAMETER_GAP: Fuzzy.Threshold, Fuzzy.AmbiguityMargin, Fuzzy.Weights e defaults de campo
+               (excepto Fuzzy.Enabled=false, normativo).
+Limitação: policy de scope mais específico substitui por inteiro (sem merge campo-a-campo nesta wave).
+Limitação: snapshot é creado quando CreateSnapshotAsync é invocado; o wiring ao RunCoordinator
+           (chamada automática no início do Run) fica para a integração de W5.2+.
+```
+
+### M.5 Contagens do Manifest
+
+W5.1 é implementação; não abre nem fecha `DG-*`.
+
+```text
+DG-* (73): CLOSED = 66, PARAMETER_GAP = 6, OPEN-HUMAN = 0, BLOCKED = 1, FALSE_GAP = 0
+```

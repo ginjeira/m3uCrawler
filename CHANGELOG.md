@@ -7,6 +7,27 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Unreleased]
 
+### ✨ Adicionado
+- **W5.1 — RecognitionPolicy (2026-09-20).** Primeira implementação de W5; limitada à policy e ao seu mecanismo de resolução/snapshot.
+  - `RecognitionPolicyEntity` (`recognition_policies`) com scopes `system`/`global`/`group:{key}`/`channel:{key}`, schema `Enabled`, `Fuzzy.Enabled`, `Fuzzy.Threshold`, `Fuzzy.AmbiguityMargin`, `Fuzzy.Weights`, `Version`; `Fuzzy.Enabled=false` por defeito; threshold/margem/pesos permanecem `PARAMETER_GAP` (`null`).
+  - Resolução determinística `channel > group > global > system/default` (`RecognitionPolicySet`/`RecognitionPolicyResolver`).
+  - Snapshot imutável por Run (`recognition_policy_snapshots`): criado antes do processamento, devolve o existente sem o alterar; alterações posteriores à policy não afectam Runs já iniciados.
+  - Persistência com versionamento (incrementa por alteração) e auditoria (`AuditRecordEntity`, `catalog.recognition-policy.upsert|delete`).
+  - Migração aditiva/reversível `20260920093237_AddRecognitionPolicy`; sem alteração a `ChannelSource` nem ao algoritmo de reconhecimento; fuzzy continua inactivo.
+  - Testes `WaveW51RecognitionPolicyTests` (17): defaults, global/group/channel, fallback, determinismo, fuzzy off, round-trip, snapshot estável, versões coexistentes, auditoria, migração Up/Down e preservação de dados, isolamento. Suite: 2394 passed / 1 skipped / 0 failed.
+
+### 📝 Documentação
+- **W5.0 — decisões normativas de Recognition / Fuzzy / Review (2026-09-20).** Documentação-only; sem código.
+  - **D1** `RecognitionPolicy` com scopes `system/default|global|group|channel`, precedência `channel>group>global>default`, snapshot imutável por Run e schema mínimo (`Enabled`, `Fuzzy.Enabled`, `Fuzzy.Threshold`, `Fuzzy.AmbiguityMargin`, `Fuzzy.Weights`) — `38-POLICIES.md §5.1`, `32-DOMAIN-SCHEMA.md`.
+  - **D2/D3** fuzzy é **opt-in** (`Fuzzy.Enabled=false`); sem candidato→`UNKNOWN`, plausíveis→`AMBIGUOUS`, único acima do threshold pode→`CANONICAL`; thresholds/margem/pesos são `PARAMETER_GAP` — `05-CATALOGUE.md §4`, novo **DL-117**.
+  - **D4** Review `Open→InReview→Resolved`, `Open→Ignored`, `Open→InReview→Ignored`; reopen `Resolved/Ignored→Open` auditado — `33-STATE-MACHINES.md`, DL-105 actualizado.
+  - **D5** API de Review normativa = `22 §7`; `Ignore` exige motivo; auditoria before/after. A implementação `/api/catalog/reviews/...` fica marcada como divergente a alinhar em W5.5.
+  - **D6** `MatchMethod` (enum conceptual de métodos) e `MatchConfidence` (`0..1`, não é score de fuzzy, não comparável entre métodos sem semântica explícita) normativizados — `05 §4.1`, `32` ChannelSource.
+  - **D7/D8/D9** nome normalizado como passo próprio; `IdentityRule` explícita; namespace de provider na comparação (sem novo scope de policy).
+  - **D10/D11** P6 = `Canonical|Unknown|Ambiguous|Excluded` (`Rejected` não é P6; `Excluded ≠ Unknown/Ambiguous`); `Ambiguous` qualificado por `Stage`.
+  - **C1–C11** reconciliados: gates Q3/Q4 ajustados (`44`), anti-patterns 23–28 (`43`), `IMPLEMENTATION_ROADMAP.md` marcado superseded.
+  - **RecognitionPolicy** é o núcleo de W5.1–W5.3; implementação continua pendente. `46` e o GAP_MANIFEST (Anexo L) actualizados.
+
 ### 🔧 Corrigido
 - **Wave W4.1 — resolução fingerprint-aware no `SourceSelectionStage` (2026-09-20).**
   - **Problema:** a persistência consolida `ChannelSource` por fingerprint, mas a selecção fazia o join apenas por `CredentialSanitizer.SanitizeUrl`. URLs fingerprint-equivalentes com representação sanitizada diferente (casing do host, porta default, fragmento, credenciais em query) eram classificadas como `Unmatched` artificial.

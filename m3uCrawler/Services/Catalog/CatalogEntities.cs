@@ -1273,3 +1273,67 @@ public sealed class SourcePriorityPolicyEntity
     public DateTime CreatedAtUtc { get; set; }
     public DateTime UpdatedAtUtc { get; set; }
 }
+
+/// <summary>
+/// W5.1 — Política de reconhecimento persistida no catálogo. Scopes: <c>system</c>,
+/// <c>global</c>, <c>group:{key}</c>, <c>channel:{key}</c>
+/// (<c>docs/Reestructure/38-POLICIES.md §5.1</c>). O fuzzy é <b>opt-in</b>
+/// (<see cref="FuzzyEnabled"/> = <c>false</c> por defeito); threshold, margem e
+/// pesos são <c>PARAMETER_GAP</c> (<c>null</c> = não decidido). Não contém
+/// segredos.
+/// </summary>
+public sealed class RecognitionPolicyEntity
+{
+    public long Id { get; set; }
+
+    /// <summary><c>system</c>, <c>global</c>, <c>group:{key}</c> ou <c>channel:{key}</c>.</summary>
+    public string ScopeKey { get; set; } = "global";
+
+    /// <summary>Chave canónica para overrides de canal; <c>null</c> nos restantes scopes.</summary>
+    public string? CanonicalChannelKey { get; set; }
+
+    /// <summary>Chave de grupo para overrides de grupo; <c>null</c> nos restantes scopes.</summary>
+    public string? GroupKey { get; set; }
+
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>Fuzzy opt-in. Default normativo: <c>false</c>.</summary>
+    public bool FuzzyEnabled { get; set; }
+
+    /// <summary>PARAMETER_GAP — <c>null</c> significa não decidido.</summary>
+    public int? FuzzyThreshold { get; set; }
+
+    /// <summary>PARAMETER_GAP — <c>null</c> significa não decidido.</summary>
+    public int? FuzzyAmbiguityMargin { get; set; }
+
+    /// <summary>PARAMETER_GAP — JSON opaco de pesos; <c>null</c> = não decidido.</summary>
+    public string? FuzzyWeightsJson { get; set; }
+
+    /// <summary>Versão da policy; incrementa em cada alteração (DL-110).</summary>
+    public int Version { get; set; } = 1;
+
+    public DateTime CreatedAtUtc { get; set; }
+    public DateTime UpdatedAtUtc { get; set; }
+}
+
+/// <summary>
+/// W5.1 — Snapshot imutável da política de reconhecimento efectiva de um Run
+/// (<c>38-POLICIES.md §5.1</c>; DL-017). Um Run tem no máximo um snapshot;
+/// nunca é actualizado, pelo que alterações posteriores à policy não alteram
+/// retroactivamente o Run.
+/// </summary>
+public sealed class RecognitionPolicySnapshotEntity
+{
+    public long Id { get; set; }
+
+    /// <summary>RunId a que o snapshot pertence (único).</summary>
+    public string RunId { get; set; } = string.Empty;
+
+    /// <summary>Versão do resolvedor que produziu o snapshot (ex.: <c>rp1</c>).</summary>
+    public string ResolverVersion { get; set; } = string.Empty;
+
+    /// <summary>Payload JSON com as políticas resolvidas (sem segredos).</summary>
+    public string PoliciesJson { get; set; } = "{}";
+
+    public DateTime ResolvedAtUtc { get; set; }
+}

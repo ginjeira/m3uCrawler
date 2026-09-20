@@ -277,6 +277,42 @@ Regras mantidas: correspondência com `>1 CanonicalChannelId` distinto ⇒ `Ambi
 
 Quality gate W4.1: `dotnet build` 0 erros (52 avisos, iguais ao baseline); `dotnet test` 0 failed / 2377 passed / 1 skipped (baseline W4 2365/1/0; +12 testes W4.1).
 
+## W5.0 — Decisões normativas de Recognition / Fuzzy / Review
+
+Registo documental (sem implementação de código). Baseline `8142c0d`. As decisões D1–D11 foram inscritas na BÍBLIA.
+
+| Decisão | Contrato | Documentos | Wave |
+|---|---|---|---|
+| D1 RecognitionPolicy (scopes, precedência, snapshot, schema) | `38 §5.1`; `32 RecognitionPolicy` | 38, 32 | W5.1 |
+| D2 Fuzzy opt-in; sem candidato→UNKNOWN; plausíveis→AMBIGUOUS; único acima do threshold pode→CANONICAL | `05 §4`; DL-117 | 05, 31 | W5.3 |
+| D3 Threshold/margem/pesos = PARAMETER_GAP | `38 §5.1`; `32` | 38, 32 | W5.3 |
+| D4 Review lifecycle `Open→InReview→Resolved`, `Open→Ignored`, `Open→InReview→Ignored`, reopen `Resolved/Ignored→Open` | `33 ReviewItem`; DL-105 | 33, 31 | W5.4 |
+| D5 API Review normativa = `22 §7`; `Ignore` exige motivo; auditoria before/after | `22 §7` | 22 | W5.5 |
+| D6 MatchMethod/MatchConfidence normativos (`0..1`, versionados, registo não autoridade) | `05 §4.1`; `32 ChannelSource` | 05, 32 | W5.6 |
+| D7 Nome normalizado = passo próprio (3) distinto de alias (4) | `05 §4/§4.1`; `34 P6` | 05, 34 | W5.2 |
+| D8 IdentityRule explícita (`Review`/`Excluded`), não excepção silenciosa | `05 §4.1`; `34 P6` | 05, 34 | W5.2 |
+| D9 Namespace de provider na comparação de identidade externa (sem novo scope) | `05 §4.1`; `32` | 05, 32 | W5.2 |
+| D10 P6 = `Canonical/Unknown/Ambiguous/Excluded`; `Rejected` não é P6; `Excluded ≠ Unknown/Ambiguous` | `34 P6`; `05 §4.1` | 34, 05 | W5.2 |
+| D11 `Ambiguous` qualificado por `Stage` (Recognition vs Selection) | `05 §4.1`; `34 P6` | 05, 34 | W5.2 |
+
+As linhas `46:118-125` e `46:159` mantêm-se como **estado de implementação** (`DIVERGENT`/`PARTIAL`/`MISSING`) até W5.1–W5.6; as decisões normativas estão agora fechadas. `MatchConfidence`/`MatchMethod` passam a ter linha de rastreabilidade própria (D6).
+
+Quality gate W5.0: documental, sem build/test (nenhuma alteração de código).
+
+## W5.1 — RecognitionPolicy implementada
+
+| Requirement | Contrato | Implementação | Teste | Estado |
+|---|---|---|---|---|
+| Scopes `system/global/group/channel` + precedência determinística | `38 §5.1`, DL-103 | `Services/Recognition/RecognitionPolicyScopes.cs`; `RecognitionPolicySet.cs` | `WaveW51RecognitionPolicyTests` (1–6) | COMPLIANT |
+| Schema (`Enabled`, `Fuzzy.Enabled/Threshold/AmbiguityMargin/Weights`) com fuzzy opt-in por defeito | `05 §4`, `32`, DL-117 | `RecognitionPolicy.cs`; `RecognitionPolicyEntity`; `ChannelCatalogDbContext` | idem (1,7,8) | COMPLIANT |
+| Snapshot imutável por Run | `38 §5.1`, DL-017 | `RecognitionPolicyResolver.CreateSnapshotAsync`; `RecognitionPolicySnapshotEntity` | idem (9, snapshot isolation) | COMPLIANT |
+| Persistência + versionamento + auditoria | DL-110, `17 §5` | `CatalogResolver.UpsertRecognitionPolicyAsync`/`DeleteRecognitionPolicyAsync` (+ `AuditRecordEntity`) | idem (10,11) | COMPLIANT |
+| Migration aditiva e reversível | `16` | `20260920093237_AddRecognitionPolicy` | idem (12,13) | COMPLIANT |
+
+`PARAMETER_GAP` inalterados: `Fuzzy.Threshold`, `Fuzzy.AmbiguityMargin`, `Fuzzy.Weights`, defaults de campo (excepto `Fuzzy.Enabled=false`). Nenhum comportamento de reconhecimento/fuzzy/Review foi alterado nesta wave.
+
+Quality gate W5.1: `dotnet build` 0 erros (52 avisos, iguais ao baseline); `dotnet test` 0 failed / 2394 passed / 1 skipped (baseline 2377/1/0; +17 testes W5.1).
+
 ## Cobertura de requisitos
 
 Todo o requisito/contrato da BÍBLIA deve ter um ID único e constar da matriz de rastreabilidade. A matriz DEVE incluir explicitamente os requisitos de delegação/completude (`00-BIBLE.md` §5/§6) e de contratos (`22`, `23`). Um requisito sem implementação é uma wave futura; um requisito com implementação contraditória é uma divergência a analisar antes de avançar downstream.

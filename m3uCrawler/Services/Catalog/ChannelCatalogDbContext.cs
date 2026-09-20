@@ -31,6 +31,8 @@ public sealed class ChannelCatalogDbContext : DbContext
     public DbSet<OrderingItemEntity> OrderingItems => Set<OrderingItemEntity>();
     public DbSet<SourcePriorityPolicyEntity> SourcePriorityPolicies => Set<SourcePriorityPolicyEntity>();
     public DbSet<SourceSelectionPolicyEntity> SourceSelectionPolicies => Set<SourceSelectionPolicyEntity>();
+    public DbSet<RecognitionPolicyEntity> RecognitionPolicies => Set<RecognitionPolicyEntity>();
+    public DbSet<RecognitionPolicySnapshotEntity> RecognitionPolicySnapshots => Set<RecognitionPolicySnapshotEntity>();
     public DbSet<ImportPolicyEntity> ImportPolicies => Set<ImportPolicyEntity>();
     public DbSet<CanonicalGroupEntity> CanonicalGroups => Set<CanonicalGroupEntity>();
     public DbSet<GroupMappingEntity> GroupMappings => Set<GroupMappingEntity>();
@@ -481,6 +483,38 @@ public sealed class ChannelCatalogDbContext : DbContext
             e.Property(x => x.CreatedAtUtc).IsRequired();
             e.Property(x => x.UpdatedAtUtc).IsRequired();
             e.HasIndex(x => x.ScopeKey).IsUnique();
+        });
+
+        // W5.1 — RecognitionPolicy + snapshot por Run
+        modelBuilder.Entity<RecognitionPolicyEntity>(e =>
+        {
+            e.ToTable("recognition_policies");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Id).ValueGeneratedOnAdd();
+            e.Property(x => x.ScopeKey).IsRequired().HasMaxLength(160);
+            e.Property(x => x.CanonicalChannelKey).HasMaxLength(120);
+            e.Property(x => x.GroupKey).HasMaxLength(120);
+            e.Property(x => x.Enabled).IsRequired();
+            e.Property(x => x.FuzzyEnabled).IsRequired();
+            e.Property(x => x.FuzzyThreshold);
+            e.Property(x => x.FuzzyAmbiguityMargin);
+            e.Property(x => x.FuzzyWeightsJson).HasMaxLength(2000);
+            e.Property(x => x.Version).IsRequired();
+            e.Property(x => x.CreatedAtUtc).IsRequired();
+            e.Property(x => x.UpdatedAtUtc).IsRequired();
+            e.HasIndex(x => x.ScopeKey).IsUnique();
+        });
+
+        modelBuilder.Entity<RecognitionPolicySnapshotEntity>(e =>
+        {
+            e.ToTable("recognition_policy_snapshots");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Id).ValueGeneratedOnAdd();
+            e.Property(x => x.RunId).IsRequired().HasMaxLength(64);
+            e.Property(x => x.ResolverVersion).IsRequired().HasMaxLength(32);
+            e.Property(x => x.PoliciesJson).IsRequired();
+            e.Property(x => x.ResolvedAtUtc).IsRequired();
+            e.HasIndex(x => x.RunId).IsUnique();
         });
 
         // PHASE 8 — ImportPolicy

@@ -2989,6 +2989,249 @@ public sealed class CatalogResolver
             .ToListAsync(cancellationToken);
     }
 
+    // ----------------------------------------------------------------------------
+    // W5.1 — RecognitionPolicy (scopes system/global/group/channel) + snapshot por Run
+    //
+    // Resolução e snapshot vivem no RecognitionPolicyResolver; aqui fica apenas
+    // a persistência, versionamento e auditoria. Os métodos não aplicam fuzzy
+    // nem alteram o algoritmo de reconhecimento.
+    // ----------------------------------------------------------------------------
+
+    /// <summary>Lista todas as linhas de RecognitionPolicy (read-only).</summary>
+    public async Task<IReadOnlyList<RecognitionPolicyEntity>> ListRecognitionPoliciesAsync(
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.RecognitionPolicies
+            .AsNoTracking()
+            .OrderBy(p => p.ScopeKey)
+            .ToListAsync(cancellationToken);
+    }
+
+    /// <summary>Devolve a policy do âmbito indicado, ou <c>null</c>.</summary>
+    public async Task<RecognitionPolicyEntity?> GetRecognitionPolicyAsync(
+        string scopeKey,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(scopeKey))
+        {
+            throw new ArgumentException("ScopeKey é obrigatório.", nameof(scopeKey));
+        }
+
+        var key = scopeKey.Trim();
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.RecognitionPolicies
+            .AsNoTracking()
+            .FirstOrDefaultAsync(p => p.ScopeKey == key, cancellationToken);
+    }
+
+    /// <summary>
+    /// Cria ou actualiza a policy do âmbito indicado. Incrementa a versão e
+    /// escreve um <see cref="AuditRecordEntity"/> na mesma transacção.
+    /// Valores <c>null</c> em threshold/margem/pesos permanecem PARAMETER_GAP.
+    /// </summary>
+    public async Task<RecognitionPolicyEntity> UpsertRecognitionPolicyAsync(
+        string scopeKey,
+        bool enabled,
+        bool fuzzyEnabled,
+        int? fuzzyThreshold,
+        int? fuzzyAmbiguityMargin,
+        string? fuzzyWeightsJson,
+        string? actor = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(scopeKey))
+        {
+            throw new ArgumentException("ScopeKey é obrigatório.", nameof(scopeKey));
+        }
+
+        var key = scopeKey.Trim();
+        var now = DateTime.UtcNow;
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var existing = await context.RecognitionPolicies
+            .FirstOrDefaultAsync(p => p.ScopeKey == key, cancellationToken);
+
+        string? before = existing is null ? null : RecognitionPolicyAuditJson(existing);
+        RecognitionPolicyEntity entity;
+        if (existing is not null)
+        {
+            entity = existing;
+            entity.Enabled = enabled;
+            entity.FuzzyEnabled = fuzzyEnabled;
+            entity.FuzzyThreshold = fuzzyThreshold;
+            entity.FuzzyAmbiguityMargin = fuzzyAmbiguityMargin;
+            entity.FuzzyWeightsJson = fuzzyWeightsJson;
+            entity.Version += 1;
+            entity.UpdatedAtUtc = now;
+        }
+        else
+        {
+            entity = new RecognitionPolicyEntity
+            {
+                ScopeKey = key,
+                CanonicalChannelKey = Recognition.RecognitionPolicyScopes.ChannelKeyFromScope(key),
+                GroupKey = Recognition.RecognitionPolicyScopes.GroupKeyFromScope(key),
+                Enabled = enabled,
+                FuzzyEnabled = fuzzyEnabled,
+                FuzzyThreshold = fuzzyThreshold,
+                FuzzyAmbiguityMargin = fuzzyAmbiguityMargin,
+                FuzzyWeightsJson = fuzzyWeightsJson,
+                Version = 1,
+                CreatedAtUtc = now,
+                UpdatedAtUtc = now,
+            };
+            context.RecognitionPolicies.Add(entity);
+        }
+
+        context.AuditRecords.Add(new AuditRecordEntity
+        {
+            OccurredAtUtc = now,
+            ActorType = string.IsNullOrWhiteSpace(actor) ? "system" : "user",
+            ActorName = actor,
+            Operation = "catalog.recognition-policy.upsert",
+            ObjectType = "recognition-policy",
+            ObjectId = key,
+            BeforeJson = before,
+            AfterJson = RecognitionPolicyAuditJson(entity),
+            Result = "success",
+        });
+
+        await context.SaveChangesAsync(cancellationToken);
+        return entity;
+    }
+
+    /// <summary>Conveniência: policy global.</summary>
+    public Task<RecognitionPolicyEntity> UpsertGlobalRecognitionPolicyAsync(
+        bool enabled,
+        bool fuzzyEnabled,
+        int? fuzzyThreshold = null,
+        int? fuzzyAmbiguityMargin = null,
+        string? fuzzyWeightsJson = null,
+        string? actor = null,
+        CancellationToken cancellationToken = default)
+        => UpsertRecognitionPolicyAsync(
+            Recognition.RecognitionPolicyScopes.Global,
+            enabled, fuzzyEnabled, fuzzyThreshold, fuzzyAmbiguityMargin, fuzzyWeightsJson,
+            actor, cancellationToken);
+
+    /// <summary>Conveniência: override por grupo.</summary>
+    public Task<RecognitionPolicyEntity> UpsertGroupRecognitionPolicyAsync(
+        string groupKey,
+        bool enabled,
+        bool fuzzyEnabled,
+        int? fuzzyThreshold = null,
+        int? fuzzyAmbiguityMargin = null,
+        string? fuzzyWeightsJson = null,
+        string? actor = null,
+        CancellationToken cancellationToken = default)
+        => UpsertRecognitionPolicyAsync(
+            Recognition.RecognitionPolicyScopes.ForGroup(groupKey),
+            enabled, fuzzyEnabled, fuzzyThreshold, fuzzyAmbiguityMargin, fuzzyWeightsJson,
+            actor, cancellationToken);
+
+    /// <summary>Conveniência: override por canal.</summary>
+    public Task<RecognitionPolicyEntity> UpsertChannelRecognitionPolicyAsync(
+        string canonicalChannelKey,
+        bool enabled,
+        bool fuzzyEnabled,
+        int? fuzzyThreshold = null,
+        int? fuzzyAmbiguityMargin = null,
+        string? fuzzyWeightsJson = null,
+        string? actor = null,
+        CancellationToken cancellationToken = default)
+        => UpsertRecognitionPolicyAsync(
+            Recognition.RecognitionPolicyScopes.ForChannel(canonicalChannelKey),
+            enabled, fuzzyEnabled, fuzzyThreshold, fuzzyAmbiguityMargin, fuzzyWeightsJson,
+            actor, cancellationToken);
+
+    /// <summary>Apaga a policy do âmbito indicado; audita. Devolve <c>true</c> se apagou.</summary>
+    public async Task<bool> DeleteRecognitionPolicyAsync(
+        string scopeKey,
+        string? actor = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(scopeKey))
+        {
+            throw new ArgumentException("ScopeKey é obrigatório.", nameof(scopeKey));
+        }
+
+        var key = scopeKey.Trim();
+        var now = DateTime.UtcNow;
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var existing = await context.RecognitionPolicies
+            .FirstOrDefaultAsync(p => p.ScopeKey == key, cancellationToken);
+        if (existing is null) return false;
+
+        context.RecognitionPolicies.Remove(existing);
+        context.AuditRecords.Add(new AuditRecordEntity
+        {
+            OccurredAtUtc = now,
+            ActorType = string.IsNullOrWhiteSpace(actor) ? "system" : "user",
+            ActorName = actor,
+            Operation = "catalog.recognition-policy.delete",
+            ObjectType = "recognition-policy",
+            ObjectId = key,
+            BeforeJson = RecognitionPolicyAuditJson(existing),
+            AfterJson = null,
+            Result = "success",
+        });
+        await context.SaveChangesAsync(cancellationToken);
+        return true;
+    }
+
+    /// <summary>Devolve o snapshot de um Run, ou <c>null</c>.</summary>
+    public async Task<RecognitionPolicySnapshotEntity?> GetRecognitionPolicySnapshotAsync(
+        string runId,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(runId)) return null;
+        var id = runId.Trim();
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.RecognitionPolicySnapshots
+            .AsNoTracking()
+            .FirstOrDefaultAsync(s => s.RunId == id, cancellationToken);
+    }
+
+    /// <summary>
+    /// Grava o snapshot de um Run se ainda não existir (imutável). Se já existir,
+    /// devolve o existente sem o alterar.
+    /// </summary>
+    public async Task<RecognitionPolicySnapshotEntity> SaveRecognitionPolicySnapshotAsync(
+        string runId,
+        string policiesJson,
+        string resolverVersion,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(runId))
+        {
+            throw new ArgumentException("RunId é obrigatório.", nameof(runId));
+        }
+
+        var id = runId.Trim();
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var existing = await context.RecognitionPolicySnapshots
+            .FirstOrDefaultAsync(s => s.RunId == id, cancellationToken);
+        if (existing is not null) return existing;
+
+        var entity = new RecognitionPolicySnapshotEntity
+        {
+            RunId = id,
+            ResolverVersion = resolverVersion,
+            PoliciesJson = policiesJson,
+            ResolvedAtUtc = DateTime.UtcNow,
+        };
+        context.RecognitionPolicySnapshots.Add(entity);
+        await context.SaveChangesAsync(cancellationToken);
+        return entity;
+    }
+
+    private static string RecognitionPolicyAuditJson(RecognitionPolicyEntity e)
+        => $"{{\"scopeKey\":\"{e.ScopeKey}\",\"enabled\":{e.Enabled.ToString().ToLowerInvariant()}," +
+           $"\"fuzzyEnabled\":{e.FuzzyEnabled.ToString().ToLowerInvariant()}," +
+           $"\"fuzzyThreshold\":{(e.FuzzyThreshold?.ToString() ?? "null")}," +
+           $"\"fuzzyAmbiguityMargin\":{(e.FuzzyAmbiguityMargin?.ToString() ?? "null")}," +
+           $"\"version\":{e.Version}}}";
+
     // ============================================================================
     // PHASE 8 — TV/Radio/VOD/Groups + Import Policies
     // ============================================================================
