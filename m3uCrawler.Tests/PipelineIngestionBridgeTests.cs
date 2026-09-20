@@ -7,6 +7,7 @@ using m3uCrawler.Models;
 using m3uCrawler.Services;
 using m3uCrawler.Services.Catalog;
 using m3uCrawler.Services.Matching;
+using m3uCrawler.Services.Recognition;
 using Xunit;
 
 namespace m3uCrawler.Tests;
@@ -254,7 +255,11 @@ public class PipelineIngestionBridgeTests : IAsyncLifetime
         var cs = (await _resolver.ListChannelSourcesAsync(sourceId: src.Id)).Single();
         // MatchMethod deve indicar o tipo de decisão.
         Assert.False(string.IsNullOrWhiteSpace(cs.MatchMethod));
-        Assert.True(cs.MatchConfidence >= 0 && cs.MatchConfidence <= 1.0);
+        // W5.6 — MatchConfidence passou a nullable; para um match canónico
+        // o pipeline transporta o valor decidido pela Recognition.
+        Assert.NotNull(cs.MatchConfidence);
+        Assert.InRange(cs.MatchConfidence!.Value, 0.0, 1.0);
+        Assert.Equal(RecognitionMatchMethods.MatchSemanticsVersion, cs.MatchSemanticsVersion);
         // StreamUrl persistida deve estar sanitizada (sem credenciais).
         Assert.Equal(stream.Url, cs.StreamUrl); // sem credenciais aqui, mas passa pelo sanitizer
     }

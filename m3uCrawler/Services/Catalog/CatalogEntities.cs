@@ -996,8 +996,17 @@ public sealed class ChannelSourceEntity
     public EpgState Epg { get; set; } = EpgState.Unknown;
     public AvailabilityState Availability { get; set; } = AvailabilityState.Discovered;
 
-    public double MatchConfidence { get; set; }
+    public double? MatchConfidence { get; set; }
     public string MatchMethod { get; set; } = string.Empty;
+
+    /// <summary>
+    /// W5.6 (OD-D) — versão da semântica de matching que produziu
+    /// <see cref="MatchMethod"/>/<see cref="MatchConfidence"/>
+    /// (actualmente <c>"msm1"</c>). Distinta de
+    /// <see cref="FingerprintVersion"/> (DL-108) e de
+    /// <c>RecognitionPolicy.Version</c>. <c>null</c> em rows legacy.
+    /// </summary>
+    public string? MatchSemanticsVersion { get; set; }
 
     public DateTime FirstSeenAtUtc { get; set; }
     public DateTime LastSeenAtUtc { get; set; }

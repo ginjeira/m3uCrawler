@@ -1149,7 +1149,8 @@ W5.3 Fuzzy gate + below-threshold + diagnóstico (CatalogResolution; SEM ReviewI
 W5.4 Review lifecycle (InReview/Resolved/Ignored + reopen) + ReviewItem de fuzzy
      ambiguity (a partir de CatalogResolution.FuzzyDiagnostic) + migração mínima
 W5.5 Review API (22 §7) + motivo obrigatório + auditoria
-W5.6 MatchMethod/MatchConfidence (semântica versionada) e reconciliação completa C6/C7
+W5.6 MatchMethod/MatchConfidence (semântica versionada; C6) e fronteira C7 documentada
+     (DL-121: C7 não é inventado sem contrato implementável)
 W5.7 Traceability/gates/docs (44, 46, manifest)
 ```
 
@@ -1511,3 +1512,88 @@ W5.5 é implementação; não abre nem fecha `DG-*`.
 ```text
 DG-* (73): CLOSED = 66, PARAMETER_GAP = 6, OPEN-HUMAN = 0, BLOCKED = 1, FALSE_GAP = 0
 ```
+
+---
+
+## Anexo R — W5.6: contrato + especificação de MatchMethod/MatchConfidence ratificados e implementados
+
+Ratificação documental do contrato (DL-121) e da especificação normativa
+`49-W56-MATCH-CONFIDENCE-SPECIFICATION.md` (DL-122), agora **implementada** em código, schema e
+testes: tabela método→confidence centralizada em `RecognitionMatchMethods`; `CatalogResolution`
+transporta `MatchConfidence` (`double?`, init-only); a Recognition produz o valor por método; o
+pipeline persiste sem recalcular (o `const 1.0` foi removido); `ChannelSource` tem a coluna
+`MatchSemanticsVersion="msm1"` (migration `AddMatchSemanticsVersionAndNullableMatchConfidence`) e
+`MatchConfidence` nullable; o endpoint manual legacy valida `MatchMethod`/`MatchConfidence` na
+camada HTTP (OD-E). Valores/versão/política: Anexo S.
+
+```text
+W5.6: Contract + Specification ratified / Implementation complete
+```
+
+### R.1 Decisões ratificadas
+
+| ID | Decisão | Contrato |
+|---|---|---|
+| D-W56-01 | Semântica de `MatchMethod`/`MatchConfidence` **versionada**; a versão identifica as regras/algoritmo e não é propriedade arbitrária por `ChannelSource`; mecanismo físico na especificação W5.6 (precedentes `sfp1`/DL-108, policy `Version`/DL-110). | DL-121 |
+| D-W56-02 | `MatchConfidence` `double 0..1` **method-specific**; sem escala global; regra normativa própria por método (8 valores); valores concretos `OPEN`. | `05 §4.1`; `32:218`; DL-121 |
+| D-W56-03 | `FuzzyScore ≠ MatchConfidence`; proibida a conversão `0..100 → 0..1`. | DL-119; `48`; `43 #24` |
+| D-W56-04 | `Unknown`/`Ambiguous` → `MatchConfidence = null` (nunca `0`/melhor `FuzzyScore`). | DL-121 |
+| D-W56-05 | Producer = Recognition; `CatalogResolution` transporta `MatchMethod`+`MatchConfidence`; pipeline persiste sem recalcular; `const 1.0` = divergência a corrigir. | DL-121 |
+| D-W56-06 | C7 sem contrato implementável **não** é inventado; M.4 `OUT` (`W5.6 ≠ M.4`). | `32:163`; `C7`; `M.4` |
+| D-W56-07 | Endpoint manual valida `MatchMethod` (8 valores), `MatchConfidence` (`0..1`) e versão; compatibilidade preservada. | DL-121 |
+
+### R.2 Scope
+
+```text
+IN (implementado): semântica method-specific de MatchConfidence; valores da tabela
+   normativa; versão `MatchSemanticsVersion="msm1"` persistida; produção em Recognition
+   (CatalogResolution); pipeline apenas persiste; validação/compatibilidade do endpoint manual
+   (OD-E); testes; reconciliação documental C6.
+OUT: M.4; motor legacy (ChannelMatcher/MatchScorer/MatchingOptions); conversão FuzzyScore→MatchConfidence;
+   campos C7 sem contrato (RunId/StreamId/Actor/Evidence/Candidates/Decision); API W5.5;
+   persistência nova sem contrato.
+OPEN: reconciliação documental C7 (permanece C7 `OPEN`/limitado); M.4 `OUT`.
+```
+
+### R.3 Contagens do Manifest
+
+W5.6 é ratificação de contrato + especificação; não abre nem fecha `DG-*`.
+
+```text
+DG-* (73): CLOSED = 66, PARAMETER_GAP = 6, OPEN-HUMAN = 0, BLOCKED = 1, FALSE_GAP = 0
+```
+
+---
+
+## Anexo S — W5.6: valores, versão e política do endpoint manual ratificados (DL-122) e implementados
+
+Ratificação das decisões `OPEN` de DL-121, fixadas na especificação normativa
+`49-W56-MATCH-CONFIDENCE-SPECIFICATION.md`. **Implementado** em código/schema/testes (ver Anexo R;
+`WaveW56MatchConfidenceTests`).
+
+| ID | Decisão ratificada |
+|---|---|
+| OD-A | `MatchMethod=ExplicitHeuristic` → `MatchConfidence = 0.80`. |
+| OD-B | `MatchMethod=Fuzzy` → `MatchConfidence = 0.60`; **sem** cálculo a partir de `FuzzyScore` (proibido `FuzzyScore/100` ou equivalente); `FuzzyScore` permanece `0..100` diagnóstico. `Ambiguous → null`; `Unknown → null`. |
+| OD-C | `MatchMethod=ManualReview` → `MatchConfidence = 1.0` ("explicitamente confirmado via review"; não certeza matemática; sem comparabilidade global). |
+| OD-D | `MatchSemanticsVersion = "msm1"`, **persistida em `ChannelSource`**; proveniência derivada do algoritmo; rows novas recebem `"msm1"`; não exigida de clientes legacy do endpoint manual (servidor atribui a corrente); **não** usar `RecognitionPolicy` como substituto; distinta de `FingerprintVersion`. |
+| OD-E | Endpoint manual: omissão de `MatchMethod` preserva comportamento; se fornecido, aceitar só os 8 valores; `MatchConfidence` só `double 0..1`; ambos → validar combinação; versão não exigida; inválidos → erro de validação sem persistência parcial; endpoints legacy inalterados. |
+
+Tabela normativa dos 8 métodos:
+
+| MatchMethod | MatchConfidence |
+|---|---|
+| ExternalIdentityExact | 1.0 |
+| TvgIdExact | 1.0 |
+| CanonicalExact | 1.0 |
+| NormalizedName | 1.0 |
+| KnownAlias | 1.0 |
+| ExplicitHeuristic | 0.80 |
+| Fuzzy | 0.60 |
+| ManualReview | 1.0 |
+
+Regra global implementada: `double 0..1`; method-specific; **sem** escala global comparável (nunca
+ordenar métodos pelo número); `Unknown`/`Ambiguous → null`; `FuzzyScore != MatchConfidence`. C7
+permanece `OPEN`/limitado e M.4 permanece `OUT`. `44` Q4 passa a **satisfeito** para a semântica de
+matching de W5.6 (evidência: `WaveW56MatchConfidenceTests`, migration
+`AddMatchSemanticsVersionAndNullableMatchConfidence`).

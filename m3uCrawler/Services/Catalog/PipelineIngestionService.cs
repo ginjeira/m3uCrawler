@@ -82,8 +82,11 @@ namespace m3uCrawler.Services.Catalog;
     ///         método efectivo de <c>CatalogResolution.MatchMethod</c>
     ///         (ex.: <c>NormalizedName</c>, <c>KnownAlias</c>); fallback
     ///         historico <c>"canonical-alias"</c> quando ausente;</item>
-///   <item><c>ChannelSourceEntity.MatchConfidence</c> = 1.0 (canonical
-///         existente).</item>
+    ///   <item><c>ChannelSourceEntity.MatchConfidence</c> = valor transportado
+    ///         por <c>CatalogResolution.MatchConfidence</c> (W5.6; nunca
+    ///         recalculado nem fixado pelo pipeline); e
+    ///         <c>ChannelSourceEntity.MatchSemanticsVersion</c> =
+    ///         <c>"msm1"</c>.</item>
 /// </list>
 ///
 /// <para>
@@ -141,7 +144,7 @@ public sealed class PipelineIngestionService
         string NormalizedIdentity,
         long CanonicalChannelId,
         string MatchMethod,
-        double MatchConfidence,
+        double? MatchConfidence,
         bool AutoCreated);
 
     public async Task<IngestionResult> IngestAsync(
@@ -281,7 +284,14 @@ public sealed class PipelineIngestionService
             {
                 var canonicalId = resolution.CanonicalChannelId.Value;
                 var matchMethod = resolution.MatchMethod ?? "canonical-alias";
-                const double confidence = 1.0;
+                // W5.6 — o pipeline apenas transporta a confiança decidida pela
+                // Recognition; nunca a calcula, altera ou infere. Não existe
+                // fallback para 0 quando o valor é null (o pipeline não pode
+                // fabricar confiança).
+                var matchConfidence = resolution.MatchConfidence;
+                // Confiança de evidência legacy (audit/identidade externa),
+                // conceito distinto de MatchConfidence; comportamento inalterado.
+                const double legacyEvidenceConfidence = 1.0;
                 matched++;
 
                 var availability = stream.IsWorking
@@ -295,7 +305,7 @@ public sealed class PipelineIngestionService
                     quality: StreamQuality.Unknown,
                     epg: EpgState.Unknown,
                     availability: availability,
-                    matchConfidence: confidence,
+                    matchConfidence: matchConfidence,
                     matchMethod: matchMethod,
                     isEnabled: stream.IsWorking,
                     cancellationToken: cancellationToken);
@@ -330,7 +340,7 @@ public sealed class PipelineIngestionService
                     sourceGroup: stream.Group,
                     kind: CatalogResolutionKind.Canonical,
                     canonicalChannelId: canonicalId,
-                    confidence: confidence,
+                    confidence: legacyEvidenceConfidence,
                     reasonSignature: "matched-via-pipeline",
                     cancellationToken: cancellationToken);
 
@@ -345,14 +355,14 @@ public sealed class PipelineIngestionService
                     @namespace: ExternalIdentityNamespaces.TvgId,
                     rawValue: stream.OriginalTvgId,
                     origin: "ingestion",
-                    confidence: confidence,
+                    confidence: legacyEvidenceConfidence,
                     cancellationToken: cancellationToken);
 
                 entries.Add(new IngestionEntry(
                     NormalizedIdentity: normalized,
                     CanonicalChannelId: canonicalId,
                     MatchMethod: matchMethod,
-                    MatchConfidence: confidence,
+                    MatchConfidence: matchConfidence,
                     AutoCreated: false));
                 continue;
             }

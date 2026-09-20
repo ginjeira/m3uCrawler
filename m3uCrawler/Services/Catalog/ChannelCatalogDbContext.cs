@@ -388,8 +388,14 @@ public sealed class ChannelCatalogDbContext : DbContext
             e.Property(x => x.Quality).HasConversion<int>();
             e.Property(x => x.Epg).HasConversion<int>();
             e.Property(x => x.Availability).HasConversion<int>();
-            e.Property(x => x.MatchConfidence).IsRequired();
+            // W5.6 — MatchConfidence passou a nullable (null em
+            // Unknown/Ambiguous e em rows legacy sem valor normativo);
+            // MatchSemanticsVersion identifica a semântica que produziu o par
+            // MatchMethod/MatchConfidence (ex.: "msm1"). São conceitos
+            // independentes de FingerprintVersion (DL-108).
+            e.Property(x => x.MatchConfidence);
             e.Property(x => x.MatchMethod).IsRequired().HasMaxLength(80);
+            e.Property(x => x.MatchSemanticsVersion).HasMaxLength(32);
             e.Property(x => x.FirstSeenAtUtc).IsRequired();
             e.Property(x => x.LastSeenAtUtc).IsRequired();
             e.Property(x => x.LastTestedAtUtc).IsRequired();

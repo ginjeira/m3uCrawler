@@ -2794,7 +2794,7 @@ public sealed class CatalogResolver
         StreamQuality quality = StreamQuality.Unknown,
         EpgState epg = EpgState.Unknown,
         AvailabilityState availability = AvailabilityState.Discovered,
-        double matchConfidence = 0,
+        double? matchConfidence = 0,
         string matchMethod = "unknown",
         string? externalStreamId = null,
         bool isEnabled = true,
@@ -2840,6 +2840,7 @@ public sealed class CatalogResolver
             existing.Availability = availability;
             existing.MatchConfidence = matchConfidence;
             existing.MatchMethod = matchMethod;
+            existing.MatchSemanticsVersion = RecognitionMatchMethods.MatchSemanticsVersion;
             existing.ExternalStreamId = externalStreamId;
             existing.IsEnabled = isEnabled;
             existing.LastSeenAtUtc = now;
@@ -2867,6 +2868,7 @@ public sealed class CatalogResolver
             Availability = availability,
             MatchConfidence = matchConfidence,
             MatchMethod = matchMethod,
+            MatchSemanticsVersion = RecognitionMatchMethods.MatchSemanticsVersion,
             FirstSeenAtUtc = now,
             LastSeenAtUtc = now,
             LastTestedAtUtc = now,
@@ -4402,6 +4404,16 @@ public readonly record struct CatalogResolution(
     public string? MatchMethod { get; init; }
 
     /// <summary>
+    /// W5.6 — Confiança do reconhecimento (<c>double 0..1</c>), method-specific,
+    /// atribuída pela Recognition segundo a tabela normativa
+    /// (<see cref="RecognitionMatchMethods.TryGetMatchConfidence"/>). É
+    /// <c>null</c> em <c>Unknown</c>/<c>Ambiguous</c> e quando o método é
+    /// nulo/desconhecido. <b>Não</b> é <c>FuzzyScore</c> (domínio <c>0..100</c>)
+    /// e nunca é calculada no pipeline.
+    /// </summary>
+    public double? MatchConfidence { get; init; }
+
+    /// <summary>
     /// Versão da <c>RecognitionPolicy</c> consumida (snapshot) quando o
     /// resultado foi produzido. <c>null</c> quando não foi fornecida
     /// policy explícita. Registo, não autoridade.
@@ -4450,6 +4462,9 @@ public readonly record struct CatalogResolution(
         ch.PublicationPolicy, null, null)
     {
         MatchMethod = matchMethod,
+        MatchConfidence = RecognitionMatchMethods.TryGetMatchConfidence(matchMethod, out var confidence)
+            ? confidence
+            : null,
     };
 
     public static CatalogResolution FromRule(IdentityRuleEntity rule) => new(
@@ -4461,6 +4476,8 @@ public readonly record struct CatalogResolution(
         rule.Disposition, rule.Reason)
     {
         MatchMethod = RecognitionMatchMethods.ManualReview,
+        MatchConfidence = RecognitionMatchMethods.TryGetMatchConfidence(
+            RecognitionMatchMethods.ManualReview, out var confidence) ? confidence : null,
     };
 
     /// <summary>

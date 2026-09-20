@@ -8,6 +8,13 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 ## [Unreleased]
 
 ### ✨ Adicionado
+- **W5.6 — MatchMethod/MatchConfidence implementados (2026-09-20).** Implementa a especificação normativa `49` (DL-121/DL-122).
+  - **Producer (Recognition):** tabela método→confidence centralizada em `Services/Recognition/RecognitionMatchMethods.cs` (`MatchSemanticsVersion="msm1"`, `IsKnownMethod`, `TryGetMatchConfidence`); `CatalogResolution` ganha `MatchConfidence` (`double?`, init-only aditivo); `FromCanonical`/`FromRule` atribuem o valor por método (`ExternalIdentityExact`/`TvgIdExact`/`CanonicalExact`/`NormalizedName`/`KnownAlias`/`ManualReview`=`1.0`, `ExplicitHeuristic`=`0.80`, `Fuzzy`=`0.60`); `Unknown`/`Ambiguous` → `null`.
+  - **`FuzzyScore` ≠ `MatchConfidence`:** `Fuzzy` é constante `0.60`, nunca `FuzzyScore/100` nem equivalente; algoritmo fuzzy W5.3 inalterado.
+  - **Persistência:** `ChannelSourceEntity.MatchConfidence` passa a `double?` e ganha `MatchSemanticsVersion` (max 32); EF config e migration `20260920200933_AddMatchSemanticsVersionAndNullableMatchConfidence` (sem backfill; rows existentes preservadas). Versão atribuída pelo servidor.
+  - **Pipeline:** `PipelineIngestionService` remove o `const double confidence = 1.0`; transporta `resolution.MatchConfidence`/`MatchMethod` sem recalcular nem inferir (`IngestionEntry.MatchConfidence` passa a `double?`).
+  - **Endpoint manual (OD-E):** validação HTTP em `WebDashboardService` (rota legacy `POST /api/catalog/sources/{id}/streams`): omissão de `MatchMethod` preserva comportamento; se fornecido, só os 8 valores; `MatchConfidence` só `0..1`; ambos → combinação válida; inválidos → `400 {error}` sem persistência. `RecordChannelSourceAsync` mantém defaults legacy (`0`/`"unknown"`) e valida só comprimento.
+  - **Testes:** `WaveW56MatchConfidenceTests` (38). Suite: 2570 passed / 1 skipped / 0 failed.
 - **W5.5 — API HTTP de Review (2026-09-20).** Implementa o contrato ratificado (DL-120; `22 §7`) no handler manual de `WebDashboardService.cs`. Sem migration, sem novas dependências, sem alteração das rotas legacy.
   - **Rotas:** `GET /api/reviews` (filtro `state` Open|InReview|Resolved|Ignored, `limit`/`offset`, ordem `CreatedAtUtc DESC, Id DESC`, `subject = NormalizedIdentity`, `runId = null` como limitação C7/W5.6); `GET /api/review?id`; `POST /api/review/ignore` (motivo obrigatório); `POST /api/review/reopen` (justificação obrigatória, manual); `POST /api/review/resolve` (declaração explícita + `Resolved`).
   - **Identidade:** `ReviewItem.Id` (`id`/`reviewItemId`); novo `CatalogResolver.GetReviewItemAsync`. `Fingerprint` fica só nas rotas legacy.
@@ -48,6 +55,23 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
   - Testes `WaveW51RecognitionPolicyTests` (17): defaults, global/group/channel, fallback, determinismo, fuzzy off, round-trip, snapshot estável, versões coexistentes, auditoria, migração Up/Down e preservação de dados, isolamento. Suite: 2394 passed / 1 skipped / 0 failed.
 
 ### 📝 Documentação
+- **W5.6 — especificação de MatchMethod/MatchConfidence ratificada (2026-09-20).** Documentação-only; implementação concluída na wave W5.6 (ver entrada em `[Unreleased]` `✨ Adicionado`). Fecha as decisões `OPEN` de DL-121 (OD-A..OD-E) numa especificação normativa:
+  - **OD-A:** `ExplicitHeuristic` → `MatchConfidence = 0.80`.
+  - **OD-B:** `Fuzzy` → `MatchConfidence = 0.60`, **sem** cálculo a partir de `FuzzyScore` (proibido `FuzzyScore/100` ou equivalente); `FuzzyScore` permanece `0..100` diagnóstico; `Ambiguous`/`Unknown` → `null`.
+  - **OD-C:** `ManualReview` → `1.0` ("explicitamente confirmado via review"; não certeza matemática; sem comparabilidade global). Exactos = `1.0` (`ExternalIdentityExact`/`TvgIdExact`/`CanonicalExact`/`NormalizedName`/`KnownAlias`).
+  - **Regra global:** `double 0..1`, method-specific, sem escala global comparável (nunca ordenar métodos pelo número); `FuzzyScore != MatchConfidence`.
+  - **OD-D:** `MatchSemanticsVersion = "msm1"` persistida em `ChannelSource` (proveniência derivada do algoritmo, não propriedade do operador; não exigida de clientes legacy do endpoint manual; distinta de `FingerprintVersion`; não substituível por `RecognitionPolicy`).
+  - **OD-E:** endpoint manual — omissão de `MatchMethod` preserva comportamento; se fornecido, aceitar só os 8 valores; `MatchConfidence` só `double 0..1`; ambos → validar combinação; versão não exigida; inválidos → erro sem persistência parcial; endpoints legacy inalterados.
+  - **Documentos:** novo `docs/Reestructure/49-W56-MATCH-CONFIDENCE-SPECIFICATION.md`; novo **DL-122** em `31`; `05 §4.1`, `32` (ChannelSource), `44` (Q4, entretanto satisfeito pela implementação W5.6), `46` (W5.6 = IMPLEMENTED), manifest (Anexo R + novo Anexo S). C7 permanece `OPEN`/limitado; M.4 permanece `OUT`. Sem alteração de código, testes, schema, migrations ou Git.
+- **W5.6 — semântica de MatchMethod/MatchConfidence ratificada (2026-09-20).** Documentação-only; **especificação/implementação pendentes**. Regista D-W56-01..07 (DL-121):
+  - **D-W56-01:** semântica versionada; a versão pertence às regras/algoritmo (não propriedade arbitrária por `ChannelSource`); mecanismo físico na especificação W5.6.
+  - **D-W56-02:** `MatchConfidence` `double 0..1` **method-specific**, sem escala global comparável; regra própria por cada um dos 8 métodos; valores concretos `OPEN`.
+  - **D-W56-03:** `FuzzyScore ≠ MatchConfidence`; conversão proibida (DL-119, não reaberta).
+  - **D-W56-04:** `Unknown`/`Ambiguous` → `MatchConfidence = null`.
+  - **D-W56-05:** producer = Recognition (`CatalogResolution` transporta `MatchMethod`+`MatchConfidence`); pipeline só persiste; `const 1.0` actual é divergência a corrigir.
+  - **D-W56-06:** C7 sem contrato não é inventado; M.4 permanece `OUT` (`W5.6 ≠ M.4`).
+  - **D-W56-07:** endpoint manual valida `MatchMethod` (8 valores), `MatchConfidence` (`0..1`) e versão, preservando compatibilidade.
+  - Ratificado em `31` (DL-121), `05 §4.1`, `32`, `44`, `46` e manifest (Anexo R). Sem alteração de código, testes, schema ou Git.
 - **W5.5 — contrato da API HTTP de Review ratificado (2026-09-20).** Documentação-only; **implementação pendente**. Regista as decisões D1–D7 + AuthZ (DL-120; Anexo Q do manifest):
   - **D1:** `POST /api/review/resolve` = "declaração explícita de alteração + resolução" (`Open→InReview→Resolved` ou `InReview→Resolved`); nunca cria identidade implicitamente; `422 declared-change-invalid`; usa apenas capacidades de domínio existentes; audit before/after.
   - **D2:** não se cria `/api/review/begin`; `InReview` é alcançado implicitamente; as 5 operações de `22 §7` são as únicas.

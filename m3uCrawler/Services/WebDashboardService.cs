@@ -7,6 +7,7 @@ using m3uCrawler.Services.Catalog;
 using m3uCrawler.Services.Configuration;
 using m3uCrawler.Services.Dispatcharr;
 using m3uCrawler.Services.LiveRun;
+using m3uCrawler.Services.Recognition;
 using m3uCrawler.Services.SourceSelection;
 using m3uCrawler.Services.Sync;
 using m3uCrawler.Services.Telegram;
@@ -2753,9 +2754,67 @@ namespace m3uCrawler.Services
                             if (!Enum.TryParse<StreamQuality>(payload.Quality, true, out var quality)) quality = StreamQuality.Unknown;
                             if (!Enum.TryParse<EpgState>(payload.Epg, true, out var epg)) epg = EpgState.Unknown;
                             if (!Enum.TryParse<AvailabilityState>(payload.Availability, true, out var availability)) availability = AvailabilityState.Discovered;
+
+                            // W5.6 §12 (OD-E) — validação de MatchMethod/MatchConfidence
+                            // apenas na camada HTTP (nunca em RecordChannelSourceAsync,
+                            // para preservar consumidores/testes legacy que usam métodos
+                            // arbitrários). MatchMethod ausente preserva o comportamento
+                            // legacy (persistido como "unknown"). MatchSemanticsVersion
+                            // não é exigida ao cliente: o servidor atribui "msm1".
+                            if (payload.MatchMethod is not null)
+                            {
+                                if (!RecognitionMatchMethods.TryGetMatchConfidence(
+                                        payload.MatchMethod, out var expectedConfidence))
+                                {
+                                    context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                                    await WriteJsonAsync(context.Response, new
+                                    {
+                                        error = $"MatchMethod inválido: '{payload.MatchMethod}'. Valores aceites: " +
+                                            "ExternalIdentityExact, TvgIdExact, CanonicalExact, NormalizedName, " +
+                                            "KnownAlias, ExplicitHeuristic, Fuzzy, ManualReview.",
+                                    }, HttpStatusCode.BadRequest);
+                                    return;
+                                }
+
+                                if (payload.MatchConfidence is double providedWithMethod)
+                                {
+                                    if (providedWithMethod < 0 || providedWithMethod > 1)
+                                    {
+                                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                                        await WriteJsonAsync(context.Response, new
+                                        {
+                                            error = "MatchConfidence fora do domínio 0..1.",
+                                        }, HttpStatusCode.BadRequest);
+                                        return;
+                                    }
+
+                                    if (Math.Abs(providedWithMethod - expectedConfidence) > 1e-9)
+                                    {
+                                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                                        await WriteJsonAsync(context.Response, new
+                                        {
+                                            error = $"Combinação MatchMethod/MatchConfidence inválida: " +
+                                                $"'{payload.MatchMethod}' exige MatchConfidence " +
+                                                $"{expectedConfidence.ToString(System.Globalization.CultureInfo.InvariantCulture)}.",
+                                        }, HttpStatusCode.BadRequest);
+                                        return;
+                                    }
+                                }
+                            }
+                            else if (payload.MatchConfidence is double providedWithoutMethod
+                                && (providedWithoutMethod < 0 || providedWithoutMethod > 1))
+                            {
+                                context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                                await WriteJsonAsync(context.Response, new
+                                {
+                                    error = "MatchConfidence fora do domínio 0..1.",
+                                }, HttpStatusCode.BadRequest);
+                                return;
+                            }
+
                             var cs = await _catalogResolver.RecordChannelSourceAsync(
                                 payload.CanonicalChannelId, sourceId, payload.StreamUrl,
-                                quality, epg, availability, payload.MatchConfidence,
+                                quality, epg, availability, payload.MatchConfidence ?? 0,
                                 payload.MatchMethod ?? "unknown",
                                 payload.ExternalStreamId,
                                 payload.IsEnabled);
@@ -4259,7 +4318,7 @@ namespace m3uCrawler.Services
         [JsonPropertyName("quality")] public string? Quality { get; set; }
         [JsonPropertyName("epg")] public string? Epg { get; set; }
         [JsonPropertyName("availability")] public string? Availability { get; set; }
-        [JsonPropertyName("matchConfidence")] public double MatchConfidence { get; set; }
+        [JsonPropertyName("matchConfidence")] public double? MatchConfidence { get; set; }
         [JsonPropertyName("matchMethod")] public string? MatchMethod { get; set; }
         [JsonPropertyName("isEnabled")] public bool IsEnabled { get; set; } = true;
     }
@@ -4336,6 +4395,7 @@ namespace m3uCrawler.Services
             availability = cs.Availability.ToString(),
             matchConfidence = cs.MatchConfidence,
             matchMethod = cs.MatchMethod,
+            matchSemanticsVersion = cs.MatchSemanticsVersion,
             isEnabled = cs.IsEnabled,
             firstSeenAtUtc = cs.FirstSeenAtUtc.ToString("o"),
             lastSeenAtUtc = cs.LastSeenAtUtc.ToString("o"),

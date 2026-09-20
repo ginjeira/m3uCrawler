@@ -337,6 +337,38 @@ Quality gate W5.5: `dotnet build` 0 erros; `WaveW55ReviewApiTests` 42/42; suite 
 
 Revisão pós-implementação (B1/B2): o gate emite o envelope `{error,message,correlationId}` também nos 401/403 das Review APIs (legacy inalterado) e excepções inesperadas são mapeadas para `500 persistence-error` no dispatcher; testes `Unexpected_exception_returns_500_persistence_error`, `Unauthenticated_review_api_uses_error_envelope`, `Csrf_error_on_review_api_uses_error_envelope`, `Legacy_gate_error_format_is_unchanged`.
 
+## W5.6 — MatchMethod/MatchConfidence: IMPLEMENTED
+
+Implementação da especificação normativa `49-W56-MATCH-CONFIDENCE-SPECIFICATION.md` (DL-121/DL-122). A tabela método→confidence vive em `Services/Recognition/RecognitionMatchMethods.cs`; `CatalogResolution` transporta `MatchConfidence` (`double?`, init-only aditivo); a `Recognition` (passos de `CatalogResolver.ResolveAsync`, `FromCanonical`/`FromRule`) atribui o valor por método; o pipeline (`PipelineIngestionService`) apenas persiste o par recebido, sem recalcular (o `const 1.0` foi removido); `ChannelSourceEntity` tem `MatchConfidence` nullable e `MatchSemanticsVersion` (`"msm1"`), com migration `AddMatchSemanticsVersionAndNullableMatchConfidence`; o endpoint manual legacy valida `MatchMethod`/`MatchConfidence` na camada HTTP (OD-E). C7 e M.4 permanecem `OUT`.
+
+| Decisão | Contrato | Contratos/rastreio | Estado |
+|---|---|---|---|
+| D-W56-01 | Semântica versionada; versão das regras/algoritmo, não propriedade arbitrária por `ChannelSource`; mecanismo físico = `MatchSemanticsVersion="msm1"` persistida | DL-108/`sfp1`; DL-110; DL-122; `49 §10` | RATIFIED (mecanismo fechado) |
+| D-W56-02 | `MatchConfidence` `double 0..1` **method-specific**; sem escala global; regra própria por método (8 valores); valores concretos RATIFIED | `05 §4.1`; `32:218`; DL-121; DL-122; `49 §6/§7` | RATIFIED (valores fechados) |
+| D-W56-03 | `FuzzyScore` ≠ `MatchConfidence`; conversão proibida | DL-119; `48`; `43 #24` | RATIFIED (fechada) |
+| D-W56-04 | `Unknown`/`Ambiguous` → `MatchConfidence = null` (nunca `0`/melhor `FuzzyScore`) | DL-121 | RATIFIED |
+| D-W56-05 | Producer = Recognition (`CatalogResolution` transporta `MatchMethod`+`MatchConfidence`); pipeline persiste; `const 1.0` = divergência a corrigir | DL-121 | RATIFIED |
+| D-W56-06 | C7 sem contrato não é inventado; M.4 `OUT` (`W5.6 ≠ M.4`) | `32:163`; manifest `C7`/`M.4` | RATIFIED |
+| D-W56-07 | Endpoint manual valida `MatchMethod` (8 valores), `MatchConfidence` (`0..1`) e versão; compatibilidade preservada | DL-121; DL-122; `49 §12` | RATIFIED (política OD-E fechada) |
+
+### Matriz de rastreabilidade da especificação W5.6 (DL-122; `49`)
+
+| Requirement | Fonte normativa | Conceito | Implementação | Teste | Estado |
+|---|---|---|---|---|---|
+| W56-METHODS | `49 §5/§7`; DL-122 | Conjunto fechado de 8 `MatchMethod` | `RecognitionMatchMethods` (8 constantes + `IsKnownMethod`) | `WaveW52...`/`WaveW53...`; `WaveW56MatchConfidenceTests` | COMPLIANT |
+| W56-TABLE | `49 §7`; DL-122; `05 §4.1` | Tabela normativa método→confidence (`1.0`/`0.80`/`0.60`/`1.0`) | `RecognitionMatchMethods.ConfidenceByMethod` + `TryGetMatchConfidence`; `CatalogResolution.FromCanonical`/`FromRule` | `WaveW56MatchConfidenceTests` (tabela + 8 métodos) | COMPLIANT |
+| W56-VERSION | `49 §10`; DL-122; DL-108 | `MatchSemanticsVersion="msm1"` persistida em `ChannelSource` | `RecognitionMatchMethods.MatchSemanticsVersion`; `ChannelSourceEntity.MatchSemanticsVersion`; `ChannelCatalogDbContext`; migration `20260920200933_AddMatchSemanticsVersionAndNullableMatchConfidence` | `WaveW56MatchConfidenceTests` (persistência/versão) | COMPLIANT |
+| W56-PRODUCER | `49 §11`; DL-121/DL-122 | Recognition produz; `CatalogResolution` transporta `MatchMethod`+`MatchConfidence`; pipeline persiste sem recalcular | `CatalogResolution.MatchConfidence` (init-only); `PipelineIngestionService` transporta `resolution.MatchConfidence` (sem `const 1.0`) | `WaveW56MatchConfidenceTests` (pipeline exact/heuristic) | COMPLIANT |
+| W56-NULL | `49 §9`; DL-121 | `Unknown`/`Ambiguous` → `null` | `CatalogResolution.FromCanonical` (método desconhecido→null); `Unknown()`/`Ambiguous()` sem confiança | `WaveW56MatchConfidenceTests` | COMPLIANT |
+| W56-FUZZY-SEP | `49 §8`; `48 §5`; DL-119 | `FuzzyScore != MatchConfidence`; proibido `score/100`; `Fuzzy`=`0.60` independente | `RecognitionMatchMethods.TryGetMatchConfidence` (constante `0.60`) | `WaveW56MatchConfidenceTests` (0.60 vs `FuzzyScore=95`) | COMPLIANT |
+| W56-ENDPOINT | `49 §12`; DL-122; `22 §2` | OD-E: omissão preserva; se fornecido só 8 valores e `0..1`; versão não exigida; inválidos→erro sem persistência parcial; legacy inalterado | `WebDashboardService` handler `POST /api/catalog/sources/{id}/streams` (validação HTTP, antes de `RecordChannelSourceAsync`) | `WaveW56MatchConfidenceTests` (válido/inválido/legacy) | COMPLIANT |
+| W56-C7 | `32:163`; `49 §14`; DL-121 | C7 sem contrato **não** é inventado | inalterado | — | OPEN (OUT de W5.6) |
+| W56-M4 | `49 §14`; DL-119 | M.4 (wiring snapshot→Run/pipeline) | inalterado | — | OUT (`W5.6 ≠ M.4`) |
+
+Testes criados: `m3uCrawler.Tests/WaveW56MatchConfidenceTests.cs` — tabela dos 8 métodos; `Unknown`/`Ambiguous → null`; separação `FuzzyScore`/`MatchConfidence` (sem `/100`); transporte aditivo em `CatalogResolution`; persistência nullable + `msm1`; pipeline transporta sem recalcular; validação OD-E do endpoint manual (válido, método inválido, confidence fora de `0..1`, combinação inválida, método ausente, confidence ausente, legacy). Dependência de M.4 marcada como tal (não requisito W5.6).
+
+Quality gate W5.6: `dotnet build` 0 erros / 0 warnings novos; `WaveW56MatchConfidenceTests` 38/38; suite completa 2570 passed / 1 skipped / 0 failed (baseline W5.5 2532/1/0; +38); `dotnet ef migrations has-pending-model-changes` = sem alterações pendentes; `git diff --check` clean. Q4 (`44`) passa a satisfeito para a semântica de matching de W5.6.
+
 ## Cobertura de requisitos
 
 Todo o requisito/contrato da BÍBLIA deve ter um ID único e constar da matriz de rastreabilidade. A matriz DEVE incluir explicitamente os requisitos de delegação/completude (`00-BIBLE.md` §5/§6) e de contratos (`22`, `23`). Um requisito sem implementação é uma wave futura; um requisito com implementação contraditória é uma divergência a analisar antes de avançar downstream.
