@@ -697,6 +697,21 @@ public sealed class CatalogResolver
     }
 
     /// <summary>
+    /// W5.5 — Lê um <see cref="ReviewItemEntity"/> pela sua identidade
+    /// persistida (<see cref="ReviewItemEntity.Id"/>), usada pela API HTTP
+    /// de Review (DL-120). Não é identidade de negócio do catálogo; é a
+    /// chave de referência das novas rotas.
+    /// </summary>
+    public async Task<ReviewItemEntity?> GetReviewItemAsync(
+        long id, CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.ReviewItems
+            .AsNoTracking()
+            .FirstOrDefaultAsync(r => r.Id == id, cancellationToken);
+    }
+
+    /// <summary>
     /// Lista todos os canais canónicos (com aliases) ordenados por
     /// DisplayName. Usado pelo dashboard.
     /// </summary>

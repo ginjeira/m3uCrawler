@@ -313,6 +313,30 @@ Quality gate W5.0: documental, sem build/test (nenhuma alteração de código).
 
 Quality gate W5.1: `dotnet build` 0 erros (52 avisos, iguais ao baseline); `dotnet test` 0 failed / 2394 passed / 1 skipped (baseline 2377/1/0; +17 testes W5.1).
 
+## W5.5 — API HTTP de Review: IMPLEMENTED
+
+Implementação do contrato ratificado (DL-120; `22 §7`) no handler manual de `WebDashboardService.cs`. Identidade = `ReviewItem.Id`; erros `{error,message,correlationId}`; audit before/after; auth/CSRF pelo gate existente.
+
+| Requirement | Contrato | Implementação | Teste | Estado |
+|---|---|---|---|---|
+| `GET /api/reviews` (filtro `state`, `limit`/`offset`, ordem `CreatedAtUtc DESC, Id DESC`) | `22 §7.1`; DL-120 | `HandleReviewListAsync`; `subject = NormalizedIdentity`; `runId = null` (limitação C7/W5.6) | `WaveW55ReviewApiTests` (list) | COMPLIANT |
+| `GET /api/review?id` | `22 §7.2`; DL-120 | `HandleReviewDetailAsync`; `400 review-id-required`; `404 review-not-found` | idem (detail) | COMPLIANT |
+| `POST /api/review/ignore` (motivo obrigatório) | `22 §7.4`; DL-120 | `HandleReviewIgnoreAsync` → `IgnoreReviewAsync`; `400 reason-required`; `409 state-conflict` | idem (ignore) | COMPLIANT |
+| `POST /api/review/reopen` (justificação) | `22 §7.5`; DL-120 | `HandleReviewReopenAsync` → `ReopenReviewAsync`; manual/auditado | idem (reopen) | COMPLIANT |
+| `POST /api/review/resolve` (declaração + `Resolved`) | `22 §7.3`; DL-120 | `HandleReviewResolveAsync`; `channelAlias`→`AddAlias`, `canonicalChannel`→`CreateChannel` via `ApplyReviewApprovalAsync`; `Open→InReview→Resolved`/`InReview→Resolved`; `422` para declarações inválidas/independentes | idem (resolve) | PARTIAL (ver gap) |
+| Formato de erro `{error,message,correlationId}` | `22 §2/§7`; DL-120 | `WriteReviewApiErrorAsync`; sem `Exception.Message`; legacy não normalizado | idem (error contract) | COMPLIANT |
+| Identidade `ReviewItem.Id` | DL-120 | `GetReviewItemAsync`; rotas novas usam `id`/`reviewItemId` | idem | COMPLIANT |
+| AuthZ `Administrator` (modelo actual, sem RBAC) | `22 §7`; `35`; DL-120 | gate existente (sessão/token + CSRF); sem role column | idem | COMPLIANT (implicit admin) |
+| Lifecycle via W5.4 | DL-119; DL-120 | `ReviewLifecycle`/`Ignore`/`Reopen`; resolve usa `ApplyReviewApprovalAsync` (composição de arestas válidas) | idem | COMPLIANT |
+| `subject`/`runId` | `22 §7.1`; DL-120 | `subject = NormalizedIdentity`; `runId = null` | idem | `runId` = W5.6/C7 |
+| Rotas legacy mantidas | DL-120 | `/api/catalog/reviews/...` inalteradas | `ReviewApprovalEndpointTests` | COMPLIANT (OUT) |
+
+**`W5.5 IMPLEMENTATION GAP` (resolve):** `change.type` `externalIdentity` e `channelSource` não têm operação de domínio de Review *declarada* demonstrada (só existem `RecordExternalIdentityAsync`/`RecordChannelSourceAsync`, gravadores de ingestão com parâmetros sem contrato de declaração), e `none` não tem semântica definida em `22 §7.3`. São rejeitados com `422 declared-change-invalid`; não se inventou domínio. Suportados: `channelAlias`, `canonicalChannel`.
+
+Quality gate W5.5: `dotnet build` 0 erros; `WaveW55ReviewApiTests` 42/42; suite completa 2532 passed / 1 skipped / 0 failed (baseline W5.4 2490/1/0; +42). `git diff --check` clean. Estado Git preservado (sem commit/push).
+
+Revisão pós-implementação (B1/B2): o gate emite o envelope `{error,message,correlationId}` também nos 401/403 das Review APIs (legacy inalterado) e excepções inesperadas são mapeadas para `500 persistence-error` no dispatcher; testes `Unexpected_exception_returns_500_persistence_error`, `Unauthenticated_review_api_uses_error_envelope`, `Csrf_error_on_review_api_uses_error_envelope`, `Legacy_gate_error_format_is_unchanged`.
+
 ## Cobertura de requisitos
 
 Todo o requisito/contrato da BÍBLIA deve ter um ID único e constar da matriz de rastreabilidade. A matriz DEVE incluir explicitamente os requisitos de delegação/completude (`00-BIBLE.md` §5/§6) e de contratos (`22`, `23`). Um requisito sem implementação é uma wave futura; um requisito com implementação contraditória é uma divergência a analisar antes de avançar downstream.

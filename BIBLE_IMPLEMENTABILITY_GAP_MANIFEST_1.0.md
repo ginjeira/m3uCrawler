@@ -1430,3 +1430,84 @@ W5.4 é ratificação de scope; não abre nem fecha `DG-*`.
 ```text
 DG-* (73): CLOSED = 66, PARAMETER_GAP = 6, OPEN-HUMAN = 0, BLOCKED = 1, FALSE_GAP = 0
 ```
+
+---
+
+## Anexo Q — W5.5: API HTTP de Review (W5.5 implementada)
+
+Ratificação (DL-120) e implementação subsequente das cinco rotas de `22 §7` no
+handler manual de `WebDashboardService.cs`. Sem migration, sem alteração das rotas
+legacy, sem RBAC, sem `MatchMethod`/`MatchConfidence`/C7/M.4.
+
+```text
+W5.5: Contract ratified / Implementation complete (1 resolve gap: externalIdentity/channelSource/none)
+```
+
+### Q.1 Decisões ratificadas
+
+| ID | Decisão | Contrato |
+|---|---|---|
+| D1 | `POST /api/review/resolve` = "declaração explícita de alteração + resolução"; termina em `Resolved` (`Open→InReview→Resolved` ou `InReview→Resolved`); nunca cria identidade implicitamente; `422 declared-change-invalid`; usa apenas capacidades de domínio existentes; audit before/after. | `22 §7.3`; DL-120 |
+| D2 | Não se cria `/api/review/begin`; `InReview` é alcançado implicitamente por composição no `resolve`/`ignore`. As cinco operações de `22 §7` permanecem as únicas. | `22 §7`; DL-120 |
+| D3 | `ReviewItem.Id` = identidade normativa (`id`/`reviewItemId`); `Fingerprint` só para compatibilidade legacy; sem schema/migration. | DL-120 |
+| D4 | Formato `{error,message,correlationId}` nas cinco novas rotas; códigos estáveis; `400/401/403/404/409/422/500`; sem `Exception.Message`; `correlationId` opaco por pedido; legacy não normalizado; sem subsistema novo de tracing. | `22 §2/§7`; DL-120 |
+| D5 | Rotas legacy mantidas sem alteração de semântica; novas rotas podem reutilizar serviços internos; remoção/depreciação definitiva é decisão futura. | DL-120 |
+| D6 | `state ∈ {Open,InReview,Resolved,Ignored}`; inválido → `400 invalid-filter`; `offset` default `0`; `limit` default/máximo = `PARAMETER GAP`; ordem `CreatedAtUtc DESC, Id DESC`; rate limiting `OUT OF SCOPE`/`PARAMETER GAP`. | `22 §7.1/§8`; DL-120 |
+| D7 | `subject = NormalizedIdentity`; **não** criar `RunId` em `ReviewItemEntity`; `runId` = dependência W5.6/C7, tratada como limitação actual (não solução definitiva). | `22 §7.1`; DL-120 |
+| AuthZ | Mutações usam o modelo actual de `Administrator`; sem migration de roles nem ACL/`Operator`; RBAC fora de W5.5. | `22 §7`; `35`; DL-120 |
+
+### Q.2 Scope ratificado
+
+```text
+IN:  5 rotas 22 §7; auth/CSRF existentes; authz Administrator; novo formato de erro;
+     correlationId opaco; filtro state; paginação; leitura por ReviewItem.Id;
+     integração ReviewLifecycle W5.4; audit; idempotência; respostas sanitizadas; testes HTTP.
+OUT: /api/review/begin; remoção/semântica das rotas legacy; RBAC/Operator; migration de roles;
+     MatchMethod/MatchConfidence; C7 completo; RunId em ReviewItem; M.4; reabertura automática;
+     subsistema de tracing/correlation; rate limiting; alterações especulativas ao catálogo.
+```
+
+### Q.3 Dependências e gaps de implementação
+
+Capacidades de domínio existentes verificadas (reutilizadas ou avaliadas; **não** inventar):
+
+```text
+channelAlias     : ApplyReviewApprovalAsync(AddAlias)  → SUPORTADO no resolve
+canonicalChannel : ApplyReviewApprovalAsync(CreateChannel) → SUPORTADO no resolve
+externalIdentity : RecordExternalIdentityAsync (CatalogResolver.cs:403) → NÃO suportado como declaração de Review
+channelSource    : RecordChannelSourceAsync    (CatalogResolver.cs:2775) → NÃO suportado como declaração de Review
+```
+
+`W5.5 IMPLEMENTATION GAP` (FACT, reportado na implementação): apenas `channelAlias` e
+`canonicalChannel` têm operação de domínio de Review **declarada** demonstrada
+(`ApplyReviewApprovalAsync`). `externalIdentity` e `channelSource` só dispõem de
+gravadores de ingestão com parâmetros sem contrato de declaração, e `none` não tem
+semântica definida em `22 §7.3`; os três são rejeitados com `422 declared-change-invalid`.
+Não foi criado subsistema novo nem domínio especulativo.
+
+`PARAMETER GAP`: `limit` default/máximo; rate limiting. `W5.6/C7`: `RunId`/schema completo do `ReviewItem`.
+
+### Q.4 Implementação (W5.5)
+
+```text
+Código:  WebDashboardService.cs — IsReviewApiPath/HandleReviewApiAsync +
+         HandleReviewListAsync/DetailAsync/IgnoreAsync/ReopenAsync/ResolveAsync,
+         WriteReviewApiErrorAsync, WriteReviewDomainErrorAsync, ReviewApiPayload.
+         CatalogResolver.GetReviewItemAsync (leitura por ReviewItem.Id).
+Rotas:   GET /api/reviews; GET /api/review?id; POST /api/review/resolve|ignore|reopen.
+Legacy:  /api/catalog/reviews[/{fingerprint}/approve|exclude] inalteradas.
+Testes:  WaveW55ReviewApiTests.cs (42, inclui B1/B2).
+Evidência: build 0 erros; suite 2532 passed / 1 skipped / 0 failed.
+B1/B2:   500 persistence-error no dispatcher; envelope {error,message,correlationId} nos
+         401/403 das Review APIs via gate localizado (legacy inalterado).
+Migration: nenhuma.
+Gap: resolve — externalIdentity/channelSource/none → 422 (W5.5 IMPLEMENTATION GAP).
+```
+
+### Q.5 Contagens do Manifest
+
+W5.5 é implementação; não abre nem fecha `DG-*`.
+
+```text
+DG-* (73): CLOSED = 66, PARAMETER_GAP = 6, OPEN-HUMAN = 0, BLOCKED = 1, FALSE_GAP = 0
+```

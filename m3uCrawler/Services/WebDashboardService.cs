@@ -446,7 +446,19 @@ namespace m3uCrawler.Services
             var tokenAuthorization = EvaluateTokenAuthorization(context.Request, webToken);
             if (tokenAuthorization == TokenAuthorization.Rejected)
             {
-                await WriteUnauthorizedAsync(context.Response);
+                if (IsReviewApiPath(requestPath))
+                {
+                    // W5.5 (B2) — as novas Review APIs usam o envelope
+                    // {error,message,correlationId} também nos 401 do gate.
+                    await WriteReviewApiErrorAsync(
+                        context.Response, HttpStatusCode.Unauthorized,
+                        "authentication-required", "Autenticação necessária.",
+                        NewReviewCorrelationId());
+                }
+                else
+                {
+                    await WriteUnauthorizedAsync(context.Response);
+                }
                 return;
             }
             var machineAuthorized = tokenAuthorization == TokenAuthorization.Authorized;
@@ -457,6 +469,11 @@ namespace m3uCrawler.Services
             var (authMode, lifecycleState) = await ResolveAuthDecisionAsync();
             var sessionId = GetCookieValue(context.Request, SessionCookieName);
             var isRootPath = requestPath.Length == 0 || requestPath == "/";
+            // W5.5 (B2) — os erros de gate (401/403) das novas Review APIs usam o
+            // envelope {error,message,correlationId}; os restantes endpoints
+            // mantêm o formato existente.
+            var isReviewApiRequest = IsReviewApiPath(requestPath);
+            var gateCorrelationId = isReviewApiRequest ? NewReviewCorrelationId() : string.Empty;
             // W6a — Sessão humana validada pelo gate, usada para atribuir o actor
             // dos registos de auditoria das mutações administrativas.
             AdminSessionEntity? auditSession = null;
@@ -501,10 +518,20 @@ namespace m3uCrawler.Services
                 {
                     // PHASE 9C.5 (F6) — reportar o estado real (pode ser READY
                     // em BOOTSTRAP_REQUIRED), nunca um valor fixo.
-                    await WriteJsonAsync(
-                        context.Response,
-                        new { error = "bootstrap-required", state = lifecycleState.ToWireName() },
-                        HttpStatusCode.Forbidden);
+                    if (isReviewApiRequest)
+                    {
+                        await WriteReviewApiErrorAsync(
+                            context.Response, HttpStatusCode.Forbidden,
+                            "bootstrap-required", "Aplicação em bootstrap.",
+                            gateCorrelationId);
+                    }
+                    else
+                    {
+                        await WriteJsonAsync(
+                            context.Response,
+                            new { error = "bootstrap-required", state = lifecycleState.ToWireName() },
+                            HttpStatusCode.Forbidden);
+                    }
                     return;
                 }
 
@@ -518,10 +545,10 @@ namespace m3uCrawler.Services
                         : null;
                     if (session == null)
                     {
-                        await WriteJsonAsync(
-                            context.Response,
-                            new { error = "authentication-required" },
-                            HttpStatusCode.Unauthorized);
+                        await WriteGateErrorAsync(
+                            context.Response, HttpStatusCode.Unauthorized,
+                            "authentication-required", "Autenticação necessária.",
+                            isReviewApiRequest, gateCorrelationId);
                         return;
                     }
 
@@ -532,10 +559,10 @@ namespace m3uCrawler.Services
                         var presented = context.Request.Headers[CsrfHeaderName];
                         if (string.IsNullOrEmpty(presented) || !FixedEquals(presented, session.CsrfToken))
                         {
-                            await WriteJsonAsync(
-                                context.Response,
-                                new { error = "csrf-invalid" },
-                                HttpStatusCode.Forbidden);
+                            await WriteGateErrorAsync(
+                                context.Response, HttpStatusCode.Forbidden,
+                                "csrf-invalid", "Token CSRF inválido.",
+                                isReviewApiRequest, gateCorrelationId);
                             return;
                         }
                     }
@@ -1265,6 +1292,15 @@ namespace m3uCrawler.Services
                 }
 
                 context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
+                return;
+            }
+
+            // W5.5 — API HTTP de Review (DL-120). Novas rotas /api/reviews e
+            // /api/review[/*]. As rotas legacy /api/catalog/reviews/... mantêm-se
+            // inalteradas mais abaixo (D5).
+            if (IsReviewApiPath(requestPath))
+            {
+                await HandleReviewApiAsync(context, requestPath, auditActor);
                 return;
             }
 
@@ -3251,6 +3287,571 @@ namespace m3uCrawler.Services
             // Nota: WriteJsonAsync repõe sempre o status; o código tem de
             // ser passado explicitamente (senão o erro sairia como 200).
             await WriteJsonAsync(response, new { error = ex.Message, code = ex.Error.ToString() }, status);
+        }
+
+        // ────────────────────────────────────────────────────────────────
+        // W5.5 — API HTTP de Review (DL-120; 22 §7).
+        // Cinco rotas: GET /api/reviews, GET /api/review?id, POST
+        // /api/review/{resolve|ignore|reopen}. Identidade = ReviewItem.Id;
+        // erros no formato { error, message, correlationId }. As rotas legacy
+        // /api/catalog/reviews/... mantêm-se inalteradas (D5).
+        // ────────────────────────────────────────────────────────────────
+
+        // Operational default (não normativo; `limit` default/máximo permanece
+        // PARAMETER GAP, DL-120/D6). Existe apenas para impedir consultas ilimitadas.
+        private const int ReviewListOperationalDefaultLimit = 100;
+        private const int ReviewListOperationalMaxLimit = 500;
+
+        private static bool IsReviewApiPath(string path)
+            => path.Equals("/api/reviews", StringComparison.OrdinalIgnoreCase)
+                || path.Equals("/api/review", StringComparison.OrdinalIgnoreCase)
+                || path.StartsWith("/api/review/", StringComparison.OrdinalIgnoreCase);
+
+        private static string NewReviewCorrelationId() => Guid.NewGuid().ToString("N");
+
+        /// <summary>
+        /// W5.5 (B2) — Erro de gate (401/403). Para as novas Review APIs usa o
+        /// envelope <c>{error,message,correlationId}</c>; para os restantes
+        /// endpoints mantém o corpo existente <c>{error}</c> (sem regressão).
+        /// </summary>
+        private static Task WriteGateErrorAsync(
+            HttpListenerResponse response, HttpStatusCode status, string code, string safeMessage,
+            bool reviewApi, string correlationId)
+            => reviewApi
+                ? WriteJsonAsync(response, new { error = code, message = safeMessage, correlationId }, status)
+                : WriteJsonAsync(response, new { error = code }, status);
+
+        private static async Task HandleReviewApiAsync(
+            HttpListenerContext context, string requestPath, AuditActor auditActor)
+        {
+            var correlationId = NewReviewCorrelationId();
+            try
+            {
+                await DispatchReviewApiAsync(context, requestPath, auditActor, correlationId);
+            }
+            catch (Exception)
+            {
+                // W5.5 (B1) — fallback para erros inesperados: HTTP 500
+                // `persistence-error` com envelope completo. Nunca expõe
+                // Exception.Message nem stack trace.
+                try
+                {
+                    await WriteReviewApiErrorAsync(
+                        context.Response, HttpStatusCode.InternalServerError,
+                        "persistence-error", "Erro interno.", correlationId);
+                }
+                catch
+                {
+                    // A resposta pode já ter sido parcialmente escrita/fechada.
+                }
+            }
+        }
+
+        private static async Task DispatchReviewApiAsync(
+            HttpListenerContext context, string requestPath, AuditActor auditActor, string correlationId)
+        {
+            if (requestPath.Equals("/api/reviews", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.MethodNotAllowed,
+                        "invalid-payload", "Método não permitido.", correlationId);
+                    return;
+                }
+                await HandleReviewListAsync(context, correlationId);
+                return;
+            }
+
+            if (requestPath.Equals("/api/review", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.MethodNotAllowed,
+                        "invalid-payload", "Método não permitido.", correlationId);
+                    return;
+                }
+                await HandleReviewDetailAsync(context, correlationId);
+                return;
+            }
+
+            var operation = requestPath.Substring("/api/review/".Length).Trim('/').ToLowerInvariant();
+            if (!context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+            {
+                await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.MethodNotAllowed,
+                    "invalid-payload", "Método não permitido.", correlationId);
+                return;
+            }
+
+            switch (operation)
+            {
+                case "ignore":
+                    await HandleReviewIgnoreAsync(context, auditActor, correlationId);
+                    return;
+                case "reopen":
+                    await HandleReviewReopenAsync(context, auditActor, correlationId);
+                    return;
+                case "resolve":
+                    await HandleReviewResolveAsync(context, auditActor, correlationId);
+                    return;
+                default:
+                    await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.NotFound,
+                        "review-not-found", "Operação de review desconhecida.", correlationId);
+                    return;
+            }
+        }
+
+        private static async Task HandleReviewListAsync(HttpListenerContext context, string correlationId)
+        {
+            var query = context.Request.QueryString;
+
+            ReviewItemState? stateFilter = null;
+            var rawState = query["state"];
+            if (!string.IsNullOrWhiteSpace(rawState))
+            {
+                if (!Enum.TryParse<ReviewItemState>(rawState.Trim(), ignoreCase: true, out var parsed)
+                    || !Enum.IsDefined(parsed))
+                {
+                    await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.BadRequest,
+                        "invalid-filter", "state inválido.", correlationId);
+                    return;
+                }
+                stateFilter = parsed;
+            }
+
+            if (!TryParseReviewInt(query["offset"], allowZero: true, defaultValue: 0, out var offset)
+                || offset < 0)
+            {
+                await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.BadRequest,
+                    "invalid-filter", "offset inválido.", correlationId);
+                return;
+            }
+
+            if (!TryParseReviewInt(query["limit"], allowZero: false,
+                    defaultValue: ReviewListOperationalDefaultLimit, out var limit))
+            {
+                await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.BadRequest,
+                    "invalid-filter", "limit inválido.", correlationId);
+                return;
+            }
+            if (limit > ReviewListOperationalMaxLimit)
+            {
+                limit = ReviewListOperationalMaxLimit;
+            }
+
+            var all = await _catalogResolver!.ListAllReviewItemsAsync();
+            IEnumerable<ReviewItemEntity> filtered = all;
+            if (stateFilter is not null)
+            {
+                filtered = all.Where(r => r.State == stateFilter.Value);
+            }
+
+            var page = filtered
+                .OrderByDescending(r => r.CreatedAtUtc)
+                .ThenByDescending(r => r.Id)
+                .Skip(offset)
+                .Take(limit)
+                .Select(ReviewSummaryJson)
+                .ToList();
+
+            await WriteJsonAsync(context.Response, page);
+        }
+
+        private static async Task HandleReviewDetailAsync(HttpListenerContext context, string correlationId)
+        {
+            var rawId = context.Request.QueryString["id"];
+            if (string.IsNullOrWhiteSpace(rawId)
+                || !long.TryParse(rawId.Trim(), out var id)
+                || id <= 0)
+            {
+                await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.BadRequest,
+                    "review-id-required", "id é obrigatório.", correlationId);
+                return;
+            }
+
+            var item = await _catalogResolver!.GetReviewItemAsync(id);
+            if (item is null)
+            {
+                await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.NotFound,
+                    "review-not-found", "Review não encontrada.", correlationId);
+                return;
+            }
+
+            await WriteJsonAsync(context.Response, ReviewDetailJson(item));
+        }
+
+        private static async Task HandleReviewIgnoreAsync(
+            HttpListenerContext context, AuditActor auditActor, string correlationId)
+        {
+            var payload = await ReadReviewApiBodyAsync(context.Request);
+            if (payload?.ReviewItemId is not > 0)
+            {
+                await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.BadRequest,
+                    "invalid-payload", "reviewItemId é obrigatório.", correlationId);
+                return;
+            }
+            if (string.IsNullOrWhiteSpace(payload.Reason))
+            {
+                await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.BadRequest,
+                    "reason-required", "reason é obrigatório.", correlationId);
+                return;
+            }
+
+            var item = await _catalogResolver!.GetReviewItemAsync(payload.ReviewItemId.Value);
+            if (item is null)
+            {
+                await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.NotFound,
+                    "review-not-found", "Review não encontrada.", correlationId);
+                return;
+            }
+
+            try
+            {
+                var reason = SanitizeReviewText(payload.Reason);
+                var result = await _catalogResolver.IgnoreReviewAsync(item.Fingerprint, reason);
+                if (result is null)
+                {
+                    await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.NotFound,
+                        "review-not-found", "Review não encontrada.", correlationId);
+                    return;
+                }
+
+                await RecordAuditAsync(auditActor, "catalog.review.ignore", "review-item",
+                    item.Id.ToString(),
+                    new { state = result.PriorState.ToString() },
+                    new { state = result.Review.State.ToString() },
+                    AuditResult.Success, reason);
+
+                await WriteJsonAsync(context.Response, ReviewLifecycleJson(result, correlationId));
+            }
+            catch (ChannelAdministrationException ex)
+            {
+                await WriteReviewDomainErrorAsync(context.Response, ex, correlationId);
+            }
+        }
+
+        private static async Task HandleReviewReopenAsync(
+            HttpListenerContext context, AuditActor auditActor, string correlationId)
+        {
+            var payload = await ReadReviewApiBodyAsync(context.Request);
+            if (payload?.ReviewItemId is not > 0)
+            {
+                await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.BadRequest,
+                    "invalid-payload", "reviewItemId é obrigatório.", correlationId);
+                return;
+            }
+
+            var justification = payload.Justification ?? payload.Reason;
+            if (string.IsNullOrWhiteSpace(justification))
+            {
+                await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.BadRequest,
+                    "reason-required", "justification é obrigatória.", correlationId);
+                return;
+            }
+
+            var item = await _catalogResolver!.GetReviewItemAsync(payload.ReviewItemId.Value);
+            if (item is null)
+            {
+                await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.NotFound,
+                    "review-not-found", "Review não encontrada.", correlationId);
+                return;
+            }
+
+            try
+            {
+                var reason = SanitizeReviewText(justification);
+                var result = await _catalogResolver.ReopenReviewAsync(item.Fingerprint, reason);
+                if (result is null)
+                {
+                    await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.NotFound,
+                        "review-not-found", "Review não encontrada.", correlationId);
+                    return;
+                }
+
+                await RecordAuditAsync(auditActor, "catalog.review.reopen", "review-item",
+                    item.Id.ToString(),
+                    new { state = result.PriorState.ToString() },
+                    new { state = result.Review.State.ToString() },
+                    AuditResult.Success, reason);
+
+                await WriteJsonAsync(context.Response, ReviewLifecycleJson(result, correlationId));
+            }
+            catch (ChannelAdministrationException ex)
+            {
+                await WriteReviewDomainErrorAsync(context.Response, ex, correlationId);
+            }
+        }
+
+        private static async Task HandleReviewResolveAsync(
+            HttpListenerContext context, AuditActor auditActor, string correlationId)
+        {
+            var payload = await ReadReviewApiBodyAsync(context.Request);
+            if (payload?.ReviewItemId is not > 0)
+            {
+                await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.BadRequest,
+                    "invalid-payload", "reviewItemId é obrigatório.", correlationId);
+                return;
+            }
+
+            var item = await _catalogResolver!.GetReviewItemAsync(payload.ReviewItemId.Value);
+            if (item is null)
+            {
+                await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.NotFound,
+                    "review-not-found", "Review não encontrada.", correlationId);
+                return;
+            }
+
+            var change = payload.Change;
+            if (change is null || string.IsNullOrWhiteSpace(change.Type))
+            {
+                await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.UnprocessableEntity,
+                    "declared-change-invalid", "change.type é obrigatório.", correlationId);
+                return;
+            }
+
+            var declaredType = change.Type.Trim();
+            var changeType = declaredType.ToLowerInvariant();
+
+            // W5.5 IMPLEMENTATION GAP (DL-120/D1): `externalIdentity` e
+            // `channelSource` não têm operação de domínio de Review *declarada*
+            // demonstrada (só existem gravadores de ingestão com parâmetros sem
+            // contrato: RecordExternalIdentityAsync/RecordChannelSourceAsync), e
+            // `none` não tem semântica definida em 22 §7.3. Não se inventa
+            // semântica: rejeita-se com 422 e documenta-se o gap.
+            if (changeType is "externalidentity" or "channelsource" or "none")
+            {
+                await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.UnprocessableEntity,
+                    "declared-change-invalid",
+                    $"change.type '{changeType}' não tem operação de domínio de Review suportada (W5.5 IMPLEMENTATION GAP).",
+                    correlationId);
+                return;
+            }
+
+            ReviewApprovalAction action;
+            ReviewChannelSpec? channelSpec = null;
+            switch (changeType)
+            {
+                case "channelalias":
+                    action = ReviewApprovalAction.AddAlias;
+                    if (string.IsNullOrWhiteSpace(change.CanonicalChannelKey))
+                    {
+                        await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.UnprocessableEntity,
+                            "declared-change-invalid",
+                            "canonicalChannelKey é obrigatório para change.type='channelAlias'.", correlationId);
+                        return;
+                    }
+                    break;
+
+                case "canonicalchannel":
+                    action = ReviewApprovalAction.CreateChannel;
+                    var ch = change.Channel;
+                    if (ch is null || string.IsNullOrWhiteSpace(ch.Key) || string.IsNullOrWhiteSpace(ch.Name))
+                    {
+                        await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.UnprocessableEntity,
+                            "declared-change-invalid",
+                            "channel.key e channel.name são obrigatórios para change.type='canonicalChannel'.",
+                            correlationId);
+                        return;
+                    }
+                    if (!TryParseOptionalEnum(ch.EditorialCategory, out EditorialCategory? editorialCategory)
+                        || !TryParseOptionalEnum(ch.EditorialGroup, out CanonicalEditorialGroup? editorialGroup)
+                        || !TryParseOptionalEnum(ch.PublicationPolicy, out PublicationPolicy? publicationPolicy))
+                    {
+                        await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.UnprocessableEntity,
+                            "declared-change-invalid", "Valor editorial inválido em channel.", correlationId);
+                        return;
+                    }
+                    channelSpec = new ReviewChannelSpec(
+                        ch.Key!, ch.Name!, ch.Country, editorialCategory, editorialGroup, publicationPolicy);
+                    break;
+
+                default:
+                    await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.UnprocessableEntity,
+                        "declared-change-invalid", "change.type inválido.", correlationId);
+                    return;
+            }
+
+            var note = SanitizeReviewText(payload.Note);
+            var decision = new ReviewApprovalDecision(
+                action, change.CanonicalChannelKey, change.Alias, note, channelSpec);
+
+            try
+            {
+                var result = await _catalogResolver.ApplyReviewApprovalAsync(item.Fingerprint, decision);
+                if (result is null)
+                {
+                    await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.NotFound,
+                        "review-not-found", "Review não encontrada.", correlationId);
+                    return;
+                }
+
+                var after = new
+                {
+                    state = result.Review.State.ToString(),
+                    change = declaredType,
+                    idempotent = result.Idempotent,
+                    catalogueChanged = result.CatalogueChanged,
+                    canonicalChannelId = result.Channel?.Id,
+                    canonicalChannelKey = result.Channel?.Key,
+                    alias = result.Alias?.NormalizedAlias,
+                };
+                await RecordAuditAsync(auditActor, "catalog.review.resolve", "review-item",
+                    item.Id.ToString(),
+                    new
+                    {
+                        state = result.PriorState.ToString(),
+                        approvedCanonicalChannelId = result.PriorApprovedCanonicalChannelId,
+                    },
+                    after, AuditResult.Success, string.IsNullOrEmpty(note) ? null : note);
+
+                await WriteJsonAsync(context.Response, new
+                {
+                    id = result.Review.Id,
+                    state = result.Review.State.ToString(),
+                    change = declaredType,
+                    idempotent = result.Idempotent,
+                    catalogueChanged = result.CatalogueChanged,
+                    canonicalChannelId = result.Channel?.Id,
+                    canonicalChannelKey = result.Channel?.Key,
+                    alias = result.Alias?.NormalizedAlias,
+                    resolvedAt = result.Review.ResolvedAtUtc?.ToString("o"),
+                    correlationId,
+                });
+            }
+            catch (ChannelAdministrationException ex)
+            {
+                await WriteReviewDomainErrorAsync(context.Response, ex, correlationId, resolveDeclaration: true);
+            }
+        }
+
+        private static async Task<ReviewApiPayload?> ReadReviewApiBodyAsync(HttpListenerRequest request)
+        {
+            using var reader = new StreamReader(
+                request.InputStream, request.ContentEncoding ?? Encoding.UTF8);
+            var body = await reader.ReadToEndAsync();
+            if (string.IsNullOrWhiteSpace(body)) return null;
+            try
+            {
+                return JsonSerializer.Deserialize<ReviewApiPayload>(body, JsonOptions);
+            }
+            catch (JsonException)
+            {
+                return null;
+            }
+        }
+
+        private static object ReviewSummaryJson(ReviewItemEntity r) => new
+        {
+            id = r.Id,
+            subject = SanitizeReviewText(r.NormalizedIdentity),
+            state = r.State.ToString(),
+            createdAt = r.CreatedAtUtc.ToString("o"),
+            updatedAt = r.UpdatedAtUtc.ToString("o"),
+            // `runId` não existe no modelo actual (dependência C7/W5.6). Expõe-se
+            // null explicitamente como limitação, não como solução definitiva.
+            runId = (string?)null,
+        };
+
+        private static object ReviewDetailJson(ReviewItemEntity r) => new
+        {
+            id = r.Id,
+            subject = SanitizeReviewText(r.NormalizedIdentity),
+            state = r.State.ToString(),
+            sourceGroup = r.SourceGroup,
+            reason = SanitizeReviewText(r.ReasonSignature),
+            note = SanitizeReviewText(r.Note),
+            approvedCanonicalChannelId = r.ApprovedCanonicalChannelId,
+            createdAt = r.CreatedAtUtc.ToString("o"),
+            updatedAt = r.UpdatedAtUtc.ToString("o"),
+            resolvedAt = r.ResolvedAtUtc?.ToString("o"),
+        };
+
+        private static object ReviewLifecycleJson(ReviewLifecycleResult result, string correlationId) => new
+        {
+            id = result.Review.Id,
+            state = result.Review.State.ToString(),
+            changed = result.Changed,
+            operation = result.Operation,
+            correlationId,
+        };
+
+        private static string SanitizeReviewText(string? value)
+            => string.IsNullOrEmpty(value)
+                ? string.Empty
+                : (CredentialSanitizer.SanitizeSensitiveText(value) ?? string.Empty);
+
+        private static bool TryParseReviewInt(string? raw, bool allowZero, int defaultValue, out int value)
+        {
+            value = defaultValue;
+            if (string.IsNullOrWhiteSpace(raw)) return true;
+            if (!int.TryParse(raw.Trim(), out var parsed)) return false;
+            if (allowZero ? parsed < 0 : parsed <= 0) return false;
+            value = parsed;
+            return true;
+        }
+
+        private static Task WriteReviewApiErrorAsync(
+            HttpListenerResponse response, HttpStatusCode status, string code, string message, string correlationId)
+            => WriteJsonAsync(response, new { error = code, message, correlationId }, status);
+
+        /// <summary>
+        /// W5.5 — Traduz erros de domínio para o contrato de erro das novas rotas.
+        /// Nunca expõe <see cref="Exception.Message"/>. Conflito de estado → 409;
+        /// erros de declaração (resolve) → 422. As restantes causas de domínio
+        /// mapeiam para 400 (input inválido).
+        /// </summary>
+        private static async Task WriteReviewDomainErrorAsync(
+            HttpListenerResponse response, ChannelAdministrationException ex, string correlationId,
+            bool resolveDeclaration = false)
+        {
+            if (ex.Error == ChannelAdministrationError.ReviewConflict)
+            {
+                await WriteReviewApiErrorAsync(response, HttpStatusCode.Conflict,
+                    "state-conflict", "Conflito de estado da Review.", correlationId);
+                return;
+            }
+
+            if (resolveDeclaration)
+            {
+                await WriteReviewApiErrorAsync(response, HttpStatusCode.UnprocessableEntity,
+                    "declared-change-invalid", "Declaração de alteração inválida.", correlationId);
+                return;
+            }
+
+            await WriteReviewApiErrorAsync(response, HttpStatusCode.BadRequest,
+                "invalid-payload", "Pedido inválido.", correlationId);
+        }
+
+        private sealed class ReviewApiPayload
+        {
+            [JsonPropertyName("reviewItemId")]
+            public long? ReviewItemId { get; set; }
+
+            [JsonPropertyName("reason")]
+            public string? Reason { get; set; }
+
+            [JsonPropertyName("justification")]
+            public string? Justification { get; set; }
+
+            [JsonPropertyName("note")]
+            public string? Note { get; set; }
+
+            [JsonPropertyName("change")]
+            public ReviewChangePayload? Change { get; set; }
+        }
+
+        private sealed class ReviewChangePayload
+        {
+            [JsonPropertyName("type")]
+            public string? Type { get; set; }
+
+            [JsonPropertyName("canonicalChannelKey")]
+            public string? CanonicalChannelKey { get; set; }
+
+            [JsonPropertyName("alias")]
+            public string? Alias { get; set; }
+
+            [JsonPropertyName("channel")]
+            public ReviewChannelPayload? Channel { get; set; }
         }
 
         // Opções JSON partilhadas por todos os endpoints do dashboard: serializam

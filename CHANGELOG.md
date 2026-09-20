@@ -8,6 +8,15 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 ## [Unreleased]
 
 ### ✨ Adicionado
+- **W5.5 — API HTTP de Review (2026-09-20).** Implementa o contrato ratificado (DL-120; `22 §7`) no handler manual de `WebDashboardService.cs`. Sem migration, sem novas dependências, sem alteração das rotas legacy.
+  - **Rotas:** `GET /api/reviews` (filtro `state` Open|InReview|Resolved|Ignored, `limit`/`offset`, ordem `CreatedAtUtc DESC, Id DESC`, `subject = NormalizedIdentity`, `runId = null` como limitação C7/W5.6); `GET /api/review?id`; `POST /api/review/ignore` (motivo obrigatório); `POST /api/review/reopen` (justificação obrigatória, manual); `POST /api/review/resolve` (declaração explícita + `Resolved`).
+  - **Identidade:** `ReviewItem.Id` (`id`/`reviewItemId`); novo `CatalogResolver.GetReviewItemAsync`. `Fingerprint` fica só nas rotas legacy.
+  - **Erros:** `{ error, message, correlationId }` nas cinco rotas; códigos estáveis; `400/401/403/404/409/422/500`; sem `Exception.Message`; `correlationId` opaco por pedido. Rotas legacy não normalizadas.
+  - **Auth/CSRF:** gate existente (sessão `m3u_session` ou `--web-token`; CSRF em mutações); `Administrator` implícito (sem RBAC/role column).
+  - **Lifecycle:** `ignore`/`reopen` reutilizam `IgnoreReviewAsync`/`ReopenReviewAsync`; `resolve` compõe `Open→InReview→Resolved` ou `InReview→Resolved` via `ApplyReviewApprovalAsync`; nunca cria identidade implicitamente; audit before/after; idempotência.
+  - **`W5.5 IMPLEMENTATION GAP` (resolve):** `channelAlias` e `canonicalChannel` suportados; `externalIdentity`, `channelSource` e `none` não têm operação de domínio declarada demonstrada e devolvem `422 declared-change-invalid` (não se inventou domínio).
+  - **B1/B2 (revisão pós-implementação):** excepções inesperadas das Review APIs → `500 persistence-error` com envelope; 401/403 das Review APIs usam `{error,message,correlationId}` (gate localizado por `IsReviewApiPath`; restantes endpoints inalterados).
+  - **Testes:** `WaveW55ReviewApiTests` (42). Suite: 2532 passed / 1 skipped / 0 failed.
 - **W5.4 — Review lifecycle (2026-09-20).** Implementa o contrato `33-STATE-MACHINES.md`/DL-105/DL-119.
   - **Estados:** `Open | InReview | Resolved | Ignored` (`Approved→Resolved`, `Excluded→Ignored`) em `CatalogEntities.ReviewItemState`; os valores `int` persistidos preservam-se (`Open=0`, `Resolved=1`, `Ignored=2`; `InReview=3` novo) e **não é necessária migration**.
   - **Máquina de estados:** `Services/Catalog/ReviewLifecycle.cs` — exactamente as seis transições normativas; todas as restantes rejeitadas.
@@ -39,6 +48,15 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
   - Testes `WaveW51RecognitionPolicyTests` (17): defaults, global/group/channel, fallback, determinismo, fuzzy off, round-trip, snapshot estável, versões coexistentes, auditoria, migração Up/Down e preservação de dados, isolamento. Suite: 2394 passed / 1 skipped / 0 failed.
 
 ### 📝 Documentação
+- **W5.5 — contrato da API HTTP de Review ratificado (2026-09-20).** Documentação-only; **implementação pendente**. Regista as decisões D1–D7 + AuthZ (DL-120; Anexo Q do manifest):
+  - **D1:** `POST /api/review/resolve` = "declaração explícita de alteração + resolução" (`Open→InReview→Resolved` ou `InReview→Resolved`); nunca cria identidade implicitamente; `422 declared-change-invalid`; usa apenas capacidades de domínio existentes; audit before/after.
+  - **D2:** não se cria `/api/review/begin`; `InReview` é alcançado implicitamente; as 5 operações de `22 §7` são as únicas.
+  - **D3:** identidade normativa = `ReviewItem.Id`; `Fingerprint` só compatibilidade legacy; sem schema/migration.
+  - **D4:** formato `{error,message,correlationId}` nas novas rotas; códigos estáveis 400/401/403/404/409/422/500; sem `Exception.Message`; legacy não normalizado.
+  - **D5:** rotas legacy mantidas sem alteração de semântica; remoção futura.
+  - **D6:** `state` válido; `offset` default 0; `limit` default/máximo = `PARAMETER GAP`; ordem `CreatedAtUtc DESC, Id DESC`; rate limiting fora de scope.
+  - **D7:** `subject = NormalizedIdentity`; sem `RunId` em `ReviewItem` (W5.6/C7); ausência tratada como limitação actual.
+  - **AuthZ:** `Administrator` implícito; sem RBAC/`Operator` nesta wave. Ratificado em `31` (DL-120), `22 §7`, `44`, `46` e manifest (Anexo Q). Sem alteração de código, testes, migrations ou rotas.
 - **W5.4 — scope ratificado (2026-09-20).** Ratificação das fronteiras de scope (DL-119; Anexo P do manifest). A implementação do lifecycle foi concluída na entrada correspondente em ✨ Adicionado. Decisões:
   - **D-W54-01 (C7):** W5.4 altera `ReviewItem` apenas no mínimo necessário ao lifecycle; `RunId`/`StreamId`/`Actor`/`Evidence`/`Candidates`/`Decision` não são inventados (ficam `OPEN`); reconciliação completa do schema em W5.6.
   - **D-W54-02:** `ReviewItem` de fuzzy ambiguity (`CatalogResolution.FuzzyDiagnostic`, `DecisionReason=fuzzy-ambiguous`) pertence a **W5.4**; W5.3 continua sem criar `ReviewItem` (corrigida a atribuição contraditória a W5.3 no manifest L.4).
