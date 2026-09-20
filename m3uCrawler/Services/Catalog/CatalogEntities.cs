@@ -357,9 +357,11 @@ public sealed class DispatcharrStreamOwnershipEntity
 
 /// <summary>
 /// Item para revisão humana. Gerado quando o matcher não
-/// consegue decidir automaticamente (ex.: "PT: SPORT TV NBA"). Estados:
-/// <c>Open</c> (a aguardar decisão), <c>Approved</c> (aprovado por
-/// humano), <c>Excluded</c> (excluído por humano). O fingerprint
+/// consegue decidir automaticamente (ex.: "PT: SPORT TV NBA"). Estados
+/// (W5.4, DL-105/DL-119): <c>Open</c> (a aguardar decisão),
+/// <c>InReview</c> (tratamento administrativo iniciado),
+/// <c>Resolved</c> (resolvido — mapeia o legacy <c>Approved</c>) e
+/// <c>Ignored</c> (ignorado — mapeia o legacy <c>Excluded</c>). O fingerprint
 /// é determinístico e baseado em
 /// <c>(normalizedIdentity, sourceGroup, reasonSignature)</c> para
 /// evitar duplicados.
@@ -398,11 +400,24 @@ public sealed class ReviewItemEntity
     public DateTime? ResolvedAtUtc { get; set; }
 }
 
+/// <summary>
+/// W5.4 — Estados do lifecycle de <see cref="ReviewItemEntity"/>
+/// (<c>33-STATE-MACHINES.md §ReviewItem</c>, DL-105/DL-119).
+///
+/// <para>
+/// Os valores persistidos preservam os dados legados: <c>Resolved</c> ocupa o
+/// valor do antigo <c>Approved</c> (1) e <c>Ignored</c> o do antigo
+/// <c>Excluded</c> (2); <c>InReview</c> é um valor novo (3). A coluna é
+/// persistida como <c>int</c>, pelo que o mapeamento não exige migration de
+/// dados.
+/// </para>
+/// </summary>
 public enum ReviewItemState
 {
     Open = 0,
-    Approved = 1,
-    Excluded = 2,
+    Resolved = 1,
+    Ignored = 2,
+    InReview = 3,
 }
 
 /// <summary>

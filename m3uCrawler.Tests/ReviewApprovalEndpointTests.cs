@@ -189,7 +189,7 @@ public class ReviewApprovalEndpointTests : IAsyncLifetime
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         using (var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync()))
         {
-            Assert.Equal("Approved", doc.RootElement.GetProperty("state").GetString());
+            Assert.Equal("Resolved", doc.RootElement.GetProperty("state").GetString());
             Assert.Equal("add-alias", doc.RootElement.GetProperty("action").GetString());
             Assert.True(doc.RootElement.GetProperty("catalogueChanged").GetBoolean());
             Assert.Equal(channel.Id, doc.RootElement.GetProperty("canonicalChannelId").GetInt64());
@@ -205,7 +205,7 @@ public class ReviewApprovalEndpointTests : IAsyncLifetime
             Assert.Equal(ChannelNormalizer.Normalize("reviewaliasobs"), alias.NormalizedAlias);
 
             var item = await ctx.ReviewItems.SingleAsync(r => r.Fingerprint == review.Fingerprint);
-            Assert.Equal(ReviewItemState.Approved, item.State);
+            Assert.Equal(ReviewItemState.Resolved, item.State);
             Assert.Equal(channel.Id, item.ApprovedCanonicalChannelId);
             Assert.NotNull(item.ResolvedAtUtc);
         }
@@ -249,7 +249,7 @@ public class ReviewApprovalEndpointTests : IAsyncLifetime
         long createdId;
         using (var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync()))
         {
-            Assert.Equal("Approved", doc.RootElement.GetProperty("state").GetString());
+            Assert.Equal("Resolved", doc.RootElement.GetProperty("state").GetString());
             Assert.Equal("create-channel", doc.RootElement.GetProperty("action").GetString());
             Assert.True(doc.RootElement.GetProperty("catalogueChanged").GetBoolean());
             createdId = doc.RootElement.GetProperty("canonicalChannelId").GetInt64();
@@ -266,7 +266,7 @@ public class ReviewApprovalEndpointTests : IAsyncLifetime
                 && a.NormalizedAlias == ChannelNormalizer.Normalize("reviewcreateobs")));
 
             var item = await ctx.ReviewItems.SingleAsync(r => r.Fingerprint == review.Fingerprint);
-            Assert.Equal(ReviewItemState.Approved, item.State);
+            Assert.Equal(ReviewItemState.Resolved, item.State);
             Assert.Equal(channel.Id, item.ApprovedCanonicalChannelId);
         }
 
@@ -306,7 +306,7 @@ public class ReviewApprovalEndpointTests : IAsyncLifetime
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         using (var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync()))
         {
-            Assert.Equal("Excluded", doc.RootElement.GetProperty("state").GetString());
+            Assert.Equal("Ignored", doc.RootElement.GetProperty("state").GetString());
             Assert.Equal("exclude", doc.RootElement.GetProperty("action").GetString());
             Assert.False(doc.RootElement.GetProperty("catalogueChanged").GetBoolean());
         }
@@ -317,7 +317,7 @@ public class ReviewApprovalEndpointTests : IAsyncLifetime
             Assert.Equal(aliasesBefore, await ctx.ChannelAliases.CountAsync());
 
             var item = await ctx.ReviewItems.SingleAsync(r => r.Fingerprint == review.Fingerprint);
-            Assert.Equal(ReviewItemState.Excluded, item.State);
+            Assert.Equal(ReviewItemState.Ignored, item.State);
             Assert.Null(item.ApprovedCanonicalChannelId);
             Assert.Equal("conteúdo indesejado", item.Note);
             Assert.NotNull(item.ResolvedAtUtc);
@@ -459,7 +459,7 @@ public class ReviewApprovalEndpointTests : IAsyncLifetime
 
         await using var ctx = _factory.CreateDbContext();
         var item = await ctx.ReviewItems.SingleAsync(r => r.Fingerprint == review.Fingerprint);
-        Assert.Equal(ReviewItemState.Approved, item.State);
+        Assert.Equal(ReviewItemState.Resolved, item.State);
         Assert.Equal(channelA.Id, item.ApprovedCanonicalChannelId);
         Assert.Equal(1, await ctx.ChannelAliases.CountAsync(a => a.CanonicalChannelId == channelA.Id));
         Assert.Equal(0, await ctx.ChannelAliases.CountAsync(a => a.CanonicalChannelId == channelB.Id));
@@ -486,7 +486,7 @@ public class ReviewApprovalEndpointTests : IAsyncLifetime
         Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
 
         await using var ctx = _factory.CreateDbContext();
-        Assert.Equal(ReviewItemState.Approved,
+        Assert.Equal(ReviewItemState.Resolved,
             (await ctx.ReviewItems.SingleAsync(r => r.Fingerprint == review.Fingerprint)).State);
     }
 
@@ -512,7 +512,7 @@ public class ReviewApprovalEndpointTests : IAsyncLifetime
 
             observed = await _resolver.UpsertReviewItemAsync("reviewnotreopenedobs", "grp", "sig", "nova evidência");
 
-            Assert.Equal(ReviewItemState.Approved, observed.State);
+            Assert.Equal(ReviewItemState.Resolved, observed.State);
             Assert.Equal(resolvedAt, observed.ResolvedAtUtc);
         }
 

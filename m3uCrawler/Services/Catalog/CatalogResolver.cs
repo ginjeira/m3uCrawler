@@ -4,6 +4,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.EntityFrameworkCore;
+using m3uCrawler.Services.Audit;
 using m3uCrawler.Services.Matching;
 using m3uCrawler.Services.Recognition;
 using m3uCrawler.Services.Validation;
@@ -27,11 +28,21 @@ public sealed class CatalogResolver
 {
     private readonly IDbContextFactory<ChannelCatalogDbContext> _factory;
     private readonly string _dbPath;
+    private readonly IAuditService? _audit;
 
-    public CatalogResolver(IDbContextFactory<ChannelCatalogDbContext> factory, string dbPath)
+    /// <summary>
+    /// Construtor de compatibilidade. <paramref name="audit"/> é opcional
+    /// (W5.4): quando fornecido, as operações de lifecycle de Review registam
+    /// auditoria; sem ele, o comportamento mantém-se o anterior.
+    /// </summary>
+    public CatalogResolver(
+        IDbContextFactory<ChannelCatalogDbContext> factory,
+        string dbPath,
+        IAuditService? audit = null)
     {
         _factory = factory;
         _dbPath = dbPath;
+        _audit = audit;
     }
 
     /// <summary>
@@ -299,15 +310,76 @@ public sealed class CatalogResolver
             }
         }
 
-        // 6. Fuzzy — opt-in. W5.2 NÃO executa o passo fuzzy e não
-        //    consulta o FuzzyMatcher. Sem policy explícita com
-        //    FuzzyEnabled=true, o passo não corre. Threshold/weights são
-        //    PARAMETER_GAP e não são inventados aqui.
+        // 6. Fuzzy — opt-in (W5.3; contrato 48 F1–F14). Só corre quando a
+        //    policy tem FuzzyEnabled=true e um threshold válido (0..100);
+        //    caso contrário é fail-closed e cai para Unknown com diagnóstico
+        //    de configuração. Universo: todos os canais activos + aliases
+        //    (F11). Nunca cria identidade nem ReviewItem (F14).
         if (policy?.FuzzyEnabled == true)
         {
-            // Placeholder deliberado: a implementação fuzzy pertence a
-            // W5.3 e exige thresholds/desempate definidos pela policy.
-            // Nunca chamar FuzzyMatcher neste caminho nesta wave.
+            // Aliases normalizados dos canais activos (F11). Carregados
+            // apenas quando o passo fuzzy corre, para não onerar os passos
+            // exactos quando o fuzzy está desligado.
+            var aliasRows = await context.ChannelAliases
+                .AsNoTracking()
+                .Where(a => a.CanonicalChannel!.IsEnabled)
+                .Select(a => new { a.CanonicalChannelId, a.NormalizedAlias })
+                .ToListAsync(cancellationToken);
+
+            var aliasesByChannel = aliasRows
+                .GroupBy(a => a.CanonicalChannelId)
+                .ToDictionary(
+                    g => g.Key,
+                    g => (IReadOnlyList<string>)g.Select(a => a.NormalizedAlias).ToList());
+
+            var fuzzyCandidates = enabledChannels
+                .Select(c => new FuzzyCandidate(
+                    c.Id,
+                    c.Key,
+                    c.DisplayName,
+                    aliasesByChannel.TryGetValue(c.Id, out var aliases)
+                        ? aliases
+                        : Array.Empty<string>()))
+                .ToList();
+
+            var fuzzy = FuzzyRecognitionEvaluator.Evaluate(normalizedIdentity, fuzzyCandidates, policy);
+
+            switch (fuzzy.Kind)
+            {
+                case FuzzyDecisionKind.Canonical when fuzzy.CanonicalChannelId is long fuzzyId:
+                {
+                    var fuzzyChannel = await context.CanonicalChannels
+                        .AsNoTracking()
+                        .FirstOrDefaultAsync(c => c.Id == fuzzyId, cancellationToken);
+                    if (fuzzyChannel != null)
+                    {
+                        return Stamp(CatalogResolution.FromCanonical(
+                            fuzzyChannel, RecognitionMatchMethods.Fuzzy) with
+                        {
+                            FuzzyScore = fuzzy.Score,
+                            FuzzyDiagnostic = fuzzy.Diagnostic,
+                        });
+                    }
+
+                    break;
+                }
+
+                case FuzzyDecisionKind.Ambiguous:
+                    return Stamp(CatalogResolution.Ambiguous(
+                        fuzzy.Diagnostic?.DecisionReason ?? FuzzyDecisionReasons.Ambiguous) with
+                    {
+                        FuzzyDiagnostic = fuzzy.Diagnostic,
+                    });
+
+                default:
+                    // Unknown (sem candidato) ou NotExecuted (fail-closed):
+                    // comportamento observável idêntico a fuzzy off, mas com
+                    // diagnóstico técnico quando aplicável.
+                    return Stamp(CatalogResolution.Unknown() with
+                    {
+                        FuzzyDiagnostic = fuzzy.Diagnostic,
+                    });
+            }
         }
 
         // 7. Unknown (sem canal canónico).
@@ -405,12 +477,12 @@ public sealed class CatalogResolver
     ///
     /// <para>
     /// <b>Decisão humana não é revertida.</b> Se o item já estiver
-    /// <see cref="ReviewItemState.Approved"/> ou
-    /// <see cref="ReviewItemState.Excluded"/>, uma nova observação
+    /// <see cref="ReviewItemState.Resolved"/> ou
+    /// <see cref="ReviewItemState.Ignored"/>, uma nova observação
     /// apenas actualiza <c>UpdatedAtUtc</c> (nova evidência); o
     /// estado decidido, o <c>ResolvedAtUtc</c>, a nota e o canal
-    /// aprovado permanecem intactos. Só um item <c>Open</c> é
-    /// devolvido tal como está.
+    /// resolvido permanecem intactos. Um item <c>Open</c> ou
+    /// <c>InReview</c> é devolvido tal como está.
     /// </para>
     /// </summary>
     public async Task<ReviewItemEntity> UpsertReviewItemAsync(
@@ -432,11 +504,11 @@ public sealed class CatalogResolver
             .FirstOrDefaultAsync(r => r.Fingerprint == fingerprint, cancellationToken);
         if (existing != null)
         {
-            if (existing.State == ReviewItemState.Open)
+            if (existing.State is ReviewItemState.Open or ReviewItemState.InReview)
             {
                 return existing;
             }
-            // Aprovado/excluído: uma decisão humana NÃO é revertida
+            // Resolved/Ignored: uma decisão humana NÃO é revertida
             // silenciosamente por uma nova observação. Registamos a
             // nova evidência actualizando o timestamp, sem resetar o
             // estado nem apagar a nota/decisão.
@@ -995,9 +1067,221 @@ public sealed class CatalogResolver
         return true;
     }
 
+    // ────────────────────────────────────────────────────────────────
+    // W5.4 — Lifecycle de Review (DL-105/DL-119; 33-STATE-MACHINES.md).
+    // Operações administrativas auditadas. O motor puro de transições
+    // vive em ReviewLifecycle; aqui aplica-se persistência + auditoria.
+    // ────────────────────────────────────────────────────────────────
+
     /// <summary>
-    /// Approva um item de revisão (ReviewItemState.Approved) e
-    /// opcionalmente regista o canal canónico aprovado.
+    /// <c>Open → InReview</c>. Idempotente se já estiver <c>InReview</c>.
+    /// </summary>
+    public Task<ReviewLifecycleResult?> BeginReviewAsync(
+        string fingerprint,
+        AuditActor? actor = null,
+        CancellationToken cancellationToken = default)
+        => ApplyLifecycleTransitionAsync(
+            fingerprint,
+            target: ReviewItemState.InReview,
+            operation: "catalog.review.begin",
+            note: null,
+            auditDetail: null,
+            setApprovedChannel: false,
+            approvedCanonicalChannelId: null,
+            clearApprovedChannel: false,
+            actor: actor,
+            cancellationToken: cancellationToken);
+
+    /// <summary>
+    /// <c>InReview → Resolved</c>. Requer que o item esteja em tratamento
+    /// (<c>InReview</c>); nunca cria identidade nem catálogo.
+    /// </summary>
+    public Task<ReviewLifecycleResult?> ResolveReviewAsync(
+        string fingerprint,
+        long? approvedCanonicalChannelId = null,
+        string? note = null,
+        AuditActor? actor = null,
+        CancellationToken cancellationToken = default)
+        => ApplyLifecycleTransitionAsync(
+            fingerprint,
+            target: ReviewItemState.Resolved,
+            operation: "catalog.review.resolve",
+            note: note,
+            auditDetail: note,
+            setApprovedChannel: true,
+            approvedCanonicalChannelId: approvedCanonicalChannelId,
+            clearApprovedChannel: false,
+            actor: actor,
+            cancellationToken: cancellationToken);
+
+    /// <summary>
+    /// <c>Open → Ignored</c> / <c>InReview → Ignored</c>. O motivo é
+    /// obrigatório (não vazio). Idempotente se já estiver <c>Ignored</c>.
+    /// </summary>
+    public Task<ReviewLifecycleResult?> IgnoreReviewAsync(
+        string fingerprint,
+        string reason,
+        AuditActor? actor = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(reason))
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.InvalidInput,
+                "Motivo é obrigatório para ignorar um item de revisão.");
+        }
+
+        return ApplyLifecycleTransitionAsync(
+            fingerprint,
+            target: ReviewItemState.Ignored,
+            operation: "catalog.review.ignore",
+            note: reason.Trim(),
+            auditDetail: reason.Trim(),
+            setApprovedChannel: false,
+            approvedCanonicalChannelId: null,
+            clearApprovedChannel: true,
+            actor: actor,
+            cancellationToken: cancellationToken);
+    }
+
+    /// <summary>
+    /// <c>Resolved → Open</c> / <c>Ignored → Open</c> (reabertura manual
+    /// auditada). A justificação é obrigatória (não vazia). A deteção
+    /// automática de evidência materialmente incompatível está fora desta
+    /// wave (DL-119).
+    /// </summary>
+    public Task<ReviewLifecycleResult?> ReopenReviewAsync(
+        string fingerprint,
+        string justification,
+        AuditActor? actor = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(justification))
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.InvalidInput,
+                "Justificação é obrigatória para reabrir um item de revisão.");
+        }
+
+        return ApplyLifecycleTransitionAsync(
+            fingerprint,
+            target: ReviewItemState.Open,
+            operation: "catalog.review.reopen",
+            note: null,
+            auditDetail: justification.Trim(),
+            setApprovedChannel: false,
+            approvedCanonicalChannelId: null,
+            clearApprovedChannel: true,
+            actor: actor,
+            cancellationToken: cancellationToken);
+    }
+
+    private async Task<ReviewLifecycleResult?> ApplyLifecycleTransitionAsync(
+        string fingerprint,
+        ReviewItemState target,
+        string operation,
+        string? note,
+        string? auditDetail,
+        bool setApprovedChannel,
+        long? approvedCanonicalChannelId,
+        bool clearApprovedChannel,
+        AuditActor? actor,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(fingerprint))
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.InvalidInput,
+                "Fingerprint é obrigatório.");
+        }
+
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var item = await context.ReviewItems
+            .FirstOrDefaultAsync(r => r.Fingerprint == fingerprint, cancellationToken);
+        if (item == null) return null;
+
+        var prior = item.State;
+        if (prior == target)
+        {
+            // Reexecução idempotente: já está no estado pretendido.
+            return new ReviewLifecycleResult(item, prior, Changed: false, operation);
+        }
+
+        if (!ReviewLifecycle.CanTransition(prior, target))
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.ReviewConflict,
+                $"Transição de Review inválida: {prior} → {target}.");
+        }
+
+        var now = DateTime.UtcNow;
+        item.State = target;
+        item.UpdatedAtUtc = now;
+
+        if (ReviewLifecycle.IsTerminal(target))
+        {
+            item.ResolvedAtUtc = now;
+        }
+        else if (target == ReviewItemState.Open)
+        {
+            item.ResolvedAtUtc = null;
+        }
+
+        if (setApprovedChannel)
+        {
+            item.ApprovedCanonicalChannelId = approvedCanonicalChannelId;
+        }
+        if (clearApprovedChannel)
+        {
+            item.ApprovedCanonicalChannelId = null;
+        }
+        if (note != null)
+        {
+            item.Note = TruncateReviewNote(note);
+        }
+
+        await context.SaveChangesAsync(cancellationToken);
+        await RecordReviewAuditAsync(operation, fingerprint, prior, target, auditDetail, actor, cancellationToken);
+
+        return new ReviewLifecycleResult(item, prior, Changed: true, operation);
+    }
+
+    private async Task RecordReviewAuditAsync(
+        string operation,
+        string fingerprint,
+        ReviewItemState? before,
+        ReviewItemState? after,
+        string? detail,
+        AuditActor? actor,
+        CancellationToken cancellationToken)
+    {
+        if (_audit is null) return;
+
+        await _audit.RecordAsync(
+            new AuditRecord
+            {
+                // Actor de sistema com nome estável quando o chamador não
+                // fornece um actor humano (W5.5 injectará o actor da sessão).
+                Actor = actor ?? AuditActor.System("catalog-review"),
+                Operation = operation,
+                ObjectType = "review-item",
+                ObjectId = fingerprint,
+                Before = before is null ? null : new { state = before.Value.ToString() },
+                After = after is null ? null : new { state = after.Value.ToString() },
+                Detail = detail,
+            },
+            cancellationToken);
+    }
+
+    private static string TruncateReviewNote(string note)
+        => note.Length > 500 ? note.Substring(0, 500) : note;
+
+    /// <summary>
+    /// Compatibilidade (W5.4): o antigo <c>Approve</c> passa a terminar em
+    /// <see cref="ReviewItemState.Resolved"/>. Um item <c>Open</c> percorre
+    /// <c>Open → InReview → Resolved</c> (nunca um salto directo), preservando
+    /// o resultado observável da API existente. A auditoria desta via é feita
+    /// pelo chamador HTTP (W5.5).
     /// </summary>
     public async Task<ReviewItemEntity?> ApproveReviewAsync(
         string fingerprint,
@@ -1009,16 +1293,32 @@ public sealed class CatalogResolver
             .FirstOrDefaultAsync(r => r.Fingerprint == fingerprint, cancellationToken);
         if (item == null) return null;
 
-        item.State = ReviewItemState.Approved;
-        item.ResolvedAtUtc = DateTime.UtcNow;
-        item.UpdatedAtUtc = DateTime.UtcNow;
-        item.ApprovedCanonicalChannelId = approvedCanonicalChannelId;
+        if (item.State == ReviewItemState.Resolved)
+        {
+            if (item.ApprovedCanonicalChannelId == approvedCanonicalChannelId)
+            {
+                return item; // idempotente
+            }
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.ReviewConflict,
+                "O item de revisão já foi resolvido com outro canal canónico.");
+        }
+        if (item.State == ReviewItemState.Ignored)
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.ReviewConflict,
+                "O item de revisão já foi ignorado; uma decisão fechada não é reaberta.");
+        }
+
+        ApplyLegacyResolveTransition(item, approvedCanonicalChannelId, DateTime.UtcNow);
         await context.SaveChangesAsync(cancellationToken);
         return item;
     }
 
     /// <summary>
-    /// Exclui um item de revisão (ReviewItemState.Excluded).
+    /// Compatibilidade (W5.4): o antigo <c>Exclude</c> passa a terminar em
+    /// <see cref="ReviewItemState.Ignored"/>. Usa o motivo administrativo
+    /// por defeito (não vazio). Auditoria pelo chamador HTTP (W5.5).
     /// </summary>
     public async Task<ReviewItemEntity?> ExcludeReviewAsync(
         string fingerprint,
@@ -1029,11 +1329,56 @@ public sealed class CatalogResolver
             .FirstOrDefaultAsync(r => r.Fingerprint == fingerprint, cancellationToken);
         if (item == null) return null;
 
-        item.State = ReviewItemState.Excluded;
-        item.ResolvedAtUtc = DateTime.UtcNow;
-        item.UpdatedAtUtc = DateTime.UtcNow;
+        if (item.State == ReviewItemState.Ignored)
+        {
+            return item; // idempotente
+        }
+        if (item.State == ReviewItemState.Resolved)
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.ReviewConflict,
+                "O item de revisão já foi resolvido; uma decisão fechada não é reaberta.");
+        }
+
+        ApplyIgnoreTransition(item, DefaultExclusionReason, DateTime.UtcNow);
         await context.SaveChangesAsync(cancellationToken);
         return item;
+    }
+
+    /// <summary>
+    /// Aplica o caminho de aprovação legacy composto por transições válidas:
+    /// <c>Open → InReview → Resolved</c> ou <c>InReview → Resolved</c>.
+    /// </summary>
+    private static void ApplyLegacyResolveTransition(
+        ReviewItemEntity item, long? approvedCanonicalChannelId, DateTime now)
+    {
+        if (item.State == ReviewItemState.Resolved)
+        {
+            // Reexecução idempotente da aprovação.
+            item.UpdatedAtUtc = now;
+            item.ApprovedCanonicalChannelId = approvedCanonicalChannelId;
+            return;
+        }
+        if (item.State == ReviewItemState.Open)
+        {
+            ReviewLifecycle.EnsureTransition(ReviewItemState.Open, ReviewItemState.InReview);
+            item.State = ReviewItemState.InReview;
+        }
+        ReviewLifecycle.EnsureTransition(item.State, ReviewItemState.Resolved);
+        item.State = ReviewItemState.Resolved;
+        item.ResolvedAtUtc = now;
+        item.UpdatedAtUtc = now;
+        item.ApprovedCanonicalChannelId = approvedCanonicalChannelId;
+    }
+
+    private static void ApplyIgnoreTransition(ReviewItemEntity item, string reason, DateTime now)
+    {
+        ReviewLifecycle.EnsureTransition(item.State, ReviewItemState.Ignored);
+        item.State = ReviewItemState.Ignored;
+        item.ResolvedAtUtc = now;
+        item.UpdatedAtUtc = now;
+        item.ApprovedCanonicalChannelId = null;
+        item.Note = TruncateReviewNote(reason);
     }
 
     private const string DefaultExclusionReason = "excluído por decisão administrativa";
@@ -1160,7 +1505,7 @@ public sealed class CatalogResolver
             catalogueChanged = true;
         }
 
-        ResolveReview(item, ReviewItemState.Approved, channel.Id, now);
+        ApplyLegacyResolveTransition(item, channel.Id, now);
         await SaveReviewApprovalAsync(context, alias, cancellationToken);
 
         return new ReviewApprovalResult(
@@ -1194,7 +1539,7 @@ public sealed class CatalogResolver
         CanonicalChannelEntity channel;
         var channelCreated = false;
 
-        if (item.State == ReviewItemState.Approved)
+        if (item.State == ReviewItemState.Resolved)
         {
             var approved = item.ApprovedCanonicalChannelId.HasValue
                 ? await context.CanonicalChannels.FirstOrDefaultAsync(
@@ -1204,15 +1549,15 @@ public sealed class CatalogResolver
             {
                 throw new ChannelAdministrationException(
                     ChannelAdministrationError.ReviewConflict,
-                    "O item de revisão já foi aprovado com outra mudança de catálogo.");
+                    "O item de revisão já foi resolvido com outra mudança de catálogo.");
             }
             channel = approved;
         }
-        else if (item.State == ReviewItemState.Excluded)
+        else if (item.State == ReviewItemState.Ignored)
         {
             throw new ChannelAdministrationException(
                 ChannelAdministrationError.ReviewConflict,
-                "O item de revisão já foi excluído; uma decisão resolvida não é reaberta.");
+                "O item de revisão já foi ignorado; uma decisão fechada não é reaberta.");
         }
         else
         {
@@ -1272,7 +1617,7 @@ public sealed class CatalogResolver
             aliasCreated = true;
         }
 
-        ResolveReview(item, ReviewItemState.Approved, channel.Id, now);
+        ApplyLegacyResolveTransition(item, channel.Id, now);
         await SaveReviewApprovalAsync(context, alias, cancellationToken);
 
         var changed = channelCreated || aliasCreated;
@@ -1295,27 +1640,21 @@ public sealed class CatalogResolver
         var priorState = item.State;
         var priorApprovedId = item.ApprovedCanonicalChannelId;
 
-        if (item.State == ReviewItemState.Approved)
+        if (item.State == ReviewItemState.Resolved)
         {
             throw new ChannelAdministrationException(
                 ChannelAdministrationError.ReviewConflict,
-                "O item de revisão já foi aprovado; uma decisão resolvida não é reaberta.");
+                "O item de revisão já foi resolvido; uma decisão fechada não é reaberta.");
         }
 
-        if (item.State == ReviewItemState.Excluded)
+        if (item.State == ReviewItemState.Ignored)
         {
             return new ReviewApprovalResult(
                 item, priorState, priorApprovedId, null, null,
                 Idempotent: true, CatalogueChanged: false, Action: "exclude");
         }
 
-        var now = DateTime.UtcNow;
-        item.State = ReviewItemState.Excluded;
-        item.ResolvedAtUtc = now;
-        item.UpdatedAtUtc = now;
-        item.ApprovedCanonicalChannelId = null;
-        // A razão da decisão é persistida (a Nota tem limite de 500).
-        item.Note = reason.Length > 500 ? reason.Substring(0, 500) : reason;
+        ApplyIgnoreTransition(item, reason, DateTime.UtcNow);
         await context.SaveChangesAsync(cancellationToken);
 
         return new ReviewApprovalResult(
@@ -1325,32 +1664,20 @@ public sealed class CatalogResolver
 
     private static void EnsureOpenOrSameApproval(ReviewItemEntity item, long channelId)
     {
-        if (item.State == ReviewItemState.Excluded)
+        if (item.State == ReviewItemState.Ignored)
         {
             throw new ChannelAdministrationException(
                 ChannelAdministrationError.ReviewConflict,
-                "O item de revisão já foi excluído; uma decisão resolvida não é reaberta.");
+                "O item de revisão já foi ignorado; uma decisão fechada não é reaberta.");
         }
-        if (item.State == ReviewItemState.Approved
+        if (item.State == ReviewItemState.Resolved
             && item.ApprovedCanonicalChannelId.HasValue
             && item.ApprovedCanonicalChannelId.Value != channelId)
         {
             throw new ChannelAdministrationException(
                 ChannelAdministrationError.ReviewConflict,
-                "O item de revisão já foi aprovado com outro canal canónico.");
+                "O item de revisão já foi resolvido com outro canal canónico.");
         }
-    }
-
-    private static void ResolveReview(
-        ReviewItemEntity item, ReviewItemState state, long? channelId, DateTime now)
-    {
-        if (item.State == ReviewItemState.Open)
-        {
-            item.State = state;
-            item.ResolvedAtUtc = now;
-        }
-        item.UpdatedAtUtc = now;
-        item.ApprovedCanonicalChannelId = channelId;
     }
 
     private static string NormalizeReviewAlias(string? explicitAlias, string observed)
@@ -1957,8 +2284,9 @@ public sealed class CatalogResolver
             DispatcharrChannelOwnerships = await context.DispatcharrChannelOwnerships.AsNoTracking().CountAsync(cancellationToken),
             DispatcharrStreamOwnerships = await context.DispatcharrStreamOwnerships.AsNoTracking().CountAsync(cancellationToken),
             ReviewItemsOpen = await context.ReviewItems.AsNoTracking().CountAsync(r => r.State == ReviewItemState.Open, cancellationToken),
-            ReviewItemsApproved = await context.ReviewItems.AsNoTracking().CountAsync(r => r.State == ReviewItemState.Approved, cancellationToken),
-            ReviewItemsExcluded = await context.ReviewItems.AsNoTracking().CountAsync(r => r.State == ReviewItemState.Excluded, cancellationToken),
+            ReviewItemsInReview = await context.ReviewItems.AsNoTracking().CountAsync(r => r.State == ReviewItemState.InReview, cancellationToken),
+            ReviewItemsResolved = await context.ReviewItems.AsNoTracking().CountAsync(r => r.State == ReviewItemState.Resolved, cancellationToken),
+            ReviewItemsIgnored = await context.ReviewItems.AsNoTracking().CountAsync(r => r.State == ReviewItemState.Ignored, cancellationToken),
             SyncRuns = await context.SyncRuns.AsNoTracking().CountAsync(cancellationToken),
             PendingCountryApprovals = await context.PendingCountryApprovals.AsNoTracking().CountAsync(cancellationToken),
             PendingCountryApprovalsOpen = await context.PendingCountryApprovals.AsNoTracking().CountAsync(r => r.State == PendingApprovalState.Open, cancellationToken),
@@ -4018,8 +4346,9 @@ public sealed class CatalogStats
     public int DispatcharrChannelOwnerships { get; set; }
     public int DispatcharrStreamOwnerships { get; set; }
     public int ReviewItemsOpen { get; set; }
-    public int ReviewItemsApproved { get; set; }
-    public int ReviewItemsExcluded { get; set; }
+    public int ReviewItemsInReview { get; set; }
+    public int ReviewItemsResolved { get; set; }
+    public int ReviewItemsIgnored { get; set; }
     public int SyncRuns { get; set; }
     public int PendingCountryApprovals { get; set; }
     public int PendingCountryApprovalsOpen { get; set; }
@@ -4063,6 +4392,20 @@ public readonly record struct CatalogResolution(
     /// policy explícita. Registo, não autoridade.
     /// </summary>
     public int? PolicyVersion { get; init; }
+
+    /// <summary>
+    /// W5.3 — Score técnico do passo fuzzy (<c>0..100</c>), preenchido quando
+    /// o método efectivo é <see cref="RecognitionMatchMethods.Fuzzy"/>. Não é
+    /// <c>MatchConfidence</c> (domínio <c>0..1</c>, W5.6).
+    /// </summary>
+    public int? FuzzyScore { get; init; }
+
+    /// <summary>
+    /// W5.3 — Diagnóstico técnico do passo fuzzy (candidatos, scores e motivo
+    /// de decisão) para consumo por W5.4. É evidência, não autoridade: não
+    /// altera a decisão nem cria Review.
+    /// </summary>
+    public FuzzyRecognitionDiagnostic? FuzzyDiagnostic { get; init; }
 
     /// <summary>
     /// Resultado P6 de Recognition (W5.2) derivado do caminho:

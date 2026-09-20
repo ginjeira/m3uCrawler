@@ -5549,8 +5549,9 @@ const rows = Object.entries(inv).map(([k, v]) => {
       cards.push(metricCard('Aliases', nfmt(stats.channelAliases || 0), '', 'Aliases normalizados activos.'));
       cards.push(metricCard('Regras', nfmt(stats.identityRules || 0), '', 'Regras de identidade explícitas.'));
       cards.push(metricCard('Reviews (Open)', nfmt(stats.reviewItemsOpen || 0), `<span class='badge warn'>${nfmt(stats.reviewItemsOpen || 0)}</span>`, 'Aguardam decisão humana.'));
-      cards.push(metricCard('Reviews (Approved)', nfmt(stats.reviewItemsApproved || 0), '', ''));
-      cards.push(metricCard('Reviews (Excluded)', nfmt(stats.reviewItemsExcluded || 0), '', ''));
+      cards.push(metricCard('Reviews (In review)', nfmt(stats.reviewItemsInReview || 0), '', ''));
+      cards.push(metricCard('Reviews (Resolved)', nfmt(stats.reviewItemsResolved || 0), '', ''));
+      cards.push(metricCard('Reviews (Ignored)', nfmt(stats.reviewItemsIgnored || 0), '', ''));
       cards.push(metricCard('Ownership canais', nfmt(stats.dispatcharrChannelOwnerships || 0), '', 'Canais do Dispatcharr registados.'));
       cards.push(metricCard('Ownership streams', nfmt(stats.dispatcharrStreamOwnerships || 0), '', 'Streams do Dispatcharr registadas.'));
       cards.push(metricCard('Sync runs', nfmt(stats.syncRuns || 0), '', 'Execuções de sync gravadas.'));
@@ -6007,8 +6008,9 @@ const rows = Object.entries(inv).map(([k, v]) => {
       if (!reviews.length) { document.getElementById('catalogReviewsTable').innerHTML = '<p class="muted">Nenhum item de revisão.</p>'; return; }
       const rows = reviews.map(r => {
         const stateBadge = r.state === 'Open' ? '<span class="badge warn">Open</span>'
-          : r.state === 'Approved' ? '<span class="badge ok">Approved</span>'
-          : '<span class="badge err">Excluded</span>';
+          : r.state === 'InReview' ? '<span class="badge warn">InReview</span>'
+          : r.state === 'Resolved' ? '<span class="badge ok">Resolved</span>'
+          : '<span class="badge err">Ignored</span>';
         const actions = r.state === 'Open'
           ? `<button style='padding:4px 8px;' onclick='approveReview("${r.fingerprint.replace(/"/g, '\\"')}","${(r.normalizedIdentity || '').replace(/"/g, '\\"')}")'>Approve</button>
              <button class='secondary' style='padding:4px 8px;' onclick='excludeReview("${r.fingerprint.replace(/"/g, '\\"')}")'>Exclude</button>`

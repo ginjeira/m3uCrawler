@@ -369,7 +369,7 @@ public sealed class PipelineIngestionService
                         ? "excluded-via-pipeline"
                         : "review-only-via-pipeline"),
                 CatalogResolutionKind.Ambiguous =>
-                    (CatalogResolutionKind.Unknown, "ambiguous-external-identity"),
+                    (CatalogResolutionKind.Unknown, AmbiguousReasonSignature(resolution)),
                 _ => (CatalogResolutionKind.Unknown, "unknown-via-pipeline"),
             };
 
@@ -410,6 +410,21 @@ public sealed class PipelineIngestionService
             // compatibilidade e sempre 0.
             AutoCreatedCount: 0,
             Entries: entries);
+    }
+
+    /// <summary>
+    /// W5.4 — Uma ambiguidade de Recognition que traz diagnóstico fuzzy de
+    /// W5.3 preserva o motivo técnico (<c>fuzzy-ambiguous</c> /
+    /// <c>fuzzy-below-threshold</c>) como <c>reasonSignature</c> do
+    /// <see cref="ReviewItemEntity"/>; as restantes ambiguidades mantêm o
+    /// motivo histórico. Não altera o motor fuzzy nem cria identidade.
+    /// </summary>
+    internal static string AmbiguousReasonSignature(CatalogResolution resolution)
+    {
+        var fuzzyReason = resolution.FuzzyDiagnostic?.DecisionReason;
+        return string.IsNullOrWhiteSpace(fuzzyReason)
+            ? "ambiguous-external-identity"
+            : fuzzyReason!;
     }
 
     private static SourceKind ParseKind(string name) => name?.Trim().ToLowerInvariant() switch

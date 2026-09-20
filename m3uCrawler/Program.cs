@@ -1566,7 +1566,8 @@ namespace m3uCrawler
             await using var context = await bootstrapper.InitializeAsync(ct);
             await context.DisposeAsync();
             var factory = new RuntimeChannelCatalogDbContextFactory(dbPath);
-            return new CatalogResolver(factory, dbPath);
+            // W5.4 — lifecycle de Review auditado na camada de serviço.
+            return new CatalogResolver(factory, dbPath, new AuditService(factory));
         }
 
         /// <summary>

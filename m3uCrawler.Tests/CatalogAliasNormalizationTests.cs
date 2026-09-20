@@ -305,7 +305,7 @@ public class CatalogAliasNormalizationTests : IAsyncLifetime
     // ════════════════════════════════════════════════════════════════
 
     [Fact]
-    public async Task UpsertReviewItem_does_not_reopen_approved_decision()
+    public async Task UpsertReviewItem_does_not_reopen_resolved_decision()
     {
         var open = await _resolver.UpsertReviewItemAsync(
             "review-approved-subject", "grp", "sig", "initial note");
@@ -318,7 +318,7 @@ public class CatalogAliasNormalizationTests : IAsyncLifetime
         var observed = await _resolver.UpsertReviewItemAsync(
             "review-approved-subject", "grp", "sig", "new evidence");
 
-        Assert.Equal(ReviewItemState.Approved, observed.State);
+        Assert.Equal(ReviewItemState.Resolved, observed.State);
         Assert.Equal(open.Fingerprint, observed.Fingerprint);
         Assert.Equal(resolvedAt, observed.ResolvedAtUtc);
         Assert.Equal("initial note", observed.Note);
@@ -329,7 +329,7 @@ public class CatalogAliasNormalizationTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task UpsertReviewItem_does_not_reopen_excluded_decision()
+    public async Task UpsertReviewItem_does_not_reopen_ignored_decision()
     {
         var open = await _resolver.UpsertReviewItemAsync(
             "review-excluded-subject", "grp", "sig", "n");
@@ -338,7 +338,7 @@ public class CatalogAliasNormalizationTests : IAsyncLifetime
         var observed = await _resolver.UpsertReviewItemAsync(
             "review-excluded-subject", "grp", "sig", "again");
 
-        Assert.Equal(ReviewItemState.Excluded, observed.State);
+        Assert.Equal(ReviewItemState.Ignored, observed.State);
         Assert.NotNull(observed.ResolvedAtUtc);
     }
 

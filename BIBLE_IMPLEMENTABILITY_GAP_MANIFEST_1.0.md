@@ -1116,11 +1116,15 @@ Wave **documental/design**. Nenhum código, schema, migration, API ou teste de c
 ```text
 C1  fuzzy default-active → BÍBLIA fixa opt-in (D2, DL-117). Código DIVERGENT (W5.3).
 C2  thresholds hardcoded → PARAMETER_GAP (D3). Código DIVERGENT (W5.3).
-C3  curated ambiguity sem ReviewItem → BÍBLIA mantém Review (W5.3).
+C3  curated ambiguity (legacy) sem ReviewItem → BÍBLIA mantém Review. O motor legacy
+    (`ChannelMatcher`) está fora de scope (OPEN-D2); NÃO é entregue em W5.3 nem em W5.4.
 C4  Review states sem InReview/reopen → BÍBLIA fixa lifecycle (D4, DL-105). Código DIVERGENT (W5.4).
 C5  rotas Review divergentes → 22 §7 normativa; alinhar em W5.5.
 C6  MatchConfidence/MatchMethod sem base → normativizados (D6) em 05/32.
-C7  ReviewItem schema divergente → reconciliar em W5.4 (mantendo 32 como autoridade).
+C7  ReviewItem schema divergente → W5.4 reconcilia apenas o mínimo necessário ao
+    lifecycle (33/DL-105/DL-119), mantendo 32 como autoridade. A reconciliação
+    completa dos campos conceptuais (RunId/StreamId/Actor/Evidence/Candidates/
+    Decision) fica separada (W5.6, L.4), sem inventar contrato inexistente.
 C8  IdentityRule/nome normalizado → documentados (D7/D8) em 05/34.
 C9  roadmap auto-create → marcado SUPERSEDED em docs/IMPLEMENTATION_ROADMAP.md.
 C10 gates Q3/Q4 sobrestimados → estado ajustado em 44.
@@ -1141,10 +1145,11 @@ C11 Open→Ignored directo → explicitado em 33/DL-105 (InReview não obrigató
 ```text
 W5.1 RecognitionPolicy (entidade/schema/snapshot/persistência)
 W5.2 Ordem de reconhecimento (namespace, nome normalizado, IdentityRule, Excluded, Ambiguous por Stage)
-W5.3 Fuzzy gate + below-threshold + ReviewItem de ambiguidade
-W5.4 Review lifecycle (InReview/Resolved/Ignored + reopen) + migração
+W5.3 Fuzzy gate + below-threshold + diagnóstico (CatalogResolution; SEM ReviewItem)
+W5.4 Review lifecycle (InReview/Resolved/Ignored + reopen) + ReviewItem de fuzzy
+     ambiguity (a partir de CatalogResolution.FuzzyDiagnostic) + migração mínima
 W5.5 Review API (22 §7) + motivo obrigatório + auditoria
-W5.6 MatchMethod/MatchConfidence (semântica versionada) e reconciliação C6/C7
+W5.6 MatchMethod/MatchConfidence (semântica versionada) e reconciliação completa C6/C7
 W5.7 Traceability/gates/docs (44, 46, manifest)
 ```
 
@@ -1188,8 +1193,12 @@ git diff --check → clean (apenas avisos LF→CRLF)
 PARAMETER_GAP: Fuzzy.Threshold, Fuzzy.AmbiguityMargin, Fuzzy.Weights e defaults de campo
                (excepto Fuzzy.Enabled=false, normativo).
 Limitação: policy de scope mais específico substitui por inteiro (sem merge campo-a-campo nesta wave).
-Limitação: snapshot é creado quando CreateSnapshotAsync é invocado; o wiring ao RunCoordinator
-           (chamada automática no início do Run) fica para a integração de W5.2+.
+M.4: snapshot é criado quando CreateSnapshotAsync é invocado; o wiring ao RunCoordinator
+     (chamada automática no início do Run) permanece:
+       Status: OPEN
+       Wave: não atribuída
+     NÃO pertence a W5.4 (D-W54-03), W5.5 nem W5.6. Não alterar o pipeline para tornar
+     o fuzzy automaticamente alcançável.
 ```
 
 ### M.5 Contagens do Manifest
@@ -1283,6 +1292,140 @@ fuzzy off).
 W5.2 é implementação; não abre nem fecha `DG-*`. Fuzzy (W5.3), Review
 (W5.4/W5.5) e `MatchMethod`/`MatchConfidence` versionados (W5.6) mantêm-se
 como waves seguintes.
+
+```text
+DG-* (73): CLOSED = 66, PARAMETER_GAP = 6, OPEN-HUMAN = 0, BLOCKED = 1, FALSE_GAP = 0
+```
+
+---
+
+## Anexo O — Wave W5.3: passo fuzzy de Recognition implementado
+
+Implementação do passo 6 (fuzzy) de `CatalogResolver.ResolveAsync` e
+ratificação documental do contrato `48-RECOGNITION-FUZZY-CONTRACT.md`
+(F1–F14). Nenhuma migration, alteração de Review lifecycle/API, de ordem W5.2
+ou do motor legacy `ChannelMatcher`/`MatchScorer`.
+
+### O.1 Entregue
+
+- `Services/Recognition/FuzzyRecognition.cs`: `FuzzyDecisionReasons`,
+  `FuzzyCandidate`, `FuzzyCandidateDiagnostic`, `FuzzyRecognitionDiagnostic`,
+  `FuzzyDecisionKind`, `FuzzyRecognitionDecision` e
+  `FuzzyRecognitionEvaluator` (F5–F10). Reutiliza `FuzzyMatcher` e
+  `ChannelNormalizer`; score `0..100`.
+- `CatalogResolver.ResolveAsync` passo 6: substitui o placeholder por geração
+  de candidatos (canais activos + aliases; projecção estendida) → avaliação
+  fuzzy → `Canonical` (`MatchMethod=Fuzzy`), `Ambiguous`
+  (`fuzzy-ambiguous`/`fuzzy-below-threshold`) ou `Unknown`, sempre com
+  `PolicyVersion`. Fail-closed com diagnóstico quando o threshold é nulo/
+  inválido.
+- `CatalogResolution`: `FuzzyScore` (`int?`, `0..100`) e `FuzzyDiagnostic`
+  (`FuzzyRecognitionDiagnostic?`), propriedades `init`-only aditivas; sem
+  quebra de consumidores. Não é `MatchConfidence` (W5.6).
+- Ratificação: `05 §4.2`, `32`, `38 §5.1`, DL-118, `46` (secção W5.3), `48`
+  (estado IMPLEMENTADO).
+
+### O.2 Decisões de scope
+
+```text
+OPEN-D2 RESOLVIDO: legacy matcher (ChannelMatcher/MatchScorer/MatchingOptions)
+                   FORA de scope; permanece DIVERGENT (C2). Waves futuras.
+OPEN-D3 RESOLVIDO: diagnóstico via CatalogResolution.FuzzyScore/FuzzyDiagnostic.
+OPEN-N1 / OPEN-P2: fora do v1 (normalização por idioma; CandidateFloor).
+PARAMETER: Fuzzy.Threshold, Fuzzy.AmbiguityMargin, Fuzzy.Weights (valores).
+```
+
+### O.3 Evidência
+
+```text
+dotnet build → 0 erros (52 avisos = baseline)
+dotnet test  → 2448 passed, 1 skipped, 0 failed (baseline W5.2 2413/1/0; +35)
+WaveW53FuzzyRecognitionTests: 35 (28 casos do contrato + integração + diagnóstico)
+git diff --check → clean (apenas avisos LF→CRLF pré-existentes)
+```
+
+Nota: numa execução intermédia, o teste de concorrência pré-existente
+`Phase93AccountGateCoordinatorTests.H_bounds_concurrency_even_with_unbounded_callers`
+falhou com `ObjectDisposedException` sob carga paralela; passa isolado e na
+reexecução completa, não sendo relacionado com W5.3.
+
+### O.4 Contagens do Manifest
+
+W5.3 é implementação; não abre nem fecha `DG-*`. Review (W5.4/W5.5),
+`MatchMethod`/`MatchConfidence` versionados (W5.6) e a reconciliação do motor
+legacy mantêm-se como waves seguintes.
+
+```text
+DG-* (73): CLOSED = 66, PARAMETER_GAP = 6, OPEN-HUMAN = 0, BLOCKED = 1, FALSE_GAP = 0
+```
+
+---
+
+## Anexo P — W5.4: scope ratificado e implementado
+
+Ratificação documental das decisões de scope identificadas na investigação W5.4
+e respectiva implementação. **Sem migration** (a coluna `State` é `INTEGER` sem
+CHECK; os valores `0/1/2` preservam-se e `InReview=3` é novo). Sem alteração de
+API HTTP (W5.5), de `MatchMethod`/`MatchConfidence` (W5.6), de M.4 nem do motor
+legacy.
+
+```text
+W5.4: Scope ratified / Implementation complete
+```
+
+### P.1 Decisões ratificadas
+
+| ID | Decisão | Contrato |
+|---|---|---|
+| D-W54-01 | C7 / schema `ReviewItem`: W5.4 altera o `ReviewItem` apenas no mínimo necessário ao lifecycle. `RunId`, `StreamId`, `Actor`, `Evidence`, `Candidates`, `Decision` **não** são inventados; onde indispensáveis ficam `OPEN`. A reconciliação completa do schema permanece separada (W5.6, L.4). | DL-119; `32` |
+| D-W54-02 | `ReviewItem` de fuzzy ambiguity pertence a **W5.4**, criado a partir de `CatalogResolution.FuzzyDiagnostic.DecisionReason = fuzzy-ambiguous`. W5.3 continua sem criar `ReviewItem`. | DL-119; `48 §12` |
+| D-W54-03 | **M.4 não pertence a W5.4.** Permanece `OPEN` e **sem wave atribuída**; não é atribuído a W5.5/W5.6. | `M.4` |
+| D-W54-04 | Reopen de W5.4 é apenas `Resolved→Open` e `Ignored→Open`, por operação administrativa explícita, auditada e **justificada** pelo operador. Deteção automática de "evidência materialmente incompatível" **não** faz parte de W5.4 e o critério permanece `OPEN`. | DL-119; DL-105 |
+| D-W54-05 | W5.4 = domínio/persistência/lifecycle/serviço interno/auditoria; **sem novas rotas HTTP**. W5.5 = API HTTP (`22 §7`). | DL-119; `22 §7` |
+
+### P.2 Estados do ReviewItem (ratificados)
+
+```text
+Open | InReview | Resolved | Ignored
+legacy: Approved → Resolved ; Excluded → Ignored
+```
+
+`InReview` é o novo estado. `33`/DL-105 mantêm-se como autoridade das transições.
+
+### P.3 Contradições corrigidas
+
+```text
+W5.3 "+ ReviewItem de ambiguidade"      → removido; W5.3 só reconhecimento + diagnóstico (L.4)
+W5.3 cria ReviewItem de fuzzy ambiguity → W5.4 cria (D-W54-02; L.4; 48 §12)
+C7 W5.4 vs W5.6                         → W5.4 mínimo; reconciliação completa em W5.6 (C7, L.4)
+M.4 atribuído a W5.4                    → M.4 OPEN / sem wave atribuída (D-W54-03; M.4)
+reopen automático vs manual             → W5.4 manual/auditado/justificado; automático OPEN (D-W54-04)
+```
+
+`W5.6` continua responsável por `MatchMethod`/`MatchConfidence`; não existe conversão
+`FuzzyScore 0..100 → MatchConfidence 0..1`. O motor legacy
+(`ChannelMatcher`/`MatchScorer`/`MatchingOptions`) permanece fora de scope.
+
+### P.4 Implementação (W5.4)
+
+```text
+Código:  Services/Catalog/ReviewLifecycle.cs (máquina pura, 6 transições)
+         Services/Catalog/ReviewLifecycleModels.cs
+         CatalogResolver: BeginReviewAsync/ResolveReviewAsync/IgnoreReviewAsync/
+                          ReopenReviewAsync (auditadas via IAuditService opcional);
+                          Approve/Exclude/ApplyReviewApproval adaptados (Resolved/Ignored)
+         CatalogEntities: ReviewItemState { Open=0, Resolved=1, Ignored=2, InReview=3 }
+         PipelineIngestionService.AmbiguousReasonSignature (fuzzy-ambiguous → reasonSignature)
+         WebDashboardService: stats/badges de estado (sem novas rotas)
+         Program.cs: CatalogResolver com AuditService
+Testes:  WaveW54ReviewLifecycleTests.cs (42)
+Evidência: build 0 erros; suite 2490 passed / 1 skipped / 0 failed
+Migration: nenhuma necessária (State INTEGER sem CHECK; valores preservados)
+```
+
+### P.5 Contagens do Manifest
+
+W5.4 é ratificação de scope; não abre nem fecha `DG-*`.
 
 ```text
 DG-* (73): CLOSED = 66, PARAMETER_GAP = 6, OPEN-HUMAN = 0, BLOCKED = 1, FALSE_GAP = 0
