@@ -8,6 +8,11 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 ## [Unreleased]
 
 ### ✨ Adicionado
+- **D-M4-02a — identidade de Run na ocorrência de descoberta (2026-09-20).** Corrige a primeira divergência confirmada: `DiscoveryCandidate.RunId` passa a usar exclusivamente a identidade operacional `ILiveRunProgress.RunId` (= `RunCoordinator.RunId`); `PipelineTrace.RunId` deixa de alimentar a ingestão e permanece exclusivamente diagnóstico.
+  - **`TelegramScraperService`:** novo helper `ResolveOperationalRunId(ILiveRunProgress?)`, usado pelo gate in-memory de dedup e por `PipelineIngestionService.IngestAsync(runId)`. Sem Run operacional → `runId = null` (não fabrica identidade; nunca usa o trace como fallback; sem dedup por Run) — D-M4-01 B1.
+  - **Sem alterações** a schema/migrations, `DiscoveryCandidate`, índice `(RunId, ProviderAccountId)`, `RecognitionPolicy`, snapshots, `ResolveAsync`, fuzzy, W5.3/W5.5, Review→Output, C7, W2-FU, matcher legacy, Dispatcharr.
+  - **Testes:** `DM402aOperationalRunIdTests` (seleção operacional vs diagnóstico; dois runs distintos com trace constante; tracing on/off; sem Run → null e sem dedup).
+  - **Governação:** a ratificação formal (D-M4-02a-1/2/3) requer uma entrada em `31-DECISION-LOCK.md`; não introduzida nesta wave.
 - **W5.6 — MatchMethod/MatchConfidence implementados (2026-09-20).** Implementa a especificação normativa `49` (DL-121/DL-122).
   - **Producer (Recognition):** tabela método→confidence centralizada em `Services/Recognition/RecognitionMatchMethods.cs` (`MatchSemanticsVersion="msm1"`, `IsKnownMethod`, `TryGetMatchConfidence`); `CatalogResolution` ganha `MatchConfidence` (`double?`, init-only aditivo); `FromCanonical`/`FromRule` atribuem o valor por método (`ExternalIdentityExact`/`TvgIdExact`/`CanonicalExact`/`NormalizedName`/`KnownAlias`/`ManualReview`=`1.0`, `ExplicitHeuristic`=`0.80`, `Fuzzy`=`0.60`); `Unknown`/`Ambiguous` → `null`.
   - **`FuzzyScore` ≠ `MatchConfidence`:** `Fuzzy` é constante `0.60`, nunca `FuzzyScore/100` nem equivalente; algoritmo fuzzy W5.3 inalterado.

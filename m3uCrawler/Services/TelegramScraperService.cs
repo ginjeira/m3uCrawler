@@ -73,6 +73,24 @@ namespace m3uCrawler.Services
         }
 
         /// <summary>
+        /// D-M4-02a — identidade operacional do Run para as ocorrências de
+        /// descoberta (W1). Usa exclusivamente
+        /// <see cref="ILiveRunProgress.RunId"/> (= <c>RunCoordinator.RunId</c>).
+        ///
+        /// <para>
+        /// Sem Run operacional devolve <c>null</c>: não fabrica identidade e
+        /// <b>nunca</b> usa <c>PipelineTrace.RunId</c> (diagnóstico) como
+        /// fallback. Nesse caso mantém-se o comportamento conservador de não
+        /// aplicar deduplicação baseada em Run (D-M4-01 B1).
+        /// </para>
+        /// </summary>
+        internal static string? ResolveOperationalRunId(ILiveRunProgress? liveRunProgress)
+        {
+            var runId = liveRunProgress?.RunId;
+            return string.IsNullOrWhiteSpace(runId) ? null : runId;
+        }
+
+        /// <summary>
         /// Construtor padrão (legacy CLI interactiva): não cria cliente de
         /// imediato. O cliente é criado preguiçosamente a partir do
         /// <c>wtelegram.config</c> lido no momento do login, permitindo
@@ -449,7 +467,9 @@ namespace m3uCrawler.Services
             // W1 — dedup por identidade funcional no mesmo Run: a mesma
             // conta funcional não origina processamento equivalente
             // duplicado. Candidatos sem identidade estável passam intactos.
-            var discoveryRunId = (_trace as m3uCrawler.Services.Validation.PipelineTrace)?.RunId;
+            // D-M4-02a — identidade operacional do Run (nunca o trace de
+            // diagnóstico). Sem Run operacional => null (sem dedup por Run).
+            var discoveryRunId = ResolveOperationalRunId(liveRunProgress);
             var seenDiscoveryAccounts =
                 new System.Collections.Concurrent.ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
             try
@@ -557,8 +577,11 @@ namespace m3uCrawler.Services
                 {
                     // W1 — a ocorrência de descoberta é atribuída ao Run
                     // efectivo (RunId opaco), quando disponível.
-                    var discoveryRunIdForIngestion =
-                        (_trace as m3uCrawler.Services.Validation.PipelineTrace)?.RunId;
+                    // D-M4-02a — identidade operacional
+                    // (ILiveRunProgress.RunId = RunCoordinator.RunId); sem Run
+                    // operacional => null. Nunca se usa PipelineTrace.RunId
+                    // como identidade de Run.
+                    var discoveryRunIdForIngestion = ResolveOperationalRunId(liveRunProgress);
                     var ingestionResult = await pipelineIngestor.IngestAsync(
                         working, sourceKey, "Telegram", countryCode, cancellationToken,
                         discoveryRunIdForIngestion);
