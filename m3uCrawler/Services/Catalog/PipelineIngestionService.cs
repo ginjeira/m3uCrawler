@@ -6,6 +6,7 @@ using System.Threading.Tasks;
 using m3uCrawler.Models;
 using m3uCrawler.Services.Catalog;
 using m3uCrawler.Services.Matching;
+using m3uCrawler.Services.Recognition;
 using m3uCrawler.Services.Validation;
 
 namespace m3uCrawler.Services.Catalog;
@@ -153,7 +154,8 @@ public sealed class PipelineIngestionService
         string sourceKindName,
         string countryCode,
         CancellationToken cancellationToken = default,
-        string? runId = null)
+        string? runId = null,
+        RecognitionPolicy? policy = null)
     {
         if (streams == null) throw new ArgumentNullException(nameof(streams));
         if (string.IsNullOrWhiteSpace(sourceKey))
@@ -273,8 +275,14 @@ public sealed class PipelineIngestionService
             }
 
             var normalized = ChannelNormalizer.Normalize(stream.Title);
+            // D-M4-02 — quando o caller passou uma `RecognitionPolicy`
+            // derivada do snapshot do Run, propaga-a ao núcleo de
+            // `ResolveAsync`. Quando `policy == null`, a forma do
+            // overload legado (3-arg com `policy: null`) é equivalente
+            // ao comportamento anterior (B1: nunca fallback para policy
+            // viva; sem policy ⇒ sem policy).
             var resolution = await _catalog.ResolveAsync(
-                normalized, stream.OriginalTvgId, cancellationToken);
+                normalized, stream.OriginalTvgId, policy, cancellationToken);
             var auditIdentity = string.IsNullOrEmpty(normalized) ? stream.Url : normalized;
             var originalTitle = stream.Title ?? string.Empty;
 

@@ -414,6 +414,7 @@ namespace m3uCrawler
                 // M3U continua a ser produzida.
                 PipelineIngestionService? pipelineIngestor = null;
                 CatalogResolver? catalogForIngestion = null;
+                m3uCrawler.Services.Recognition.RecognitionPolicyResolver? recognitionPolicyResolver = null;
                 try
                 {
                     catalogForIngestion = await InitializeCatalogAsync(catalogDbPath, CancellationToken.None);
@@ -423,6 +424,13 @@ namespace m3uCrawler
                     // (linha 186), partilhando configuração com o scraper.
                     pipelineIngestor = new PipelineIngestionService(
                         catalogForIngestion, countryChannelValidator);
+                    // D-M4-02 — resolver de policies partilhado por
+                    // scraper (propagação) e RunCoordinator (criação do
+                    // snapshot). Sem catálogo disponível ⇒ null ⇒ o
+                    // wiring continua a funcionar sem snapshot machinery.
+                    recognitionPolicyResolver = new m3uCrawler.Services.Recognition.RecognitionPolicyResolver(
+                        catalogForIngestion);
+                    scraper.SetRecognitionPolicyResolver(recognitionPolicyResolver);
                     Console.WriteLine("📦 Ingestor de catálogo inicializado.");
                 }
                 catch (Exception ex)
@@ -559,12 +567,19 @@ namespace m3uCrawler
                     if (liveRunHost is not null)
                     {
                         liveRunCoordinator = liveRunHost.ConfigureExecutor(liveRunPipelineFactory);
+                        // D-M4-02 — host devolve a instância única do
+                        // coordinator; injectamos o resolver de policies
+                        // para que o caminho dashboard herde o snapshot
+                        // machinery sem alterar a superfície do host.
+                        liveRunCoordinator.SetRecognitionPolicyResolver(
+                            recognitionPolicyResolver);
                         Console.WriteLine("🔁 RunCoordinator partilhado com o dashboard (LiveRunHost).");
                     }
                     else
                     {
                         liveRunCoordinator = new RunCoordinator(
-                            catalogForIngestion.GetFactory(), liveRunPipelineFactory);
+                            catalogForIngestion.GetFactory(), liveRunPipelineFactory,
+                            recognitionPolicyResolver: recognitionPolicyResolver);
                     }
 
                     // PHASE 9C.4 — Recuperar runs interrompidos por crash

@@ -4,6 +4,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using m3uCrawler.Services.Catalog;
+using m3uCrawler.Services.Recognition;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -60,6 +61,7 @@ public sealed class RunCoordinator
     private readonly IDbContextFactory<ChannelCatalogDbContext> _dbFactory;
     private readonly Func<LiveRunRequest, IRunPipeline> _pipelineFactory;
     private readonly ILogger<RunCoordinator> _logger;
+    private RecognitionPolicyResolver? _recognitionPolicyResolver;
 
     // Estado vivo (in-memory). Atomic CAS protege contra dois
     // entry points a iniciarem runs em simultâneo.
@@ -70,11 +72,29 @@ public sealed class RunCoordinator
     public RunCoordinator(
         IDbContextFactory<ChannelCatalogDbContext> dbFactory,
         Func<LiveRunRequest, IRunPipeline> pipelineFactory,
-        ILogger<RunCoordinator>? logger = null)
+        ILogger<RunCoordinator>? logger = null,
+        RecognitionPolicyResolver? recognitionPolicyResolver = null)
     {
         _dbFactory = dbFactory ?? throw new ArgumentNullException(nameof(dbFactory));
         _pipelineFactory = pipelineFactory ?? throw new ArgumentNullException(nameof(pipelineFactory));
         _logger = logger ?? NullLogger<RunCoordinator>.Instance;
+        // D-M4-02 — opcional: testes/callers sem snapshot infrastructure
+        // continuam a funcionar sem alterações (snapshot creation é no-op
+        // quando o resolver é null). Program.cs injecta-o quando há
+        // catálogo.
+        _recognitionPolicyResolver = recognitionPolicyResolver;
+    }
+
+    /// <summary>
+    /// D-M4-02 — Define/injecta o resolver de policies em runtime. Útil
+    /// quando o coordinator é construído por um agregador externo
+    /// (e.g. <see cref="LiveRunHost"/>) sem visibilidade sobre o
+    /// resolvedor na altura da construção. Setter é no-op quando
+    /// chamado com <c>null</c> (preserva comportamento).
+    /// </summary>
+    public void SetRecognitionPolicyResolver(RecognitionPolicyResolver? resolver)
+    {
+        _recognitionPolicyResolver = resolver;
     }
 
     /// <summary>
@@ -293,8 +313,20 @@ public sealed class RunCoordinator
 
     /// <summary>
     /// Corpo principal partilhado por <see cref="StartAsync"/> e
-    /// <see cref="KickStartAsync"/>: invoca a pipeline, marca
-    /// <c>Completed</c>/<c>Failed</c> e devolve o resultado terminal.
+    /// <see cref="KickStartAsync"/>: cria o snapshot de policy
+    /// (D-M4-02), invoca a pipeline, marca <c>Completed</c>/<c>Failed</c>
+    /// e devolve o resultado terminal.
+    ///
+    /// <para>
+    /// <b>D-M4-02 — orquestração.</b> A criação do snapshot acontece
+    /// <b>antes</b> do <c>pipeline.ExecuteAsync</c>. Se a criação do
+    /// snapshot falhar (e.g. BD indisponível, excepção do
+    /// <see cref="RecognitionPolicyResolver"/>), o run é marcado
+    /// terminal <see cref="LiveRunTerminalStatus.Failed"/> com
+    /// <c>lastMessage = "failed: snapshot creation exception"</c> e a
+    /// pipeline <b>não</b> é invocada. A função devolve
+    /// <c>Succeeded = false</c> nesse caso.
+    /// </para>
     /// </summary>
     private async Task<LiveRunOutcome> RunCoreAsync(
         LiveRunEntity entity,
@@ -302,6 +334,44 @@ public sealed class RunCoordinator
         LiveRunMonitor monitor,
         CancellationToken cancellationToken)
     {
+        // D-M4-02 — criar snapshot ANTES de iniciar a pipeline. Quando o
+        // resolver não está injectado (legacy tests, coordinator sem
+        // catálogo), este bloco é no-op e a semântica anterior mantém-se.
+        if (_recognitionPolicyResolver is not null)
+        {
+            try
+            {
+                await _recognitionPolicyResolver
+                    .CreateSnapshotAsync(entity.RunId, cancellationToken)
+                    .ConfigureAwait(false);
+                _logger.LogInformation(
+                    "Recognition policy snapshot ensured: runId={RunId}", entity.RunId);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception snapshotEx)
+            {
+                _logger.LogError(snapshotEx,
+                    "Recognition policy snapshot creation failed: runId={RunId}",
+                    entity.RunId);
+                await SafeEnterPhaseAsync(monitor, Catalog.LiveRunPhase.Error,
+                    "failed: snapshot creation exception").ConfigureAwait(false);
+                await MarkTerminalAsync(entity, LiveRunTerminalStatus.Failed,
+                    "failed: snapshot creation exception", CancellationToken.None)
+                    .ConfigureAwait(false);
+                var snapshot = BuildLiveSnapshot(entity, isRunning: false, currentPhase: null, monitor);
+                SetCurrentSnapshot(snapshot);
+                return new LiveRunOutcome
+                {
+                    Snapshot = snapshot,
+                    Succeeded = false,
+                    ErrorMessage = "snapshot creation exception",
+                };
+            }
+        }
+
         var pipeline = _pipelineFactory(request);
         if (pipeline is ILiveRunProgressAware progressAware)
         {

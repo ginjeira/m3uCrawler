@@ -4,6 +4,7 @@ using System.Text.RegularExpressions;
 using m3uCrawler.Models;
 using m3uCrawler.Services.Catalog;
 using m3uCrawler.Services.LiveRun;
+using m3uCrawler.Services.Recognition;
 using m3uCrawler.Services.Telegram;
 using m3uCrawler.Services.Validation;
 using TL;
@@ -40,6 +41,13 @@ namespace m3uCrawler.Services
         // comportamento dos testes que instanciam directamente.
         private m3uCrawler.Services.Validation.ITraceSink _trace = m3uCrawler.Services.Validation.NullTraceSink.Instance;
 
+        // D-M4-02 — resolvedor de policies (W5.1). Opcional; quando
+        // configurado, o scraper lê a policy efectiva do snapshot do Run
+        // (ILiveRunProgress.RunId) e propaga-a para a ingestão do
+        // catálogo. Sem resolver => sem policy (B1: nunca fallback para
+        // policy viva; sem fabrico).
+        private m3uCrawler.Services.Recognition.RecognitionPolicyResolver? _recognitionPolicyResolver;
+
         // Membros de afinidade Kind=Country (classificação de país), por
         // código ISO. Injectados na construção do CountryChannelValidator
         // deste scraper. Escopo de instância: não existe estado estático
@@ -57,6 +65,20 @@ namespace m3uCrawler.Services
         public void SetTrace(m3uCrawler.Services.Validation.ITraceSink trace)
         {
             _trace = trace ?? m3uCrawler.Services.Validation.NullTraceSink.Instance;
+        }
+
+        /// <summary>
+        /// D-M4-02 — Injecta o resolvedor de policies de reconhecimento.
+        /// Quando configurado, o scraper resolve a policy efectiva a
+        /// partir do snapshot do Run (criado em <c>RunCoordinator</c>) e
+        /// propaga-a para <see cref="PipelineIngestionService.IngestAsync"/>.
+        /// <c>null</c> (default) preserva o comportamento anterior (sem
+        /// policy ⇒ mesma forma da wave W5.1 com policy nula).
+        /// </summary>
+        public void SetRecognitionPolicyResolver(
+            m3uCrawler.Services.Recognition.RecognitionPolicyResolver? resolver)
+        {
+            _recognitionPolicyResolver = resolver;
         }
 
         /// <summary>
@@ -582,9 +604,25 @@ namespace m3uCrawler.Services
                     // operacional => null. Nunca se usa PipelineTrace.RunId
                     // como identidade de Run.
                     var discoveryRunIdForIngestion = ResolveOperationalRunId(liveRunProgress);
+
+                    // D-M4-02 — propaga a policy efectiva do snapshot do
+                    // Run para a ingestion. Sem Run operacional (sem
+                    // snapshot a propagar) ⇒ policy = null: B1 (nunca
+                    // fallback para policy viva, nunca fabrico). Sem
+                    // resolver injectado ⇒ policy = null (sem mudança
+                    // face à wave W5.1).
+                    RecognitionPolicy? snapshotPolicy = null;
+                    if (_recognitionPolicyResolver is not null
+                        && !string.IsNullOrEmpty(discoveryRunIdForIngestion))
+                    {
+                        snapshotPolicy = await _recognitionPolicyResolver
+                            .GetSnapshotPolicyAsync(discoveryRunIdForIngestion, null, null, cancellationToken)
+                            .ConfigureAwait(false);
+                    }
+
                     var ingestionResult = await pipelineIngestor.IngestAsync(
                         working, sourceKey, "Telegram", countryCode, cancellationToken,
-                        discoveryRunIdForIngestion);
+                        discoveryRunIdForIngestion, snapshotPolicy);
                     Console.WriteLine(
                         $"📥 Ingestão no catálogo: {ingestionResult.IngestedCount}/{ingestionResult.ReceivedCount} " +
                         $"streams → source='{sourceKey}', matched={ingestionResult.MatchedCount}, " +

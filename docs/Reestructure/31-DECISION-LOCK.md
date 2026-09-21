@@ -266,6 +266,29 @@ Ratifica a decisão humana **D-M4-01** do M.4 Decision Pack (HEAD `780fa01`). Re
 
 **Fronteiras:** M.4 permanece `OPEN`/sem wave de implementação; esta ratificação não altera código, `PipelineTrace`, `RunCoordinator`, `TelegramScraperService`, `CatalogResolver`, `RecognitionPolicyResolver`, schema/migration ou testes funcionais. A enumeração e o estado de D-M4-02..D-M4-10 mantêm-se no M.4 Decision Pack e no Anexo M do `BIBLE_IMPLEMENTABILITY_GAP_MANIFEST_1.0.md`.
 
+### DL-126 — D-M4-02: Recognition Policy Snapshot Lifecycle (ratificado; implementado)
+
+Ratifica **D-M4-02**. O snapshot de policy é criado **antes** do `pipeline.ExecuteAsync` e é imutável (UNIQUE em `recognition_policy_snapshots.RunId`). A policy efectiva consumida pela ingestão provém exclusivamente do snapshot; nunca da policy mutável (B1).
+
+- **A1 (citado de DL-103):** `channel → group → global → system/default`.
+- **B1 modificado:** o `CatalogResolver.ResolveAsync` permanece um núcleo que recebe `RecognitionPolicy?` por injeção. **NÃO** consulta directamente as tabelas `recognition_policies`/`recognition_policy_snapshots`. A policy do snapshot é lida **uma vez** por ingestion call (em `TelegramScraperService`/`RecognitionPolicyResolver.GetSnapshotPolicyAsync(runId, null, null)`) e propagada ao overload de `ResolveAsync(normalized, tvgId, policy, ct)`. Política viva nunca é consumida em fallback.
+- **C1 (race-safety):** a inserção em `recognition_policy_snapshots` está protegida por UNIQUE em `RunId`. O caminho rápido é a leitura prévia (curto-circuito). O caminho lento usa o mesmo idioma de `RecordExternalIdentityAsync` (`CatalogResolver.cs:466`): envolver o `SaveChangesAsync` em `try/catch (DbUpdateException)` e re-ler o registo do vencedor. Erros não-UNIQUE propagam-se.
+- **D1 (insert-only por código):** o snapshot é criado por `RecognitionPolicyResolver.CreateSnapshotAsync`; uma vez persistido, nunca é regravado. Tentativas repetidas para o mesmo `RunId` devolvem o existente.
+- **E1 (fail-closed no arranque do Run):** falha de criação do snapshot durante `RunCoordinator.RunCoreAsync` marca o run terminal `Failed` com `lastMessage = "failed: snapshot creation exception"`, **não** invoca `pipeline.ExecuteAsync`, e devolve `Succeeded = false`. `OperationCanceledException` propaga (não é engolida).
+- **Run-less path (sem `ILiveRunProgress`):** sem RunId operacional ⇒ nenhum snapshot é criado, nenhuma `RunId` é fabricada, e nenhuma policy é propagada à ingestion. `PipelineTrace.RunId` continua a ser diagnóstico e nunca identidade de Run (DL-124/DL-125).
+
+**Implementação:**
+- `CatalogResolver.SaveRecognitionPolicySnapshotAsync` (`Services/Catalog/CatalogResolver.cs:3681-3758`) — race-safe via `DbUpdateException` re-leitura.
+- `RunCoordinator.RunCoreAsync` (`Services/LiveRun/RunCoordinator.cs:319-371`) — orquestração snapshot → pipeline → terminal.
+- `RunCoordinator.SetRecognitionPolicyResolver` — setter opcional para wiring via `LiveRunHost` sem alargar a superfície pública.
+- `TelegramScraperService.SetRecognitionPolicyResolver` + leitura em `SearchAndTestM3UInTelegramAsync` (`Services/TelegramScraperService.cs:73-82`, `:600-617`).
+- `PipelineIngestionService.IngestAsync` ganha parâmetro opcional `RecognitionPolicy? policy = null` (`Services/Catalog/PipelineIngestionService.cs:156`, `:282-289`).
+- `Program.cs:430-450, 580-600` — wiring de `new RecognitionPolicyResolver(catalogForIngestion)` para `scraper` e para o `RunCoordinator` (caminho host + caminho direct).
+
+**Testes:** `m3uCrawler.Tests/DM402SnapshotLifecycleTests.cs` (6): start creates snapshot; creation failure blocks pipeline & marks Failed; sequential idempotency; 16 concurrent calls never throw; snapshot frozen after policy change; snapshot.RunId is coordinator RunId (never trace). Sem migration, sem mudança de schema, sem dependências novas, sem alteração de `ResolveAsync`, fuzzy, W5.3/W5.5, Review→Output.
+
+**Itens OPEN remanescentes:** D-F, D-G, D-H, D-I, D-J, D-M4-03..D-M4-10, C7, W2-FU, Review→Output.
+
 ### DL-125 — D-M4-02a: identidade de Run na ocorrência de descoberta (ratificado; implementado)
 
 Ratifica **D-M4-02a**. `discovery_candidates.RunId` representa exclusivamente a identidade operacional `ILiveRunProgress.RunId` = `RunCoordinator.RunId`. `PipelineTrace.RunId` não é identidade operacional em nenhum ponto da ingestão de descoberta.
@@ -280,6 +303,6 @@ Ratifica **D-M4-02a**. `discovery_candidates.RunId` representa exclusivamente a 
 
 ## C. Regra
 
-Uma implementação que contradiga DL-001..125 está incorrecta relativamente à BÍBLIA.
+Uma implementação que contradiga DL-001..126 está incorrecta relativamente à BÍBLIA.
 
 Uma alteração destas decisões exige alteração explícita da BÍBLIA, testes e documentação derivada.

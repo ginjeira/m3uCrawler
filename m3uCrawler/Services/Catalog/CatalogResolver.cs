@@ -3677,6 +3677,23 @@ public sealed class CatalogResolver
     /// <summary>
     /// Grava o snapshot de um Run se ainda não existir (imutável). Se já existir,
     /// devolve o existente sem o alterar.
+    ///
+    /// <para>
+    /// <b>D-M4-02 — C1 (race-safe).</b> O snapshot é único por <c>RunId</c>
+    /// (UNIQUE constraint em <c>recognition_policy_snapshots.RunId</c>,
+    /// <c>ChannelCatalogDbContext.OnModelCreating</c>). O caminho rápido
+    /// é a leitura prévia (curto-circuito); quando dois writers
+    /// concorrentes vencem a corrida de leitura (ambos vêem
+    /// <c>existing == null</c>) o segundo <c>SaveChangesAsync</c>
+    /// rebenta com <see cref="DbUpdateException"/>. Em vez de propagar
+    /// a falha, recarregamos o snapshot já persistido pelo vencedor e
+    /// devolvemo-lo ao caller — exactamente o mesmo idioma de
+    /// <see cref="RecordExternalIdentityAsync"/>. Outros erros
+    /// (<see cref="DbUpdateException"/> não relacionados com o
+    /// invariante de unicidade, falhas de I/O, etc.) NÃO são
+    /// engolidos: propagam-se para o coordinator, que marca o run
+    /// como <see cref="LiveRunTerminalStatus.Failed"/>.
+    /// </para>
     /// </summary>
     public async Task<RecognitionPolicySnapshotEntity> SaveRecognitionPolicySnapshotAsync(
         string runId,
@@ -3703,8 +3720,23 @@ public sealed class CatalogResolver
             ResolvedAtUtc = DateTime.UtcNow,
         };
         context.RecognitionPolicySnapshots.Add(entity);
-        await context.SaveChangesAsync(cancellationToken);
-        return entity;
+        try
+        {
+            await context.SaveChangesAsync(cancellationToken);
+            return entity;
+        }
+        catch (DbUpdateException)
+        {
+            // Corrida: outro writer inseriu o snapshot para o mesmo RunId
+            // entre a nossa leitura e o SaveChanges. O invariante de
+            // unicidade manda; não duplicar — devolver o registo existente.
+            // O context já foi disposed pelo using; abrir um novo apenas
+            // para a re-leitura é mais barato que re-lançar.
+            await context.DisposeAsync();
+            await using var reload = await _factory.CreateDbContextAsync(cancellationToken);
+            return await reload.RecognitionPolicySnapshots
+                .FirstAsync(s => s.RunId == id, cancellationToken);
+        }
     }
 
     private static string RecognitionPolicyAuditJson(RecognitionPolicyEntity e)

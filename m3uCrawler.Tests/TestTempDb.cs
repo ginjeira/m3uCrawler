@@ -103,6 +103,8 @@ internal static class TestTempDb
         "sched-out-",
         "degradation-", "http-api-tests-", "pipeline-bridge-",
         "matching-audit-", "sync-run-steps-",
+        // D-M4-02 — RecognitionPolicySnapshot lifecycle.
+        "dm402-", "dm402-",
         // Phase 13 (Wave 13-3/13-4/13-5) — source selection.
         "source-selection-stage-", "source-selection-policy-", "source-selection-preview-",
         // Phase 9C.6 — identidade canónica (Key autoritativa).
@@ -145,6 +147,8 @@ internal static class TestTempDb
         "sched_out-",
         "degradation-", "http_api_tests-", "pipeline_bridge-",
         "matching_audit-", "sync_run_steps-",
+        // D-M4-02 — RecognitionPolicySnapshot lifecycle.
+        "dm402-", "dm402_",
         // Phase 13 (Wave 13-3/13-4/13-5) — source selection.
         "source_selection_stage-", "source_selection_policy-", "source_selection_preview-",
         // Phase 9C.6 — identidade canónica (Key autoritativa).
