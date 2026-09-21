@@ -409,12 +409,27 @@ public sealed class PipelineIngestionService
             {
                 if (!string.IsNullOrEmpty(normalized))
                 {
+                    // W-REVIEW-01 — captura evidência da ocorrência actual
+                    // (StreamUrl + Source.Id + fingerprint sfp1 + RunId
+                    // operacional). NUNCA reconstruir de outros Runs ou
+                    // candidates: o que fica persistido é o que esta
+                    // ingestion observou.
+                    var streamUrl = stream.Url;
+                    var streamFingerprint = m3uCrawler.Services.Matching.StreamFingerprint
+                        .TryComputeFingerprint(streamUrl);
                     await _catalog.UpsertReviewItemAsync(
                         normalizedIdentity: normalized,
                         sourceGroup: stream.Group ?? string.Empty,
                         reasonSignature: reasonSignature,
                         reasonText: "Ingestion não encontrou canal canónico; stream não foi ligado ao catálogo.",
-                        cancellationToken: cancellationToken);
+                        cancellationToken: cancellationToken,
+                        streamUrl: streamUrl,
+                        sourceId: source.Id,
+                        streamFingerprint: streamFingerprint,
+                        streamFingerprintVersion: streamFingerprint != null
+                            ? m3uCrawler.Services.Matching.StreamFingerprint.Version
+                            : null,
+                        runId: runId);
                 }
             }
         }

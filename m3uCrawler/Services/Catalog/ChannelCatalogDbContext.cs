@@ -222,6 +222,10 @@ public sealed class ChannelCatalogDbContext : DbContext
             e.Property(x => x.CreatedAtUtc).IsRequired();
             e.Property(x => x.UpdatedAtUtc).IsRequired();
             e.Property(x => x.ResolvedAtUtc);
+            e.Property(x => x.StreamUrl).HasMaxLength(1000);
+            e.Property(x => x.StreamFingerprint).HasMaxLength(64);
+            e.Property(x => x.StreamFingerprintVersion).HasMaxLength(16);
+            e.Property(x => x.RunId).HasMaxLength(64);
             e.HasIndex(x => x.Fingerprint).IsUnique();
             e.HasOne(x => x.ApprovedCanonicalChannel)
                 .WithMany()

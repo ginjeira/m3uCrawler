@@ -490,7 +490,17 @@ public sealed class CatalogResolver
         string sourceGroup,
         string reasonSignature,
         string reasonText,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        // W-REVIEW-01 — evidência persistente da ocorrência que originou
+        // a Review. Todos opcionais para retro-compatibilidade: callers
+        // sem Source/RunId (e.g. ChannelMatcher.ClassifyStreams) passam
+        // null e a row fica com evidência parcial — exactamente como
+        // reviews legadas.
+        string? streamUrl = null,
+        long? sourceId = null,
+        string? streamFingerprint = null,
+        string? streamFingerprintVersion = null,
+        string? runId = null)
     {
         if (string.IsNullOrWhiteSpace(normalizedIdentity))
         {
@@ -506,6 +516,17 @@ public sealed class CatalogResolver
         {
             if (existing.State is ReviewItemState.Open or ReviewItemState.InReview)
             {
+                // W-REVIEW-01 — refresca a evidência para reflectir a
+                // ocorrência mais recente (a Review ainda não foi
+                // decidida). Apenas campos fornecidos pelo caller são
+                // tocados: nunca limpamos evidência já persistida.
+                if (streamUrl != null) existing.StreamUrl = streamUrl;
+                if (sourceId != null) existing.SourceId = sourceId;
+                if (streamFingerprint != null) existing.StreamFingerprint = streamFingerprint;
+                if (streamFingerprintVersion != null) existing.StreamFingerprintVersion = streamFingerprintVersion;
+                if (runId != null) existing.RunId = runId;
+                existing.UpdatedAtUtc = DateTime.UtcNow;
+                await context.SaveChangesAsync(cancellationToken);
                 return existing;
             }
             // Resolved/Ignored: uma decisão humana NÃO é revertida
@@ -528,6 +549,12 @@ public sealed class CatalogResolver
             Note = reasonText ?? string.Empty,
             CreatedAtUtc = now,
             UpdatedAtUtc = now,
+            // W-REVIEW-01
+            StreamUrl = streamUrl,
+            SourceId = sourceId,
+            StreamFingerprint = streamFingerprint,
+            StreamFingerprintVersion = streamFingerprintVersion,
+            RunId = runId,
         };
         context.ReviewItems.Add(entry);
         await context.SaveChangesAsync(cancellationToken);

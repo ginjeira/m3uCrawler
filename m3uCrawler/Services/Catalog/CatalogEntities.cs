@@ -398,6 +398,48 @@ public sealed class ReviewItemEntity
     public DateTime CreatedAtUtc { get; set; }
     public DateTime UpdatedAtUtc { get; set; }
     public DateTime? ResolvedAtUtc { get; set; }
+
+    // W-REVIEW-01 — evidência persistente da ocorrência que originou a
+    // Review. Capturada no momento da ingestion para que a aprovação
+    // possa localizar o stream sem depender de joins a DiscoveryCandidate
+    // (1:N ambíguo) nem de re-ingestion. Todas nullable para retro-
+    // compatibilidade com reviews legadas.
+
+    /// <summary>
+    /// URL observada (sanitizada — sem credenciais em claro). <c>null</c>
+    /// para reviews criadas antes de W-REVIEW-01 ou quando o stream de
+    /// origem não tem URL (e.g. caminhos que ainda não chegaram ao ingestion).
+    /// </summary>
+    public string? StreamUrl { get; set; }
+
+    /// <summary>
+    /// <c>Source.Id</c> resolvido pelo ingestion. <c>null</c> se a
+    /// Review não foi criada via ingestion (e.g. legado, ou caminho
+    /// classificação sem Source persistido como em
+    /// <c>ChannelMatcher.ClassifyStreams</c>).
+    /// </summary>
+    public long? SourceId { get; set; }
+
+    /// <summary>
+    /// Fingerprint canónico do stream (versão <c>"sfp1"</c>). Hex
+    /// minúsculo SHA-256 de <c>"sfp1\n" + canonicalUrl</c>. <c>null</c>
+    /// se o URL não é http(s) absoluto, ou para reviews legadas.
+    /// </summary>
+    public string? StreamFingerprint { get; set; }
+
+    /// <summary>
+    /// Versão do algoritmo de <see cref="StreamFingerprint"/>. Sempre
+    /// <c>"sfp1"</c> quando <see cref="StreamFingerprint"/> é não-nulo.
+    /// </summary>
+    public string? StreamFingerprintVersion { get; set; }
+
+    /// <summary>
+    /// RunId operacional (D-M4-02a) do ingestion. NUNCA
+    /// <c>PipelineTrace.RunId</c> (diagnóstico). <c>null</c> quando o
+    /// ingestion corre sem RunId (e.g. legacy, testes unitários, ou
+    /// caminhos como <c>ChannelMatcher</c> que não recebem RunId).
+    /// </summary>
+    public string? RunId { get; set; }
 }
 
 /// <summary>
