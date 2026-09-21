@@ -578,4 +578,170 @@ public class ReviewApprovalMaterializationTests : IAsyncLifetime
         Assert.True(cs.Id > 0);
         Assert.True(cs.LastSeenAtUtc > DateTime.MinValue);
     }
+
+    // ═══════════════════════════════════════════Status═══════════════
+    // K — Rollback transaccional REAL (W-REVIEW-02C)
+    //
+    // O teste I da W-REVIEW-02 verificava rollback indirectamente via
+    // ChannelAdministrationException pré-SaveChanges. Aqui provamos o
+    // rollback REAL forçando um DbUpdateException durante SaveChanges.
+    //
+    // Estratégia: usar a FK constraint existente em
+    // ChannelSource.SourceId → Sources.Id (criada via convention EF
+    // na migration inicial). Inserir um ChannelSource com
+    // SourceId inexistente força um FK constraint failure em
+    // SaveChangesAsync. O EF Core SQLite provider executa
+    // SaveChanges numa transacção SQLite que faz ROLLBACK atómico
+    // de todas as INSERTs no mesmo SaveChanges (incluindo o alias e o
+    // review-item mutation tracked no mesmo context).
+    //
+    // Este teste NÃO altera produção: usa o contrato público
+    // existente (alias tracked + review-item tracked + ChannelSource
+    // tracked + SaveChangesAsync).
+    // ════════════════════════════════════════════════════════════════
+
+    [Fact]
+    public async Task K_real_DbUpdateException_during_SaveChanges_rolls_back_alias_and_channelSource()
+    {
+        // Arrange: pre-create the canonical channel + a real Source
+        // for the Ingestor path to populate Review.SourceId with a
+        // value that EXISTS. Then, in the same DbContext we will
+        // simulate the wave's tracked path with a DIFFERENT bad
+        // SourceId (intentionally non-existent) on the ChannelSource
+        // to force the FK failure.
+        const string title = "Rollback K";
+        const string url = "http://stream.example/wreview02-k/playlist.m3u8";
+        const string goodSourceKey = "OpE2E-K-good";
+        const string goodRunId = "run-wreview02-k";
+
+        // Step 1: seed a Review with REAL evidence (StreamUrl +
+        // SourceId + Fingerprint + RunId) via ingestion.
+        WriteCountryWhitelist(title);
+        var stream = MakeUnrecognizedStream(title, url);
+        await _ingestor.IngestAsync(
+            new[] { stream },
+            goodSourceKey,
+            "Telegram",
+            "pt",
+            default,
+            goodRunId);
+
+        await using (var ctx = await _factory.CreateDbContextAsync())
+        {
+            var review = await ctx.ReviewItems.AsNoTracking()
+                .SingleAsync(r => r.NormalizedIdentity == ChannelNormalizer.Normalize(title));
+            Assert.NotNull(review.StreamUrl);
+            Assert.NotNull(review.SourceId);
+            Assert.NotNull(review.StreamFingerprint);
+            Assert.NotNull(review.RunId);
+        }
+
+        // Step 2: simulate the wave's atomicity contract — open a
+        // SINGLE DbContext, track alias + review-item transition +
+        // ChannelSource, then force DbUpdateException by giving the
+        // ChannelSource a SourceId that does NOT exist.
+        //
+        // The exact `SourceId = 999_999` is intentionally far above
+        // any auto-increment seed (SQLite rowid starts at 1); the FK
+        // constraint will fail at SaveChanges.
+        const long NonExistentSourceId = 999_999L;
+
+        await using (var trackedCtx = await _factory.CreateDbContextAsync())
+        {
+            // Re-load tracked copies of the real entities (alias + review).
+            var review = await trackedCtx.ReviewItems
+                .SingleAsync(r => r.NormalizedIdentity == ChannelNormalizer.Normalize(title));
+            var canonical = await trackedCtx.CanonicalChannels
+                .SingleAsync(c => c.Key == "rtp1");
+
+            // Track a fresh alias (this is what ApplyAddAliasAsync
+            // would do for a new review — same path as the existing
+            // TestA scenario).
+            var aliasEntity = new ChannelAliasEntity
+            {
+                NormalizedAlias = ChannelNormalizer.Normalize(title),
+                CanonicalChannelId = canonical.Id,
+                CreatedAtUtc = DateTime.UtcNow,
+            };
+            trackedCtx.ChannelAliases.Add(aliasEntity);
+
+            // Mutate the review-item (same as ApplyLegacyResolveTransition).
+            review.State = ReviewItemState.Resolved;
+            review.ApprovedCanonicalChannelId = canonical.Id;
+            review.UpdatedAtUtc = DateTime.UtcNow;
+            review.ResolvedAtUtc = DateTime.UtcNow;
+
+            // Track the ChannelSource with an INTENTIONALLY BAD SourceId.
+            // The FK constraint exists in the schema (created via EF
+            // convention from the navigation property Source on the
+            // ChannelSource entity). SQLite will reject the INSERT.
+            trackedCtx.ChannelSources.Add(new ChannelSourceEntity
+            {
+                CanonicalChannelId = canonical.Id,
+                SourceId = NonExistentSourceId,
+                StreamUrl = url,
+                ExternalStreamId = review.NormalizedIdentity,
+                Fingerprint = review.StreamFingerprint,
+                FingerprintVersion = review.StreamFingerprintVersion,
+                Quality = StreamQuality.Unknown,
+                Epg = EpgState.Unknown,
+                Availability = AvailabilityState.Discovered,
+                MatchConfidence = 1.0,
+                MatchMethod = RecognitionMatchMethods.ReviewApproval,
+                MatchSemanticsVersion = null,
+                FirstSeenAtUtc = DateTime.UtcNow,
+                LastSeenAtUtc = DateTime.UtcNow,
+                LastTestedAtUtc = DateTime.UtcNow,
+                LastResponseTimeMs = 0,
+                IsEnabled = true,
+                CreatedAtUtc = DateTime.UtcNow,
+                UpdatedAtUtc = DateTime.UtcNow,
+            });
+
+            // Act: SaveChanges should throw DbUpdateException (FK
+            // constraint failure on ChannelSource.SourceId).
+            var ex = await Assert.ThrowsAsync<DbUpdateException>(async () =>
+                await trackedCtx.SaveChangesAsync());
+
+            // The exception must reference the FK constraint, NOT
+            // some other unrelated error.
+            Assert.NotNull(ex.InnerException);
+            Assert.Contains("FOREIGN KEY", ex.InnerException!.Message, StringComparison.OrdinalIgnoreCase);
+        }
+
+        // Step 3: open a FRESH DbContext and verify nothing was
+        // committed. This is the actual rollback proof — in-memory
+        // state would still show the mutations, but the DB does not.
+        await using (var verifyCtx = await _factory.CreateDbContextAsync())
+        {
+            // ChannelSource: should not exist (rolled back).
+            var channelSources = await verifyCtx.ChannelSources.AsNoTracking()
+                .ToListAsync();
+            Assert.Empty(channelSources);
+
+            // Alias: should not exist (rolled back).
+            var aliases = await verifyCtx.ChannelAliases.AsNoTracking()
+                .Where(a => a.NormalizedAlias == ChannelNormalizer.Normalize(title))
+                .ToListAsync();
+            Assert.Empty(aliases);
+
+            // ReviewItem: state should be UNCHANGED (Open, with the
+            // pre-existing StreamUrl/SourceId/RunId evidence from
+            // the ingestion above). The Open→Resolved transition
+            // was rolled back together with the alias and
+            // ChannelSource inserts.
+            var reviewDb = await verifyCtx.ReviewItems.AsNoTracking()
+                .SingleAsync(r => r.NormalizedIdentity == ChannelNormalizer.Normalize(title));
+            Assert.Equal(ReviewItemState.Open, reviewDb.State);
+            Assert.Null(reviewDb.ApprovedCanonicalChannelId);
+            Assert.Null(reviewDb.ResolvedAtUtc);
+            // Pre-ingestion evidence is preserved (ingestion was a
+            // separate, prior, successful operation; only the failed
+            // approval's mutations rolled back).
+            Assert.Equal(url, reviewDb.StreamUrl);
+            Assert.NotNull(reviewDb.SourceId);
+            Assert.NotNull(reviewDb.StreamFingerprint);
+            Assert.Equal(goodRunId, reviewDb.RunId);
+        }
+    }
 }
