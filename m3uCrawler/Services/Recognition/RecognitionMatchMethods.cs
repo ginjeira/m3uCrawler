@@ -54,6 +54,17 @@ public static class RecognitionMatchMethods
     public const string ManualReview = "ManualReview";
 
     /// <summary>
+    /// W-REVIEW-02 — Aprovação explícita de uma ReviewItem pelo
+    /// dashboard. Proveniência distinta do <see cref="ManualReview"/>
+    /// (regra de identidade automática): aqui o administrador decide
+    /// com base numa observação registada. Não entra na tabela
+    /// normativa <c>ConfidenceByMethod</c> por ser uma semântica
+    /// diferente (não é decisão de matching, é uma resolução humana
+    /// consumida por SourceSelection downstream).
+    /// </summary>
+    public const string ReviewApproval = "ReviewApproval";
+
+    /// <summary>
     /// Tabela normativa (W5.6 §7) de <c>MatchConfidence</c> por método. Valores
     /// ratificados (OD-A/B/C + exactos): exactos e <see cref="ManualReview"/> →
     /// <c>1.0</c>; <see cref="ExplicitHeuristic"/> → <c>0.80</c>;

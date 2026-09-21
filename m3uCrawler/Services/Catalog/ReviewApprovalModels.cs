@@ -58,6 +58,15 @@ public sealed record ReviewApprovalDecision(
 /// Resultado de <see cref="CatalogResolver.ApplyReviewApprovalAsync"/>:
 /// o item resolvido, o canal/alias resultante e a indicação de
 /// idempotência (sem alteração de catálogo numa re-aprovação).
+///
+/// <para>
+/// W-REVIEW-02 — adicionada propriedade opcional
+/// <see cref="MaterializedChannelSource"/> com default <c>null</c>
+/// (estritamente aditiva; callers existentes não-break). Quando não-nula,
+/// indica que a materialização Review→ChannelSource correu (create ou update).
+/// Quando <c>null</c>, a materialização foi saltada (gate falhou) ou não
+/// aplicável (Exclude).
+/// </para>
 /// </summary>
 public sealed record ReviewApprovalResult(
     ReviewItemEntity Review,
@@ -67,4 +76,5 @@ public sealed record ReviewApprovalResult(
     ChannelAliasEntity? Alias,
     bool Idempotent,
     bool CatalogueChanged,
-    string Action);
+    string Action,
+    ChannelSourceEntity? MaterializedChannelSource = null);

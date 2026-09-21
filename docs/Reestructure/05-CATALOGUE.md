@@ -149,3 +149,16 @@ HD/FHD/SD pode influenciar Selection, mas nunca Matching.
 Adicionar, editar, aliasar, fundir ou desactivar um CanonicalChannel é uma mutação administrativa do catálogo e deve ficar auditada.
 
 Uma aprovação de Review que altere o catálogo deve declarar exactamente que mudança produz.
+
+### 9.1 Materialização de ChannelSource em aprovação (W-REVIEW-02)
+
+Uma aprovação de Review com evidência completa (campos persistidos pela W-REVIEW-01: `StreamUrl`, `SourceId`, `StreamFingerprint`, `StreamFingerprintVersion`, `RunId`) **materializa um `ChannelSource`** na mesma transacção da aprovação. Sem evidência, a aprovação prossegue sem materialização.
+
+- **Gate:** `ApprovedCanonicalChannelId.HasValue` ∧ `StreamUrl != null` ∧ `SourceId > 0`.
+- **Atomicidade:** `AddAlias` corre num único `SaveChangesAsync` (alias + ReviewItem + ChannelSource). `CreateChannel` mantém dois `SaveChanges` por restrição estrutural (o `Id` do `CanonicalChannel` só é conhecido após o primeiro save); a materialização corre no segundo save (alias + ReviewItem + ChannelSource atómicos entre si; canonical já committed).
+- **`MatchMethod`:** literal `"ReviewApproval"` (constante em `Services/Recognition/RecognitionMatchMethods.cs`); `MatchConfidence = 1.0`; `IsEnabled = true`; `Availability = Discovered`.
+- **Idempotência:** chamada repetida com mesmo `(CanonicalChannelId, SourceId, Fingerprint, FingerprintVersion)` actualiza a mesma row (sem duplicação).
+- **Concurrency:** sem UNIQUE constraint em `channel_sources`. Dívida documentada em W-REVIEW-02A — resolvida em wave futura W-REVIEW-02B.
+- **Exclude** nunca materializa (gate bloqueado: `ApplyIgnoreIgnoreTransition` zera `ApprovedCanonicalChannelId`).
+- **Audit:** novos eventos `catalog.review.approval.materialize_created` / `materialize_skipped` (best-effort, mesmo mecanismo do HTTP layer).
+- **Reviews legadas (pré-W-REVIEW-01):** `StreamUrl=null`/`SourceId=null` → skip sem erro; aprovação prossegue normalmente.

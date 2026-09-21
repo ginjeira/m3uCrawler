@@ -211,8 +211,8 @@ public class ReviewApprovalEndpointTests : IAsyncLifetime
         }
 
         var rows = await ReadAuditRowsAsync();
-        var row = Assert.Single(rows, r => r.ObjectId == review.Fingerprint);
-        Assert.Equal("catalog.review.approve.add-alias", row.Operation);
+        var row = Assert.Single(rows, r => r.ObjectId == review.Fingerprint
+            && r.Operation == "catalog.review.approve.add-alias");
         Assert.Equal("review-item", row.ObjectType);
         Assert.Equal(AuditActorType.User, row.ActorType);
         Assert.Equal("admin", row.ActorName);
@@ -271,8 +271,8 @@ public class ReviewApprovalEndpointTests : IAsyncLifetime
         }
 
         var rows = await ReadAuditRowsAsync();
-        var row = Assert.Single(rows, r => r.ObjectId == review.Fingerprint);
-        Assert.Equal("catalog.review.approve.create-channel", row.Operation);
+        var row = Assert.Single(rows, r => r.ObjectId == review.Fingerprint
+            && r.Operation == "catalog.review.approve.create-channel");
         Assert.Equal(AuditResult.Success, row.Result);
         Assert.Contains(key, row.AfterJson);
     }

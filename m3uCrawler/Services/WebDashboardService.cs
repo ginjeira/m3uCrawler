@@ -1498,10 +1498,30 @@ namespace m3uCrawler.Services
                     canonicalChannelKey = result.Channel?.Key,
                     alias = result.Alias?.NormalizedAlias,
                     reason = result.Action == "exclude" ? result.Review.Note : null,
+                    materialized = result.MaterializedChannelSource != null,
                 };
                 await RecordAuditAsync(auditActor, auditOperation, "review-item", fingerprint,
                     new { state = result.PriorState.ToString(), approvedCanonicalChannelId = result.PriorApprovedCanonicalChannelId },
                     after, AuditResult.Success);
+
+                // W-REVIEW-02 — auditoria específica do efeito de materialização
+                // (cobre os endpoints legacy `add-alias` e `create-channel`).
+                if (result.Action is "add-alias" or "create-channel")
+                {
+                    var materializedOp = result.MaterializedChannelSource != null
+                        ? "catalog.review.approval.materialize_created"
+                        : "catalog.review.approval.materialize_skipped";
+                    var detail = result.MaterializedChannelSource != null
+                        ? $"channelSourceId={result.MaterializedChannelSource.Id};fingerprintVersion={result.MaterializedChannelSource.FingerprintVersion}"
+                        : "missing-evidence";
+                    await RecordAuditAsync(auditActor, materializedOp, "review-item", fingerprint,
+                        null,
+                        result.MaterializedChannelSource is null
+                            ? null
+                            : ChannelSourceToJson(result.MaterializedChannelSource),
+                        AuditResult.Success,
+                        detail);
+                }
 
                 await WriteJsonAsync(context.Response, new
                 {
@@ -3763,6 +3783,7 @@ namespace m3uCrawler.Services
                     canonicalChannelId = result.Channel?.Id,
                     canonicalChannelKey = result.Channel?.Key,
                     alias = result.Alias?.NormalizedAlias,
+                    materialized = result.MaterializedChannelSource != null,
                 };
                 await RecordAuditAsync(auditActor, "catalog.review.resolve", "review-item",
                     item.Id.ToString(),
@@ -3772,6 +3793,27 @@ namespace m3uCrawler.Services
                         approvedCanonicalChannelId = result.PriorApprovedCanonicalChannelId,
                     },
                     after, AuditResult.Success, string.IsNullOrEmpty(note) ? null : note);
+
+                // W-REVIEW-02 — auditoria específica do efeito de materialização.
+                // Best-effort: uma falha aqui não reverte a approval (gestão
+                // central de erros do RecordAuditAsync engole excepções).
+                if (declaredType is "channelAlias" or "canonicalChannel")
+                {
+                    var materializedOp = result.MaterializedChannelSource != null
+                        ? "catalog.review.approval.materialize_created"
+                        : "catalog.review.approval.materialize_skipped";
+                    var detail = result.MaterializedChannelSource != null
+                        ? $"channelSourceId={result.MaterializedChannelSource.Id};fingerprintVersion={result.MaterializedChannelSource.FingerprintVersion}"
+                        : "missing-evidence";
+                    await RecordAuditAsync(auditActor, materializedOp, "review-item",
+                        item.Id.ToString(),
+                        null,
+                        result.MaterializedChannelSource is null
+                            ? null
+                            : ChannelSourceToJson(result.MaterializedChannelSource),
+                        AuditResult.Success,
+                        detail);
+                }
 
                 await WriteJsonAsync(context.Response, new
                 {

@@ -1548,13 +1548,21 @@ public sealed class CatalogResolver
         }
 
         ApplyLegacyResolveTransition(item, channel.Id, now);
+
+        // W-REVIEW-02 — materializar ChannelSource no mesmo DbContext
+        // ANTES do SaveChanges final. Se a materialização for saltada
+        // (gate), retorna null sem erro; a aprovação prossegue
+        // normalmente (alias + ReviewItem committed).
+        var materialized = await MaterializeChannelSourceFromReviewAsync(context, item, cancellationToken);
+
         await SaveReviewApprovalAsync(context, alias, cancellationToken);
 
         return new ReviewApprovalResult(
             item, priorState, priorApprovedId, channel, aliasEntity,
             Idempotent: !catalogueChanged,
             CatalogueChanged: catalogueChanged,
-            Action: "add-alias");
+            Action: "add-alias",
+            MaterializedChannelSource: materialized);
     }
 
     private async Task<ReviewApprovalResult> ApplyCreateChannelAsync(
@@ -1626,6 +1634,17 @@ public sealed class CatalogResolver
                 UpdatedAtUtc = createdNow,
             };
             context.CanonicalChannels.Add(channel);
+            // W-REVIEW-02 — SaveChanges intermédio PRESERVADO. A
+            // atribuição por navigation property (linha abaixo) só
+            // funciona se o `channel.Id` for conhecido; EF Core só
+            // atribui o Id durante o SaveChanges (topological insert).
+            // Como o ramo de criação precisa do Id para passar a
+            // ApplyLegacyResolveTransition e ao materializador, esta
+            // primeira escrita é inevitável. O risco pré-existente
+            // de canonical órfão (se o 2º SaveChanges falhar) é
+            // documentado mas não tratado nesta wave — alternativas
+            // como deferred-execution ou shadow-FK estão fora do
+            // escopo.
             await context.SaveChangesAsync(cancellationToken);
             channelCreated = true;
         }
@@ -1651,6 +1670,13 @@ public sealed class CatalogResolver
             aliasEntity = new ChannelAliasEntity
             {
                 NormalizedAlias = alias,
+                // W-REVIEW-02 — FK-id (não navigation property) atribuído
+                // AQUI, depois do SaveChanges intermédio ter popular
+                // `channel.Id`. Esta combinação preserva a estrutura
+                // existente (FK-id directo) sem regressão de
+                // comportamento. Mantém o risco pré-existente de
+                // canonical órfão se o 2º SaveChanges falhar — fora
+                // do escopo desta wave.
                 CanonicalChannelId = channel.Id,
                 CreatedAtUtc = now,
             };
@@ -1660,6 +1686,14 @@ public sealed class CatalogResolver
         }
 
         ApplyLegacyResolveTransition(item, channel.Id, now);
+
+        // W-REVIEW-02 — materializar ChannelSource no mesmo DbContext
+        // ANTES do SaveChanges final. Atomicidade: alias + review-item
+        // + ChannelSource committed num único SaveChanges (o mesmo
+        // que AddAlias usa). O canonical já está committed; aqui só
+        // o segundo grupo é atómico.
+        var materialized = await MaterializeChannelSourceFromReviewAsync(context, item, cancellationToken);
+
         await SaveReviewApprovalAsync(context, alias, cancellationToken);
 
         var changed = channelCreated || aliasCreated;
@@ -1667,7 +1701,8 @@ public sealed class CatalogResolver
             item, priorState, priorApprovedId, channel, aliasEntity,
             Idempotent: !changed,
             CatalogueChanged: changed,
-            Action: "create-channel");
+            Action: "create-channel",
+            MaterializedChannelSource: materialized);
     }
 
     private static async Task<ReviewApprovalResult> ApplyExcludeAsync(
@@ -1699,9 +1734,69 @@ public sealed class CatalogResolver
         ApplyIgnoreTransition(item, reason, DateTime.UtcNow);
         await context.SaveChangesAsync(cancellationToken);
 
+        // W-REVIEW-02 — Exclude nunca materializa ChannelSource (por
+        // design). ApplyIgnoreTransition zera ApprovedCanonicalChannelId,
+        // fechando o gate de qualquer materialização acidental.
         return new ReviewApprovalResult(
             item, priorState, priorApprovedId, null, null,
             Idempotent: false, CatalogueChanged: false, Action: "exclude");
+    }
+
+    /// <summary>
+    /// W-REVIEW-02 — Materializa um <see cref="ChannelSourceEntity"/> a partir
+    /// da evidência persistida no próprio <see cref="ReviewItemEntity"/>
+    /// aprovado. A materialização corre no MESMO <c>DbContext</c> da aprovação,
+    /// sendo commitada no mesmo <c>SaveChangesAsync</c> final (atomicidade
+    /// transaccional dentro do mesmo implicit EF transaction).
+    ///
+    /// <para><b>Gate (pré-requisitos):</b></para>
+    /// <list type="bullet">
+    ///   <item><c>item.ApprovedCanonicalChannelId.HasValue</c> — set pela transição de resolução;</item>
+    ///   <item><c>!string.IsNullOrWhiteSpace(item.StreamUrl)</c> — evidência da ocorrência original;</item>
+    ///   <item><c>item.SourceId.HasValue &amp;&amp; item.SourceId.Value > 0</c> — Source resolvida pelo ingestion.</item>
+    /// </list>
+    /// <para>
+    /// Se qualquer pré-requisito falhar, devolve <c>false</c> e NÃO
+    /// modifica o contexto. Reviews legadas (pré-W-REVIEW-01) têm
+    /// <c>StreamUrl</c>/<c>SourceId</c> a <c>null</c> e ficam
+    /// correctamente saltadas — a aprovação prossegue sem
+    /// materialização e o operador pode reprocessar com nova ingestion
+    /// para activar a evidência.
+    /// </para>
+    /// <para>
+    /// Não inventa evidência, não consulta <c>DiscoveryCandidate</c>,
+    /// não procura o URL noutro Run.
+    /// </para>
+    /// </summary>
+    private async Task<ChannelSourceEntity?> MaterializeChannelSourceFromReviewAsync(
+        ChannelCatalogDbContext context,
+        ReviewItemEntity item,
+        CancellationToken cancellationToken)
+    {
+        if (!item.ApprovedCanonicalChannelId.HasValue) return null;
+        if (string.IsNullOrWhiteSpace(item.StreamUrl)) return null;
+        if (!item.SourceId.HasValue || item.SourceId.Value <= 0) return null;
+
+        // A approval já passou pelo EnsureOpenOrSameApproval / state-guard;
+        // o item está tracked em `context` (Open→Resolved, com
+        // ApprovedCanonicalChannelId acabado de setar). Materializamos
+        // sem qualquer lookup adicional: os 3 campos mínimos estão
+        // garantidos pelo gate.
+        var materialized = await RecordChannelSourceAsync(
+            canonicalChannelId: item.ApprovedCanonicalChannelId.Value,
+            sourceId: item.SourceId.Value,
+            streamUrl: item.StreamUrl!,
+            quality: StreamQuality.Unknown,
+            epg: EpgState.Unknown,
+            availability: AvailabilityState.Discovered,
+            matchConfidence: 1.0,
+            matchMethod: RecognitionMatchMethods.ReviewApproval,
+            externalStreamId: item.NormalizedIdentity,
+            isEnabled: true,
+            cancellationToken: cancellationToken,
+            context: context);
+
+        return materialized;
     }
 
     private static void EnsureOpenOrSameApproval(ReviewItemEntity item, long channelId)
@@ -2825,7 +2920,15 @@ public sealed class CatalogResolver
         string matchMethod = "unknown",
         string? externalStreamId = null,
         bool isEnabled = true,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        // W-REVIEW-02 — tracked-vs-persisted bifurcation. Quando não-nulo,
+        // o caller (ApplyAddAliasAsync / ApplyCreateChannelAsync) já possui
+        // o DbContext da aprovação; este método limita-se a fazer lookup +
+        // Add/Update tracked, sem SaveChanges, sem dispose. Os dois callers
+        // existentes (PipelineIngestionService, HandleChannelSourceUpsertAsync)
+        // continuam a passar null por omissão — comportamento idêntico ao
+        // pré-wave.
+        ChannelCatalogDbContext? context = null)
     {
         if (canonicalChannelId <= 0) throw new ArgumentException("CanonicalChannelId inválido.", nameof(canonicalChannelId));
         if (sourceId <= 0) throw new ArgumentException("SourceId inválido.", nameof(sourceId));
@@ -2849,77 +2952,93 @@ public sealed class CatalogResolver
         var hasFingerprint = StreamFingerprint.TryCreate(streamUrl, out _, out var fingerprint);
         var fingerprintVersion = hasFingerprint ? StreamFingerprint.Version : null;
 
-        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
-
-        // 1. Dedup canónico intra-Source: mesma Source + canal + fingerprint
-        //    + versão consolidam na mesma row.
-        ChannelSourceEntity? existing = null;
-        if (hasFingerprint)
+        // W-REVIEW-02 — bifurcação tracked vs persisted. Quando o caller
+        // passou um context, NÃO criamos outro (mantemos a transacção do
+        // caller) e NÃO chamamos SaveChanges (caller controla o save).
+        var ownsContext = context is null;
+        var activeContext = context ?? await _factory.CreateDbContextAsync(cancellationToken);
+        try
         {
-            existing = await context.ChannelSources
+            // 1. Dedup canónico intra-Source: mesma Source + canal + fingerprint
+            //    + versão consolidam na mesma row.
+            ChannelSourceEntity? existing = null;
+            if (hasFingerprint)
+            {
+                existing = await activeContext.ChannelSources
+                    .FirstOrDefaultAsync(cs => cs.CanonicalChannelId == canonicalChannelId
+                                            && cs.SourceId == sourceId
+                                            && cs.Fingerprint == fingerprint
+                                            && cs.FingerprintVersion == fingerprintVersion,
+                        cancellationToken);
+            }
+
+            // 2. Fallback (legacy/não-fingerprintável): comportamento anterior por
+            //    URL sanitizada. Também enriquece uma row legacy sem fingerprint.
+            existing ??= await activeContext.ChannelSources
                 .FirstOrDefaultAsync(cs => cs.CanonicalChannelId == canonicalChannelId
                                         && cs.SourceId == sourceId
-                                        && cs.Fingerprint == fingerprint
-                                        && cs.FingerprintVersion == fingerprintVersion,
+                                        && cs.StreamUrl == sanitizedUrl,
                     cancellationToken);
-        }
 
-        // 2. Fallback (legacy/não-fingerprintável): comportamento anterior por
-        //    URL sanitizada. Também enriquece uma row legacy sem fingerprint.
-        existing ??= await context.ChannelSources
-            .FirstOrDefaultAsync(cs => cs.CanonicalChannelId == canonicalChannelId
-                                    && cs.SourceId == sourceId
-                                    && cs.StreamUrl == sanitizedUrl,
-                cancellationToken);
-
-        var now = DateTime.UtcNow;
-        if (existing != null)
-        {
-            existing.Quality = quality;
-            existing.Epg = epg;
-            existing.Availability = availability;
-            existing.MatchConfidence = matchConfidence;
-            existing.MatchMethod = matchMethod;
-            existing.MatchSemanticsVersion = matchSemanticsVersion;
-            existing.ExternalStreamId = externalStreamId;
-            existing.IsEnabled = isEnabled;
-            existing.LastSeenAtUtc = now;
-            existing.LastTestedAtUtc = now;
-            existing.UpdatedAtUtc = now;
-            if (hasFingerprint && string.IsNullOrEmpty(existing.Fingerprint))
+            var now = DateTime.UtcNow;
+            if (existing != null)
             {
-                existing.Fingerprint = fingerprint;
-                existing.FingerprintVersion = fingerprintVersion;
+                existing.Quality = quality;
+                existing.Epg = epg;
+                existing.Availability = availability;
+                existing.MatchConfidence = matchConfidence;
+                existing.MatchMethod = matchMethod;
+                existing.MatchSemanticsVersion = matchSemanticsVersion;
+                existing.ExternalStreamId = externalStreamId;
+                existing.IsEnabled = isEnabled;
+                existing.LastSeenAtUtc = now;
+                existing.LastTestedAtUtc = now;
+                existing.UpdatedAtUtc = now;
+                if (hasFingerprint && string.IsNullOrEmpty(existing.Fingerprint))
+                {
+                    existing.Fingerprint = fingerprint;
+                    existing.FingerprintVersion = fingerprintVersion;
+                }
+                if (ownsContext)
+                {
+                    await activeContext.SaveChangesAsync(cancellationToken);
+                }
+                return existing;
             }
-            await context.SaveChangesAsync(cancellationToken);
-            return existing;
-        }
 
-        var entity = new ChannelSourceEntity
+            var entity = new ChannelSourceEntity
+            {
+                CanonicalChannelId = canonicalChannelId,
+                SourceId = sourceId,
+                StreamUrl = sanitizedUrl,
+                ExternalStreamId = externalStreamId,
+                Fingerprint = hasFingerprint ? fingerprint : null,
+                FingerprintVersion = fingerprintVersion,
+                Quality = quality,
+                Epg = epg,
+                Availability = availability,
+                MatchConfidence = matchConfidence,
+                MatchMethod = matchMethod,
+                MatchSemanticsVersion = matchSemanticsVersion,
+                FirstSeenAtUtc = now,
+                LastSeenAtUtc = now,
+                LastTestedAtUtc = now,
+                LastResponseTimeMs = 0,
+                IsEnabled = isEnabled,
+                CreatedAtUtc = now,
+                UpdatedAtUtc = now,
+            };
+            activeContext.ChannelSources.Add(entity);
+            if (ownsContext)
+            {
+                await activeContext.SaveChangesAsync(cancellationToken);
+            }
+            return entity;
+        }
+        finally
         {
-            CanonicalChannelId = canonicalChannelId,
-            SourceId = sourceId,
-            StreamUrl = sanitizedUrl,
-            ExternalStreamId = externalStreamId,
-            Fingerprint = hasFingerprint ? fingerprint : null,
-            FingerprintVersion = fingerprintVersion,
-            Quality = quality,
-            Epg = epg,
-            Availability = availability,
-            MatchConfidence = matchConfidence,
-            MatchMethod = matchMethod,
-            MatchSemanticsVersion = matchSemanticsVersion,
-            FirstSeenAtUtc = now,
-            LastSeenAtUtc = now,
-            LastTestedAtUtc = now,
-            LastResponseTimeMs = 0,
-            IsEnabled = isEnabled,
-            CreatedAtUtc = now,
-            UpdatedAtUtc = now,
-        };
-        context.ChannelSources.Add(entity);
-        await context.SaveChangesAsync(cancellationToken);
-        return entity;
+            if (ownsContext) await activeContext.DisposeAsync();
+        }
     }
 
     public async Task<IReadOnlyList<ChannelSourceEntity>> ListChannelSourcesAsync(
