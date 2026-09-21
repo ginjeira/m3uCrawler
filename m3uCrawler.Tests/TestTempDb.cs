@@ -119,6 +119,8 @@ internal static class TestTempDb
         "wave-w2-",
         // Wave W4 (2026-09-19) — fingerprint canónico de stream.
         "wave-w4-",
+        // W-E2E-02 — Operational E2E (run lifecycle).
+        "op-e2e-",
         // Out dir.
         "out_",
     };
@@ -163,6 +165,8 @@ internal static class TestTempDb
         "wave_w2-", "wave-w2-",
         // Wave W4 (2026-09-19) — fingerprint canónico de stream.
         "wave_w4-", "wave-w4-",
+        // W-E2E-02 — Operational E2E (run lifecycle).
+        "op_e2e-", "op-e2e-",
         // Auditoria / validação live (timestamped).
         "bundle_guard_validation_", "content_type_distribution_",
         "country_opcao_c_live_validation_", "country_opcao_c_validation_",
