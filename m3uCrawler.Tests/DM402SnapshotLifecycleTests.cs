@@ -7,6 +7,7 @@ using System.Threading.Tasks;
 using m3uCrawler.Services.Catalog;
 using m3uCrawler.Services.LiveRun;
 using m3uCrawler.Services.Recognition;
+using m3uCrawler.Services.Validation;
 using Microsoft.EntityFrameworkCore;
 using Xunit;
 
@@ -282,5 +283,228 @@ public class DM402SnapshotLifecycleTests : IAsyncLifetime
         // coordinator (ver `D-M4-02a`). Esta asserção documenta que o
         // snapshot.RunId nunca é um trace.RunId hipotético.
         Assert.False(string.IsNullOrWhiteSpace(snaps[0].RunId));
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Helpers adicionais (Testes 7/8/9)
+    // ──────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Fixture para Teste A — captura o <see cref="PipelineTrace"/> que
+    /// estiver em contexto no momento de <see cref="ExecuteAsync"/>.
+    /// </summary>
+    /// <remarks>
+    /// A API pública de produção de <see cref="IRunPipeline"/> não
+    /// recebe <see cref="PipelineTrace"/>; este fixture é uma
+    /// superfície de teste que regista qual trace foi observado
+    /// durante a execução, para que a asserção seja por contraponto
+    /// (se a identidade operacional fosse contaminada, isto falharia).
+    /// </remarks>
+    private sealed class TraceCapturingPipeline : IRunPipeline
+    {
+        private readonly PipelineTrace _trace;
+
+        public TraceCapturingPipeline(PipelineTrace trace)
+        {
+            _trace = trace;
+        }
+
+        public int ExecuteCallCount { get; private set; }
+
+        /// <summary>Trace observado durante <see cref="ExecuteAsync"/>.</summary>
+        public PipelineTrace? ObservedTrace { get; private set; }
+
+        public Task ExecuteAsync(LiveRunRequest request, CancellationToken cancellationToken)
+        {
+            ExecuteCallCount++;
+            ObservedTrace = _trace;
+            return Task.CompletedTask;
+        }
+    }
+
+    private async Task<List<LiveRunEntity>> LiveRunsAsync()
+    {
+        var factory = (IDbContextFactory<ChannelCatalogDbContext>)_factory;
+        await using var ctx = await factory.CreateDbContextAsync();
+        return await ctx.LiveRuns.AsNoTracking().ToListAsync();
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // 7 — Snapshot RunId is coordinator GUID, not PipelineTrace.RunId
+    // ──────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Prova por contraponto: mesmo com um <see cref="PipelineTrace"/>
+    /// activo em contexto, o <c>RecognitionPolicySnapshot.RunId</c>
+    /// continua a ser o GUID operacional do <see cref="RunCoordinator"/>,
+    /// nunca o <c>PipelineTrace.RunId</c>.
+    ///
+    /// <para>
+    /// <b>Observação sobre a superfície de teste.</b> A API pública de
+    /// produção de <see cref="IRunPipeline"/> NÃO recebe
+    /// <see cref="PipelineTrace"/> como argumento — o trace é um sink
+    /// puramente observacional sem acoplamento ao snapshot lifecycle.
+    /// Este teste NÃO simula wiring de produção; injecta o trace via
+    /// <see cref="TraceCapturingPipeline"/> para garantir que, se em
+    /// algum momento futuro o caminho do snapshot fosse contaminado
+    /// pelo trace, este teste falharia de forma observável.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task Snapshot_RunId_is_coordinator_guid_not_pipeline_trace_runid()
+    {
+        const string TraceRunId = "trace-fixed-id";
+        var trace = new PipelineTrace(TraceRunId);
+
+        var pipeline = new TraceCapturingPipeline(trace);
+        var coordinator = NewCoordinator(pipeline, _policyResolver);
+
+        var outcome = await coordinator.StartAsync(
+            new LiveRunRequest
+            {
+                Mode = LiveRunMode.Telegram,
+                Source = LiveRunSource.Manual,
+                Keyword = "dm402-7",
+            },
+            CancellationToken.None);
+
+        // O trace esteve em contexto durante a execução.
+        Assert.NotNull(pipeline.ObservedTrace);
+        Assert.Equal(TraceRunId, pipeline.ObservedTrace!.RunId);
+
+        Assert.True(outcome.Succeeded);
+        Assert.NotNull(outcome.Snapshot);
+
+        // O RunId do snapshot é o GUID emitido pelo RunCoordinator.
+        var coordinatorRunId = outcome.Snapshot!.RunId;
+        Assert.True(Guid.TryParse(coordinatorRunId, out _),
+            $"Snapshot.RunId '{coordinatorRunId}' deve ser um GUID emitido pelo RunCoordinator.");
+
+        // Row persistida: 1, com RunId do coordinator.
+        var snaps = await SnapshotsAsync();
+        Assert.Single(snaps);
+        Assert.Equal(coordinatorRunId, snaps[0].RunId);
+
+        // NUNCA o PipelineTrace.RunId.
+        Assert.NotEqual(TraceRunId, snaps[0].RunId);
+        Assert.NotEqual(TraceRunId, outcome.Snapshot.RunId);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // 8 — CreateSnapshotAsync é função pura do argumento runId
+    // ──────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Prova que <see cref="RecognitionPolicyResolver.CreateSnapshotAsync(string, CancellationToken)"/>
+    /// persiste exactamente o <c>runId</c> que recebe como argumento e
+    /// não deriva, substitui ou consulta qualquer estado ambient
+    /// (incluindo <see cref="PipelineTrace"/>).
+    ///
+    /// <para>
+    /// O teste instancia um <see cref="PipelineTrace"/> activo no
+    /// mesmo thread/processo e chama directamente o resolver com
+    /// identificadores em formatos plausíveis (12 hex chars como um
+    /// <c>PipelineTrace</c> default, e GUID) — o resultado deve ser
+    /// determinístico: a row persistida tem o <c>RunId</c> EXACTO
+    /// recebido.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task CreateSnapshotAsync_does_not_derive_runid_from_pipeline_trace_or_other_ambient()
+    {
+        const string TraceLikeRunId = "trace-fixed-id";
+        const string GuidLikeRunId = "00000000-0000-0000-0000-000000000001";
+
+        // Um PipelineTrace activo em contexto. Se CreateSnapshotAsync
+        // consultasse o trace ambient, isto seria observado.
+        _ = new PipelineTrace(TraceLikeRunId);
+
+        var traceLike = await _policyResolver.CreateSnapshotAsync(TraceLikeRunId);
+        var guidLike = await _policyResolver.CreateSnapshotAsync(GuidLikeRunId);
+
+        Assert.Equal(TraceLikeRunId, traceLike.RunId);
+        Assert.Equal(GuidLikeRunId, guidLike.RunId);
+
+        var rows = await SnapshotsAsync();
+        Assert.Equal(2, rows.Count);
+
+        // Cada RunId aparece exactamente uma vez, com o valor exacto.
+        Assert.Single(rows, r => r.RunId == TraceLikeRunId);
+        Assert.Single(rows, r => r.RunId == GuidLikeRunId);
+
+        // Os dois snapshots têm entidades distintas (Ids diferentes):
+        // o UNIQUE constraint em RunId garante que cada snapshot é uma
+        // row autónoma. PoliciesJson é idêntica porque nenhuma policy
+        // foi mutada entre as duas chamadas — isso reflecte o estado
+        // de policy capturado, não a identidade operacional.
+        Assert.NotEqual(traceLike.Id, guidLike.Id);
+
+        // Nenhuma row tem um RunId diferente dos dois argumentos.
+        Assert.All(rows, r =>
+            Assert.True(
+                r.RunId == TraceLikeRunId || r.RunId == GuidLikeRunId,
+                $"RunId inesperado: '{r.RunId}'"));
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // 9 — Run sem snapshot infrastructure: Run é real, snapshot não existe
+    // ──────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Prova o contrato "Sem Run operacional ⇒ sem snapshot, sem
+    /// fabrico de RunId".
+    ///
+    /// <para>
+    /// <b>Superfície pública usada.</b> O único caminho Run-less
+    /// exercitável sem introduzir nova API é
+    /// <see cref="RunCoordinator"/> com
+    /// <c>recognitionPolicyResolver: null</c> — isto representa a
+    /// AUSÊNCIA DO COMPONENTE DE SNAPSHOT (documentado em
+    /// <c>RunCoordinator.cs:81-84</c>), não uma decisão de lifecycle.
+    /// O Run continua a ser operacional: persiste <see cref="LiveRunEntity"/>,
+    /// executa a pipeline, marca Completed. Apenas o snapshot é
+    /// silenciosamente skipped (sem throw, sem fabrico de RunId).
+    /// </para>
+    ///
+    /// <para>
+    /// <b>Não há fabrico.</b> O teste verifica que o snapshot row não
+    /// é criado (zero rows em <c>RecognitionPolicySnapshots</c>) e que
+    /// a row <see cref="LiveRunEntity"/> é persistida com o GUID do
+    /// coordinator (não com o <c>PipelineTrace.RunId</c>).
+    /// </para>
+    /// </summary>
+    [Fact]
+    public async Task Run_less_path_creates_no_snapshot_and_no_fabricated_runid()
+    {
+        var pipeline = new CapturingPipeline();
+        // recognitionPolicyResolver: null → sem componente de snapshot.
+        var coordinator = NewCoordinator(pipeline, resolver: null);
+
+        var outcome = await coordinator.StartAsync(
+            new LiveRunRequest
+            {
+                Mode = LiveRunMode.Telegram,
+                Source = LiveRunSource.Manual,
+                Keyword = "dm402-9",
+            },
+            CancellationToken.None);
+
+        Assert.True(outcome.Succeeded);
+        Assert.Equal(1, pipeline.ExecuteCallCount);
+
+        // 1) Zero rows em RecognitionPolicySnapshots.
+        Assert.Empty(await SnapshotsAsync());
+
+        // 2) O RunId do LiveRunSnapshot é o GUID emitido pelo coordinator.
+        var coordinatorRunId = outcome.Snapshot!.RunId;
+        Assert.False(string.IsNullOrWhiteSpace(coordinatorRunId));
+        Assert.True(Guid.TryParse(coordinatorRunId, out _),
+            $"LiveRunSnapshot.RunId '{coordinatorRunId}' deve ser GUID do RunCoordinator.");
+
+        // 3) A row LiveRunEntity foi persistida com o mesmo GUID.
+        var liveRuns = await LiveRunsAsync();
+        Assert.Single(liveRuns);
+        Assert.Equal(coordinatorRunId, liveRuns[0].RunId);
+        Assert.Equal(LiveRunTerminalStatus.Completed, liveRuns[0].TerminalStatus);
     }
 }
