@@ -57,6 +57,20 @@ O literal fica centralizado em `RecognitionMatchMethods.ReviewApproval` (constan
 
 Uma ChannelSource pode possuir múltiplas streams candidatas. Selection escolhe a que deve ser usada.
 
+### Schema-level enforcement (W-REVIEW-02B)
+
+A identidade persistente `(CanonicalChannelId, SourceId, Fingerprint, FingerprintVersion)` é imposta ao nível do schema por um UNIQUE filtered index (migration `20260921220000_AddChannelSourceUniqueOnFingerprint`):
+
+```sql
+CREATE UNIQUE INDEX IX_channel_sources_Channel_Source_Fingerprint_Unique
+ON channel_sources (CanonicalChannelId, SourceId, Fingerprint, FingerprintVersion)
+WHERE "Fingerprint" IS NOT NULL;
+```
+
+O filtro `WHERE "Fingerprint" IS NOT NULL"` preserva a coexistência de rows legacy e de streams não-fingerprintáveis (`Fingerprint=NULL`). Múltiplas streams distintas com fingerprints diferentes sob o mesmo `(CanonicalChannelId, SourceId)` continuam permitidas (D2).
+
+A UNIQUE é a segunda linha de defesa. A deduplicação primária continua a ser application-level via lookup em `RecordChannelSourceAsync` (`Services/Catalog/CatalogResolver.cs:2964-2981`). Em aprovação (`ApplyAddAliasAsync`, `ApplyCreateChannelAsync`), uma violação do UNIQUE é detectada, a entidade `Added` que falhou é detached, a row existente é recarregada, e os writes remanescentes (alias + review-item) são commitados.
+
 ## 6. Desactivação
 
 Desactivar uma Source impede novas execuções para essa origem, mas não deve apagar automaticamente o catálogo nem reescrever identidades históricas.

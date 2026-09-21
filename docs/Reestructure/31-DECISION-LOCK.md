@@ -301,8 +301,16 @@ Ratifica **D-M4-02a**. `discovery_candidates.RunId` representa exclusivamente a 
 
 **Fronteiras:** sem alteração de schema/migrations, `DiscoveryCandidate`, índice, `RecognitionPolicy`, snapshots, `ResolveAsync`, fuzzy, W5.3/W5.5, Review→Output, C7, W2-FU, matcher legacy, Dispatcharr. D-M4-02..D-M4-10 permanecem `OPEN`.
 
+### DL-127 — W-REVIEW-02B: Identidade persistente de `ChannelSource` + atomicidade de `CreateChannel` (ratificado; implementado)
+
+- **Identidade persistente de `ChannelSource`** é `(CanonicalChannelId, SourceId, Fingerprint, FingerprintVersion)`. Aplicação impõe via lookup (`RecordChannelSourceAsync`); schema impõe via UNIQUE filtered index `IX_channel_sources_Channel_Source_Fingerprint_Unique WHERE "Fingerprint" IS NOT NULL` (W-REVIEW-02B). Coexistência de rows `Fingerprint IS NULL` preservada. Múltiplas streams distintas por `(CanonicalChannelId, SourceId)` continuam permitidas (D2).
+- **`CreateChannel` é atómico** — `Database.BeginTransactionAsync` envolve ambos os `SaveChangesAsync` (canonical-create + alias+review+ChannelSource). O risco pré-existente de canonical órfão (SaveChanges #1 committed, SaveChanges #2 falhava) está eliminado.
+- **Duplicate `CanonicalChannel.Key` race** é traduzido para `ChannelAdministrationException(DuplicateKey)` (HTTP 409) na primeira escrita de `CreateChannel`.
+- **Sem `RowVersion` / `xmin` / optimistic concurrency token em qualquer entidade** — provider de produção é SQLite (sem row version system column). As UNIQUE pré-existentes em `channel_aliases.NormalizedAlias` e `canonical_channels.Key` + a nova UNIQUE de `channel_sources` fecham as janelas de corrida reais para o deployment single-instance actual. Concurrency tokens só serão reconsiderados se a topologia mudar para multi-instance (com eventual revisão do provider).
+- **Reforço:** não foi adicionado navigation property em `CanonicalChannelEntity` para suportar single-save. A escolha deliberada é manter dois `SaveChanges` (necessários para conhecer `CanonicalChannel.Id` antes do FK assignment) dentro de uma única transacção explícita.
+
 ## C. Regra
 
-Uma implementação que contradiga DL-001..126 está incorrecta relativamente à BÍBLIA.
+Uma implementação que contradiga DL-001..127 está incorrecta relativamente à BÍBLIA.
 
 Uma alteração destas decisões exige alteração explícita da BÍBLIA, testes e documentação derivada.

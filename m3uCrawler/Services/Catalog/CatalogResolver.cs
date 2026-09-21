@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using m3uCrawler.Services.Audit;
 using m3uCrawler.Services.Matching;
@@ -1555,7 +1556,29 @@ public sealed class CatalogResolver
         // normalmente (alias + ReviewItem committed).
         var materialized = await MaterializeChannelSourceFromReviewAsync(context, item, cancellationToken);
 
-        await SaveReviewApprovalAsync(context, alias, cancellationToken);
+        // W-REVIEW-02B — channel_sources UNIQUE discrimination. The reload
+        // callback detaches the failed Added entity, reloads the existing
+        // row by fingerprint (or URL fallback), and re-issues SaveChanges
+        // so the alias + review-item changes get committed.
+        try
+        {
+            await SaveReviewApprovalAsync(context, alias, cancellationToken);
+        }
+        catch (ChannelAdministrationException ex) when (
+            ex.Error == ChannelAdministrationError.AliasConflict
+            && materialized != null
+            && ex.Message.Contains("UNIQUE em channel_sources", StringComparison.Ordinal))
+        {
+            var reloaded = await ReloadChannelSourceOnUniqueAsync(
+                context,
+                canonicalChannelId: channel.Id,
+                sourceId: item.SourceId!.Value,
+                sanitizedUrl: materialized.StreamUrl,
+                fingerprint: materialized.Fingerprint,
+                fingerprintVersion: materialized.FingerprintVersion,
+                cancellationToken);
+            if (reloaded == null) throw;
+        }
 
         return new ReviewApprovalResult(
             item, priorState, priorApprovedId, channel, aliasEntity,
@@ -1589,120 +1612,165 @@ public sealed class CatalogResolver
         CanonicalChannelEntity channel;
         var channelCreated = false;
 
-        if (item.State == ReviewItemState.Resolved)
+        // W-REVIEW-02B — explicit transaction wrapping canonical-create
+        // (when applicable) + alias + review-item + ChannelSource. The
+        // pre-existing orphan-canonical risk between SaveChanges #1 and #2
+        // is now closed: a failure on either rolls back both. The
+        // pre-write queries (Resolved/Ignored dispatch, byKey pre-check)
+        // stay OUTSIDE the transaction — they don't perform writes that
+        // would need rolling back, and throwing ReviewConflict/DuplicateKey
+        // before any insert avoids opening a needless transaction.
+        await using var tx = await context.Database.BeginTransactionAsync(cancellationToken);
+        try
         {
-            var approved = item.ApprovedCanonicalChannelId.HasValue
-                ? await context.CanonicalChannels.FirstOrDefaultAsync(
-                    c => c.Id == item.ApprovedCanonicalChannelId!.Value, cancellationToken)
-                : null;
-            if (approved == null || !string.Equals(approved.Key, key, StringComparison.Ordinal))
+            if (item.State == ReviewItemState.Resolved)
+            {
+                var approved = item.ApprovedCanonicalChannelId.HasValue
+                    ? await context.CanonicalChannels.FirstOrDefaultAsync(
+                        c => c.Id == item.ApprovedCanonicalChannelId!.Value, cancellationToken)
+                    : null;
+                if (approved == null || !string.Equals(approved.Key, key, StringComparison.Ordinal))
+                {
+                    throw new ChannelAdministrationException(
+                        ChannelAdministrationError.ReviewConflict,
+                        "O item de revisão já foi resolvido com outra mudança de catálogo.");
+                }
+                channel = approved;
+            }
+            else if (item.State == ReviewItemState.Ignored)
             {
                 throw new ChannelAdministrationException(
                     ChannelAdministrationError.ReviewConflict,
-                    "O item de revisão já foi resolvido com outra mudança de catálogo.");
+                    "O item de revisão já foi ignorado; uma decisão fechada não é reaberta.");
             }
-            channel = approved;
-        }
-        else if (item.State == ReviewItemState.Ignored)
-        {
-            throw new ChannelAdministrationException(
-                ChannelAdministrationError.ReviewConflict,
-                "O item de revisão já foi ignorado; uma decisão fechada não é reaberta.");
-        }
-        else
-        {
-            var byKey = await context.CanonicalChannels
-                .FirstOrDefaultAsync(c => c.Key == key, cancellationToken);
-            if (byKey != null)
+            else
+            {
+                var byKey = await context.CanonicalChannels
+                    .FirstOrDefaultAsync(c => c.Key == key, cancellationToken);
+                if (byKey != null)
+                {
+                    throw new ChannelAdministrationException(
+                        ChannelAdministrationError.DuplicateKey,
+                        $"Já existe um canal canónico com a key '{key}' (id={byKey.Id}).");
+                }
+
+                var createdNow = DateTime.UtcNow;
+                channel = new CanonicalChannelEntity
+                {
+                    Key = key,
+                    DisplayName = spec.Name.Trim(),
+                    Country = NormalizeCountry(spec.Country),
+                    EditorialCategory = spec.EditorialCategory ?? EditorialCategory.Live,
+                    EditorialGroup = spec.EditorialGroup ?? CanonicalEditorialGroup.Other,
+                    PublicationPolicy = spec.PublicationPolicy ?? PublicationPolicy.CreateEligible,
+                    IsEnabled = true,
+                    CreatedAtUtc = createdNow,
+                    UpdatedAtUtc = createdNow,
+                };
+                context.CanonicalChannels.Add(channel);
+                // W-REVIEW-02B — SaveChanges #1 of two, wrapped in tx.
+                // On UNIQUE violation of canonical_channels.Key (race between
+                // pre-check and save) translate to DuplicateKey domain
+                // exception. The outer transaction will roll back.
+                try
+                {
+                    await context.SaveChangesAsync(cancellationToken);
+                }
+                catch (DbUpdateException ex) when (IsCanonicalChannelsKeyUniqueViolation(ex))
+                {
+                    throw new ChannelAdministrationException(
+                        ChannelAdministrationError.DuplicateKey,
+                        $"Já existe um canal canónico com a key '{key}' (corrida concorrente).");
+                }
+                channelCreated = true;
+            }
+
+            var existing = await context.ChannelAliases
+                .FirstOrDefaultAsync(a => a.NormalizedAlias == alias, cancellationToken);
+            if (existing != null && existing.CanonicalChannelId != channel.Id)
             {
                 throw new ChannelAdministrationException(
-                    ChannelAdministrationError.DuplicateKey,
-                    $"Já existe um canal canónico com a key '{key}' (id={byKey.Id}).");
+                    ChannelAdministrationError.AliasConflict,
+                    $"Alias '{alias}' já pertence ao canal #{existing.CanonicalChannelId}.");
             }
 
-            var createdNow = DateTime.UtcNow;
-            channel = new CanonicalChannelEntity
+            var now = DateTime.UtcNow;
+            ChannelAliasEntity aliasEntity;
+            var aliasCreated = false;
+            if (existing != null)
             {
-                Key = key,
-                DisplayName = spec.Name.Trim(),
-                Country = NormalizeCountry(spec.Country),
-                EditorialCategory = spec.EditorialCategory ?? EditorialCategory.Live,
-                EditorialGroup = spec.EditorialGroup ?? CanonicalEditorialGroup.Other,
-                PublicationPolicy = spec.PublicationPolicy ?? PublicationPolicy.CreateEligible,
-                IsEnabled = true,
-                CreatedAtUtc = createdNow,
-                UpdatedAtUtc = createdNow,
-            };
-            context.CanonicalChannels.Add(channel);
-            // W-REVIEW-02 — SaveChanges intermédio PRESERVADO. A
-            // atribuição por navigation property (linha abaixo) só
-            // funciona se o `channel.Id` for conhecido; EF Core só
-            // atribui o Id durante o SaveChanges (topological insert).
-            // Como o ramo de criação precisa do Id para passar a
-            // ApplyLegacyResolveTransition e ao materializador, esta
-            // primeira escrita é inevitável. O risco pré-existente
-            // de canonical órfão (se o 2º SaveChanges falhar) é
-            // documentado mas não tratado nesta wave — alternativas
-            // como deferred-execution ou shadow-FK estão fora do
-            // escopo.
-            await context.SaveChangesAsync(cancellationToken);
-            channelCreated = true;
-        }
-
-        var existing = await context.ChannelAliases
-            .FirstOrDefaultAsync(a => a.NormalizedAlias == alias, cancellationToken);
-        if (existing != null && existing.CanonicalChannelId != channel.Id)
-        {
-            throw new ChannelAdministrationException(
-                ChannelAdministrationError.AliasConflict,
-                $"Alias '{alias}' já pertence ao canal #{existing.CanonicalChannelId}.");
-        }
-
-        var now = DateTime.UtcNow;
-        ChannelAliasEntity aliasEntity;
-        var aliasCreated = false;
-        if (existing != null)
-        {
-            aliasEntity = existing;
-        }
-        else
-        {
-            aliasEntity = new ChannelAliasEntity
+                aliasEntity = existing;
+            }
+            else
             {
-                NormalizedAlias = alias,
-                // W-REVIEW-02 — FK-id (não navigation property) atribuído
-                // AQUI, depois do SaveChanges intermédio ter popular
-                // `channel.Id`. Esta combinação preserva a estrutura
-                // existente (FK-id directo) sem regressão de
-                // comportamento. Mantém o risco pré-existente de
-                // canonical órfão se o 2º SaveChanges falhar — fora
-                // do escopo desta wave.
-                CanonicalChannelId = channel.Id,
-                CreatedAtUtc = now,
-            };
-            context.ChannelAliases.Add(aliasEntity);
-            channel.UpdatedAtUtc = now;
-            aliasCreated = true;
+                aliasEntity = new ChannelAliasEntity
+                {
+                    NormalizedAlias = alias,
+                    // W-REVIEW-02 — FK-id (não navigation property) atribuído
+                    // AQUI, depois do SaveChanges intermédio ter popular
+                    // `channel.Id`. Esta combinação preserva a estrutura
+                    // existente (FK-id directo) sem regressão de
+                    // comportamento.
+                    CanonicalChannelId = channel.Id,
+                    CreatedAtUtc = now,
+                };
+                context.ChannelAliases.Add(aliasEntity);
+                channel.UpdatedAtUtc = now;
+                aliasCreated = true;
+            }
+
+            ApplyLegacyResolveTransition(item, channel.Id, now);
+
+            // W-REVIEW-02 — materializar ChannelSource no mesmo DbContext
+            // ANTES do SaveChanges final. Atomicidade: alias + review-item
+            // + ChannelSource committed num único SaveChanges, dentro do
+            // mesmo transaction que cobre o canonical-create (quando
+            // aplicável).
+            var materialized = await MaterializeChannelSourceFromReviewAsync(context, item, cancellationToken);
+
+            // W-REVIEW-02B — channel_sources UNIQUE discrimination. The
+            // reload callback detaches the failed Added entity, reloads
+            // the existing row by fingerprint (or URL fallback), and
+            // re-issues SaveChanges so the alias + review-item changes
+            // (and the canonical, when applicable) get committed even when
+            // the channel_sources INSERT was rejected by the new filtered
+            // UNIQUE index.
+            try
+            {
+                await SaveReviewApprovalAsync(context, alias, cancellationToken);
+            }
+            catch (ChannelAdministrationException ex) when (
+                ex.Error == ChannelAdministrationError.AliasConflict
+                && materialized != null
+                && ex.Message.Contains("UNIQUE em channel_sources", StringComparison.Ordinal))
+            {
+                var reloaded = await ReloadChannelSourceOnUniqueAsync(
+                    context,
+                    canonicalChannelId: channel.Id,
+                    sourceId: item.SourceId!.Value,
+                    sanitizedUrl: materialized.StreamUrl,
+                    fingerprint: materialized.Fingerprint,
+                    fingerprintVersion: materialized.FingerprintVersion,
+                    cancellationToken);
+                if (reloaded == null) throw;
+            }
+
+            var changed = channelCreated || aliasCreated;
+            var result = new ReviewApprovalResult(
+                item, priorState, priorApprovedId, channel, aliasEntity,
+                Idempotent: !changed,
+                CatalogueChanged: changed,
+                Action: "create-channel",
+                MaterializedChannelSource: materialized);
+
+            await tx.CommitAsync(cancellationToken);
+            return result;
         }
-
-        ApplyLegacyResolveTransition(item, channel.Id, now);
-
-        // W-REVIEW-02 — materializar ChannelSource no mesmo DbContext
-        // ANTES do SaveChanges final. Atomicidade: alias + review-item
-        // + ChannelSource committed num único SaveChanges (o mesmo
-        // que AddAlias usa). O canonical já está committed; aqui só
-        // o segundo grupo é atómico.
-        var materialized = await MaterializeChannelSourceFromReviewAsync(context, item, cancellationToken);
-
-        await SaveReviewApprovalAsync(context, alias, cancellationToken);
-
-        var changed = channelCreated || aliasCreated;
-        return new ReviewApprovalResult(
-            item, priorState, priorApprovedId, channel, aliasEntity,
-            Idempotent: !changed,
-            CatalogueChanged: changed,
-            Action: "create-channel",
-            MaterializedChannelSource: materialized);
+        catch
+        {
+            await tx.RollbackAsync(cancellationToken);
+            throw;
+        }
     }
 
     private static async Task<ReviewApprovalResult> ApplyExcludeAsync(
@@ -1837,21 +1905,107 @@ public sealed class CatalogResolver
     }
 
     private static async Task SaveReviewApprovalAsync(
-        ChannelCatalogDbContext context, string? alias, CancellationToken cancellationToken)
+        ChannelCatalogDbContext context,
+        string? alias,
+        CancellationToken cancellationToken)
     {
         try
         {
             await context.SaveChangesAsync(cancellationToken);
         }
+        catch (DbUpdateException ex) when (IsChannelSourcesUniqueViolation(ex))
+        {
+            // W-REVIEW-02B — channel_sources UNIQUE violation. The caller has
+            // its own try/catch (with reload callback) for this branch — when
+            // we reach here, no callback was supplied. Translate to a domain
+            // exception with a clear message; the caller may catch it before
+            // falling through.
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.AliasConflict,
+                "UNIQUE em channel_sources violada; nenhum reload configurado para esta operação.");
+        }
         catch (DbUpdateException)
         {
-            // Corrida: unicidade de alias/canal manda; não duplicar.
+            // channel_aliases UNIQUE (or any other DbUpdateException) — alias
+            // uniqueness manda; não duplicar.
             throw new ChannelAdministrationException(
                 ChannelAdministrationError.AliasConflict,
                 alias is null
                     ? "Conflito de unicidade ao resolver a Review."
                     : $"Alias '{alias}' já existe (corrida concorrente).");
         }
+    }
+
+    /// <summary>
+    /// W-REVIEW-02B — Discriminates <c>DbUpdateException</c> by inspecting the
+    /// inner <see cref="SqliteException"/>: code 19 (<c>SQLITE_CONSTRAINT</c>)
+    /// combined with substring match on the index name in the error message.
+    /// SQLite error messages include the index name when a UNIQUE INDEX trips,
+    /// which makes the message substring the most portable discriminator
+    /// across SQLite versions.
+    /// </summary>
+    private static bool IsChannelSourcesUniqueViolation(DbUpdateException ex)
+        => IsSqliteUniqueViolationOnIndex(ex, "IX_channel_sources_Channel_Source_Fingerprint_Unique");
+
+    private static bool IsChannelAliasesUniqueViolation(DbUpdateException ex)
+        => IsSqliteUniqueViolationOnIndex(ex, "IX_channel_aliases_NormalizedAlias");
+
+    private static bool IsCanonicalChannelsKeyUniqueViolation(DbUpdateException ex)
+        => IsSqliteUniqueViolationOnIndex(ex, "IX_canonical_channels_Key");
+
+    private static bool IsSqliteUniqueViolationOnIndex(DbUpdateException ex, string indexName)
+    {
+        if (ex.InnerException is not SqliteException sql) return false;
+        // SqliteErrorCode 19 == SQLITE_CONSTRAINT (incl. UNIQUE).
+        if (sql.SqliteErrorCode != 19) return false;
+        // The error message includes the index name for UNIQUE-index violations.
+        return sql.Message.Contains(indexName, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// W-REVIEW-02B — Reload callback for <c>channel_sources</c> UNIQUE violation.
+    /// Detaches the uncommitted <see cref="EntityState.Added"/> entry, reloads
+    /// the existing row by fingerprint (preferred) or URL (fallback), and
+    /// re-issues SaveChanges so the alias + review-item changes get committed
+    /// even when the channel_sources INSERT was rejected.
+    /// </summary>
+    private static async Task<ChannelSourceEntity?> ReloadChannelSourceOnUniqueAsync(
+        ChannelCatalogDbContext context,
+        long canonicalChannelId,
+        long sourceId,
+        string sanitizedUrl,
+        string? fingerprint,
+        string? fingerprintVersion,
+        CancellationToken cancellationToken)
+    {
+        var added = context.ChangeTracker.Entries<ChannelSourceEntity>()
+            .FirstOrDefault(e => e.State == EntityState.Added
+                && e.Entity.CanonicalChannelId == canonicalChannelId
+                && e.Entity.SourceId == sourceId);
+        if (added != null) added.State = EntityState.Detached;
+
+        ChannelSourceEntity? existing = null;
+        if (!string.IsNullOrEmpty(fingerprint))
+        {
+            existing = await context.ChannelSources.FirstOrDefaultAsync(
+                cs => cs.CanonicalChannelId == canonicalChannelId
+                    && cs.SourceId == sourceId
+                    && cs.Fingerprint == fingerprint
+                    && cs.FingerprintVersion == fingerprintVersion,
+                cancellationToken);
+        }
+        existing ??= await context.ChannelSources.FirstOrDefaultAsync(
+            cs => cs.CanonicalChannelId == canonicalChannelId
+                && cs.SourceId == sourceId
+                && cs.StreamUrl == sanitizedUrl,
+            cancellationToken);
+
+        if (existing != null)
+        {
+            context.ChangeTracker.DetectChanges();
+            await context.SaveChangesAsync(cancellationToken);
+        }
+        return existing;
     }
 
     /// <summary>

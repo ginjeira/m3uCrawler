@@ -416,6 +416,16 @@ public sealed class ChannelCatalogDbContext : DbContext
             // (CanonicalChannelId, SourceId).
             e.HasIndex(x => new { x.CanonicalChannelId, x.SourceId, x.Fingerprint })
                 .HasDatabaseName("IX_channel_sources_Channel_Source_Fingerprint");
+            // W-REVIEW-02B — Identidade persistente de ChannelSource
+            // (CanonicalChannelId, SourceId, Fingerprint, FingerprintVersion)
+            // é imposta ao nível do schema via UNIQUE filtered index.
+            // Filtro: legacy rows com Fingerprint=NULL (não-fingerprintáveis)
+            // permanecem coexistentes. (CanonicalChannelId, SourceId) NÃO é
+            // único — múltiplas streams distintas por source são suportadas (D2).
+            e.HasIndex(x => new { x.CanonicalChannelId, x.SourceId, x.Fingerprint, x.FingerprintVersion })
+                .HasDatabaseName("IX_channel_sources_Channel_Source_Fingerprint_Unique")
+                .IsUnique()
+                .HasFilter("\"Fingerprint\" IS NOT NULL");
             e.HasOne(x => x.CanonicalChannel)
                 .WithMany()
                 .HasForeignKey(x => x.CanonicalChannelId)
