@@ -44,7 +44,7 @@ Waves de reconstrução posteriores ao estado 9c registado acima. Gates registad
 | Wave | Scope | Commit | Recorded gate | State |
 |---|---|---|---|---|
 | W1 | Identidade de discovery; resíduo de identidade de conta | `ab3f817` | n/d | Implementado; resíduo W1 (sem `FirstSeen`/`LastSeen`; `AccountIdentity.Compute` legado) — ver dívida 1 |
-| W2 | Segurança de aquisição (SSRF/redirect/retry) | `ab3f817` | n/d | Testes de unidade verdes; W2-FU: observer de falhas de aquisição não ligado em produção — ver dívida 2 |
+| W2 | Segurança de aquisição (SSRF/redirect/retry) | `ab3f817` | n/d | Testes de unidade verdes; W2-FU-1 FECHADO (parcial — observer no Telegram live com sourceId=null); W2-FU-2 OPEN (persistência em Source para Telegram) |
 | W3 | Contrato de parsing M3U | `ab3f817` | 2302 passed / 1 skipped / 0 failed | Implementado |
 | W4 | Normalização e fingerprinting de streams | `c73e134` | 2365 / 1 / 0 | Implementado; divergências de composição a jusante — ver dívida 4 |
 | W4.1 | `SourceSelectionStage` ciente de fingerprint | `8142c0d` | 2377 / 1 / 0 | Implementado; divergências de output/selection a jusante — ver dívida 4 |
@@ -62,7 +62,8 @@ Waves de reconstrução posteriores ao estado 9c registado acima. Gates registad
 |---|---|---|---|---|
 | W6b-3 | Ligar/esconder funcionalidades inertes decididas: `import-policies`, `canonical-groups`/`group-mappings`, `pending-country-approvals` | Definida / pendente (a decidir quando ligar vs. esconder) | feature/phase-9c-first-run-dashboard | n/d |
 | M.4 | Ligar o snapshot de `RecognitionPolicy` ao Run/pipeline (desbloqueia o fuzzy W5.3 em produção) | **OPEN** — sem wave atribuída; Decision Pack em preparação/ratificação; snapshot→Run/pipeline não wired. Implementação não decidida | feature/phase-9c-first-run-dashboard | n/d |
-| W2-FU | Ligar `CatalogAcquisitionFailureObserver`/`IAcquisitionFailureObserver` em produção | Pendente — observer nunca ligado em produção; persistência de falhas de aquisição parcial em runtime | feature/phase-9c-first-run-dashboard | n/d |
+| W2-FU-1 | Wire do `CatalogAcquisitionFailureObserver` no Telegram live run (RunReport aggregation com `sourceId=null`) | **FECHADO** — observer instalado em `SearchAndTestM3UInTelegramAsync` via `SetCatalogResolver` + nova sobrecarga da factory; `sourceId` permanece `null` (persistência em `Source` fica para W2-FU-2) | feature/phase-9c-first-run-dashboard | n/d |
+| W2-FU-2 | Source persistence para Telegram via bridge `peer/chat → SourceId` | **OPEN** — follow-up de W2-FU-1; depende de definição de identidade operacional `Source`↔peer/chat | feature/phase-9c-first-run-dashboard | n/d |
 
 ## Pending
 | Item | Origin | Dependency | Status |
@@ -138,7 +139,7 @@ Dívida funcional verificada no código após as waves de reconstrução. Cada i
 | # | Item | Evidência |
 |---|---|---|
 | 1 | W1 residual: `DiscoveryCandidateEntity` persistido (tabela `discovery_candidates`) sem `FirstSeen`/`LastSeen` (by design); `AccountIdentity.Compute` legado (URL-sem-password + username) mantido para serialização de trabalho ao lado de `AccountKey.Compose` (namespace + identidade externa) | `ChannelCatalogDbContext.cs:336`; `AccountIdentity.Compute` |
-| 2 | W2-FU: `CatalogAcquisitionFailureObserver`/`IAcquisitionFailureObserver` nunca ligado em produção → `Source.LastAcquisitionFailure*` e `RunReport.AcquisitionFailures` só preenchidos em testes; persistência de falhas de aquisição é PARCIAL em runtime | `StreamValidationTesterFactory.cs:32`; `WebDashboardService.cs:3290` |
+| 2 | W2-FU-1 FECHADO (parcial): `CatalogAcquisitionFailureObserver` ligado em produção no caminho Telegram live com `sourceId=null` (RunReport aggregation). W2-FU-2 AINDA OPEN: persistência em `Source.LastAcquisitionFailure*` para Telegram depende de bridge `peer/chat → SourceId`; restantes call sites sem wiring (`TelegramBotService /test`, `Program.cs:898`, `Program.cs:1405`, `ScheduledValidationAction`, `ScheduledM3uDiscoveryAction`, `ScheduledAutomationHost`, `/api/validation/test`) | `TelegramScraperService.cs` (wiring via `SetCatalogResolver`); `StreamValidationTesterFactory.cs` (sobrecarga) |
 | 3 | W2 testado verde em unidade (SSRF/redirect/retry) — mantém-se implementado; a dívida é apenas o wiring do observer em produção | testes de unidade W2 |
 | 4 | W4/W4.1: fingerprint + `SourceSelectionStage` ciente de fingerprint implementados; composição de output/selection mantém divergências documentadas a jusante | `c73e134`, `8142c0d` |
 | 5 | W5.1: schema/snapshot de `RecognitionPolicy` implementado, mas sem integração de autoria/consumo em produção | `5236364` |
@@ -182,6 +183,6 @@ Recalibrações normativas (não alteram a BÍBLIA; clarificam leitura):
 Não existe passo único: os próximos passos são independentes e nenhum deve iniciar implementação de `M.4` sem Decision Pack ratificado.
 
 1. `M.4` — **OPEN**: ratificar o Decision Pack do wiring do snapshot de `RecognitionPolicy` ao Run/pipeline (desbloqueia o fuzzy W5.3 em produção). Não existe desenho de implementação decidido.
-2. Dívida funcional de reconstrução: W2-FU (ligar `CatalogAcquisitionFailureObserver` em produção); C7 (campos de `ReviewItem`); Review→Output (produzir/seleccionar `ChannelSource`/output e re-publicar); gap de `resolve` W5.5 (`externalIdentity`/`channelSource`/`none`); preencher linhas `TBD`/`UNMAPPED` da matriz de rastreabilidade.
+2. Dívida funcional de reconstrução: W2-FU-2 (Source persistence para Telegram via bridge peer/chat → SourceId); C7 (campos de `ReviewItem`); Review→Output (produzir/seleccionar `ChannelSource`/output e re-publicar); gap de `resolve` W5.5 (`externalIdentity`/`channelSource`/`none`); preencher linhas `TBD`/`UNMAPPED` da matriz de rastreabilidade.
 3. W6b-3 (ligar/esconder funcionalidades inertes: `import-policies`, `canonical-groups`/`group-mappings`, `pending-country-approvals`).
 4. E2E de dois ciclos: deploy do HEAD para o runtime fresco e execução Discovery→Selection→Playlist→Dispatcharr duas vezes, com verificação de idempotência (sem duplicar channels/streams/sources/ownership; sem apagar externos).

@@ -324,6 +324,13 @@ namespace m3uCrawler
                     catalogForAffinity = await InitializeCatalogAsync(catalogDbPath, CancellationToken.None);
                     countryAffinityMembers = await LoadCountryAffinityMembersAsync(catalogForAffinity);
                     scraper.SetCountryAffinityMembers(countryAffinityMembers);
+                    // W2-FU-1 (2026-09-22) — wire do resolver para o
+                    // observer de falhas de aquisição. Sem catalog
+                    // disponível, o scraper fica sem observer (no-op,
+                    // preserva o comportamento legacy). Reutiliza a
+                    // mesma instância de catalogForAffinity (já criada
+                    // para afinidades) para evitar inicialização dupla.
+                    scraper.SetCatalogResolver(catalogForAffinity);
                 }
                 catch (Exception ex)
                 {

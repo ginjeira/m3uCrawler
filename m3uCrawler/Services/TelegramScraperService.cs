@@ -48,6 +48,17 @@ namespace m3uCrawler.Services
         // policy viva; sem fabrico).
         private m3uCrawler.Services.Recognition.RecognitionPolicyResolver? _recognitionPolicyResolver;
 
+        // W2-FU-1 (2026-09-22) — resolvedor de catálogo opcional para
+        // alimentar o observer de falhas de aquisição. Quando configurado
+        // E o caller fornece um pipelineIngestor (caminho com ingestion),
+        // o scraper instala um CatalogAcquisitionFailureObserver com
+        // sourceId=null no tester — agrega em RunReport mas NÃO persiste
+        // em Source (a identidade operacional Source<->peer/chat ainda
+        // não está ligada; ver W2-FU-2 follow-up). Sem resolver, sem
+        // observer: o comportamento legacy é preservado (no-op, sem
+        // side-effects).
+        private m3uCrawler.Services.Catalog.CatalogResolver? _catalogResolver;
+
         // Membros de afinidade Kind=Country (classificação de país), por
         // código ISO. Injectados na construção do CountryChannelValidator
         // deste scraper. Escopo de instância: não existe estado estático
@@ -79,6 +90,23 @@ namespace m3uCrawler.Services
             m3uCrawler.Services.Recognition.RecognitionPolicyResolver? resolver)
         {
             _recognitionPolicyResolver = resolver;
+        }
+
+        /// <summary>
+        /// W2-FU-1 (2026-09-22) — Injecta o resolvedor de catálogo
+        /// utilizado pelo observer de falhas de aquisição. Quando
+        /// configurado E o caller fornece um <c>pipelineIngestor</c> (caminho
+        /// com ingestion), <see cref="SearchAndTestM3UInTelegramAsync"/>
+        /// instala um <see cref="Validation.CatalogAcquisitionFailureObserver"/>
+        /// com <c>sourceId=null</c> no tester — agrega em
+        /// <see cref="RunReport"/> mas NÃO persiste em <c>Source</c>.
+        /// Passar <c>null</c> (default) preserva o comportamento legacy
+        /// (sem observer, sem side-effects).
+        /// </summary>
+        public void SetCatalogResolver(
+            m3uCrawler.Services.Catalog.CatalogResolver? resolver)
+        {
+            _catalogResolver = resolver;
         }
 
         /// <summary>
@@ -381,7 +409,23 @@ namespace m3uCrawler.Services
             // defaults.
             var validationState = TryLoadSharedValidationState()
                 ?? StreamValidationTesterFactory.CreateIsolatedState();
-            var tester = StreamValidationTesterFactory.CreateTester(validationState);
+            // W2-FU-1 (2026-09-22) — wire do observer de falhas de
+            // aquisição. sourceId é SEMPRE null neste wave: a identidade
+            // operacional Source<->peer/chat não está ainda ligada (ver
+            // W2-FU-2 follow-up). Só instalamos o observer no caminho
+            // COM ingestion (pipelineIngestor != null) E quando o
+            // caller injectou um catalog resolver. Caminho legacy sem
+            // catalog preserva o comportamento actual (no observer, sem
+            // side-effects).
+            m3uCrawler.Services.Validation.IAcquisitionFailureObserver? acquisitionFailureObserver = null;
+            if (pipelineIngestor != null && _catalogResolver != null)
+            {
+                acquisitionFailureObserver = new m3uCrawler.Services.Validation.CatalogAcquisitionFailureObserver(
+                    _catalogResolver, sourceId: null, report: rep);
+            }
+            var tester = acquisitionFailureObserver is null
+                ? StreamValidationTesterFactory.CreateTester(validationState)
+                : StreamValidationTesterFactory.CreateTester(validationState, acquisitionFailureObserver);
             // PHASE 9A.2 (2026-09-16): o validador de accounts reusa o MESMO
             // state/cache/host-tracker que o tester.
             var accountValidator = new AccountValidator(validationState, tester);

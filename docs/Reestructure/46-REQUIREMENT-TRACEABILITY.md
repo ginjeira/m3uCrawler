@@ -199,12 +199,16 @@ Implementação e testes concluídos. Mecanismos:
 | Handler sem auto-redirect e sem proxy | `Validation/HttpClientFactory.cs:83-86` | `WaveW2SsrfGuardTests.cs` | COMPLIANT |
 | Redirect manual revalidado por hop | `Validation/GuardedHttpRequest.cs:34-102` | `WaveW2SsrfGuardTests.cs` | COMPLIANT |
 | Retry técnico na mesma Run | `Validation/AcquisitionFailure.cs`; `M3uTesterService.cs` | `WaveW2AcquisitionRetryTests.cs` | COMPLIANT |
-| Source failure persistida (sanitizada) | `CatalogEntities.cs:917-922`; `CatalogResolver.MarkSourceAcquisitionFailureAsync`; migração `20260919130000_AddSourceAcquisitionFailure` | `WaveW2AcquisitionPersistenceTests.cs` | COMPLIANT |
-| Run aggregation | `RunReport.cs:228-233`; `LiveRunCounts` | `WaveW2AcquisitionPersistenceTests.cs` | COMPLIANT |
+| Source failure persistida (sanitizada) | `CatalogEntities.cs:917-922`; `CatalogResolver.MarkSourceAcquisitionFailureAsync`; migração `20260919130000_AddSourceAcquisitionFailure` | `WaveW2AcquisitionPersistenceTests.cs` | COMPLIANT (parcial — ver W2-FU-1/W2-FU-2 abaixo) |
+| Run aggregation | `RunReport.cs:228-233`; `LiveRunCounts` | `WaveW2AcquisitionPersistenceTests.cs`; `W2FU1ObserverWiringTests.cs` | COMPLIANT (W2-FU-1: agora exercitado em produção no caminho Telegram live com `sourceId=null`) |
 
 PARAMETER_GAP (técnicos, não normativos): `StreamValidationOptions.MaxRedirects`, `MaxResponseBytes`; reutilizados `MaxRetries`, `RetryDelayMilliseconds`, `ConnectionTimeoutSeconds`, `OverallTimeoutSeconds`. CIDRs/metadata adicionais continuam PARAMETER_GAP.
 
-Fora de scope: transporte Dispatcharr (BaseUrl operador-configured); wiring de Source no caminho Telegram (sem entidade Source no boundary de processamento de candidatos).
+Fora de scope: transporte Dispatcharr (BaseUrl operador-configured); wiring de Source no caminho Telegram (sem entidade Source no boundary de processamento de candidatos — W2-FU-2 follow-up).
+
+**W2-FU-1 (FECHADO 2026-09-22):** o `CatalogAcquisitionFailureObserver` é agora instalado em `TelegramScraperService.SearchAndTestM3UInTelegramAsync` quando o caller injecta um `CatalogResolver` via `SetCatalogResolver(...)` e está no caminho COM ingestion (`pipelineIngestor != null`). O observer é construído com `sourceId=null` e portanto apenas agrega em `RunReport.AcquisitionFailures`/`Retryable`/`Terminal` — não persiste em `Source`. Caminho legacy sem catalog preserva o comportamento actual (sem observer, sem side-effects).
+
+**W2-FU-2 (OPEN):** persistência em `Source.LastAcquisitionFailure*` para o caminho Telegram depende de uma bridge `peer/chat → SourceId`. Não foi derivado nem improvisado `SourceId` a partir de `peerId`, `chatTitle`, `CandidatePlaylist.Source`, `Source.Origin`/`Key`, heurísticas, queries ou `XtreamAccountInfo`. Nenhuma `Source` é criada por HTTP URL. Os 7 call sites MUST_NOT_WIRE (`TelegramBotService /test`, `Program.cs:898`, `Program.cs:1405`, `ScheduledValidationAction`, `ScheduledM3uDiscoveryAction`, `ScheduledAutomationHost`, `/api/validation/test`) permanecem sem wiring.
 
 ## W3 — Contrato de parsing M3U (estado real)
 
