@@ -52,12 +52,16 @@ is therefore **evidence**, never identity.
    3. lower-case scheme and host; strip a single trailing dot on host;
    4. remove the port when it equals the scheme default; otherwise keep it;
    5. remove the fragment;
-   6. preserve userinfo verbatim (never strip authentication);
-   7. preserve path case-sensitively (`""` → `/`);
-   8. preserve the query string verbatim, including auth-bearing parameters.
+   6. remove userinfo (`user:pass@`) — credentials are not part of technical identity;
+   7. preserve path case-sensitively (`""` → `/`); for the Xtream pattern
+      `/live|movie|series/<USER>/<PASS>/<ID>` mask `<USER>` and `<PASS>` as `***`
+      while preserving `<ID>` (other paths are unchanged);
+   8. preserve the query string verbatim in original order, removing only the
+      credential parameters `username`, `password`, `token`, `authorization`.
 
    Only elements explicitly defined above are removed. Normalization MUST NOT strip
-   authentication and then reconstruct an insecure URL (`04-PLAYLIST-STREAM.md:38`).
+   authentication and then reconstruct an insecure URL — the canonical form is held
+   in memory only and is never persisted (`04-PLAYLIST-STREAM.md:38, :55`).
 
 4. **No persistence of raw canonical URL.** The canonical URL may exist in memory
    for the duration of a computation; only the fingerprint hash is persisted in
