@@ -44,7 +44,7 @@ Waves de reconstrução posteriores ao estado 9c registado acima. Gates registad
 | Wave | Scope | Commit | Recorded gate | State |
 |---|---|---|---|---|
 | W1 | Identidade de discovery; resíduo de identidade de conta | `ab3f817` | n/d | Implementado; resíduo W1 (sem `FirstSeen`/`LastSeen`; `AccountIdentity.Compute` legado) — ver dívida 1 |
-| W2 | Segurança de aquisição (SSRF/redirect/retry) | `ab3f817` | n/d | Testes de unidade verdes; W2-FU-1 FECHADO (parcial — observer no Telegram live com sourceId=null); W2-FU-2 OPEN (persistência em Source para Telegram) |
+| W2 | Segurança de aquisição (SSRF/redirect/retry) | `ab3f817` | n/d | Testes de unidade verdes; W2-FU-1 FECHADO (cobertura de RunReport aggregation no Telegram live com sourceId=null); W2-FU-2 OPEN (persistência em Source para Telegram) |
 | W3 | Contrato de parsing M3U | `ab3f817` | 2302 passed / 1 skipped / 0 failed | Implementado |
 | W4 | Normalização e fingerprinting de streams | `c73e134` | 2365 / 1 / 0 | Implementado; divergências de composição a jusante — ver dívida 4 |
 | W4.1 | `SourceSelectionStage` ciente de fingerprint | `8142c0d` | 2377 / 1 / 0 | Implementado; divergências de output/selection a jusante — ver dívida 4 |
@@ -139,7 +139,7 @@ Dívida funcional verificada no código após as waves de reconstrução. Cada i
 | # | Item | Evidência |
 |---|---|---|
 | 1 | W1 residual: `DiscoveryCandidateEntity` persistido (tabela `discovery_candidates`) sem `FirstSeen`/`LastSeen` (by design); `AccountIdentity.Compute` legado (URL-sem-password + username) mantido para serialização de trabalho ao lado de `AccountKey.Compose` (namespace + identidade externa) | `ChannelCatalogDbContext.cs:336`; `AccountIdentity.Compute` |
-| 2 | W2-FU-1 FECHADO (parcial): `CatalogAcquisitionFailureObserver` ligado em produção no caminho Telegram live com `sourceId=null` (RunReport aggregation). W2-FU-2 AINDA OPEN: persistência em `Source.LastAcquisitionFailure*` para Telegram depende de bridge `peer/chat → SourceId`; restantes call sites sem wiring (`TelegramBotService /test`, `Program.cs:898`, `Program.cs:1405`, `ScheduledValidationAction`, `ScheduledM3uDiscoveryAction`, `ScheduledAutomationHost`, `/api/validation/test`) | `TelegramScraperService.cs` (wiring via `SetCatalogResolver`); `StreamValidationTesterFactory.cs` (sobrecarga) |
+| 2 | W2-FU-1 FECHADO: `CatalogAcquisitionFailureObserver` ligado em produção no caminho Telegram live com `sourceId=null` (RunReport aggregation). W2-FU-2 AINDA OPEN: persistência em `Source.LastAcquisitionFailure*` para Telegram depende de bridge `peer/chat → SourceId`; restantes call sites sem wiring (`TelegramBotService /test`, `Program.cs:898`, `Program.cs:1405`, `ScheduledValidationAction`, `ScheduledM3uDiscoveryAction`, `ScheduledAutomationHost`, `/api/validation/test`) | `TelegramScraperService.cs` (wiring via `SetCatalogResolver`); `StreamValidationTesterFactory.cs` (sobrecarga) |
 | 3 | W2 testado verde em unidade (SSRF/redirect/retry) — mantém-se implementado; a dívida é apenas o wiring do observer em produção | testes de unidade W2 |
 | 4 | W4/W4.1: fingerprint + `SourceSelectionStage` ciente de fingerprint implementados; composição de output/selection mantém divergências documentadas a jusante | `c73e134`, `8142c0d` |
 | 5 | W5.1: schema/snapshot de `RecognitionPolicy` implementado, mas sem integração de autoria/consumo em produção | `5236364` |

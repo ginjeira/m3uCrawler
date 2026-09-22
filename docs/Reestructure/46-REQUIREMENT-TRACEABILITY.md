@@ -199,7 +199,7 @@ Implementação e testes concluídos. Mecanismos:
 | Handler sem auto-redirect e sem proxy | `Validation/HttpClientFactory.cs:83-86` | `WaveW2SsrfGuardTests.cs` | COMPLIANT |
 | Redirect manual revalidado por hop | `Validation/GuardedHttpRequest.cs:34-102` | `WaveW2SsrfGuardTests.cs` | COMPLIANT |
 | Retry técnico na mesma Run | `Validation/AcquisitionFailure.cs`; `M3uTesterService.cs` | `WaveW2AcquisitionRetryTests.cs` | COMPLIANT |
-| Source failure persistida (sanitizada) | `CatalogEntities.cs:917-922`; `CatalogResolver.MarkSourceAcquisitionFailureAsync`; migração `20260919130000_AddSourceAcquisitionFailure` | `WaveW2AcquisitionPersistenceTests.cs` | COMPLIANT (parcial — ver W2-FU-1/W2-FU-2 abaixo) |
+| Source failure persistida (sanitizada) | `CatalogEntities.cs:917-922`; `CatalogResolver.MarkSourceAcquisitionFailureAsync`; migração `20260919130000_AddSourceAcquisitionFailure` | `WaveW2AcquisitionPersistenceTests.cs` | COMPLIANT (cobertura de `Source` exercitada em teste; ver W2-FU-1/W2-FU-2 abaixo para o wiring em produção) |
 | Run aggregation | `RunReport.cs:228-233`; `LiveRunCounts` | `WaveW2AcquisitionPersistenceTests.cs`; `W2FU1ObserverWiringTests.cs` | COMPLIANT (W2-FU-1: agora exercitado em produção no caminho Telegram live com `sourceId=null`) |
 
 PARAMETER_GAP (técnicos, não normativos): `StreamValidationOptions.MaxRedirects`, `MaxResponseBytes`; reutilizados `MaxRetries`, `RetryDelayMilliseconds`, `ConnectionTimeoutSeconds`, `OverallTimeoutSeconds`. CIDRs/metadata adicionais continuam PARAMETER_GAP.
