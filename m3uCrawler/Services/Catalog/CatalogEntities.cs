@@ -406,9 +406,14 @@ public sealed class ReviewItemEntity
     // compatibilidade com reviews legadas.
 
     /// <summary>
-    /// URL observada (sanitizada — sem credenciais em claro). <c>null</c>
-    /// para reviews criadas antes de W-REVIEW-01 ou quando o stream de
-    /// origem não tem URL (e.g. caminhos que ainda não chegaram ao ingestion).
+    /// URL observada (preservada verbatim — pode conter credenciais em
+    /// claro quando a source as expõe). A sanitização acontece apenas
+    /// na materialização para <c>ChannelSource.StreamUrl</c> (chokepoint
+    /// <c>RecordChannelSourceAsync</c>) e na exposição via API/DTO;
+    /// esta coluna persiste a URL bruta do ingestion. <c>null</c> para
+    /// reviews criadas antes de W-REVIEW-01 ou quando o stream de
+    /// origem não tem URL (e.g. caminhos que ainda não chegaram ao
+    /// ingestion).
     /// </summary>
     public string? StreamUrl { get; set; }
 
