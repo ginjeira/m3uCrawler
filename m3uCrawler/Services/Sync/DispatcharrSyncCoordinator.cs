@@ -1,8 +1,10 @@
 using System;
+using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
 using m3uCrawler.Models;
 using m3uCrawler.Services.Catalog;
+using m3uCrawler.Services.Dispatcharr;
 using m3uCrawler.Services.LiveRun;
 using m3uCrawler.Services.Matching;
 using m3uCrawler.Services.SourceOrdering;
@@ -13,6 +15,9 @@ namespace m3uCrawler.Services.Sync;
 /// Resultado de uma tentativa de sincronização Dispatcharr.
 /// <see cref="Status"/> é o contrato estável; <see cref="ErrorType"/> é
 /// apenas o tipo da excepção (nunca a mensagem, que pode conter segredos).
+/// <see cref="Report"/> é o resultado detalhado (apenas quando
+/// <see cref="Status"/> é <see cref="DispatcharrSyncStatus.Succeeded"/>);
+/// pode ser <c>null</c> em <c>Disabled</c> ou <c>CatalogUnavailable</c>.
 /// </summary>
 public enum DispatcharrSyncStatus
 {
@@ -24,7 +29,8 @@ public enum DispatcharrSyncStatus
 
 public sealed record DispatcharrSyncOutcome(
     DispatcharrSyncStatus Status,
-    string? ErrorType = null);
+    string? ErrorType = null,
+    DispatcharrSyncResult? Report = null);
 
 /// <summary>
 /// Application service único que aplica a playlist publicada ao
@@ -52,13 +58,16 @@ public sealed class DispatcharrSyncCoordinator
 {
     private readonly Func<DispatcharrConfig> _configLoader;
     private readonly Func<CancellationToken, Task<CatalogResolver>>? _catalogFactory;
+    private readonly HttpMessageHandler? _transport;
 
     public DispatcharrSyncCoordinator(
         Func<DispatcharrConfig>? configLoader = null,
-        Func<CancellationToken, Task<CatalogResolver>>? catalogFactory = null)
+        Func<CancellationToken, Task<CatalogResolver>>? catalogFactory = null,
+        HttpMessageHandler? transport = null)
     {
         _configLoader = configLoader ?? DispatcharrConfigLoader.Load;
         _catalogFactory = catalogFactory;
+        _transport = transport;
     }
 
     public async Task<DispatcharrSyncOutcome> RunAsync(
@@ -67,7 +76,8 @@ public sealed class DispatcharrSyncCoordinator
         CatalogResolver? catalog,
         DispatcharrSourceSelection? selection,
         ILiveRunProgress? liveRunProgress,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool allowLegacyWithoutCatalog = false)
     {
         var cfg = _configLoader();
         if (!cfg.Enabled)
@@ -116,6 +126,78 @@ public sealed class DispatcharrSyncCoordinator
 
         if (effectiveCatalog is null)
         {
+            // W-REVIEW-04 — compatibilidade com o caminho scheduler legacy.
+            // Quando o caller (scheduler, em modo legacy) pede
+            // explicitamente allowLegacyWithoutCatalog=true e não há
+            // catalog, NÃO abortamos: continuamos em modo legacy (sem
+            // ownership), exactamente como o scheduler fazia antes do
+            // refactor D6-A. Para os outros caminhos (Program.cs,
+            // RunPublicationService), o default false preserva o
+            // comportamento existente (CatalogUnavailable).
+            if (allowLegacyWithoutCatalog)
+            {
+                try
+                {
+                    var aliases = AliasResolver.FromFile(cfg.AliasFile);
+                    var ordering = new StreamOrderingPolicy(cfg.ProviderPriority);
+                    var matcher = new ChannelMatcher(aliases, null, effectiveCatalog);
+                    DispatcharrSyncService sync;
+                    if (_transport != null)
+                    {
+                        var built = DispatcharrClientFactory.BuildWithTransport(
+                            cfg.BaseUrl, cfg.ApiKey, cfg.Username, cfg.Password, _transport);
+                        sync = new DispatcharrSyncService(
+                            cfg, outputDir,
+                            aliases: aliases,
+                            ordering: ordering,
+                            matcher: matcher,
+                            http: built.Http,
+                            auth: built.Auth,
+                            login: built.Login,
+                            channels: built.Channels,
+                            streams: built.Streams,
+                            m3u: built.M3U,
+                            catalog: effectiveCatalog);
+                    }
+                    else
+                    {
+                        sync = new DispatcharrSyncService(
+                            cfg, outputDir,
+                            aliases: aliases,
+                            ordering: ordering,
+                            matcher: matcher,
+                            catalog: effectiveCatalog);
+                    }
+                    var syncResult = await sync.RunAsync(playlistPath, selection, cancellationToken).ConfigureAwait(false);
+
+                    if (liveRunProgress is not null)
+                    {
+                        liveRunProgress.ReportCounts(counts => counts.DispatcharrSyncCompleted++);
+                        liveRunProgress.ReportActivity(
+                            LiveRunActivityCategory.Dispatcharr,
+                            LiveRunActivityLevel.Info,
+                            "dispatcharr sync completed (legacy)");
+                    }
+                    return new DispatcharrSyncOutcome(
+                        DispatcharrSyncStatus.Succeeded,
+                        ErrorType: null,
+                        Report: syncResult);
+                }
+                catch (Exception ex)
+                {
+                    if (liveRunProgress is not null)
+                    {
+                        liveRunProgress.ReportCounts(counts => counts.DispatcharrSyncFailed++);
+                        liveRunProgress.ReportActivity(
+                            LiveRunActivityCategory.Dispatcharr,
+                            LiveRunActivityLevel.Error,
+                            "dispatcharr sync failed (legacy)");
+                    }
+                    Console.WriteLine($"⚠️ Falha na sincronização Dispatcharr (legacy): {ex.Message}");
+                    return new DispatcharrSyncOutcome(DispatcharrSyncStatus.Failed, ex.GetType().Name);
+                }
+            }
+
             liveRunProgress?.ReportCounts(counts => counts.DispatcharrSyncFailed++);
             liveRunProgress?.ReportActivity(
                 LiveRunActivityCategory.Dispatcharr,
@@ -132,13 +214,34 @@ public sealed class DispatcharrSyncCoordinator
             var aliases = AliasResolver.FromFile(cfg.AliasFile);
             var ordering = new StreamOrderingPolicy(cfg.ProviderPriority);
             var matcher = new ChannelMatcher(aliases, null, effectiveCatalog);
-            var sync = new DispatcharrSyncService(
-                cfg, outputDir,
-                aliases: aliases,
-                ordering: ordering,
-                matcher: matcher,
-                catalog: effectiveCatalog);
-            await sync.RunAsync(playlistPath, selection, cancellationToken).ConfigureAwait(false);
+            DispatcharrSyncService sync;
+            if (_transport != null)
+            {
+                var built = DispatcharrClientFactory.BuildWithTransport(
+                    cfg.BaseUrl, cfg.ApiKey, cfg.Username, cfg.Password, _transport);
+                sync = new DispatcharrSyncService(
+                    cfg, outputDir,
+                    aliases: aliases,
+                    ordering: ordering,
+                    matcher: matcher,
+                    http: built.Http,
+                    auth: built.Auth,
+                    login: built.Login,
+                    channels: built.Channels,
+                    streams: built.Streams,
+                    m3u: built.M3U,
+                    catalog: effectiveCatalog);
+            }
+            else
+            {
+                sync = new DispatcharrSyncService(
+                    cfg, outputDir,
+                    aliases: aliases,
+                    ordering: ordering,
+                    matcher: matcher,
+                    catalog: effectiveCatalog);
+            }
+            var syncResult = await sync.RunAsync(playlistPath, selection, cancellationToken).ConfigureAwait(false);
 
             if (liveRunProgress is not null)
             {
@@ -148,7 +251,10 @@ public sealed class DispatcharrSyncCoordinator
                     LiveRunActivityLevel.Info,
                     "dispatcharr sync completed");
             }
-            return new DispatcharrSyncOutcome(DispatcharrSyncStatus.Succeeded);
+            return new DispatcharrSyncOutcome(
+                DispatcharrSyncStatus.Succeeded,
+                ErrorType: null,
+                Report: syncResult);
         }
         catch (Exception ex)
         {

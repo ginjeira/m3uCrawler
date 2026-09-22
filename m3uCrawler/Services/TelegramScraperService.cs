@@ -636,6 +636,24 @@ namespace m3uCrawler.Services
                     Console.WriteLine($"⚠️ Ingestão no catálogo falhou (não fatal): {ex.Message}");
                 }
             }
+            else
+            {
+                // W-REVIEW-04 / D5-C — Modo LEGACY: pipeline Telegram sem
+                // ingestion. Quando nenhum PipelineIngestionService é fornecido,
+                // ChannelSource e ReviewItem NÃO são persistidos para este run.
+                // A playlist funcional continua a ser escrita. A mensagem é
+                // deliberadamente opaca (sem URL, credenciais, peer/message
+                // identifiers, source key ou RunId) para não introduzir
+                // superfície de leak.
+                trace.Warning(
+                    m3uCrawler.Services.Validation.TraceCategory.RunStart,
+                    runCtx,
+                    "telegram pipeline running without ingestion (pipelineIngestor=null); " +
+                    "ChannelSource/ReviewItem not persisted for this run");
+                Console.WriteLine(
+                    "⚠️ Pipeline Telegram em modo LEGACY (sem ingestion): " +
+                    "ChannelSource/ReviewItem não serão persistidos para este run.");
+            }
 
             // PHASE-OBSERVABILITY (2026-09-15): RunEnd event.
             var traceEnd = _trace ?? m3uCrawler.Services.Validation.NullTraceSink.Instance;
