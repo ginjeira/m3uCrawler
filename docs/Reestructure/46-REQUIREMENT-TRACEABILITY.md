@@ -70,20 +70,20 @@ Fichas normativas em `22-API-CONTRACTS.md` (secções 6–21) para cada família
 
 | Requirement ID | Fonte normativa | Conceito | Contrato/API | Implementação | Teste | Estado |
 |---|---|---|---|---|---|---|
-| API-System | `41` System | lifecycle/readiness/health/version | `22` §9 | ausente | ausente | UNMAPPED |
-| API-Auth | `41` Auth; `35`; `17` | login/logout/current user/CSRF | `22` §10 | ausente | ausente | UNMAPPED |
-| API-Telegram | `41` Telegram; `14` | configuração/sessão Telegram | `22` §11 | ausente | ausente | UNMAPPED |
-| API-Sources | `41` Sources; `07`; `14` | CRUD/enable/test/status | `22` §12 | ausente | ausente | UNMAPPED |
-| API-Discovery | `41` Discovery; `03` | start/list/details/accept-reject | `22` §13 | ausente | ausente | UNMAPPED |
-| API-Catalogue | `41` Catalogue; `05`; `23` | channels/aliases/external identities/import-export | `22` §14 | ausente | ausente | UNMAPPED |
-| API-Country | `41` Country; `06`; `22 §6` | países/validação/save | `22` §6, §21 | ausente | ausente | UNMAPPED |
-| API-Review | `41` Review; `05`; `33` | list/details/resolve/ignore/reopen | `22` §7 | ausente | ausente | UNMAPPED |
-| API-Validation | `41` Validation; `08` | run/observations/eligibility | `22` §15 | ausente | ausente | UNMAPPED |
-| API-Policies | `41` Policies; `38` | CRUD/effective preview | `22` §16 | ausente | ausente | UNMAPPED |
-| API-Ordering | `41` Ordering; `10` | lists/items/import-export/preview | `22` §17 | ausente | ausente | UNMAPPED |
-| API-Runs | `41` Runs; `13` | start/cancel/status/history/artifacts | `22` §18 | ausente | ausente | UNMAPPED |
-| API-Playlists | `41` Playlists; `11`; `23` | outputs/download/validation result | `22` §19 | ausente | ausente | UNMAPPED |
-| API-Dispatcharr | `41` Dispatcharr; `12` | config/test/dry-run/sync/reconciliation/ownership | `22` §20 | ausente | ausente | UNMAPPED |
+| API-System | `41` System | lifecycle/readiness/health/version | `22` §9 | `WebDashboardService.cs:579, 605, 9911` (lifecycle/version; readiness parcial) | `WebDashboardService` unit tests | PARTIAL | Gap: `GET /api/health` (ready/degraded) não implementado; lifecycle/version presentes. |
+| API-Auth | `41` Auth; `35`; `17` | login/logout/current user/CSRF | `22` §10 | `WebDashboardService.cs:506–511, 9032–9126` (login/logout/current user/CSRF; token optional auth) | `DashboardPasswordChangeEndpointTests.cs`; auth endpoint tests | COMPLIANT | Implementação completa (login, logout, current user, CSRF em mutações). |
+| API-Telegram | `41` Telegram; `14` | configuração/sessão Telegram | `22` §11 | `WebDashboardService.cs:9648–9791` (status, connect, auth flow; session/config) | Telegram dashboard tests | PARTIAL | Gap: `POST /api/telegram/auth/disconnect` não implementado (logout Telegram não exposto). |
+| API-Sources | `41` Sources; `07`; `14` | CRUD/enable/test/status | `22` §12 | `WebDashboardService.cs:2658–2744` (CRUD/enable/test/status) | Source endpoint tests | COMPLIANT | Implementação completa. |
+| API-Discovery | `41` Discovery; `03` | start/list/details/accept-reject | `22` §13 | `WebDashboardService.cs:789–824, 945–955` (start/list) | Discovery endpoint tests | PARTIAL | Gap: accept/reject HTTP + candidate details endpoint não implementados. |
+| API-Catalogue | `41` Catalogue; `05`; `23` | channels/aliases/external identities/import-export | `22` §14 | `WebDashboardService.cs:968–996, 2591–2622, 2932–3145` (channels/aliases/external identities) | Catalogue endpoint tests | PARTIAL | Gap: import/export HTTP não implementados. |
+| API-Country | `41` Country; `06`; `22 §6` | países/validação/save | `22` §6, §21 | `WebDashboardService.cs:621–697` (countries/validation/save) | Country endpoint tests | COMPLIANT | Implementação completa. |
+| API-Review | `41` Review; `05`; `33` | list/details/resolve/ignore/reopen | `22` §7 | `WebDashboardService.cs:1299–1308, 3443–3467` (list/detail/ignore/reopen; resolve via handle) | `WaveW55ReviewApiTests` | COMPLIANT | `422 declared-change-invalid` documentado em `22-API-CONTRACTS.md:228–233` como comportamento contratualmente definido (DL-120; não é gap de implementação a corrigir). Ver `ReviewApprovalEndpointTests.cs`. |
+| API-Validation | `41` Validation; `08` | run/observations/eligibility | `22` §15 | `WebDashboardService.cs:3194–3291` + `2598–2622` (run/observations; eligibility ad-hoc) | Validation endpoint tests | PARTIAL | Gap: `GET /api/validation/eligibility` não implementado como endpoint dedicado. |
+| API-Policies | `41` Policies; `38` | CRUD/effective preview | `22` §16 | `WebDashboardService.cs:1936–2242, 2427–2567` (CRUD/effective preview) | Policy endpoint tests; `WaveW51RecognitionPolicyTests` | COMPLIANT | Implementação completa. |
+| API-Ordering | `41` Ordering; `10` | lists/items/import-export/preview | `22` §17 | `WebDashboardService.cs:1702–1936` (lists/items/preview) | Ordering endpoint tests | PARTIAL | Gap: import/export HTTP não implementados. |
+| API-Runs | `41` Runs; `13` | start/cancel/status/history/artifacts | `22` §18 | `WebDashboardService.cs:573–955` (start/status/history) | Run endpoint tests | PARTIAL | Gap: `POST /api/run/cancel` + `GET /api/run/{id}/artifacts` não implementados. |
+| API-Playlists | `41` Playlists; `11`; `23` | outputs/download/validation result | `22` §19 | `WebDashboardService.cs:699–773, 919–…` (outputs/download) | Playlist endpoint tests | PARTIAL | Gap: rota dedicada de validation-result não implementada. |
+| API-Dispatcharr | `41` Dispatcharr; `12` | config/test/dry-run/sync/reconciliation/ownership | `22` §20 | `WebDashboardService.cs:900–902, 9797–9909` + `DispatcharrSyncCoordinator` (config/test) | Dispatcharr endpoint tests; `DispatcharrConnectionTesterTests` | PARTIAL | Gap: dry-run/sync/reconciliation/ownership HTTP não expostos via dashboard endpoints. |
 
 Nota: `DG-19c` (concorrência/limites de Country) está especificado em `22-API-CONTRACTS.md` §21; valores numéricos de rate limit permanecem `PARAMETER_GAP`.
 
