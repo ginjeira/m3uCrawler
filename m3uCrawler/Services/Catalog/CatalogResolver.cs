@@ -2621,6 +2621,38 @@ public sealed class CatalogResolver
     }
 
     /// <summary>
+    /// W2-FU-2A (2026-09-23) — read-only lookup por <see cref="SourceEntity.Key"/>.
+    /// Devolve <c>null</c> se a Source não existir. NÃO cria nem modifica nenhuma
+    /// entidade. Determinístico: a mesma chave devolve sempre o mesmo Id (via PK SQLite).
+    /// Thread-safe (cada chamada usa o seu próprio DbContext via factory).
+    ///
+    /// <para>
+    /// Uso: o observer de falhas de aquisição (<c>CatalogAcquisitionFailureObserver</c>)
+    /// precisa do <c>Source.Id</c> quando já existe uma Source — para que a falha
+    /// possa ser persistida. Quando a Source ainda não existe, o caller recebe
+    /// <c>null</c> e cai no caminho W2-FU-1 (apenas RunReport, sem persistência).
+    /// </para>
+    /// </summary>
+    public async Task<long?> GetSourceIdByKeyAsync(
+        string key,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(key))
+            return null;
+
+        var normalizedKey = key.Trim();
+
+        await using var context =
+            await _factory.CreateDbContextAsync(cancellationToken);
+
+        return await context.Sources
+            .AsNoTracking()
+            .Where(s => s.Key == normalizedKey)
+            .Select(s => (long?)s.Id)
+            .FirstOrDefaultAsync(cancellationToken);
+    }
+
+    /// <summary>
     /// Cria ou actualiza uma <see cref="SourceEntity"/> pela chave
     /// (slug). A origem é sanitizada antes de ser persistida para
     /// não guardar credenciais em claro.

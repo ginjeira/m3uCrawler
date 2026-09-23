@@ -420,8 +420,16 @@ namespace m3uCrawler.Services
             m3uCrawler.Services.Validation.IAcquisitionFailureObserver? acquisitionFailureObserver = null;
             if (pipelineIngestor != null && _catalogResolver != null)
             {
+                // W2-FU-2A (2026-09-23): resolve existing Source.Id by sourceKey
+                // before acquisition. Read-only; if Source does not exist,
+                // existingSourceId = null and the observer falls back to the
+                // W2-FU-1 RunReport-only path (no Source created during failure).
+                var sourceKey = pipelineSourceKey ?? $"telegram-{Slugify(keyword)}";
+                var existingSourceId = await _catalogResolver.GetSourceIdByKeyAsync(
+                    sourceKey, cancellationToken);
+
                 acquisitionFailureObserver = new m3uCrawler.Services.Validation.CatalogAcquisitionFailureObserver(
-                    _catalogResolver, sourceId: null, report: rep);
+                    _catalogResolver, sourceId: existingSourceId, report: rep);
             }
             var tester = acquisitionFailureObserver is null
                 ? StreamValidationTesterFactory.CreateTester(validationState)
