@@ -70,7 +70,7 @@ public sealed class DispatcharrSyncCoordinator
         _transport = transport;
     }
 
-    public async Task<DispatcharrSyncOutcome> RunAsync(
+    public Task<DispatcharrSyncOutcome> RunAsync(
         string playlistPath,
         string outputDir,
         CatalogResolver? catalog,
@@ -78,8 +78,89 @@ public sealed class DispatcharrSyncCoordinator
         ILiveRunProgress? liveRunProgress,
         CancellationToken cancellationToken = default,
         bool allowLegacyWithoutCatalog = false)
+        => RunAsync(playlistPath, outputDir, catalog, selection, liveRunProgress,
+            forceDryRun: null, cancellationToken, allowLegacyWithoutCatalog);
+
+    /// <summary>
+    /// W-API-DISPATCHARR-HTTP-IMPLEMENTATION (DL-128): overload que aceita
+    /// um override explícito de <c>dry_run</c>. Usado pelos endpoints HTTP
+    /// <c>/api/dispatcharr/dry-run</c> e <c>/api/dispatcharr/sync</c>:
+    /// <list type="bullet">
+    ///   <item><c>forceDryRun=true</c> → endpoint <c>/dry-run</c></item>
+    ///   <item><c>forceDryRun=false</c> → endpoint <c>/sync</c> (override
+    ///         da flag <c>dispatcharr_dry_run</c> da configuração
+    ///         persistida para esta chamada concreta).</item>
+    ///   <item><c>forceDryRun=null</c> → comportamento legado (usa
+    ///         <c>cfg.DryRun</c>); preserva o caminho do scheduler,
+    ///         Program.cs e RunPublicationService.</item>
+    /// </list>
+    /// </summary>
+    public Task<DispatcharrSyncOutcome> RunAsync(
+        string playlistPath,
+        string outputDir,
+        CatalogResolver? catalog,
+        DispatcharrSourceSelection? selection,
+        ILiveRunProgress? liveRunProgress,
+        bool? forceDryRun,
+        CancellationToken cancellationToken = default,
+        bool allowLegacyWithoutCatalog = false)
+    {
+        // O override é aplicado a nível do gate antes da pipeline. Quando
+        // forceDryRun tem valor, carregamos uma config clonada com o
+        // DryRun substituído — sem mutar o estado global.
+        if (forceDryRun.HasValue)
+        {
+            return RunWithDryRunOverrideAsync(
+                playlistPath, outputDir, catalog, selection, liveRunProgress,
+                forceDryRun.Value, cancellationToken, allowLegacyWithoutCatalog);
+        }
+
+        return RunCoreAsync(
+            playlistPath, outputDir, catalog, selection, liveRunProgress,
+            cfgOverride: null, cancellationToken, allowLegacyWithoutCatalog);
+    }
+
+    private Task<DispatcharrSyncOutcome> RunWithDryRunOverrideAsync(
+        string playlistPath,
+        string outputDir,
+        CatalogResolver? catalog,
+        DispatcharrSourceSelection? selection,
+        ILiveRunProgress? liveRunProgress,
+        bool forceDryRun,
+        CancellationToken cancellationToken,
+        bool allowLegacyWithoutCatalog)
     {
         var cfg = _configLoader();
+        var overridden = new DispatcharrConfig
+        {
+            Enabled = cfg.Enabled,
+            BaseUrl = cfg.BaseUrl,
+            ApiKey = cfg.ApiKey,
+            Username = cfg.Username,
+            Password = cfg.Password,
+            DryRun = forceDryRun,
+            MatchThreshold = cfg.MatchThreshold,
+            AliasFile = cfg.AliasFile,
+            ProviderPriority = cfg.ProviderPriority,
+            AutoCreateGroups = cfg.AutoCreateGroups,
+            TargetGroupName = cfg.TargetGroupName,
+        };
+        return RunCoreAsync(
+            playlistPath, outputDir, catalog, selection, liveRunProgress,
+            cfgOverride: overridden, cancellationToken, allowLegacyWithoutCatalog);
+    }
+
+    private async Task<DispatcharrSyncOutcome> RunCoreAsync(
+        string playlistPath,
+        string outputDir,
+        CatalogResolver? catalog,
+        DispatcharrSourceSelection? selection,
+        ILiveRunProgress? liveRunProgress,
+        DispatcharrConfig? cfgOverride,
+        CancellationToken cancellationToken,
+        bool allowLegacyWithoutCatalog)
+    {
+        var cfg = cfgOverride ?? _configLoader();
         if (!cfg.Enabled)
         {
             if (liveRunProgress is not null)

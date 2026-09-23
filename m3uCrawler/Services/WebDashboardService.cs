@@ -51,6 +51,15 @@ namespace m3uCrawler.Services
         // auditoria; GET /api/audit responde 503 audit-unavailable.
         private static IAuditService? _auditService;
 
+        // W-API-DISPATCHARR-HTTP-IMPLEMENTATION (DL-128 D8) —
+        // Coordenador + gate de concorrência dedicado ao Dispatcharr.
+        // Injectados em produção por Program.cs; nos testes pelo
+        // StaticDispatcharrSyncScope. Quando ausentes, os endpoints
+        // /api/dispatcharr/{dry-run,sync} respondem 503
+        // dispatcharr-unavailable.
+        private static DispatcharrSyncCoordinator? _dispatcharrSyncCoordinator;
+        private static DispatcharrConcurrencyGate? _dispatcharrConcurrencyGate;
+
         /// <summary>
         /// PHASE 9C.2 (S1-E) — Indica que o Dashboard corre num contexto
         /// explicitamente standalone/testes, onde a ausência simultânea de
@@ -157,6 +166,23 @@ namespace m3uCrawler.Services
         }
 
         /// <summary>
+        /// W-API-DISPATCHARR-HTTP-IMPLEMENTATION (DL-128) — Regista o
+        /// coordenador e o gate de concorrência dedicado ao Dispatcharr.
+        /// Quando o coordenador é <c>null</c>, os endpoints
+        /// <c>/api/dispatcharr/{dry-run,sync}</c> respondem 503
+        /// <c>dispatcharr-unavailable</c>. Quando o gate é <c>null</c>,
+        /// os endpoints respondem 503 <c>dispatcharr-unavailable</c> (o gate
+        /// é parte do contrato de concorrência — não pode ser omitido).
+        /// </summary>
+        public static void SetDispatcharrSync(
+            DispatcharrSyncCoordinator? coordinator,
+            DispatcharrConcurrencyGate? gate)
+        {
+            _dispatcharrSyncCoordinator = coordinator;
+            _dispatcharrConcurrencyGate = gate;
+        }
+
+        /// <summary>
         /// Wave C — Directório de runtime-data usado pelos endpoints de
         /// configuração operacional. Produção: <c><cwd>/runtime-data</c>.
         /// Testes podem sobrepor via <see cref="StaticRuntimeDataDirScope"/>
@@ -246,13 +272,16 @@ namespace m3uCrawler.Services
             DispatcharrConnectionTester? dispatcharrTester = null,
             OperationalReadinessService? readiness = null,
             IAuditService? auditService = null,
-            DispatcharrConnectionTestStore? dispatcharrTestStore = null)
+            DispatcharrConnectionTestStore? dispatcharrTestStore = null,
+            DispatcharrSyncCoordinator? dispatcharrSyncCoordinator = null,
+            DispatcharrConcurrencyGate? dispatcharrConcurrencyGate = null)
         {
             using var scope = new StaticResolverScope(resolver);
             using var authScope = new StaticAuthScope(lifecycle, authService, bootstrapService);
             using var setupScope = new StaticSetupScope(
                 telegramAuth, dispatcharrConfig, dispatcharrTester, readiness, dispatcharrTestStore);
             using var auditScope = new StaticAuditScope(auditService);
+            using var syncScope = new StaticDispatcharrSyncScope(dispatcharrSyncCoordinator, dispatcharrConcurrencyGate);
             await HandleRequestAsync(context, outputDir, historyService, webToken);
         }
 
@@ -316,6 +345,34 @@ namespace m3uCrawler.Services
             public void Dispose()
             {
                 _auditService = _previous;
+            }
+        }
+
+        /// <summary>
+        /// W-API-DISPATCHARR-HTTP-IMPLEMENTATION (DL-128) — Scope testável
+        /// para o coordenador e o gate de concorrência dedicado ao
+        /// Dispatcharr. Restaura o estado anterior em <see cref="Dispose"/>,
+        /// isolando testes paralelos.
+        /// </summary>
+        public sealed class StaticDispatcharrSyncScope : IDisposable
+        {
+            private readonly DispatcharrSyncCoordinator? _previousCoordinator;
+            private readonly DispatcharrConcurrencyGate? _previousGate;
+
+            public StaticDispatcharrSyncScope(
+                DispatcharrSyncCoordinator? coordinator,
+                DispatcharrConcurrencyGate? gate)
+            {
+                _previousCoordinator = _dispatcharrSyncCoordinator;
+                _previousGate = _dispatcharrConcurrencyGate;
+                _dispatcharrSyncCoordinator = coordinator;
+                _dispatcharrConcurrencyGate = gate;
+            }
+
+            public void Dispose()
+            {
+                _dispatcharrSyncCoordinator = _previousCoordinator;
+                _dispatcharrConcurrencyGate = _previousGate;
             }
         }
 
@@ -910,6 +967,25 @@ namespace m3uCrawler.Services
                     return;
                 }
                 await WriteJsonAsync(context.Response, state);
+                return;
+            }
+
+            // W-API-DISPATCHARR-HTTP-IMPLEMENTATION (DL-128 §20.6) —
+            // POST /api/dispatcharr/dry-run: gera MatchPlan + SyncReport
+            // sem aplicar (sem chamadas HTTP de escrita ao Dispatcharr).
+            if (requestPath.Equals("/api/dispatcharr/dry-run", StringComparison.OrdinalIgnoreCase))
+            {
+                await HandleDispatcharrDryRunOrSyncAsync(
+                    context, outputDir, forceDryRun: true);
+                return;
+            }
+
+            // W-API-DISPATCHARR-HTTP-IMPLEMENTATION (DL-128 §20.7) —
+            // POST /api/dispatcharr/sync: aplica o desired via Dispatcharr.
+            if (requestPath.Equals("/api/dispatcharr/sync", StringComparison.OrdinalIgnoreCase))
+            {
+                await HandleDispatcharrDryRunOrSyncAsync(
+                    context, outputDir, forceDryRun: false);
                 return;
             }
 
@@ -9016,17 +9092,304 @@ const rows = Object.entries(inv).map(([k, v]) => {
 
                 await WriteJsonAsync(
                     context.Response,
-                    new
-                    {
-                        outcome = validation.Outcome.ToString(),
-                        state = status.State.ToWireName(),
-                        checks = validation.Checks.Select(CheckToJson),
-                    },
-                    code);
+                     new
+                     {
+                         outcome = validation.Outcome.ToString(),
+                         state = status.State.ToWireName(),
+                         checks = validation.Checks.Select(CheckToJson),
+                     },
+                     code);
                 return;
             }
 
             await WriteJsonAsync(context.Response, new { error = "not-found" }, HttpStatusCode.NotFound);
+        }
+
+        /// <summary>
+        /// W-API-DISPATCHARR-HTTP-IMPLEMENTATION (DL-128 §20.6/§20.7) —
+        /// Handler partilhado pelos endpoints
+        /// <c>POST /api/dispatcharr/dry-run</c> e
+        /// <c>POST /api/dispatcharr/sync</c>. O único ponto de
+        /// divergência é o valor de <paramref name="forceDryRun"/>: o
+        /// handler é deliberadamente thin — toda a lógica de
+        /// domínio vive no <see cref="DispatcharrSyncCoordinator"/>.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// Contrato:
+        /// <list type="bullet">
+        ///   <item>Body: apenas <c>{ "playlistPath": "..." }</c>. Qualquer
+        ///         campo <c>dry_run</c>/<c>dryRun</c>/<c>dry-run</c>/
+        ///         <c>apply</c> no body → 422 invalid-payload.</item>
+        ///   <item><c>playlistPath</c> tem de estar contido em
+        ///         <paramref name="outputDir"/> (path traversal guard) —
+        ///         caso contrário → 422.</item>
+        ///   <item>Método diferente de POST → 405.</item>
+        ///   <item>Coordenador/Gate ausentes → 503 dispatcharr-unavailable.</item>
+        ///   <item>Gate de concorrência ocupado → 409 concurrency-conflict.</item>
+        ///   <item><see cref="DispatcharrException"/> lançada pelo
+        ///         cliente → 502 dispatcharr-comm-error (apenas sync; nunca
+        ///         em dry-run porque dry-run não toca a rede).</item>
+        ///   <item>CatalogUnavailable → 503 dispatcharr-unavailable.</item>
+        /// </list>
+        /// </para>
+        /// <para>
+        /// Auth/CSRF: o gate único aplicado em <c>HandleRequestAsync</c>
+        /// (sessão humana + token de máquina; CSRF para métodos mutantes)
+        /// é responsável por 401/403 — não se duplica aqui.
+        /// </para>
+        /// <para>
+        /// Audit: o handler NÃO cria registos de auditoria próprios; o
+        /// <see cref="DispatcharrSyncCoordinator"/> continua a usar
+        /// <c>SyncRunEntity</c> como registo canónico.
+        /// </para>
+        /// </remarks>
+        private static async Task HandleDispatcharrDryRunOrSyncAsync(
+            HttpListenerContext context,
+            string outputDir,
+            bool forceDryRun)
+        {
+            var method = context.Request.HttpMethod;
+            if (!method.Equals("POST", StringComparison.OrdinalIgnoreCase))
+            {
+                await WriteMethodNotAllowedAsync(context.Response);
+                return;
+            }
+
+            if (_dispatcharrSyncCoordinator == null || _dispatcharrConcurrencyGate == null)
+            {
+                await WriteServiceUnavailableAsync(context.Response, "dispatcharr-unavailable");
+                return;
+            }
+
+            // === Validação de payload ===
+            // (1) Body tem de ser JSON bem-formado.
+            string body;
+            try
+            {
+                using var reader = new StreamReader(
+                    context.Request.InputStream,
+                    context.Request.ContentEncoding ?? Encoding.UTF8);
+                body = await reader.ReadToEndAsync();
+            }
+            catch (Exception)
+            {
+                await WriteDispatcharrApiErrorAsync(context, HttpStatusCode.BadRequest,
+                    "invalid-payload", "Corpo do pedido inválido.");
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(body))
+            {
+                await WriteDispatcharrApiErrorAsync(context,
+                    HttpStatusCode.UnprocessableEntity,
+                    "invalid-payload", "Corpo do pedido vazio.");
+                return;
+            }
+
+            JsonElement root;
+            try
+            {
+                using var doc = JsonDocument.Parse(body, new JsonDocumentOptions
+                {
+                    AllowTrailingCommas = false,
+                    CommentHandling = JsonCommentHandling.Disallow,
+                });
+                root = doc.RootElement.Clone();
+            }
+            catch (JsonException)
+            {
+                await WriteDispatcharrApiErrorAsync(context, HttpStatusCode.BadRequest,
+                    "invalid-payload", "JSON malformado.");
+                return;
+            }
+
+            if (root.ValueKind != JsonValueKind.Object)
+            {
+                await WriteDispatcharrApiErrorAsync(context,
+                    HttpStatusCode.UnprocessableEntity,
+                    "invalid-payload", "Body tem de ser um objecto JSON.");
+                return;
+            }
+
+            // (2) Rejeitar qualquer campo dry_run/dryRun/dry-run/apply.
+            foreach (var prop in root.EnumerateObject())
+            {
+                var name = prop.Name;
+                if (name.Equals("dry_run", StringComparison.OrdinalIgnoreCase)
+                    || name.Equals("dryRun", StringComparison.OrdinalIgnoreCase)
+                    || name.Equals("dry-run", StringComparison.OrdinalIgnoreCase)
+                    || name.Equals("apply", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteDispatcharrApiErrorAsync(context,
+                        HttpStatusCode.UnprocessableEntity,
+                        "invalid-payload",
+                        "Campo não permitido: " + name);
+                    return;
+                }
+            }
+
+            // (3) playlistPath é obrigatório e tem de ser string.
+            if (!root.TryGetProperty("playlistPath", out var playlistPathElement)
+                || playlistPathElement.ValueKind != JsonValueKind.String)
+            {
+                await WriteDispatcharrApiErrorAsync(context,
+                    HttpStatusCode.UnprocessableEntity,
+                    "invalid-payload", "Campo 'playlistPath' é obrigatório e tem de ser string.");
+                return;
+            }
+            var playlistPath = playlistPathElement.GetString();
+            if (string.IsNullOrWhiteSpace(playlistPath))
+            {
+                await WriteDispatcharrApiErrorAsync(context,
+                    HttpStatusCode.UnprocessableEntity,
+                    "invalid-payload", "'playlistPath' não pode estar vazio.");
+                return;
+            }
+
+            // (4) Path traversal guard — playlistPath tem de estar dentro de outputDir.
+            string normalizedPlaylist;
+            try
+            {
+                var fullOutputDir = Path.GetFullPath(outputDir);
+                normalizedPlaylist = Path.GetFullPath(playlistPath);
+                if (!normalizedPlaylist.StartsWith(
+                        fullOutputDir + Path.DirectorySeparatorChar,
+                        StringComparison.OrdinalIgnoreCase)
+                    && !normalizedPlaylist.Equals(fullOutputDir, StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteDispatcharrApiErrorAsync(context,
+                        HttpStatusCode.UnprocessableEntity,
+                        "invalid-payload",
+                        "'playlistPath' tem de estar dentro de outputDir.");
+                    return;
+                }
+            }
+            catch (Exception)
+            {
+                await WriteDispatcharrApiErrorAsync(context,
+                    HttpStatusCode.UnprocessableEntity,
+                    "invalid-payload", "'playlistPath' inválido.");
+                return;
+            }
+
+            // === Aquisição do gate de concorrência dedicado ===
+            DispatcharrSyncLease lease;
+            try
+            {
+                lease = _dispatcharrConcurrencyGate.Acquire();
+            }
+            catch (DispatcharrConcurrencyConflictException)
+            {
+                await WriteDispatcharrApiErrorAsync(context, HttpStatusCode.Conflict,
+                    "concurrency-conflict",
+                    "Outra sincronização Dispatcharr está activa. Aguarde pela conclusão.");
+                return;
+            }
+
+            // === Invocação do domínio ===
+            DispatcharrSyncOutcome outcome;
+            try
+            {
+                outcome = await _dispatcharrSyncCoordinator.RunAsync(
+                    playlistPath: normalizedPlaylist,
+                    outputDir: outputDir,
+                    catalog: _catalogResolver,
+                    selection: null,
+                    liveRunProgress: null,
+                    forceDryRun: forceDryRun,
+                    cancellationToken: CancellationToken.None);
+            }
+            catch (DispatcharrException)
+            {
+                // 502 — Dispatcharr HTTP falhou. Mensagem sanitizada vem
+                // do próprio DispatcharrException; nunca expor a string
+                // original. O envelope mantém correlationId.
+                await WriteDispatcharrApiErrorAsync(context, HttpStatusCode.BadGateway,
+                    "dispatcharr-comm-error",
+                    "Falha de comunicação com Dispatcharr.");
+                return;
+            }
+            catch (OperationCanceledException)
+            {
+                await WriteDispatcharrApiErrorAsync(context,
+                    HttpStatusCode.InternalServerError,
+                    "persistence-error", "Operação cancelada.");
+                return;
+            }
+            catch (Exception)
+            {
+                await WriteDispatcharrApiErrorAsync(context,
+                    HttpStatusCode.InternalServerError,
+                    "persistence-error", "Falha interna ao sincronizar Dispatcharr.");
+                return;
+            }
+            finally
+            {
+                lease.Dispose();
+            }
+
+            // === Mapeamento do resultado para a resposta HTTP ===
+            switch (outcome.Status)
+            {
+                case DispatcharrSyncStatus.Disabled:
+                    await WriteDispatcharrApiErrorAsync(context, HttpStatusCode.ServiceUnavailable,
+                        "dispatcharr-unavailable",
+                        "Dispatcharr está desactivado na configuração.");
+                    return;
+
+                case DispatcharrSyncStatus.CatalogUnavailable:
+                    await WriteDispatcharrApiErrorAsync(context, HttpStatusCode.ServiceUnavailable,
+                        "dispatcharr-unavailable",
+                        "Catálogo indisponível para sincronização.");
+                    return;
+
+                case DispatcharrSyncStatus.Failed:
+                    await WriteDispatcharrApiErrorAsync(context, HttpStatusCode.InternalServerError,
+                        "persistence-error",
+                        "Falha na sincronização Dispatcharr.");
+                    return;
+
+                case DispatcharrSyncStatus.Succeeded:
+                    var report = outcome.Report;
+                    var counts = report?.Report?.Counts;
+                    await WriteJsonAsync(context.Response, new
+                    {
+                        status = report?.DryRun == true
+                            ? "dry-run"
+                            : (counts?.Failed > 0 ? "partial" : "ok"),
+                        mode = forceDryRun ? "dry-run" : "sync",
+                        planPath = report?.PlanPath,
+                        reportPath = report?.ReportPath,
+                        counts = counts == null
+                            ? null
+                            : new
+                            {
+                                matched = counts.Matched,
+                                newChannels = counts.NewChannels,
+                                newStreams = counts.NewStreams,
+                                removedStreams = counts.RemovedStreams,
+                                skipped = counts.Skipped,
+                                ambiguous = counts.Ambiguous,
+                                unchanged = counts.Unchanged,
+                                failed = counts.Failed,
+                            },
+                    });
+                    return;
+            }
+        }
+
+        /// <summary>
+        /// W-API-DISPATCHARR-HTTP-IMPLEMENTATION (DL-128 D6) — Envelope
+        /// canónico de erro para as rotas Dispatcharr:
+        /// <c>{ error, message, correlationId }</c>. Reutiliza
+        /// <see cref="WriteReviewApiErrorAsync"/> (não duplica serialização).
+        /// </summary>
+        private static Task WriteDispatcharrApiErrorAsync(
+            HttpListenerContext context, HttpStatusCode status, string code, string message)
+        {
+            return WriteReviewApiErrorAsync(context.Response, status, code, message,
+                NewReviewCorrelationId());
         }
 
         private static async Task HandleSessionEndpointAsync(HttpListenerContext context)

@@ -13,6 +13,7 @@ using m3uCrawler.Services.Auth;
 using m3uCrawler.Services.Catalog;
 using m3uCrawler.Services.Configuration;
 using m3uCrawler.Services.Dispatcharr;
+using m3uCrawler.Services.Sync;
 using m3uCrawler.Services.Telegram;
 using Microsoft.EntityFrameworkCore;
 using Xunit;
@@ -755,7 +756,9 @@ public class DashboardBootstrapEndpointTests : IAsyncLifetime
             DispatcharrConnectionTester? dispatcharrTester = null,
             OperationalReadinessService? readiness = null,
             IAuditService? auditService = null,
-            DispatcharrConnectionTestStore? dispatcharrTestStore = null)
+            DispatcharrConnectionTestStore? dispatcharrTestStore = null,
+            DispatcharrSyncCoordinator? dispatcharrSyncCoordinator = null,
+            DispatcharrConcurrencyGate? dispatcharrConcurrencyGate = null)
         {
             var port = GetFreePort();
             var listener = new HttpListener();
@@ -793,7 +796,8 @@ public class DashboardBootstrapEndpointTests : IAsyncLifetime
                                 context, outputDir, resolver, composer, history,
                                 lifecycle, auth, bootstrap, webToken,
                                 telegramAuth, dispatcharrConfig, dispatcharrTester, readiness,
-                                auditService, dispatcharrTestStore);
+                                auditService, dispatcharrTestStore,
+                                dispatcharrSyncCoordinator, dispatcharrConcurrencyGate);
                         }
                     }
                     catch
