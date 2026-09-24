@@ -6013,11 +6013,12 @@ namespace m3uCrawler.Services
     }
 
     async function loadOverview() {
-      const [run, hist, dispatcharr, inv] = await Promise.all([
+      const [run, hist, dispatcharr, inv, pub] = await Promise.all([
         safeFetchJson('/api/run-report/summary', null),
         safeFetchJson('/api/history', []),
         safeFetchJson('/api/dispatcharr/state', null),
-        safeFetchJson('/api/output/inventory', {})
+        safeFetchJson('/api/output/inventory', {}),
+        safeFetchJson('/api/publication/status', null)
       ]);
 
       // Cabeçalho
@@ -6046,6 +6047,30 @@ namespace m3uCrawler.Services
         dispatcharr && dispatcharr.dispatchedDetailDisabled ? '' :
           (dispatcharr && dispatcharr.dispatcharrVersion ? ('versão ' + dispatcharr.dispatcharrVersion) : (dispatcharr ? (dispatcharr.reason || '—') : '')),
         'Sincronização opt-in (dispatcharr_enabled=true em wtelegram.config).'));
+      // Publicação do catálogo (DL-130 Slice 2): consome publicationPending calculado no backend.
+      // Não recalcula cursores — apenas apresenta o booleano e os timestamps via tsLocal(...).
+      let pubValue = '—', pubSub = 'sem dados';
+      const pubHelp = 'Estado de publicação da playlist.m3u derivado dos cursores (DL-130). publicationPending vem do backend; não é calculado no frontend.';
+      if (pub && pub.error) {
+        pubValue = `<span class='badge muted'>Indisponível</span>`;
+        pubSub = pub.error;
+      } else if (pub) {
+        const lastPub = pub.lastSuccessfulPublicationAtUtc;
+        const changed = pub.catalogChangedAtUtc;
+        if (lastPub) {
+          if (pub.publicationPending) {
+            pubValue = `<span class='badge warn'>Pendente</span>`;
+            pubSub = `catálogo: ${tsLocal(changed)} · última publicação: ${tsLocal(lastPub)}`;
+          } else {
+            pubValue = `<span class='badge ok'>Em dia</span>`;
+            pubSub = `última publicação: ${tsLocal(lastPub)}`;
+          }
+        } else {
+          pubValue = `<span class='badge warn'>Sem publicação anterior</span>`;
+          pubSub = changed ? `catálogo alterado: ${tsLocal(changed)}` : 'catálogo vazio';
+        }
+      }
+      cards.push(metricCard('Publicação do catálogo', pubValue, pubSub, pubHelp));
       document.getElementById('overviewCards').innerHTML = cards.join('');
 
       // Relações matemáticas

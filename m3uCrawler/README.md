@@ -516,7 +516,7 @@ O dashboard (`Services/WebDashboardService.cs`, `HttpListener`) serve a UI em `h
 
 O dashboard tem os seguintes separadores principais:
 
-- **Overview**: resumo do sistema com métricas da última execução, carteiras de streams e estado do Dispatcharr.
+- **Overview**: resumo do sistema com métricas da última execução, carteiras de streams, estado do Dispatcharr e **estado de publicação do catálogo** (DL-130). O card "Publicação do catálogo" consome `GET /api/publication/status` e apresenta os 4 estados (`Pendente` / `Em dia` / `Sem publicação anterior` / `Indisponível`) com badges `warn` / `ok` / `warn` / `muted`; o booleano `publicationPending` chega já calculado pelo backend e não é recalculado no frontend.
 - **Execuções**: histórico detalhado das últimas 72h com métricas por execução.
 - **Descoberta**: playlists descobertas com filtros por estado, origem e país.
 - **Canais / Países**: validação da playlist actual por país e gestão das listas de aliases.
