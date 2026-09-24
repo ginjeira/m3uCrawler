@@ -32,6 +32,12 @@ namespace m3uCrawler.Services
         private static LiveRunHost? _liveRunHost;
         private static bool _webAllowTrigger;
 
+        // DL-130 (Phase 5) — Serviço que calcula os cursores de publicação do
+        // catálogo para o endpoint GET /api/publication/status. Opcional:
+        // quando ausente, o endpoint devolve 503 (fail-closed), tal como
+        // _liveRunHost.
+        private static PublicationStatusService? _publicationStatusService;
+
         // Wave C — Override do directório de runtime-data para testes
         // isolados (sem tocar no runtime-data real). Produção usa sempre
         // <c><cwd>/runtime-data</c>. Restaurado por StaticRuntimeDataDirScope.
@@ -122,6 +128,17 @@ namespace m3uCrawler.Services
         public static void SetLiveRunHost(LiveRunHost? host)
         {
             _liveRunHost = host;
+        }
+
+        /// <summary>
+        /// DL-130 (Phase 5) — Regista o serviço que calcula os cursores
+        /// de publicação do catálogo. Sem este serviço, o endpoint
+        /// <c>GET /api/publication/status</c> devolve 503
+        /// (fail-closed; nunca expõe estado vazio como se fosse "ok").
+        /// </summary>
+        public static void SetPublicationStatusService(PublicationStatusService service)
+        {
+            _publicationStatusService = service ?? throw new ArgumentNullException(nameof(service));
         }
 
         /// <summary>
@@ -1027,6 +1044,38 @@ namespace m3uCrawler.Services
                 && context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
             {
                 await HandleRunStartEndpointAsync(context);
+                return;
+            }
+
+            // === Publication status endpoint ===
+            if (requestPath.Equals("/api/publication/status", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = "Método não permitido." },
+                        HttpStatusCode.MethodNotAllowed);
+                    return;
+                }
+
+                // O endpoint depende de duas peças: o serviço de cursores
+                // (calcula o snapshot) e o catálogo (já exigido por todos os
+                // endpoints catalog/* abaixo). Sem qualquer uma, devolvemos
+                // 503 com a mesma mensagem usada pelo gate geral do catálogo
+                // — o operador não vê "ok" enquanto a infra-estrutura não
+                // estiver pronta.
+                if (_publicationStatusService is null || _catalogResolver is null)
+                {
+                    context.Response.StatusCode = (int)HttpStatusCode.ServiceUnavailable;
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = "Catálogo não inicializado." },
+                        HttpStatusCode.ServiceUnavailable);
+                    return;
+                }
+
+                await HandlePublicationStatusEndpointAsync(context);
                 return;
             }
 
@@ -9753,6 +9802,38 @@ const rows = Object.entries(inv).map(([k, v]) => {
                     LiveRunApiMappings.ToAlreadyRunningPayload(current),
                     HttpStatusCode.Conflict);
             }
+        }
+
+        /// <summary>
+        /// DL-130 (Phase 5) — <c>GET /api/publication/status</c>: devolve
+        /// o snapshot dos dois cursores de publicação do catálogo e o
+        /// booleano derivado. Os 405/503 já foram avaliados no caller;
+        /// aqui só calculamos e projectamos para camelCase. As datas
+        /// chegam como <c>DateTime?</c> em UTC; o <c>JsonSerializer</c>
+        /// com <c>PropertyNamingPolicy.CamelCase</c> (definido em
+        /// <see cref="JsonOptions"/>) emite-as no formato ISO-8601
+        /// default, consistente com o resto dos endpoints do dashboard.
+        /// </summary>
+        private static async Task HandlePublicationStatusEndpointAsync(HttpListenerContext context)
+        {
+            var service = _publicationStatusService;
+            if (service is null)
+            {
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = "Catálogo não inicializado." },
+                    HttpStatusCode.ServiceUnavailable);
+                return;
+            }
+
+            var status = await service.GetStatusAsync().ConfigureAwait(false);
+
+            await WriteJsonAsync(context.Response, new
+            {
+                CatalogChangedAtUtc = status.CatalogChangedAtUtc,
+                LastSuccessfulPublicationAtUtc = status.LastSuccessfulPublicationAtUtc,
+                PublicationPending = status.PublicationPending,
+            });
         }
 
         /// <summary>

@@ -97,6 +97,14 @@ namespace m3uCrawler
                         ResolveCatalogDbPath(args), CancellationToken.None);
                     WebDashboardService.SetCatalogResolver(webCatalogResolver);
 
+                    // DL-130 (Phase 5) — Cursores de publicação do catálogo.
+                    // Construído a partir da mesma factory que o resolver
+                    // (partilham o mesmo SQLite file). Se a construção
+                    // falhar (improvável: factory já existe), o endpoint
+                    // responde 503, mesmo padrão de _liveRunHost.
+                    WebDashboardService.SetPublicationStatusService(
+                        new PublicationStatusService(webCatalogResolver.GetFactory()));
+
                     // PHASE 9C.1 — Lifecycle de configuração. O dashboard
                     // fica sempre acessível; o estado é reportado em
                     // /api/configuration/lifecycle e o gate bloqueia

@@ -1118,6 +1118,37 @@ registados. A pipeline invocada é sempre a existente
 |---|---|
 | `GET /api/run/status` | Snapshot sanitizado: `isRunning`, `status`, `runId`, `mode`, `source`, `phase`, `phaseStartedAtUtc`, `durationMs`, `counts`, `recentActivities`, `recentRuns` (24 h), `webAllowTrigger`. `503 pipeline-not-configured` quando não há pipeline Telegram no processo. |
 | `POST /api/run/start` | Arranque assíncrono (não bloqueia até ao fim). `202` aceite · `409 already-running` · `503 web-allow-trigger-disabled` · `503 pipeline-not-configured` · `400 invalid payload` · `401`/`403` conforme o gate 9C.2. |
+| `GET /api/publication/status` | Snapshot derivado dos cursores de publicação do catálogo: `catalogChangedAtUtc` (`MAX` sobre `UpdatedAtUtc`/`CreatedAtUtc` das entidades que afectam a próxima `playlist.m3u`), `lastSuccessfulPublicationAtUtc` (`MAX(LiveRun.FinishedAtUtc) WHERE TerminalStatus=Completed AND Mode∈{telegram, telegram-maintain}`), `publicationPending` (`true` se o catálogo mudou depois da última publicação, ou se nunca houve uma publicação bem-sucedida). `503` quando o catálogo não está inicializado. DL-019/DL-130. |
+
+#### Cursores de publicação (DL-130)
+
+`GET /api/publication/status` é a primeira superfície observável do estado de
+publicação pendente. Os dois cursores são derivados por query — não há
+persistência adicional, schema migration ou novo campo em `ReviewItemEntity`.
+
+- **`catalogChangedAtUtc`** = `MAX` sobre os sinais canónicos das entidades
+  que contribuem para a próxima `playlist.m3u`:
+  `CanonicalChannel.UpdatedAtUtc`, `ChannelSource.UpdatedAtUtc`,
+  `Source.UpdatedAtUtc`, `ChannelAlias.CreatedAtUtc` (a entidade não tem
+  `UpdatedAtUtc`), `ExternalIdentity.UpdatedAtUtc`,
+  `ProviderAccount.UpdatedAtUtc`, e `ReviewItem.UpdatedAtUtc` filtrado por
+  `State = Resolved` (exclui `Ignored`, que não altera o catálogo).
+- **`lastSuccessfulPublicationAtUtc`** = `MAX(LiveRun.FinishedAtUtc) WHERE
+  TerminalStatus = Completed AND Mode ∈ {telegram, telegram-maintain}`.
+  O filtro `TerminalStatus = Completed` é essencial porque
+  `MarkTerminalAsync`/`RecoverInterruptedRunsAsync` também escrevem
+  `FinishedAtUtc` em runs `Failed` e em runs reaped após restart.
+- **`publicationPending`** = `true` se `lastSuccessfulPublicationAtUtc`
+  é `null` (nunca houve Run Completed, portanto nunca houve
+  `playlist.m3u` publicada — DL-019 per-artifact atomic write, sem
+  caminho de upload manual), OU se `catalogChangedAtUtc >
+  lastSuccessfulPublicationAtUtc`.
+
+**Separação DL-019/DL-128:** uma falha do Dispatcharr após a escrita
+atómica de `playlist.m3u` **não** invalida o cursor de publicação do
+ficheiro — `LiveRun.TerminalStatus=Completed` é suficiente. O outcome
+do Dispatcharr é sinal independente, exposto separadamente em
+`/api/dispatcharr/state`.
 
 A autorização reutiliza o gate da 9C.2/9C.5 (sessão + CSRF em `UserAuth`,
 `--web-token` como credencial de máquina, Bootstrap bloqueado; `READY` sem
