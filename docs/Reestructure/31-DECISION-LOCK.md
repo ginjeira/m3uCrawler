@@ -494,6 +494,31 @@ pendingReviewsCount      = COUNT(*) FROM review_items
 
 A lista exacta das entidades abrangidas por `catalogChangedAtUtc` deve ficar explicitamente documentada como contrato de implementação (ver Implementation Prerequisites). As entidades candidatas são: `CanonicalChannel`, `ChannelSource`, `Source`, `ReviewItem`, `ProviderAccount`, `ExternalIdentity`, `ChannelAlias` (cada uma com `UpdatedAtUtc` excepto onde aplicável).
 
+#### D5.1 — Conjunto final e filtros do `catalogChangedAtUtc` (formalização).
+
+Após a wave de implementação (`m3uCrawler/Services/Catalog/PublicationStatusService.cs`), o conjunto e os filtros acima ficaram implementation-locked. Esta sub-decisão **formaliza** o que o código já pratica; **não** introduz novo comportamento, novo schema ou nova arquitectura.
+
+- **`CanonicalChannel.UpdatedAtUtc`** — inclui.
+- **`ChannelSource.UpdatedAtUtc`** — inclui.
+- **`Source.UpdatedAtUtc`** — inclui.
+- **`ChannelAlias.CreatedAtUtc`** — inclui. **Nota:** `ChannelAliasEntity` (`m3uCrawler/Services/Catalog/CatalogEntities.cs:77-91`) é imutável e apenas expõe `CreatedAtUtc`; o cursor usa essa coluna. Não é decisão arquitectural — é consequência da forma da entidade.
+- **`ExternalIdentity.UpdatedAtUtc`** — inclui.
+- **`ProviderAccount.UpdatedAtUtc`** — inclui.
+- **`ReviewItem.UpdatedAtUtc` filtrado por `State == Resolved`** — inclui apenas Reviews resolvidas; `Ignore` e `Exclude` **não** contribuem. O filtro é explícito em `PublicationStatusService.cs:151-156` e decorre da invariante `Ignored ⇒ CatalogueChanged: false` documentada em `CatalogResolver.cs:1808-1810`.
+
+**Excluídas por construção:**
+
+- **`ChannelSourceObservation`** (`m3uCrawler/Services/Catalog/CatalogEntities.cs:1278-1290`) — entidade append-only com timestamp único `ObservedAtUtc` (não possui `UpdatedAtUtc`). Não consta da consulta `PublicationStatusService.ComputeCatalogChangedAtAsync` (linhas 115-156). A distinção é mantida entre **estado canónico** (entidades com `UpdatedAtUtc` que afectam a próxima publicação) e **observabilidade/diagnóstico** (`ObservedAtUtc` é sinal de medição, não sinal de mudança estrutural do catálogo).
+
+#### D5.2 — Convenção `IsEnabled` ⇒ bump de `UpdatedAtUtc` (formalização).
+
+A wave `W-RECON-D4-NEXT-ACTION` auditou o ficheiro `m3uCrawler/Services/Catalog/CatalogResolver.cs` (24 paths que afectam a propriedade `IsEnabled`, linhas 1666, 2232, 2272, 2354, 2696, 2716, 2771, 3179, 3213, 3262, 3317, 3350, 3364, 3419, 3514, 4121, 4132, 4171, 4183, 4235, 4245, 4509, 4521, 4538). Cada um satisfaz uma de duas formas:
+
+- **mutação de entidade existente** (ex.: linhas 2272-2273, 3262-3263, 4538-4539): o setter `IsEnabled` é seguido de `UpdatedAtUtc = DateTime.UtcNow; SaveChangesAsync()`;
+- **criação de entidade nova** (ex.: linhas 1666-1668, 2232-2234, 2354-2356, 2716-2717, 2771-2773, 3213-3215, 3317-3319, 4132-4134, 4183-4185, 4245-4247, 4521-4523): a nova row é criada com `CreatedAtUtc = UpdatedAtUtc = now`, ambas contribuindo para o cursor.
+
+Esta sub-decisão **regista** a convenção efectivamente observada. **Não** cria uma regra arquitectural mais ampla do que a evidência suporta: aplica-se exclusivamente ao conjunto das 7 entidades que contribuem para `catalogChangedAtUtc` (D5.1) e apenas no contexto do cálculo de D5. Ondas futuras que exijam contagem de `IsEnabled` noutros cursores devem justificá-las explicitamente.
+
 #### D6 — Não será criado `ReviewItemEntity.PublishedAtUtc`.
 
 Ratificado. O estado per-Review não pode ser provado pelo código sem diffing externo de `playlist.m3u`. Criar a coluna seria uma falsa promessa. **Esta decisão é vinculativa**: ondas futuras que requeiram um campo "published" devem usar queries de derivação, não armazenamento directo.
@@ -592,16 +617,16 @@ A próxima wave de implementação deve incluir teste que valide:
 - Review Approve → Run fail → `publicationPending = true` (Run failed; catalog not covered).
 - 3 Reviews → 1 Run → `publicationPending = false` (coalesced).
 - Restart process → `publicationPending` preserved (derived from DB).
-- Exclude/Ignore → `publicationPending` semantics (open: see D11).
+- Exclude/Ignore → `publicationPending` semantics (definido por D5.1: filtro `State == Resolved`).
 
 #### Decisões arquitecturais abertas (registadas, não resolvidas por esta DL)
 
-1. Se `lastSuccessfulPublicationAtUtc = NULL` deve retornar `publicationPending = NULL` (unknown) ou `true` (conservative). Decidir na implementação.
-2. Se Dispatcharr success deve ser tracked separadamente (cursor paralelo `lastDispatcharrSuccessAtUtc`).
-3. Se admin-`IsEnabled` operations devem contar para `catalogChangedAtUtc` (afectam `playlist.m3u` mas podem não tocar `UpdatedAtUtc`).
-4. Se `ChannelSourceObservation` insertions devem contar (timestamp dedicado `ObservedAtUtc`).
-5. Se Exclude/Ignore devem ser contados (afectam ReviewItem mas não playlist content).
-6. Se manual M3U uploads (`ProviderType.Manual`) devem ser contados.
+1. Se `lastSuccessfulPublicationAtUtc = NULL` deve retornar `publicationPending = NULL` (unknown) ou `true` (conservative). Decidir na implementação. — *Implementação actual: conservador (`true`). Ver `PublicationStatusService.cs:62-68`.*
+2. Se Dispatcharr success deve ser tracked separadamente (cursor paralelo `lastDispatcharrSuccessAtUtc`). — *D4-OPEN-05: decisão de produto em aberto.*
+3. ~~Se admin-`IsEnabled` operations devem contar para `catalogChangedAtUtc` (afectam `playlist.m3u` mas podem não tocar `UpdatedAtUtc`).~~ — **Fechado por D5.2.** A auditoria da wave `W-RECON-D4-NEXT-ACTION` confirma que todas as mutações de `IsEnabled` em `CatalogResolver.cs` bumpam `UpdatedAtUtc` (mutação) ou `CreatedAtUtc`+`UpdatedAtUtc` (insert). Decisão arquitectural subsequente que afronte este caso deve justificá-la explicitamente.
+4. ~~Se `ChannelSourceObservation` insertions devem contar (timestamp dedicado `ObservedAtUtc`).~~ — **Fechado por D5.1.** `ChannelSourceObservation` é append-only e não possui `UpdatedAtUtc`; está fora da consulta `catalogChangedAtUtc` por construção, não por decisão editorial. A exclusão reflecte a separação canónica entre **estado** (entidades com `UpdatedAtUtc`) e **observabilidade** (`ObservedAtUtc`). Uma decisão arquitectural subsequente que exija contagem deve justificá-la explicitamente e, se necessário, rever D5.1.
+5. ~~Se Exclude/Ignore devem ser contados (afectam ReviewItem mas não playlist content).~~ — **Fechado por D5.1.** O filtro `r.State == ReviewItemState.Resolved` em `PublicationStatusService.cs:151-156` exclui `Ignore`/`Exclude`. Decisão architectural subsequente que afronte este caso deve justificá-la explicitamente.
+6. Se manual M3U uploads (`ProviderType.Manual`) devem ser contados. — *D4-OPEN-08: auditoria técnica em aberto (baixa prioridade).*
 
 ## C. Regra
 
