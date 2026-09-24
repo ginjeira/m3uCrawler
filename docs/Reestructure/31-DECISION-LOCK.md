@@ -355,8 +355,256 @@ Forma **orientativa** (D4): fixa orientação estrutural — referência a artef
 - **RUNTIME-VALIDATED (dry-run)** — pipeline dry-run exercida end-to-end via `W-RUNTIME-DISPATCHARR-DRYRUN-CONTROLLED` contra `m3uCrawler.Tests/TestData/m3ucrawler_playlist_20260831_204529.m3u` (579 streams), num Dispatcharr simulado em `127.0.0.1:18080`. Resultado: `Matched=0  NewChannels=43  NewStreams=164  RemovedStreams=0  Skipped=139  Ambiguous=0  Unchanged=0  Failed=0`. HTTP observado: 4 GETs read-only (`/api/core/version/`, `/api/channels/{channels,streams,groups}/`), 0 writes. Configuração temporária restaurada byte-a-byte.
 - **NOT RUNTIME-VALIDATED (apply/sync)** — `POST /api/dispatcharr/sync` (apply real) ainda não foi exercitado contra Dispatcharr real. Wave runtime exerceu apenas o branch dry-run. Esta lacuna é mantida aberta como **OPEN** e pertence a wave futura (não fecha nesta).
 
+### DL-129 — `ReviewItem.StreamUrl` como fonte funcional de publicação para `playlist.m3u` (ratificado)
+
+Ratifica a aceitação de `ReviewItemEntity.StreamUrl` (RAW verbatim, persistido em SQLite como evidência de ingestion) como **fonte interna autorizada** para construir `M3uStream.Url` e republicar `playlist.m3u` após `POST /api/review/resolve`, sem voltar a executar Telegram discovery/ingestion e sem introduzir `ProviderUrlResolver`. **Não** implementa o caminho Review→Output (D4-A vs D4-B permanece por decidir em wave própria); **não** altera schema/migrations; **não** resolve SecretStore (DL-112 continua OPEN/PARTIAL).
+
+#### Contexto
+
+A aprovação de uma Review (`Open → Resolved`) materializa um `ChannelSourceEntity` com `StreamUrl` **sanitizado** (chokepoint `CatalogResolver.cs:3137`). Para republicar `playlist.m3u` — artefacto funcional que por definição do projecto preserva URLs Xtream reais (AGENTS.md §2) — é necessário construir `M3uStream` com URL **RAW**. O pipeline normal obtém essa URL via Telegram scrape em memória; essa informação **não** é persistida. `StreamFingerprint` é one-way (DL-108), e `ProviderAccount.CredentialsReference` é write-only (DL-112 não implementado). Resta, portanto, `ReviewItemEntity.StreamUrl` como a única fonte RAW persistida que pode servir esse papel sem nova infra-estrutura.
+
+A análise da wave `W-REVIEW-03-D4-RAW-URL-PUBLICATION-DECISION-PREP` classificou a reutilização como `RAW_REVIEW_URL_ACCEPTABLE_WITH_EXPLICIT_DECISION` e identificou que a escolha se aplica tanto a D4-A (novo Run) como a D4-B (publicação inline). Esta DL-129 formaliza o **prerequisite comum** a ambas.
+
+#### D1 — Semântica dupla reconhecida.
+
+`ReviewItemEntity.StreamUrl` permanece semanticamente **evidência observada de ingestion** (W-REVIEW-01; doc XML em `CatalogEntities.cs:418`) **e** passa também a ser **fonte funcional interna de publicação** quando uma Review aprovada necessitar de regenerar a playlist. Esta duplicidade é deliberada e **não** é uma consequência acidental da implementação.
+
+#### D2 — Restrição de destino (RAW sink permitido).
+
+A URL RAW extraída de `ReviewItem.StreamUrl` **só** pode ser entregue a:
+
+- `M3uStream.Url` construído por um pipeline de publicação; **e**
+- `playlist.m3u` (e equivalentes `output/telegram_playlist_<ts>.m3u`).
+
+**Não** pode ser entregue a (lista exaustiva):
+- Review API (`GET /api/review`, `GET /api/review?id`, `POST /api/review/{resolve,ignore,reopen}`);
+- DTOs de Review (`ReviewSummaryJson`, `ReviewDetailJson`, response de resolve);
+- Logs de qualquer tipo (`Console.WriteLine`, structured logging, exception messages);
+- Audit (`AuditService.RecordAsync` — `BeforeJson`, `AfterJson`, `Detail`);
+- `RunReport` (`telegram_run_report.json`);
+- JSON de relatório/diagnóstico (`SaveToJsonReport`);
+- `import_history.json`;
+- Documentação, fixtures versionadas, dumps de DB.
+
+#### D3 — Compatibilidade com DL-020.
+
+DL-020 ("Secrets nunca entram em diagnóstico. Sanitização é obrigatória e centralizada") **continua intacta**. A URL RAW em `ReviewItem.StreamUrl` é excepção já aceite pela doc XML (`CatalogEntities.cs:418`) e **não** é nova autorização genérica para expor credenciais. A fronteira DL-020 = "diagnóstico / API / log / audit / report / documentação / artefactos versionados = proibido" **mantém-se**. O único destino deliberadamente RAW continua a ser a playlist funcional que por definição do projecto requer URL real.
+
+#### D4 — Compatibilidade com DL-112.
+
+DL-112 ("Secrets são armazenados por referência/secret store ou mecanismo equivalente isolado do modelo funcional") continua **OPEN/PARTIAL** (`46-REQUIREMENT-TRACEABILITY.md` linha 157). `ProviderAccountEntity.CredentialsReference` permanece write-only; **não** existe `SecretStore` implementado. Esta DL-129 **não** substitui nem elimina a futura necessidade de um mecanismo de secrets adequado; **não** afirma que o uso de RAW em `ReviewItem.StreamUrl` é o modelo final de secrets — é dívida técnica conhecida, registada aqui para tracking.
+
+#### D5 — Compatibilidade com DL-108, DL-115, DL-116, DL-124, DL-125, DL-126, DL-128.
+
+- **DL-108** (`sfp1` fingerprint): compatível. `StreamFingerprint` continua a ser a identidade operacional de canal; `ReviewItem.StreamFingerprint`/`StreamFingerprintVersion` persistidos são consistentes.
+- **DL-115** (transaction boundary): compatível. A leitura de `ReviewItem.StreamUrl` ocorre após `ApplyReviewApprovalAsync` commit; **não** mantém transacção DB aberta.
+- **DL-116** (external resource reconciliation): compatível. Não toca reconciliação.
+- **DL-124** (`RunCoordinator.RunId` autoritativo): compatível. Não introduz RunId para esta decisão. Se D4-A for escolhido, RunId é fabricável via `RunCoordinator`.
+- **DL-125** (`discovery_candidates.RunId`): compatível. Não toca discovery.
+- **DL-126** (Recognition Policy snapshot): compatível. Não toca snapshot. Se D4-A for escolhido, snapshot é criado antes do pipeline execute (DL-126 invariant).
+- **DL-128** (Dispatcharr gate dedicado): compatível. Não reabre DL-128; não toca Dispatcharr gate.
+
+#### D6 — Consequências arquitecturais registadas.
+
+A utilização de `ReviewItem.StreamUrl` como fonte funcional de publicação cria uma **dependência** da publicação relativamente à **longevidade** da `ReviewItemEntity` row. Concretamente:
+
+- **Limpeza futura de Review (`review_items`)**: se um futuro mecanismo purgar `ReviewItem` (DL-113 actualmente não cobre este caso; ver §OPEN), o caminho de publicação perde a fonte RAW. Mitigação eventual: **NÃO** aplicável nesta wave; o operador/equipa decide se aceita o risco ou constrói `ProviderUrlResolver` antes do purge.
+- **Mudança futura do formato de Review evidence**: se `StreamUrl` deixar de ser persistido (substituído por fingerprint-only), o caminho de publicação precisa de migração.
+- **Substituição futura de Xtream por outro provider**: o caminho assume URL-com-credenciais no formato Xtream; outro formato pode exigir novas regras de sanitização.
+- **Export/arquivo futuro de `review_items`**: dumps de DB contêm RAW. Risco operacional **existente** (não criado por esta DL); AGENTS.md §6 e §8 cobrem parcialmente.
+
+#### D7 — Retenção.
+
+**Não existe actualmente** política de retenção/purge para `review_items`. Consequência: `ReviewItem.StreamUrl` RAW pode permanecer no SQLite **indefinidamente**. Esta persistência RAW não-temporária é fronteira de segurança **existente** (anterior a DL-129), **não** criada por esta decisão. DL-113 ("Retenção é configuração explícita") continua a aplicar-se no sentido de que qualquer purge futuro **deve** ser configuração explícita; esta DL-129 **não** autoriza nem proíbe purge.
+
+#### D8 — Acoplamento ao lifecycle de Review.
+
+A publicação fica **acoplada** à existência da Review row. **Não** é criado mecanismo de redundância. **Não** é criada cópia RAW em `ChannelSource` (essa cópia sanitizada já existe). Wave futura que decida D4-A/D4-B deve considerar este acoplamento como entrada explícita no plano de implementação.
+
+#### D9 — Pré-requisito ratificado.
+
+DL-129 ratifica apenas o **pré-requisito comum** a D4-A e D4-B: a possibilidade técnica de construir `M3uStream.Url` RAW a partir de `ReviewItem.StreamUrl` após `ApplyReviewApprovalAsync`. **Não** escolhe D4-A nem D4-B. **Não** implementa nenhum caminho de publicação. **Não** cria nova infra-estrutura (`ProviderUrlResolver`, secret store, retention policy). **Não** altera API contracts.
+
+#### Non-goals (registados explicitamente).
+
+- **Não** resolve SecretStore (DL-112 continua OPEN).
+- **Não** resolve retention/purge.
+- **Não** escolhe D4-A vs D4-B.
+- **Não** implementa Review→Output.
+- **Não** altera schema/migrations.
+- **Não** altera Review API contracts.
+- **Não** adiciona `M3uStream.Url` a RunReport ou logs.
+- **Não** adiciona RAW URL a audit ou DTOs.
+- **Não** altera `CredentialSanitizer`.
+
+#### Test gap registado (não implementado nesta wave).
+
+Wave futura que implemente D4-A ou D4-B deve incluir teste que valide, em conjunto:
+
+- `ReviewItem.StreamUrl` RAW com credenciais Xtream (`http://user:secret@host/live.m3u8`);
+- após `POST /api/review/resolve` (AddAlias/CreateChannel/Exclude) e pipeline de publicação;
+- `playlist.m3u` contém URL RAW funcional (esperado);
+- `report_<ts>.json` contém URL sanitizada (esperado);
+- `RunReport` (`telegram_run_report.json`) não contém URL RAW (esperado);
+- `import_history.json` não contém URL field (esperado);
+- Logs verbose (se activos) sanitizados (esperado);
+- Audit não contém `r.StreamUrl` (esperado);
+- Review API (`GET /api/review`, `GET /api/review?id`) não contém `r.StreamUrl` (esperado).
+
+O test `Responses_do_not_expose_credentials` (`WaveW55ReviewApiTests.cs:792-808`) cobre parcialmente o caso via `normalizedIdentity`; deve ser estendido para cobrir o path `streamUrl`-bearing quando Review→Output for implementado.
+
+### DL-130 — Review Approval / Publication Pending Lifecycle (ratificado)
+
+Ratifica o lifecycle em que uma `Review Approval` actualiza o catálogo mas **não** publica directamente `playlist.m3u` e **não** invoca directamente Dispatcharr. A publicação funcional continua a ser responsabilidade do lifecycle normal de Run/ingestion (DL-128). O estado `publication_pending` é **derivado** de cursors existentes — não é uma propriedade persistida de `ReviewItemEntity`. Não há schema migration. Não há reconstrução autónoma de URLs Xtream (per `W-REVIEW-03-D4-PROVIDER-MODEL-RECON`).
+
+#### Contexto
+
+O lifecycle actual (per `W-REVIEW-03-D4-PENDING-STATE-MODEL` e `W-REVIEW-03-D4-CATALOG-PUBLICATION-CURSOR-RECON`) já é estruturalmente compatível com este modelo: `POST /api/review/resolve` actualiza o catálogo (atomic, DL-127), emite audit, e termina. A próxima Telegram cycle / full Run republica `playlist.m3u` via `RunPublicationService.PublishAsync` (atomic write, DL-019) e invoca Dispatcharr via gate dedicado (DL-128). A única questão técnica em aberto era a representação do estado de "publicação pendente" entre estas duas fases. Esta DL-130 ratifica que essa representação é um **cursor derivado** de timestamps já existentes em `LiveRunEntity` e nas entidades de catálogo — não uma nova coluna.
+
+#### D1 — Review Approval não publica `playlist.m3u` directamente.
+
+`POST /api/review/resolve` actualiza o catálogo (atomic, DL-127), emite audit (`catalog.review.resolve` + `catalog.review.approval.materialize_*`), e responde 200 OK. **Não** invoca `SaveToM3uPlaylistAtomic`. **Não** cria `LiveRunEntity`. O `playlist.m3u` mantém-se como o último output funcional publicado pelo último Run bem sucedido.
+
+#### D2 — Review Approval não chama Dispatcharr.
+
+Por consequência de D1, e por respeito ao gate dedicado (DL-128 D8), o handler de resolve **não** invoca `DispatcharrSyncCoordinator.RunAsync` nem adquire o `DispatcharrConcurrencyGate`. Dispatcharr é actualizado exclusivamente pelo Run normal.
+
+#### D3 — Publicação funcional é responsabilidade do lifecycle de Run.
+
+`RunPublicationService.PublishAsync` permanece o único caminho para escrever `playlist.m3u` atomicamente (DL-019). `RunCoordinator.StartAsync` / `KickStartAsync` permanece o único caminho para criar um `LiveRunEntity` (DL-124). O fluxo `Telegram cycle → ingestion → validation → recognition → selection → publication → Dispatcharr` permanece inalterado.
+
+#### D4 — Unidade de publicação é `playlist.m3u` completo.
+
+Não existe unidade de publicação mais fina do que o `playlist.m3u` no sistema actual. **Não** há correspondência per-Review, per-ChannelSource, ou per-Source entre uma Review resolvida e o conteúdo de uma escrita específica de `playlist.m3u`. Esta conclusão está documentada em `W-REVIEW-03-D4-PENDING-STATE-MODEL` e é FACTUALMENTE provada pelo código: o Run lê o estado wholesale do catálogo (`RunPublicationService.PublishAsync`), não enumera `ReviewItemEntity` rows; `RunReport` e `ImportHistoryEntry` **não** carregam IDs de ReviewItem; `ReviewItem.RunId` é uma string nullable sem FK para `LiveRunEntity.RunId`.
+
+#### D5 — `publication_pending` é estado DERIVADO, não persistido.
+
+Definido por:
+
+```
+catalogChangedAtUtc      = MAX(UpdatedAtUtc) sobre entidades relevantes do catálogo
+lastSuccessfulPublicationAtUtc = MAX(LiveRunEntity.FinishedAtUtc)
+                               WHERE TerminalStatus = Completed
+                               AND Mode IN ('Telegram', 'TelegramMaintain')
+publicationPending       = catalogChangedAtUtc > lastSuccessfulPublicationAtUtc
+pendingReviewsCount      = COUNT(*) FROM review_items
+                            WHERE State = Resolved
+                            AND UpdatedAtUtc > lastSuccessfulPublicationAtUtc
+```
+
+A lista exacta das entidades abrangidas por `catalogChangedAtUtc` deve ficar explicitamente documentada como contrato de implementação (ver Implementation Prerequisites). As entidades candidatas são: `CanonicalChannel`, `ChannelSource`, `Source`, `ReviewItem`, `ProviderAccount`, `ExternalIdentity`, `ChannelAlias` (cada uma com `UpdatedAtUtc` excepto onde aplicável).
+
+#### D6 — Não será criado `ReviewItemEntity.PublishedAtUtc`.
+
+Ratificado. O estado per-Review não pode ser provado pelo código sem diffing externo de `playlist.m3u`. Criar a coluna seria uma falsa promessa. **Esta decisão é vinculativa**: ondas futuras que requeiram um campo "published" devem usar queries de derivação, não armazenamento directo.
+
+#### D7 — Não é necessário schema migration.
+
+Os cursors D5 existem como queries em tabelas existentes (`LiveRunEntity`, `CanonicalChannel`, `ChannelSource`, `Source`, `ReviewItem`). A wave de implementação pode expor isto como endpoint `GET /api/publication/status` sem migrations.
+
+#### D8 — Cursor actualiza por derivação.
+
+O Run não precisa de fazer nada de especial para "limpar" o pending state. Quando um Run termina com `TerminalStatus = Completed`, a próxima query de `MAX(LiveRunEntity.FinishedAtUtc WHERE Completed)` reflecte automaticamente esse Run. Se `catalogChangedAtUtc ≤ lastSuccessfulPublicationAtUtc` após o Run, `publicationPending = false`.
+
+#### D9 — Dispatcharr respeita DL-128 e `DispatcharrConcurrencyGate`.
+
+`DispatcharrConcurrencyGate` continua independente do `RunCoordinator`. `DispatcharrSyncCoordinator.RunAsync` continua a ser invocado por `RunPublicationService.PublishAsync` após `SaveToM3uPlaylistAtomic`. A invocação respeita `cfg.DryRun` (DL-128 D6). O estado `publicationPending` é **independente** do sucesso de Dispatcharr: o cursor `lastSuccessfulPublicationAtUtc` representa "playlist.m3u escrito", não "Dispatcharr sincronizado".
+
+#### D10 — Coalescing natural.
+
+Vários `POST /api/review/resolve` consecutivos actualizam o catálogo atomicamente (DL-127); cada um emite audit; cada um actualiza `UpdatedAtUtc` da(s) row(s) afectada(s). Um único Run subsequente lê o estado wholesale e publica uma única vez. Não há locking necessário entre Reviews; o `RunCoordinator` CAS gate previne Runs concorrentes. A coalescing é **emergente** do design.
+
+#### D11 — Observabilidade de falhas preservada.
+
+Falhas de `ApplyReviewApprovalAsync` são capturadas pelo handler resolve (responde 4xx/5xx; **não** persiste partial state — atomic transaction, DL-127). Falhas de Run são capturadas pelo `RunCoordinator` (`TerminalStatus = Failed`, `LastMessage` populado, `LiveRunEntity` persistido) e pelo `RecoverInterruptedRunsAsync`. O pending state **não** deve ser apagado artificialmente em caso de falha — isso iria obscurecer o real estado do sistema.
+
+#### D12 — O modelo afirma apenas "catalog reflects no último output" — não "Review publicada".
+
+FACTUALMENTE, uma Review resolvida NÃO implica que a stream correspondente esteja em `playlist.m3u`. A inclusão depende de: `ChannelSource.IsEnabled`, `SourceSelectionStage`, country gate, `MaxSourcesPerChannel`, e o Run ter lido a row actualizada. O modelo afirma apenas que **se** o cursor `catalogChangedAtUtc` avançou após a última publicação, **existe pelo menos uma alteração de catálogo não reflectida**. Não afirma qual nem quantas.
+
+#### D13 — Sem reconstrução autónoma de URLs Xtream.
+
+Esta DL-130 **não** fecha DL-112 (SecretStore). **Não** introduz `ProviderUrlResolver`. Para Xtream, a fonte funcional RAW continua a ser:
+- `ReviewItem.StreamUrl` (DL-129) para streams com Review resolvida.
+- `playlist.m3u` (DL-019) como cache da última publicação.
+
+A eventual migração para Model A (catalog-derived) requer a wave `W-REVIEW-03-D4-RAW-SOURCE-ARCHITECTURE-RECON`/`W-REVIEW-03-D4-PROVIDER-MODEL-RECON` (schema + SecretStore + ProviderUrlResolver). **Fora do scope desta DL-130.**
+
+#### D14 — DL-020 preservado.
+
+Nenhuma nova exposição RAW é introduzida. Os sinks RAW permitidos (DL-129 D2) permanecem: `M3uStream.Url` + `playlist.m3u` + `output/telegram_playlist_<ts>.m3u`. O pending state é derivado de timestamps sanitizados (`UpdatedAtUtc`, `FinishedAtUtc`) — não transporta URLs RAW.
+
+#### D15 — Persistência através de restart.
+
+`publicationPending` é derivado de colunas `UpdatedAtUtc` / `FinishedAtUtc` que sobrevivem restart do processo. Não há estado em memória a preservar. O `RunCoordinator.RecoverInterruptedRunsAsync` cobre `LiveRunEntity` rows interrompidas; o cursor `lastSuccessfulPublicationAtUtc` é correcto após recovery (não inclui runs `Failed`).
+
+#### Compatibilidade com DLs existentes
+
+- **DL-019** (Output atómico): COMPLIANT — `playlist.m3u` continua a ser atomicamente substituído por Run.
+- **DL-020** (Secrets nunca em diagnóstico): COMPLIANT — D14.
+- **DL-112** (Secrets por referência): não afectada — esta DL-130 **não fecha** DL-112.
+- **DL-124** (RunId autoritativo): COMPLIANT — RunCoordinator CAS gate inalterado.
+- **DL-125** (`discovery_candidates.RunId`): COMPLIANT — não introduzimos candidates para Review.
+- **DL-126** (Recognition Policy snapshot): COMPLIANT — Run normal continua a criar snapshot antes de pipeline execute.
+- **DL-127** (ChannelSource materialization atomicity): COMPLIANT — Review resolve continua atómico.
+- **DL-128** (Dispatcharr gate dedicado): COMPLIANT — D9.
+- **DL-129** (`ReviewItem.StreamUrl` como source): COMPLIANT — esta DL-130 não contradiz DL-129; ratifica `ReviewItem.StreamUrl` como RAW source para streams com Review, dentro do lifecycle do Run.
+
+#### Implementation Prerequisites (para wave futura, NÃO implementada por esta DL)
+
+A próxima wave de implementação deve, no mínimo:
+
+1. Definir a lista exacta das entidades incluídas em `catalogChangedAtUtc`. Sugestão inicial (a confirmar): `CanonicalChannel`, `ChannelSource`, `Source`, `ReviewItem`, `ProviderAccount`, `ExternalIdentity`, `ChannelAlias`. Excluir `ChannelSourceObservation` (timestamp dedicado `ObservedAtUtc`; sem relevance directa para `playlist.m3u`).
+2. Definir o filtro exacto dos Run Modes elegíveis para `lastSuccessfulPublicationAtUtc`. Sugestão: `Mode IN ('Telegram', 'TelegramMaintain')`; `TerminalStatus = Completed`. Manutenção só conta se o seu output for canónico (verificar se há política de "maintenance não substitui" — não há pelo código actual).
+3. Tratar ausência de qualquer publicação anterior: `lastSuccessfulPublicationAtUtc = NULL` deve retornar `publicationPending = NULL` (estado desconhecido) **ou** `true` (conservador). Decidir.
+4. Endpoint `GET /api/publication/status` retornando: `{ pendingReviewsCount: int?, catalogChangedAtUtc: DateTime?, lastSuccessfulPublicationAtUtc: DateTime?, publicationPending: bool? }`. O booleano é `null` quando falta baseline.
+5. Dashboard tile opcional: `Publication Status: ⏳ pending / ✅ up-to-date / ❔ unknown`.
+6. `pendingReviewsCount` é métrica **auxiliar**, não definidora do estado. O estado é o cursor.
+7. Testes unitários das queries D5 (SQLite).
+8. Testes de cenários: Review Approve + Run success; Review + Run fail; 3 Reviews + 1 Run; Restart mid-Run (recovery).
+9. NÃO criar migrations.
+10. NÃO criar `ReviewItemEntity.PublishedAtUtc` (D6 vinculativa).
+11. NÃO criar novo `LiveRunMode` (DL-124 aplicável).
+12. NÃO criar `ProviderUrlResolver`, `SecretStore` (DL-112 inalterado).
+
+#### Non-goals (registados explicitamente)
+
+- **Não** fecha DL-112 (SecretStore continua OPEN/PARTIAL).
+- **Não** resolve retention/purge (DL-113 aplicável).
+- **Não** implementa `ProviderUrlResolver`.
+- **Não** cria `ReviewItemEntity.PublishedAtUtc`.
+- **Não** implementa endpoint `GET /api/publication/status` (futuro).
+- **Não** cria migrations.
+- **Não** altera schema de qualquer entidade.
+- **Não** introduz RAW URL em nova superfície.
+- **Não** fecha D4-A vs D4-B (não aplicável — esta DL torna essa escolha desnecessária no curto prazo).
+- **Não** migra para Model A (catalog-derived output).
+- **Não** migra para Model B (immediate publication via playlist cache).
+- **Não** altera `RunCoordinator`, `DispatcharrConcurrencyGate`, `RunPublicationService`, `M3uStream`, `PlaylistManagerService`.
+- **Não** altera contract HTTP de `/api/review/resolve`.
+
+#### Test gap (não implementado por esta DL)
+
+A próxima wave de implementação deve incluir teste que valide:
+
+- Review Approve → `publicationPending = true` (catalog changed, no Run since).
+- Run success → `publicationPending = false` (catalog covered).
+- Review Approve → Run fail → `publicationPending = true` (Run failed; catalog not covered).
+- 3 Reviews → 1 Run → `publicationPending = false` (coalesced).
+- Restart process → `publicationPending` preserved (derived from DB).
+- Exclude/Ignore → `publicationPending` semantics (open: see D11).
+
+#### Decisões arquitecturais abertas (registadas, não resolvidas por esta DL)
+
+1. Se `lastSuccessfulPublicationAtUtc = NULL` deve retornar `publicationPending = NULL` (unknown) ou `true` (conservative). Decidir na implementação.
+2. Se Dispatcharr success deve ser tracked separadamente (cursor paralelo `lastDispatcharrSuccessAtUtc`).
+3. Se admin-`IsEnabled` operations devem contar para `catalogChangedAtUtc` (afectam `playlist.m3u` mas podem não tocar `UpdatedAtUtc`).
+4. Se `ChannelSourceObservation` insertions devem contar (timestamp dedicado `ObservedAtUtc`).
+5. Se Exclude/Ignore devem ser contados (afectam ReviewItem mas não playlist content).
+6. Se manual M3U uploads (`ProviderType.Manual`) devem ser contados.
+
 ## C. Regra
 
-Uma implementação que contradiga DL-001..128 está incorrecta relativamente à BÍBLIA.
+Uma implementação que contradiga DL-001..130 está incorrecta relativamente à BÍBLIA.
 
 Uma alteração destas decisões exige alteração explícita da BÍBLIA, testes e documentação derivada.
