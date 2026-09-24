@@ -1065,35 +1065,355 @@ Operações do inventário: `configuration`, `test connection`, `dry-run`, `sync
 
 ### 20.6 `dry-run` (Dispatcharr)
 
-- **Purpose:** gerar plano + relatório sem aplicar (`output/dispatcharr_plan_<ts>.json`,
-  `output/dispatcharr_report_<ts>.json`).
-- **Status:** **NÃO IMPLEMENTADO** como endpoint HTTP dedicado
-  (`46-REQUIREMENT-TRACEABILITY.md:86`). O fluxo de domínio existe
-  (`DispatcharrSyncService.RunAsync` — `DryRun` flag, `DispatcharrSyncCoordinator`).
-- **Invariantes (contratuais):** dry-run é read-only; não produz efeitos
-  remotos (DL-013/DL-015); plano inspectável (`12-DISPATCHARR.md:13-14`);
-  credenciais nunca expostas em plano/relatório (DL-020 + AGENTS.md §2);
-  `MatchPlan` byte-idêntico para mesmo input + `nowUtc` (AGENTS.md §2).
-- **OPEN/TBD:** path, método, schema, formato do `dispatcharr_plan_<ts>.json`
-  através da API (actualmente só ficheiro). Esta ficha documenta o gap,
-  NÃO o preenche.
+- **Purpose:** gerar `MatchPlan` + `SyncReport` sem aplicar (DL-015; `12-DISPATCHARR.md:11-14`;
+  AGENTS.md §2). Persiste `output/dispatcharr_plan_<ts>.json` e
+  `output/dispatcharr_report_<ts>.json` (`DispatcharrSyncService.cs:169`, `:251`).
+- **Status:** **CONTRACT RATIFIED (DL-128)** — `POST /api/dispatcharr/dry-run`
+  (D1; DL-128). **HTTP IMPLEMENTATION SHIPPED** at HEAD
+  `4b6643e77bd87328d94d1df1097e727545de7b30` (commit
+  `feat(dispatcharr-http): implement POST /api/dispatcharr/{dry-run,sync} per DL-128`):
+  endpoint registado em `WebDashboardService.cs:976`; handler único partilhado
+  em `WebDashboardService.cs:9150` (chamado de `:979` com `forceDryRun: true`);
+  gate de concorrência dedicado em `DispatcharrConcurrencyGate.cs` (D8
+  concretizado); `forceDryRun` propagado em `DispatcharrSyncCoordinator.cs:104,
+  :115`. Camada de domínio canónica mantida (DL-015; AGENTS.md §2):
+  `DispatcharrSyncService.RunAsync` — branch `_config.DryRun=true` em
+  `DispatcharrSyncService.cs:196-206`; orquestrador único
+  `DispatcharrSyncCoordinator.RunAsync` em `DispatcharrSyncCoordinator.cs:73`.
+  Gates de caminho (`dispatcharr_enabled`, `no-playlist`) continuam a viver no
+  Coordinator. **RUNTIME-VALIDATED (dry-run)** end-to-end via wave
+  `W-RUNTIME-DISPATCHARR-DRYRUN-CONTROLLED` (dry-run contra fixture):
+  4 GETs observados / 0 writes / plano + relatório produzidos em `output/` /
+  counts `0 / 43 / 164 / 0 / 139 / 0 / 0 / 0`.
+- **Method/Path:** `POST /api/dispatcharr/dry-run` (D1; ratificado por
+  DL-128). Família usa prefixo `/api/dispatcharr/...`
+  (`WebDashboardService.cs:900, 9653-9654, 9797, 9860`). Não se criam
+  variantes alternativas do path (e.g. `dryrun`); a forma é exactamente
+  `dry-run`. Método diferente de `POST` → `405`.
+- **Auth/Authz:** autenticado (gate único do dashboard); sem requisito
+  adicional de `Administrator` para `dry-run` (consistente com `22 §20:977`
+  — leitura/autenticação-base para esta operação).
+- **CSRF:** obrigatório (`22 §8:244`; `22 §20:977`); `dry-run` dispara o
+  pipeline `Generate → Validate → Apply` (secção 20.1) e é, do ponto de
+  vista HTTP, uma mutação.
+- **Request:** corpo `application/json` mínimo:
+  ```json
+  { "playlistPath": "..." }
+  ```
+  `playlistPath` corresponde directamente ao parâmetro de domínio consumido
+  por `DispatcharrSyncService.RunAsync(playlistPath, selection, ct)`
+  (`DispatcharrSyncService.cs:119`). **Não** se introduz `PlaylistId`, **não**
+  se cria entidade `Playlist`, **não** se expõe `DispatcharrSourceSelection`
+  no contrato HTTP (D2; DL-128). `DispatcharrSourceSelection` continua a ser
+  artefacto interno/sanitizado, com campo `streamUrl` portador de credenciais
+  sanitizadas via `CredentialSanitizer.SanitizeUrl` — fica de fora desta
+  superfície.
+- **dry_run override:** **não há**. O endpoint **não** aceita qualquer campo
+  de override (D3; DL-128). Concretamente:
+  - corpo **não** inclui `dry_run`, `dryRun`, `dry_run=false` nem qualquer
+    `dispatcharr_dry_run`;
+  - aceitar-e-ignorar está **proibido** — payload com campos `dry_run*` é
+    `400 invalid-payload`;
+  - sem mecanismo alternativo de override (variável de ambiente, header,
+    cookie, query string, etc.);
+  - `/dry-run` significa sempre dry-run; `/sync` significa sempre
+    apply/sync per configuração persistida e contrato existente.
+- **Response / success status:** `200 OK` (D5; DL-128) — operação
+  síncrona. Resposta híbrida **sanitizada** que **não** embebe o conteúdo
+  integral do plano/relatório:
+  ```json
+  { "status": "ok|partial|failed|dry-run|...",
+    "mode": "dry-run|sync",
+    "planPath": "...",
+    "reportPath": "...",
+    "counts": {} }
+  ```
+  Forma orientativa (D4; DL-128): o que se fixa é **orientação estrutural**
+  — referência a artefactos e contagens, **sem** credenciais, **sem**
+  conteúdo integral do `dispatcharr_plan_*.json`/`dispatcharr_report_*.json`
+  embutido, **sem** campos inventados. Reutilização de tipos existentes
+  (`SyncReportCounts`, `DispatcharrSyncResult`, `DispatcharrSyncOutcome`)
+  deve preceder criação de novos DTOs. Se a implementação revelar que a
+  estrutura requer decisão adicional, regista-se como discrepância — não se
+  resolve silenciosamente (D4; DL-128). `202 Accepted` **não** é aceitável
+  para esta versão síncrona do contrato (D5; DL-128).
+- **Side effects:** filesystem-local apenas — escreve
+  `dispatcharr_plan_<ts>.json` e `dispatcharr_report_<ts>.json` em
+  `_outputDir` (default `output/`; `DispatcharrSyncService.cs:129, 169, 251`);
+  regista `SyncRunEntity` + passos via `RecordSyncRunStepSafeAsync`
+  (`DispatcharrSyncService.cs:296-345`) com `result="dry-run"` (`:200-205`).
+  **Nenhuma** chamada HTTP de escrita ao Dispatcharr (DL-013, DL-015;
+  `DispatcharrSyncService.cs:196-206`).
+- **Idempotência:** sim (família `22 §20:982`; DL-018). Plano byte-idêntico
+  para o mesmo input + `nowUtc` injetável (AGENTS.md §2; `22 §20.1:1007-1010`).
+- **Concurrency:** no máximo uma Dispatcharr sync activa por runtime (D8;
+  DL-128). Segunda tentativa concorrente → `409 concurrency-conflict`. O
+  mecanismo concreto é um **gate de concorrência dedicado ao Dispatcharr**
+  — segue o mesmo princípio atómico de `RunCoordinator` mas **não** o
+  reutiliza directamente (gate Telegram-scoped, sem mistura de semânticas):
+  aquisição atómica; falha do segundo candidato com conflito; libertação
+  garantida em `finally`; não dependente apenas de um flag `IsRunning`
+  (`TOCTOU`); não cria uma segunda semântica de Run Telegram; não altera
+  `RunCoordinator`. A concretização deste gate é diferida para wave de
+  implementação (D8; DL-128).
+- **Audit:** `SyncRunEntity` (início em `running`, fim em `ok`/
+  `dry-run`/`error`; `DispatcharrSyncService.cs:296-345`) e passos
+  `read-plan`, `selection`, `dry-run` (`:162-167, 185-190, 200-205`). Apenas
+  o tipo de excepção é persistido em falha, nunca a mensagem
+  (`DispatcharrSyncCoordinator.cs:121`; DL-020). Nenhum mecanismo de
+  auditoria HTTP adicional duplica esta observabilidade (D10; DL-128). Se
+  um evento HTTP-nível for necessário por observabilidade/compliance,
+  demonstra-se durante a implementação — não se inventa agora.
+- **Errors:** envelope canónico (D6; DL-128):
+  ```json
+  { "error": "<código estável>", "message": "<segura>", "correlationId": "<id>" }
+  ```
+  Códigos reutilizando a família transversal `22 §8` e DL-120:
+  `401 authentication-required`; `403 forbidden`/`403 csrf-invalid`;
+  `409 concurrency-conflict` (gate Dispatcharr deteve segunda invocação);
+  `422 invalid-payload` (payload mal formado, `dry_run*` rejeitado,
+  `playlistPath` inválido); `500 persistence-error`; `502 dispatcharr-comm-error`
+  (reservado para o `sync` — não aplicável em dry-run por construção);
+  `503 dispatcharr-unavailable` (catálogo indisponível;
+  `DispatcharrSyncCoordinator.cs:127-125`). `Ambiguous` é **estado de
+  domínio**, **não** erro HTTP — preserva-se `SyncOutcome.Ambiguous` e a sua
+  exposição via `counts.ambiguous` no payload (D6; DL-128).
+- **Sanitização:** `MatchPlanSerializer.SanitizeForSerialization` aplica
+  `CredentialSanitizer.SanitizeUrl` ao campo `streamUrl` antes de qualquer
+  escrita (`MatchPlanSerializer.cs:20, 46, 56, 82, 134`; AGENTS.md §2;
+  DL-020). Plano + relatório sanitizados em disco e em qualquer exposição
+  HTTP posterior. URLs com credenciais nunca aparecem em resposta/erro/log.
+- **Artifacts:** canónicos e inalterados (D7; DL-128):
+  `dispatcharr_plan_<ts>.json` (`<ts>=yyyyMMdd_HHmmss`, mesmo `startedAt`
+  para o par — `DispatcharrSyncService.cs:131, 169`) e
+  `dispatcharr_report_<ts>.json` (`:251`). Produzidos **sempre** que o
+  dry-run corre — mesmo quando a selecção é `null` (legacy). `startedAt`
+  determina o nome do ficheiro; ficheiros novos nunca sobrescrevem runs
+  anteriores no mesmo segundo. Opcionalmente, `dispatcharr_selection_<ts>.json`
+  quando há selecção aplicada (`:178-180`). HTTP devolve **referências/
+  paths**, **não** conteúdo integral embutido. Sanitização obrigatória,
+  filesystem-local canónico, `MatchPlanSerializer` e `CredentialSanitizer`
+  preservados sem alteração (D7; DL-128). Credenciais Xtream **nunca**
+  expostas via HTTP.
+- **Administrator:** `Administrator` = administrador autenticado corrente;
+  **não** se introduz Role/Claim/Permission/Group/ACL/migração RBAC
+  (D9; DL-128). `AuthModeResolver` permanece intocado; `RequireAdministratorAsync`
+  não é criado (redundante). Autenticação = autorização enquanto só existir
+  este papel — convenção ratificada em `31-DECISION-LOCK.md` (preservada);
+  Operator/RBAC futuro é wave própria.
+- **OPEN/TBD:**
+  - Concretização do gate de concorrência dedicado ao Dispatcharr (D8) —
+    diferida para a wave de implementação; contracto aqui é princípio.
+  - Rate limit — `PARAMETER_GAP` (família `22 §20:983` e §8:250).
+  - Detalhes de schema concretos (subtipos de `counts`, forma do `status`):
+    a enumerar durante a implementação, conforme evidência de domínio.
+- **Implementation reference:** `m3uCrawler/Services/Sync/DispatcharrSyncService.cs`
+  (RunAsync 119-288, dry-run branch 196-206, artifacts 169/251);
+  `m3uCrawler/Services/Sync/DispatcharrSyncCoordinator.cs` (RunAsync 73-125);
+  `m3uCrawler/Services/Sync/MatchPlanSerializer.cs` (SanitizeForSerialization
+  56-134).
+- **Test reference (domínio):** `m3uCrawler.Tests/DispatcharrSyncServiceTests.cs`;
+  `DispatcharrSyncServiceSourceSelectionTests.cs`; `DispatcharrSyncServiceOwnershipGuardTests.cs`;
+  `DispatcharrSyncServiceGlobalPhase4Tests.cs`. Test reference **HTTP**:
+  `m3uCrawler.Tests/W2DispatcharrHttpTests.cs` (22 test cases at HEAD
+  `4b6643e77bd87328d94d1df1097e727545de7b30`; DL-128 compliance D1–D10
+  conformant).
+- **Classification:** **CONTRACT RATIFIED (DL-128)**; **HTTP IMPLEMENTATION
+  SHIPPED** at HEAD `4b6643e77bd87328d94d1df1097e727545de7b30`; **RUNTIME-
+  VALIDATED (dry-run)** via `W-RUNTIME-DISPATCHARR-DRYRUN-CONTROLLED`.
+  APPLY/SYNC contra Dispatcharr real permanece **NOT RUNTIME-VALIDATED**.
 
 ### 20.7 `sync` (Dispatcharr)
 
-- **Purpose:** aplicar `desired` calculado pelo matching layer,
-  respeitando ownership.
-- **Status:** **NÃO IMPLEMENTADO** como endpoint HTTP dedicado
-  (`46:86`). Camada de domínio existe (`DispatcharrSyncService.ApplyAsync`).
-- **Invariantes (contratuais):** `sync` é mutação administrativa (CSRF +
-  `Administrator`); `Ambiguous` **nunca** aplicado automaticamente
-  (AGENTS.md §2); só `CrawlerManaged` removido automaticamente
-  (DL-014); `MatchPlan` é o contrato intermédio entre matching e apply
-  (AGENTS.md §2); `dispatcharr_dry_run=true` continua a ser default —
-  mudar `dry_run=false` é decisão operacional explícita (AGENTS.md §2);
-  idempotência por desired/snapshot; auditoria obrigatória; sem credenciais
-  em logs/reports (DL-020).
-- **OPEN/TBD:** path, método, schema, formato de resposta, códigos de
-  erro. Esta ficha documenta o gap, NÃO o preenche.
+- **Purpose:** aplicar o `desired` calculado pelo matching ao Dispatcharr,
+  respeitando ownership (`CrawlerManaged`/`External`/`Unknown`;
+  `12-DISPATCHARR.md:17-24`; DL-014; AGENTS.md §2). Reconcilia o estado
+  remoto observado segundo DL-116 (`12-DISPATCHARR.md:27-35`).
+- **Status:** **CONTRACT RATIFIED (DL-128)** — `POST /api/dispatcharr/sync`
+  (D1; DL-128). **HTTP IMPLEMENTATION SHIPPED** at HEAD
+  `4b6643e77bd87328d94d1df1097e727545de7b30` (commit
+  `feat(dispatcharr-http): implement POST /api/dispatcharr/{dry-run,sync} per DL-128`):
+  endpoint registado em `WebDashboardService.cs:985`; handler único partilhado
+  em `WebDashboardService.cs:9150` (chamado de `:988` com `forceDryRun: false`);
+  gate de concorrência dedicado em `DispatcharrConcurrencyGate.cs` (D8
+  concretizado); `forceDryRun` propagado em `DispatcharrSyncCoordinator.cs:104,
+  :115`. Camada de domínio canónica preservada
+  (`DispatcharrSyncService.ApplyAsync`
+  `DispatcharrSyncService.cs:397, 397-…`; orquestrador único
+  `DispatcharrSyncCoordinator.RunAsync` consumido por `RunPublicationService`,
+  `Program.cs` e `ScheduledDispatcharrSyncAction`
+  (`RunPublicationService.cs:144, 154, 163`; AGENTS.md §2). Gates de caminho
+  (`dispatcharr_enabled`, `no-playlist`) continuam a viver no Coordinator.
+  **APPLY/SYNC contra Dispatcharr real: NOT RUNTIME-VALIDATED** — apenas a
+  variante `dry-run` foi exercida end-to-end via
+  `W-RUNTIME-DISPATCHARR-DRYRUN-CONTROLLED`. A validação contra Dispatcharr
+  real (writes efectivos, ownership guard, DL-116, sanitização em respostas
+  HTTP) permanece em aberto.
+- **Method/Path:** `POST /api/dispatcharr/sync` (D1; ratificado por
+  DL-128). Família usa prefixo `/api/dispatcharr/...`
+  (`WebDashboardService.cs:9653-9654`). Não se criam variantes alternativas
+  do path. Método diferente de `POST` → `405`.
+- **Auth/Authz:** autenticado + `Administrator` (`22 §20:976-977`; a família
+  fixa explicitamente que `sync` exige `Administrator`). Gate único do
+  dashboard antes do handler (idem §7.3-7.5).
+- **CSRF:** obrigatório (`22 §8:244`; `22 §20:977`). Header `X-CSRF-Token`
+  (consistente com §7).
+- **Request:** corpo `application/json` mínimo:
+  ```json
+  { "playlistPath": "..." }
+  ```
+  `playlistPath` corresponde directamente ao parâmetro de domínio consumido
+  por `DispatcharrSyncService.RunAsync(playlistPath, selection, ct)`
+  (`DispatcharrSyncService.cs:119`). **Não** se introduz `PlaylistId`, **não**
+  se cria entidade `Playlist`, **não** se expõe `DispatcharrSourceSelection`
+  no contrato HTTP (D2; DL-128).
+- **dry_run override:** **não há**. O endpoint **não** aceita qualquer campo
+  de override (D3; DL-128). Concretamente:
+  - corpo **não** inclui `dry_run`, `dryRun`, `dry_run=true`, `dry_run=false`
+    nem qualquer `dispatcharr_dry_run`;
+  - aceitar-e-ignorar está **proibido** — payload com campos `dry_run*` é
+    `400 invalid-payload`;
+  - sem mecanismo alternativo de override (variável de ambiente, header,
+    cookie, query string, etc.);
+  - `/sync` significa sempre apply/sync per configuração persistida e
+    contrato existente. `dispatcharr_dry_run=false` continua a ser decisão
+    operacional explícita do administrador (AGENTS.md §2), não argumento de
+    request HTTP.
+- **Response / success status:** `200 OK` (D5; DL-128) — operação
+  síncrona. Resposta híbrida **sanitizada** que **não** embebe o conteúdo
+  integral do plano/relatório:
+  ```json
+  { "status": "ok|partial|failed|...",
+    "mode": "dry-run|sync",
+    "planPath": "...",
+    "reportPath": "...",
+    "counts": {} }
+  ```
+  Forma orientativa (D4; DL-128): o que se fixa é **orientação estrutural**
+  — referência a artefactos e contagens, **sem** credenciais, **sem**
+  conteúdo integral do `dispatcharr_plan_*.json`/`dispatcharr_report_*.json`
+  embutido, **sem** campos inventados. Reutilização de tipos existentes
+  (`SyncReportCounts`, `DispatcharrSyncResult`, `DispatcharrSyncOutcome`)
+  deve preceder criação de novos DTOs. `Status ∈ {Disabled, CatalogUnavailable,
+  Succeeded, Failed}` quando invocado via Coordinator
+  (`DispatcharrSyncCoordinator.cs:22-33`). Se a implementação revelar que a
+  estrutura requer decisão adicional, regista-se como discrepância — não se
+  resolve silenciosamente (D4; DL-128). `202 Accepted` **não** é aceitável
+  para esta versão síncrona do contrato (D5; DL-128).
+- **Side effects (autoritativo):** `ApplyAsync` faz HTTP de escrita ao
+  Dispatcharr (`DispatcharrSyncService.cs:210`); respeita DL-014 (só
+  `CrawlerManaged` removido automaticamente; `12-DISPATCHARR.md:24`;
+  `DispatcharrSyncService.cs:569-600`); preserva `is_custom=true` em
+  streams criadas pelo crawler (AGENTS.md §2;
+  `22 §20.1:1011-1013`); nunca edita `name`/`url`/`tvg_id`/`channel_group`
+  de streams `is_custom=false` com `m3u_account` definido (AGENTS.md §2;
+  `22 §20.1:1014-1016`). Em falha parcial mantém evidência do recurso criado
+  e tenta compensação segura (DL-116; `12-DISPATCHARR.md:38-41`).
+- **SyncOutcome (preservados explicitamente, não simplificar):**
+  `NewChannel | ExistingUnchanged | ExistingReassigned | ExistingReordered
+   | NewStream | Removed | Skipped | Ambiguous | Unchanged | Failed`
+  (`Models/DiscoveredStream.cs:3-15`). **Invariante:** `Ambiguous`
+  nunca é aplicado automaticamente — fica `SyncOutcome.Ambiguous` no
+  plano, conta em `report.Counts.Ambiguous` e em
+  `report.AmbiguousDecisions` (AGENTS.md §2; `22 §20.1:1004-1006`;
+  `DispatcharrSyncService.cs:469` salta o canal ambíguo;
+  `Models/MatchPlan.cs:150-205`).
+- **Idempotência:** sim, por desired/snapshot (`22 §20:982`; DL-018).
+  Aplicação repetida com o mesmo plano produz o mesmo estado remoto
+  (`12-DISPATCHARR.md:26-35`; DL-018).
+- **Concurrency:** no máximo uma Dispatcharr sync activa por runtime (D8;
+  DL-128). Segunda tentativa concorrente → `409 concurrency-conflict`. O
+  mecanismo concreto é um **gate de concorrência dedicado ao Dispatcharr**
+  — segue o mesmo princípio atómico de `RunCoordinator` mas **não** o
+  reutiliza directamente (gate Telegram-scoped, sem mistura de semânticas):
+  aquisição atómica; falha do segundo candidato com conflito; libertação
+  garantida em `finally`; não dependente apenas de um flag `IsRunning`
+  (`TOCTOU`); não cria uma segunda semântica de Run Telegram; não altera
+  `RunCoordinator`. A concretização deste gate é diferida para wave de
+  implementação (D8; DL-128).
+- **Audit:** obrigatória (`22 §20:983`; `4.1`). Persistência:
+  `SyncRunEntity` (`running` → `ok`/`partial`/`error: <ExceptionType>`;
+  `DispatcharrSyncService.cs:296-345`) + passos `read-plan`, `selection`,
+  `apply`, `apply-create`, `apply-associate`, `apply-remove`,
+  `apply-protected`, `apply-errors`
+  (`DispatcharrSyncService.cs:162-167, 185-190, 213-244`). Apenas o
+  `Type` da excepção é persistido em falha, nunca a mensagem
+  (`DispatcharrSyncCoordinator.cs:121`; DL-020). `SyncRunEntity` continua a
+  ser o registo canónico de auditoria; nenhum mecanismo HTTP adicional
+  duplica esta observabilidade para a mesma operação (D10; DL-128). Se um
+  evento HTTP-nível for necessário por observabilidade/compliance,
+  demonstra-se durante a implementação — não se inventa agora.
+- **Errors:** envelope canónico (D6; DL-128):
+  ```json
+  { "error": "<código estável>", "message": "<segura>", "correlationId": "<id>" }
+  ```
+  Códigos reutilizando a família transversal `22 §8` e DL-120:
+  `401 authentication-required`; `403 forbidden`/`403 csrf-invalid`;
+  `409 concurrency-conflict` (gate Dispatcharr deteve segunda invocação);
+  `422 invalid-payload` (payload mal formado, `dry_run*` rejeitado,
+  `playlistPath` inválido); `500 persistence-error`;
+  `502 dispatcharr-comm-error` (HTTP falhou ao falar com Dispatcharr —
+  `DispatcharrException`; `Services/Dispatcharr/DispatcharrException.cs`);
+  `503 dispatcharr-unavailable` (`CatalogUnavailable`;
+  `DispatcharrSyncCoordinator.cs:127-125`). `Ambiguous` é **estado de
+  domínio**, **não** erro HTTP — preserva-se `SyncOutcome.Ambiguous` e a sua
+  exposição via `counts.ambiguous` no payload (D6; DL-128).
+- **Partial failure / DL-116:** uma chamada falhada não é assumida como
+  "recurso não existe"; evidência persistida; compensação segura quando
+  possível (`12-DISPATCHARR.md:38-41`; `DispatcharrSyncService.cs:548-563`).
+- **Sanitização:** `MatchPlanSerializer.SanitizeForSerialization` aplica
+  `CredentialSanitizer.SanitizeUrl` ao campo `streamUrl` antes de qualquer
+  escrita em artefactos (`MatchPlanSerializer.cs:20, 46, 56, 134`; AGENTS.md §2;
+  DL-020). `CredentialSanitizer.SanitizeUrl` e `SanitizeM3uContent` aplicam-se
+  a **todos** os pontos de saída: consola, `RunReport`, JSONs de relatório,
+  respostas HTTP, mensagens de erro (AGENTS.md §2; DL-020).
+  URLs com credenciais nunca aparecem em `dispatcharr_plan_*.json`,
+  `dispatcharr_report_*.json`, respostas/erros/logs. A playlist M3U
+  funcional (`output/playlist.m3u`, `GET /api/playlist`) preserva URLs
+  Xtream reais — é o único artefacto onde credenciais são intencionais
+  (AGENTS.md §2).
+- **Artifacts:** `dispatcharr_plan_<ts>.json` + `dispatcharr_report_<ts>.json`
+  são produzidos **sempre** que `RunAsync` completa — independentemente de
+  `DryRun` (`DispatcharrSyncService.cs:169, 251`). Em `sync` (apply),
+  contêm adicionalmente o output de `ApplyAsync` (recursos criados/removidos,
+  streams protegidas, falhas). Opcionalmente `dispatcharr_selection_<ts>.json`
+  quando há selecção (`:178-180`). Canónicos e inalterados (D7; DL-128) —
+  HTTP devolve **referências/paths**, **não** conteúdo integral embutido.
+- **Administrator:** `Administrator` = administrador autenticado corrente;
+  **não** se introduz Role/Claim/Permission/Group/ACL/migração RBAC
+  (D9; DL-128). `AuthModeResolver` permanece intocado; `RequireAdministratorAsync`
+  não é criado (redundante). Autenticação = autorização enquanto só existir
+  este papel — convenção ratificada em `31-DECISION-LOCK.md` (preservada);
+  Operator/RBAC futuro é wave própria.
+- **OPEN/TBD:**
+  - Concretização do gate de concorrência dedicado ao Dispatcharr (D8) —
+    diferida para a wave de implementação; contracto aqui é princípio.
+  - Rate limit — `PARAMETER_GAP` (família `22 §20:983` e §8:250).
+  - Detalhes de schema concretos (subtipos de `counts`, forma do `status`):
+    a enumerar durante a implementação, conforme evidência de domínio.
+- **Implementation reference:** `m3uCrawler/Services/Sync/DispatcharrSyncService.cs`
+  (RunAsync 119-288, apply branch 207-246, ApplyAsync 397-…, ownership guard
+  569-600, recorder); `m3uCrawler/Services/Sync/DispatcharrSyncCoordinator.cs`
+  (RunAsync 73-273, status enum 22-33); `m3uCrawler/Services/Sync/MatchPlanSerializer.cs`
+  (sanitização); `m3uCrawler/Services/LiveRun/RunPublicationService.cs:144,
+  154, 163` (caller canónico).
+- **Test reference (domínio):** `m3uCrawler.Tests/DispatcharrSyncServiceTests.cs`;
+  `DispatcharrSyncServiceSourceSelectionTests.cs`;
+  `DispatcharrSyncServiceOwnershipGuardTests.cs`;
+  `DispatcharrSyncServiceGlobalPhase4Tests.cs`;
+  `DispatcharrLiveReadonlyIntegrationTests.cs`;
+  `ScheduledDispatcharrSyncActionTests.cs`;
+  `Phase93DispatcharrNamingTests.cs`. Test reference **HTTP**:
+  `m3uCrawler.Tests/W2DispatcharrHttpTests.cs` (22 test cases at HEAD
+  `4b6643e77bd87328d94d1df1097e727545de7b30`; DL-128 compliance D1–D10
+  conformant para `dry-run`; cobertura HTTP do path `/sync` fica em aberto
+  até validação contra Dispatcharr real).
+- **Classification:** **CONTRACT RATIFIED (DL-128)**; **HTTP IMPLEMENTATION
+  SHIPPED** at HEAD `4b6643e77bd87328d94d1df1097e727545de7b30`; **APPLY/SYNC
+  contra Dispatcharr real: NOT RUNTIME-VALIDATED** (apenas `dry-run` foi
+  exercido end-to-end via `W-RUNTIME-DISPATCHARR-DRYRUN-CONTROLLED`). O
+  contrato de domínio (ownership, ambiguous preservado, sanitização, DL-116,
+  DL-015, DL-020) mantém-se canónico e inalterado.
 
 ### 20.8 `reconciliation` e `ownership view`
 
