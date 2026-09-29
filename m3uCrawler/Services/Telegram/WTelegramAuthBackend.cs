@@ -53,6 +53,12 @@ public sealed class WTelegramAuthBackend : ITelegramAuthBackend
             "api_id" => _options.ApiId,
             "api_hash" => _options.ApiHash,
             "session_pathname" => _options.SessionPath,
+            // W-FIX-WT-AUTH-PHONE-NUMBER: WTelegram.Client.LoginUserIfNeeded()
+            // consulta Config("phone_number") mesmo quando session.dat está
+            // presente, para validar session-recovery. Sem este caso o
+            // delegate devolvia null e o pipeline (SearchM3UInTelegramInternal)
+            // levantava WTException em runtime.
+            "phone_number" => _options.Phone,
             _ => null,
         };
     }

@@ -231,6 +231,17 @@ No `GET /api/run/status` para um Run terminado, o campo top-level `status` é `"
 
 Seguindo a convenção do projecto (cada classe de teste que precisa de HTTP tem o seu próprio harness privado), `E2EFirstRunHarness` é cópia de `Phase94RunApiHarness`. AGENTS.md §4 adverte contra refactor especulativo; refactor para extrair harness partilhado é trabalho de outra wave.
 
+### 10.5 Gap de cobertura detectado no First Real Test (W-FIX-WT-AUTH-PHONE-NUMBER)
+
+O First Real Test manual (execução real contra `/opt/m3ucrawler-first-test/runtime-data/wtelegram.config`) apanhou um bug que esta suite de testes E2E **não detectava**:
+
+* **Sintoma:** o pipeline Telegram levantava `WTException: You must provide a config value for phone_number` no segundo login (`SearchM3UInTelegramInternal` → `client.LoginUserIfNeeded()`), apesar de `wtelegram.config` conter `phone_number` correctamente.
+* **Causa:** o delegate privado `Config(string what)` de `WTelegramAuthBackend` (linhas 49-58, antes desta wave) tinha apenas três casos (`api_id`, `api_hash`, `session_pathname`) — `phone_number` caía no default `_ => null`. O telefone era passado directamente em `BeginLoginAsync` (`_client.Login(phone)`, `WTelegramAuthBackend.cs:39`), pelo que o primeiro login funcionava; mas `LoginUserIfNeeded()` consulta o delegate e falhava.
+* **Por que o E2E HTTP não apanhou:** `WFirstE2EHttpTests` (e `OperationalEndToEndRunTests`) injectam um `TelegramDiscoveryDelegate` fake — nunca instanciam `WTelegramAuthBackend` nem chamam `LoginUserIfNeeded`. A contract do delegate `Config` não estava coberta por nenhum teste.
+* **Fix (wave seguinte):** adicionar `"phone_number" => _options.Phone` ao switch em `WTelegramAuthBackend.Config` + teste unitário `WTelegramAuthBackendConfigDelegateTests` que invoca o delegate via reflection. Resultado: 4/4 testes do fix passam; suite completa 2711/1/1 (única falha continua a ser o pré-existente `WaveW6b2ObservabilityTests`).
+
+A lição para waves futuras: testes que usem apenas fakes no seam Telegram validam o pipeline, mas não a contract privada do backend WTelegram. Para cobrir a contract do delegate, é necessário um teste unitário dedicado (como o que foi adicionado em W-FIX-WT-AUTH-PHONE-NUMBER).
+
 ## 11. Validação runtime
 
 Realizada **no ambiente** (`/root/.dotnet/dotnet` instalado via `dotnet-install.sh`):
@@ -399,7 +410,7 @@ Se algum critério falhar, o diagnóstico deve seguir a ordem:
 
 A sequência recomendada a partir daqui (extraída da auditoria `2026-09-25-w-audit-web-admin-e2e.md` §16):
 
-1. **First Real Test (manual)** — executar §13 em ambiente real com Telegram/Dispatcharr.
+1. **First Real Test (manual)** — executar §13 em ambiente real com Telegram/Dispatcharr. **Resultado do primeiro intento:** o pipeline falhou com `WTException: phone_number`. A causa está documentada em §10.5 e corrigida na wave `W-FIX-WT-AUTH-PHONE-NUMBER`. Re-executar §13 após deploy do fix.
 2. **W-MULTI-COUNTRY-UI** — country por Run na UI (P1.6).
 3. **W-REVIEW-EXPAND** — fechar W5.5 gap (P1.7).
 4. **W-DISPATCHARR-CURSOR** — `lastDispatcharrSuccessAtUtc` (P2.3, DL-130 D-OPEN-05).
