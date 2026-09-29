@@ -19,6 +19,10 @@ services:
       - --web
       - --web-port
       - "5000"
+      # W-PRE-FIRST-E2E (F-22): activa o botão "Run now" no dashboard.
+      # Default do binário é 503 web-allow-trigger-disabled; sem esta
+      # flag o trigger manual fica inacessível pela Web UI.
+      - --web-allow-trigger
     ports:
       - "5000:5000"
     volumes:

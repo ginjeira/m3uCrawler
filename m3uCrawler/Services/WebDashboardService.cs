@@ -8528,9 +8528,15 @@ const rows = Object.entries(inv).map(([k, v]) => {
       var allow = !!(data && data.webAllowTrigger);
 
       if (trigger) {
+        // W-PRE-FIRST-E2E: tornar o diagnóstico accionável. O 503
+        // web-allow-trigger-disabled é opt-in deliberado (architecture
+        // doc §12.2 Opção B) e não pode ser desligado pela UI. O admin
+        // precisa de reiniciar o container com a flag para activar.
         trigger.innerHTML = allow
           ? "Trigger manual: <span class='badge ok'>activado</span> (<code>--web-allow-trigger</code>)."
-          : "Trigger manual: <span class='badge muted'>desactivado</span>. Arranque via <code>--web-allow-trigger</code>.";
+          : "Trigger manual: <span class='badge muted'>desactivado</span>. " +
+            "Active <code>--web-allow-trigger</code> no <code>docker-compose.yml</code> " +
+            "e reinicie o container para disponibilizar o botão &quot;Run now&quot;.";
       }
       if (btn) {
         btn.disabled = !allow || !!(data && data.isRunning);

@@ -259,6 +259,25 @@ public class Phase94LiveRunApiTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Get_status_reflects_web_allow_trigger_false()
+    {
+        // W-PRE-FIRST-E2E: complementar Get_status_machine_token_authorizes_when_no_user_session
+        // (que valida o caminho true). Garante que o snapshot reflecte
+        // fielmente o estado da flag, para que o UI possa apresentar o
+        // diagnóstico accionável quando o admin não passou a flag.
+        const string token = "machine-liverun-trigger-off-token";
+        var host = await BuildHostAsync(executor: _ => IdlePipeline());
+        var harness = StartHarness(host, webAllowTrigger: false, webToken: token);
+
+        var request = new HttpRequestMessage(HttpMethod.Get, "/api/run/status");
+        request.Headers.Add("Authorization", $"Bearer {token}");
+        var response = await harness.Client.SendAsync(request);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        Assert.False(doc.RootElement.GetProperty("webAllowTrigger").GetBoolean());
+    }
+
+    [Fact]
     public async Task Get_status_standalone_no_telegram_returns_503()
     {
         // Standalone = --web sem auth wiring; gate bypassed e sem host
