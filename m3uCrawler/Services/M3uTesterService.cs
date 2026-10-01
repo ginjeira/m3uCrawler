@@ -999,7 +999,11 @@ public sealed class M3uTesterService : IDisposable
             Url = url,
             Title = string.IsNullOrEmpty(title) ? ExtractTitleFromUrl(url) : title,
             Group = group,
-            LastTested = DateTime.Now,
+            // W-DEDUP (2026-10-01): um resultado reutilizado nao fabrica um
+            // novo timestamp de teste fisico. O PipelineIngestionService so'
+            // regista uma observacao quando LastTested != default, pelo que
+            // LastTested default sinaliza correctamente "sem GET fisico".
+            LastTested = outcome.ReusedKnownWorking ? default : DateTime.Now,
             IsWorking = outcome.IsWorking,
             ResponseTime = outcome.DurationMs,
         };

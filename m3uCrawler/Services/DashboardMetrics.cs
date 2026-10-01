@@ -84,6 +84,7 @@ namespace m3uCrawler.Services
                 streamsTested = r.StreamsTested,
                 streamsWorking = r.StreamsWorking,
                 streamsFailed = r.StreamsFailed,
+                streamsSkippedAlreadyValidated = r.StreamsSkippedAlreadyValidated,
                 successRatePercent = rate,
                 testsBalanced = r.StreamsWorking + r.StreamsFailed == r.StreamsTested,
             };

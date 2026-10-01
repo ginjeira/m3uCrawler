@@ -396,6 +396,21 @@ Cada entrada inclui `PublicationTriageEntry { Kind, Reference, ChannelId, Messag
 Método principal: `TelegramScraperService.SearchAndTestM3UInTelegramAsync`.
 Os dados são preservados em `TelegramScraperService.LastRunReport` durante a execução e persistidos pelo `Program.cs` em `output/telegram_run_report.json`.
 
+### Validação física por conta e deduplicação por run (W-DEDUP, 2026-10-01)
+
+No caminho de descoberta Telegram, os streams aceites por `ValidateStreams` entram em `TestStreamsAsync` → `AccountGateCoordinator` → `AccountValidator.ValidateAccountAsync` → `M3uTesterService.TestStreamForAccountAsync` → `ProbeOnceAsync`. Aqui o GET físico é **deduplicado por run**:
+
+- **ValidationKey = `sfp1`.** A chave é o fingerprint canónico `StreamFingerprint.TryComputeFingerprint(url)`; **nunca** uma URL sanitizada. Para `/live|movie|series/USER/PASS/ID`, `sfp1` mascara `USER`/`PASS` e preserva endpoint + `ID`, funcionando como chave (endpoint, canal).
+- **Chave já `Working` não é re-testada.** Um `ValidationKey` conhecido `Working` neste run não volta a ser GET-testado por outra conta. As contas não são fundidas.
+- **Probe obrigatório.** Cada conta elegível executa sempre ≥1 GET físico com as suas próprias credenciais: primeiro stream cuja chave já é `Working`; senão o primeiro com chave; senão o primeiro elegível (ordem de parse).
+- **Falhas nunca são reutilizadas.** `FailedTerminal`/`FailedTransient`, transitórios, curto-circuitados ou vazios nunca dispensam um GET físico de outra conta.
+- **Não fingerprintáveis / Xtream *bare*.** URLs não-http (`rtmp://`, `udp://`, …) são sempre testadas e nunca registadas. A forma bare `host:port/user/pass/id` não é mascarada por `sfp1` e por isso não é deduplicada (limitação conhecida).
+- **Proveniência.** Um resultado reutilizado tem `ReusedKnownWorking = true` e projecta `LastTested = default`, pelo que `PipelineIngestionService` não cria observação histórica para ele; o canal entra na lista `working` e na playlist.
+- **Contadores.** `StreamsTested` conta apenas validações físicas; os GETs evitados vão para o novo `StreamsSkippedAlreadyValidated` (também em `LiveRunCounts` e no dashboard). O invariante `StreamsTested == StreamsWorking + StreamsFailed` mantém-se; `DiscoveredPlaylist.WorkingStreams` inclui reutilizados.
+- **Âmbito.** O registo (`ValidationKeyRegistry`) é em memória, por run, thread-safe e não persistido (sem schema/migration, nada em `runtime-data`). Concorrência, timeouts e retries não mudam; manutenção, `ScheduledValidationAction`, `/api/validation/test` e Dispatcharr não são afectados.
+
+Detalhe normativo em `docs/Reestructure/08-VALIDATION.md §6`.
+
 ## Validação por país (`CountryChannelValidator`)
 
 A validação do pipeline é feita por `CountryChannelValidator.AnalyzePlaylist(content, countryCode, threshold: 3)`. A classificação:
@@ -465,7 +480,8 @@ Cada execução preenche um `RunReport` (em `Models/RunReport.cs`) com os seguin
 | `PlaylistsRejected` | Playlists rejeitadas por não atingirem o threshold de país. |
 | `ChannelsRecognized` | Soma dos canais distintos reconhecidos nas playlists aceites. |
 | `StreamsExtracted` | Streams extraídos do `M3uParserService`. |
-| `StreamsTested` | Streams enviados para `M3uTesterService`. |
+| `StreamsTested` | Validações **físicas** (GET) enviadas para `M3uTesterService`. W-DEDUP (2026-10-01): não conta streams reutilizados por `sfp1` já conhecido `Working`. |
+| `StreamsSkippedAlreadyValidated` | GETs físicos evitados porque o mesmo `sfp1` já estava `Working` neste run (W-DEDUP, 2026-10-01). |
 | `StreamsWorking` | Streams funcionais. |
 | `StreamsFailed` | Streams que falharam o teste. |
 | `RejectionReasons` | Lista de motivos (ex.: "país PT não corresponde (canais 0/3)"). |

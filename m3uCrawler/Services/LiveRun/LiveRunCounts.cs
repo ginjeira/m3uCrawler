@@ -94,6 +94,13 @@ public sealed class LiveRunCounts
     public int StreamsWorking { get; set; }
     public int StreamsFailed { get; set; }
 
+    /// <summary>
+    /// W-DEDUP (2026-10-01): GETs físicos evitados porque o mesmo
+    /// <c>sfp1</c> já estava Working neste run. <c>StreamsTested</c> conta
+    /// apenas validações físicas.
+    /// </summary>
+    public int StreamsSkippedAlreadyValidated { get; set; }
+
     // ===================== Lista alvo final (merge) =====================
 
     /// <summary>
@@ -157,6 +164,7 @@ public sealed class LiveRunCounts
         StreamsTested = report.StreamsTested;
         StreamsWorking = report.StreamsWorking;
         StreamsFailed = report.StreamsFailed;
+        StreamsSkippedAlreadyValidated = report.StreamsSkippedAlreadyValidated;
     }
 
     /// <summary>Serializa para o formato persistido em <c>CountsJson</c>.</summary>

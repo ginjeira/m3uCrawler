@@ -434,9 +434,13 @@ namespace m3uCrawler.Services
             var tester = acquisitionFailureObserver is null
                 ? StreamValidationTesterFactory.CreateTester(validationState)
                 : StreamValidationTesterFactory.CreateTester(validationState, acquisitionFailureObserver);
+            // W-DEDUP (2026-10-01): registo de validação física por run. Criado aqui
+            // porque o AccountValidator é criado uma vez por run de descoberta Telegram.
+            // In-memory, não persistido, reset implícito a cada run (nova instância).
+            var validationKeyRegistry = new ValidationKeyRegistry();
             // PHASE 9A.2 (2026-09-16): o validador de accounts reusa o MESMO
             // state/cache/host-tracker que o tester.
-            var accountValidator = new AccountValidator(validationState, tester);
+            var accountValidator = new AccountValidator(validationState, tester, validationKeyRegistry);
             var maxConcurrentAccounts = validationState.Options.MaxConcurrentAccounts;
             // PHASE 9A.3 (2026-09-16): coordenador GLOBAL por run. A mesma
             // instancia e' partilhada por TODOS os candidate workers deste
@@ -1006,9 +1010,10 @@ namespace m3uCrawler.Services
                 accountValidator.ValidateAccountAsync,
                 accountGateCoordinator,
                 candidate.Url, countryStreams, maxUrlsToTest, cancellationToken);
-            Interlocked.Add(ref rep._StreamsTested, tested.Count);
-            Interlocked.Add(ref rep._StreamsWorking, tested.Count(s => s.IsWorking));
-            Interlocked.Add(ref rep._StreamsFailed, tested.Count(s => !s.IsWorking));
+            AccumulateValidationCounters(rep, tested);
+            // WorkingStreams inclui, por design, streams conhecidos-working
+            // reutilizados (LastTested == default): nao se perde nenhum canal
+            // ja' validado neste run.
             discovered.WorkingStreams = tested.Count(s => s.IsWorking);
 
             lock (workingLock)
@@ -2047,6 +2052,34 @@ namespace m3uCrawler.Services
     int rejected = streams.Count - accepted.Count;
     return (accepted, rejected);
 }
+
+        /// <summary>
+        /// W-DEDUP (2026-10-01): acumula contadores de validacao fisica a
+        /// partir das streams construidas para um candidate.
+        ///
+        /// <para>
+        /// Invariante: <c>StreamsTested == StreamsWorking + StreamsFailed</c>
+        /// passa a cobrir apenas validacoes FISICAS. Streams reutilizadas
+        /// (<c>LastTested == default</c>, conhecidas-working de outra
+        /// AccountKey neste run) nao sao GET fisico e sao contadas em
+        /// <c>StreamsSkippedAlreadyValidated</c>. Escreve em <paramref name="rep"/>
+        /// de forma atomica (os candidate workers correm em paralelo).
+        /// </para>
+        /// </summary>
+        internal static void AccumulateValidationCounters(RunReport rep, IReadOnlyList<M3uStream> tested)
+        {
+            int physical = 0, working = 0, failed = 0;
+            foreach (var s in tested)
+            {
+                if (s.LastTested == default) continue;   // reutilizado: não é GET físico
+                physical++;
+                if (s.IsWorking) working++; else failed++;
+            }
+            Interlocked.Add(ref rep._StreamsTested, physical);
+            Interlocked.Add(ref rep._StreamsWorking, working);
+            Interlocked.Add(ref rep._StreamsFailed, failed);
+            Interlocked.Add(ref rep._StreamsSkippedAlreadyValidated, tested.Count - physical);
+        }
 
         // Filtra streams existentes re-testados para retencao na playlist.
         //

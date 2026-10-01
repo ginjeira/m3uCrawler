@@ -37,6 +37,15 @@ public sealed record StreamTestOutcome(
     int Attempts,
     bool WasShortCircuited)
 {
+    /// <summary>W-DEDUP (2026-10-01): true quando o resultado foi reutilizado a
+    /// partir de conhecimento Working já existente neste run (mesmo sfp1, outra
+    /// AccountKey). NÃO representa um GET físico desta conta.</summary>
+    public bool ReusedKnownWorking { get; init; }
+
+    // Nota: records incluem propriedades init-only na igualdade/ToString
+    // geradas; a posição do parâmetro posicional mantém-se para não quebrar
+    // os pontos de construção existentes.
+
     public static StreamTestOutcome Empty(string url) =>
         new(url, false, null, StreamFailureKind.Unknown, 0, false, 0, false);
 }

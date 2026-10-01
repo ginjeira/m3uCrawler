@@ -79,6 +79,11 @@ public class Phase94LiveRunHardeningTests : IAsyncLifetime
         "StreamsExtracted",
         "StreamsFailed",
         "StreamsRejectedByCountry",
+        // W-DEDUP (2026-10-01) — extensão intencional do contrato: contador
+        // aditivo. StreamsTested passa a contar apenas validações FÍSICAS;
+        // as reutilizadas por sfp1 já Working neste run vão para
+        // StreamsSkippedAlreadyValidated.
+        "StreamsSkippedAlreadyValidated",
         "StreamsTested",
         "StreamsWorking",
         "TraceEventsAttachmentDownloadComplete",
@@ -148,7 +153,8 @@ public class Phase94LiveRunHardeningTests : IAsyncLifetime
             .OrderBy(x => x, StringComparer.Ordinal)
             .ToArray();
 
-        Assert.Equal(60, actual.Length);
+        // W-DEDUP (2026-10-01): 60 -> 61 (contador aditivo StreamsSkippedAlreadyValidated).
+        Assert.Equal(61, actual.Length);
         Assert.Equal(expected, actual);
     }
 

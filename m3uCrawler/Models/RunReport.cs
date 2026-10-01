@@ -117,6 +117,12 @@ namespace m3uCrawler.Models
         internal int _StreamsFailed;
         public int StreamsFailed { get => _StreamsFailed; set => _StreamsFailed = value; }
 
+        // W-DEDUP (2026-10-01): GETs fisicos evitados porque o mesmo sfp1
+        // (ValidationKey) ja' estava Working neste run. StreamsTested passa a
+        // contar apenas validacoes fisicas.
+        internal int _StreamsSkippedAlreadyValidated;
+        public int StreamsSkippedAlreadyValidated { get => _StreamsSkippedAlreadyValidated; set => _StreamsSkippedAlreadyValidated = value; }
+
         // === Publicacao Discovery / Resolution (introduzido 2026-09-09) ===
 
         // Total de referencias Telegram + URLs HTTP publicas descobertas.

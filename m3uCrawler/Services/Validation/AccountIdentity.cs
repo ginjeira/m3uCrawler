@@ -309,6 +309,15 @@ public sealed record AccountStreamWork(
 
 /// <summary>
 /// Resultado da validacao de uma account/playlist.
+///
+/// <para>
+/// <b>Contadores (W-DEDUP, 2026-10-01).</b>
+/// <see cref="Tested"/> conta apenas GETs físicos desta account.
+/// <see cref="Working"/> conta o conhecimento working desta account
+/// (físico + reutilizado). <see cref="Reused"/> conta GETs físicos
+/// evitados por <c>sfp1</c> já conhecido Working neste run. Invariante:
+/// <c>Tested + Reused + (short-circuits de early-exit) == Outcomes.Count</c>.
+/// </para>
 /// </summary>
 public sealed record AccountValidationResult(
     AccountValidationWork Work,
@@ -316,4 +325,5 @@ public sealed record AccountValidationResult(
     int Working,
     int Failed,
     int ShortCircuited,
-    int Tested);
+    int Tested,
+    int Reused = 0);

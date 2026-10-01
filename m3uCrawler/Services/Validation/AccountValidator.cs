@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
+using m3uCrawler.Services.Matching;
 
 namespace m3uCrawler.Services.Validation;
 
@@ -24,6 +25,14 @@ namespace m3uCrawler.Services.Validation;
 /// SEM global lock. As contas sao serializadas APENAS por identidade
 /// (URL + username); contas diferentes correm em paralelo ate'
 /// <c>MaxConcurrentAccounts</c>.
+///
+/// <para>
+/// <b>W-DEDUP (2026-10-01).</b> A deduplicacao de validacao fisica e' feita
+/// por um <see cref="ValidationKeyRegistry"/> de escopo por run. Uma chave
+/// <c>sfp1</c> ja conhecida Working neste run nao volta a ser testada por
+/// outra AccountKey; contudo cada AccountKey elegivel executa sempre pelo
+/// menos um GET fisico (probe). As contas nunca sao fundidas.
+/// </para>
 /// </summary>
 public sealed class AccountValidator
 {
@@ -35,15 +44,21 @@ public sealed class AccountValidator
     private readonly StreamValidationState _state;
     private readonly StreamValidationOptions _options;
     private readonly M3uTesterService _tester;
+    private readonly ValidationKeyRegistry _registry;
 
     public AccountValidator(
         StreamValidationState state,
-        M3uTesterService tester)
+        M3uTesterService tester,
+        ValidationKeyRegistry? registry = null)
     {
         _state = state ?? throw new ArgumentNullException(nameof(state));
         _tester = tester ?? throw new ArgumentNullException(nameof(tester));
         _options = state.Options;
+        _registry = registry ?? new ValidationKeyRegistry();
     }
+
+    /// <summary>Registo de deduplicacao fisica por run.</summary>
+    public ValidationKeyRegistry Registry => _registry;
 
     /// <summary>
     /// Valida UMA account/playlist sequencialmente.
@@ -55,20 +70,35 @@ public sealed class AccountValidator
     {
         var sw = Stopwatch.StartNew();
         var outcomes = new List<StreamTestOutcome>(work.Streams.Count);
-        int working = 0, failed = 0, shortCircuited = 0, tested = 0;
+        int working = 0, failed = 0, shortCircuited = 0, tested = 0, reused = 0;
 
         var accountMetrics = new StreamValidationMetrics
         {
             TotalUrls = work.Streams.Count,
         };
 
+        // ValidationKeys posicionais (uma por stream, parse/input order).
+        // Chaves nulas = URL nao fingerprintavel: nunca deduplicado nem
+        // registado, testado sempre fisicamente.
+        var keys = new string?[work.Streams.Count];
+        for (var i = 0; i < work.Streams.Count; i++)
+        {
+            keys[i] = StreamFingerprint.TryComputeFingerprint(work.Streams[i].Url);
+        }
+
+        // Probe obrigatorio desta account: escolhido sobre a composicao
+        // COMPLETA da account e nunca satisfeito pelo resultado de outra
+        // account. Garante pelo menos um GET fisico por AccountKey elegivel.
+        var probeIndex = SelectMandatoryProbeIndex(keys);
+
         // hostCacheStatus e' LOCAL por account; cache e host tracker
         // sao partilhados via state.
         var hostCacheStatus = new ConcurrentDictionary<string, bool>(
             StringComparer.OrdinalIgnoreCase);
 
-        foreach (var stream in work.Streams)
+        for (var i = 0; i < work.Streams.Count; i++)
         {
+            var stream = work.Streams[i];
             if (cancellationToken.IsCancellationRequested) break;
 
             // Early-exit por work item.
@@ -83,6 +113,21 @@ public sealed class AccountValidator
                 continue;
             }
 
+            var key = keys[i];
+
+            // Deducao: so' a chave do probe e' forcada a fisico; as
+            // restantes aproveitam conhecimento Working desta run. Falhas
+            // nunca dispensam um GET fisico.
+            if (i != probeIndex && key is not null && _registry.IsKnownWorking(key))
+            {
+                outcomes.Add(new StreamTestOutcome(stream.Url, true, null, StreamFailureKind.None, 0, false, 0, false)
+                    with { ReusedKnownWorking = true });
+                reused++;
+                working++;
+                _registry.RecordReuse();
+                continue;
+            }
+
             var outcome = await _tester.TestStreamForAccountAsync(
                 stream.Url,
                 hostCacheStatus,
@@ -91,10 +136,19 @@ public sealed class AccountValidator
 
             outcomes.Add(outcome);
             tested++;
+            _registry.RecordPhysical();
 
             if (outcome.IsWorking) working++;
             else if (outcome.WasShortCircuited) shortCircuited++;
             else failed++;
+
+            // Nunca registar chaves nulas nem curto-circuitados/empty como
+            // Working. Uma falha nunca e' conhecimento reutilizavel.
+            if (key is not null && !outcome.WasShortCircuited)
+            {
+                if (outcome.IsWorking) _registry.MarkWorking(key);
+                else _registry.MarkFailed(key, outcome.FailureKind);
+            }
         }
 
         sw.Stop();
@@ -106,7 +160,8 @@ public sealed class AccountValidator
         Console.WriteLine(
             $"[VALIDATION_ACCOUNT] XTREAM_ACCOUNT host={host} user={logUser} " +
             $"fingerprint={work.AccountId} tested={tested} working={working} " +
-            $"failed={failed} shortCircuited={shortCircuited} durationMs={sw.ElapsedMilliseconds}");
+            $"failed={failed} shortCircuited={shortCircuited} reused={reused} " +
+            $"probe={probeIndex} durationMs={sw.ElapsedMilliseconds}");
 
         return new AccountValidationResult(
             work,
@@ -114,7 +169,44 @@ public sealed class AccountValidator
             working,
             failed,
             shortCircuited,
-            tested);
+            tested,
+            reused);
+    }
+
+    /// <summary>
+    /// Escolhe o indice do stream que a account testa OBRIGATORIAMENTE de
+    /// forma fisica. A escolha considera a composicao COMPLETA da account e
+    /// e' deterministica (parse/input order):
+    /// <list type="number">
+    ///   <item>primeiro stream cuja ValidationKey ja e' conhecida Working
+    ///         neste run (probe barato/rapido que confirma as credenciais
+    ///         desta account);</item>
+    ///   <item>caso contrario, primeiro stream com ValidationKey nao nula;</item>
+    ///   <item>caso contrario, primeiro stream elegivel.</item>
+    /// </list>
+    /// Devolve -1 quando nao ha streams. O probe e' decidido apenas sobre a
+    /// composicao desta account; nunca e' satisfeito pelo resultado de outra
+    /// AccountKey.
+    /// </summary>
+    private int SelectMandatoryProbeIndex(string?[] keys)
+    {
+        if (keys.Length == 0) return -1;
+
+        // (1) primeiro stream cuja ValidationKey ja' e' conhecida Working
+        // neste run.
+        for (var i = 0; i < keys.Length; i++)
+        {
+            if (keys[i] is not null && _registry.IsKnownWorking(keys[i])) return i;
+        }
+
+        // (2) primeiro stream com ValidationKey nao nula.
+        for (var i = 0; i < keys.Length; i++)
+        {
+            if (keys[i] is not null) return i;
+        }
+
+        // (3) primeiro stream elegivel.
+        return 0;
     }
 
     /// <summary>
