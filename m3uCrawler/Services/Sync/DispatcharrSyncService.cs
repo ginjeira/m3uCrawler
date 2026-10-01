@@ -613,9 +613,37 @@ namespace m3uCrawler.Services.Sync
         }
 
         /// <summary>
-        /// PHASE 13 (Wave 13-6 part 2) — indexa as URLs seleccionadas por
-        /// <see cref="ChannelDecision.CanonicalChannelKey"/> (Ordinal),
-        /// sanitizadas. Entradas com key vazia são ignoradas.
+        /// W-V3 (Wave V3) — identidade interna estável de um stream para efeitos
+        /// de matching de selecção. Usa o fingerprint canónico <c>sfp1</c>
+        /// (<see cref="StreamFingerprint.TryComputeFingerprint"/>), que é a
+        /// identidade lógica de stream definida pela arquitectura. Se a URL não
+        /// for fingerprintável (não http/https), recorre à URL RAW original.
+        ///
+        /// <para>
+        /// NUNCA usa <see cref="CredentialSanitizer.SanitizeUrl"/>: a
+        /// representação sanitizada é apenas de apresentação e colide entre
+        /// contas distintas que sirvam o mesmo stream id.
+        /// </para>
+        /// </summary>
+        private static string StreamIdentityKey(string streamUrl)
+        {
+            var fingerprint = StreamFingerprint.TryComputeFingerprint(streamUrl);
+            if (!string.IsNullOrEmpty(fingerprint))
+            {
+                return StreamFingerprint.Version + "|" + fingerprint;
+            }
+
+            // URL não fingerprintável (ex.: esquema não-http). Mantém a URL RAW
+            // como identidade — nunca a forma sanitizada.
+            return "raw|" + streamUrl;
+        }
+
+        /// <summary>
+        /// PHASE 13 (Wave 13-6 part 2) — indexa as identidades estáveis dos
+        /// streams seleccionados por <see cref="ChannelDecision.CanonicalChannelKey"/>
+        /// (Ordinal). A identidade é o fingerprint <c>sfp1</c>
+        /// (<see cref="StreamIdentityKey"/>), NÃO uma URL sanitizada. Entradas
+        /// com key vazia são ignoradas.
         /// </summary>
         private static Dictionary<string, HashSet<string>> BuildSelectedByKey(DispatcharrSourceSelection selection)
         {
@@ -625,7 +653,7 @@ namespace m3uCrawler.Services.Sync
                 if (string.IsNullOrEmpty(channel.CanonicalChannelKey)) continue;
                 var set = new HashSet<string>(StringComparer.Ordinal);
                 foreach (var selected in channel.Selected)
-                    set.Add(CredentialSanitizer.SanitizeUrl(selected.StreamUrl));
+                    set.Add(StreamIdentityKey(selected.StreamUrl));
                 result[channel.CanonicalChannelKey] = set;
             }
             return result;
@@ -659,7 +687,7 @@ namespace m3uCrawler.Services.Sync
                 foreach (var s in channel.Streams)
                 {
                     if (s.ExistingStreamId.HasValue
-                        && !selectedSet.Contains(CredentialSanitizer.SanitizeUrl(s.StreamUrl)))
+                        && !selectedSet.Contains(StreamIdentityKey(s.StreamUrl)))
                     {
                         ids.Add(s.ExistingStreamId.Value);
                     }
@@ -710,7 +738,7 @@ namespace m3uCrawler.Services.Sync
 
             foreach (var s in channel.Streams)
             {
-                if (selectedSet.Contains(CredentialSanitizer.SanitizeUrl(s.StreamUrl)))
+                if (selectedSet.Contains(StreamIdentityKey(s.StreamUrl)))
                 {
                     kept.Add(s);
                     continue;

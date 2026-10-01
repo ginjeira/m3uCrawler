@@ -610,9 +610,14 @@ selecção até ao apply; não há um segundo cálculo da selecção no apply.
   listas disjuntas (§10.3).
 
 A identidade do artefacto é `CanonicalChannel.Key`. O `CanonicalChannelId` é
-apenas transportado; nunca é a chave de associação. A correlação de URL usa
-`CredentialSanitizer.SanitizeUrl` em ambos os lados (artefacto e plano), tal como
-a chave de unicidade do catálogo (`CatalogResolver.RecordChannelSourceAsync`).
+apenas transportado; nunca é a chave de associação. A pertença de cada stream à
+selecção no apply/keep-drop é resolvida pela **identidade estável do stream** — o
+fingerprint `sfp1` (`StreamFingerprint`, via `StreamIdentityKey`) —, delimitada
+por `CanonicalChannelKey`; para streams já existentes no Dispatcharr a identidade
+operacional (remoção/ownership) continua a ser `ExistingStreamId`. A
+representação sanitizada (`CredentialSanitizer.SanitizeUrl`) permanece apenas de
+apresentação (persistência/relatório) e **nunca** é usada como identidade de
+matching.
 
 ### Persistência sanitizada
 
@@ -642,7 +647,9 @@ zero":
 ### Regra de associação (`selection != null`)
 
 - Apenas as fontes `Selected` são associadas/publicadas. `Selected` é a **única**
-  autoridade de associação.
+  autoridade de associação. A pertença de uma stream ao conjunto `Selected` é
+  resolvida por `StreamFingerprint` (`sfp1`), delimitada por `CanonicalChannelKey`
+  — nunca pela URL sanitizada.
 - `Unmatched` e `Ambiguous` **não** são associados — alteração de comportamento
   **deliberada** face ao caminho legacy. Uma stream sem entrada `Selected` é
   descartada.

@@ -803,6 +803,225 @@ public class DispatcharrSyncServiceSourceSelectionTests : IAsyncLifetime
         Assert.Contains("***", output, StringComparison.Ordinal);
     }
 
+    // ---------------- Wave V3: identidade interna = fingerprint sfp1, não URL sanitizada ----------------
+
+    // Par de URLs na forma "bare" do Xtream que colapsa sob
+    // CredentialSanitizer.SanitizeUrl (mesmo host/porta/id) mas cujos
+    // fingerprints sfp1 diferem (paths distintos). É a evidência central da
+    // Wave V3: a forma sanitizada não pode ser a identidade de decisão.
+    private const string CollisionUrlA = "http://host.example:8080/201788541134/SECAlpha99/12345";
+    private const string CollisionUrlB = "http://host.example:8080/998877665544/SECBravo77/12345";
+
+    /// <summary>
+    /// T1/T4 — a negativa essencial. As duas URLs colapsam na mesma forma
+    /// sanitizada (precondição), mas só a URL A está seleccionada. O apply tem
+    /// de publicar apenas A; sob a implementação antiga (identidade sanitizada)
+    /// B seria considerada seleccionada e também publicada.
+    /// </summary>
+    [Fact]
+    public async Task Sync_selection_keeps_only_the_selected_stream_when_sanitized_urls_collide()
+    {
+        Assert.Equal(CredentialSanitizer.SanitizeUrl(CollisionUrlA), CredentialSanitizer.SanitizeUrl(CollisionUrlB));
+        Assert.NotEqual(
+            StreamFingerprint.TryComputeFingerprint(CollisionUrlA),
+            StreamFingerprint.TryComputeFingerprint(CollisionUrlB));
+
+        var handler = new SourceSelectionRecordingHandler { NextNewStreamId = 5600 };
+        var (svc, _, state) = BuildApplySvc(handler: handler);
+
+        var decision = NewChannelDecision(
+            "collide", null,
+            NewStream(CollisionUrlA, 0),
+            NewStream(CollisionUrlB, 1));
+        var selection = Selection("collide", CollisionUrlA);
+
+        await svc.ApplyAsync(Plan(decision), state, selection, new List<FailedReportEntry>(), CancellationToken.None);
+
+        Assert.Single(handler.StreamPostBodies);
+        var posted = handler.StreamPostBodies.Select(ParseUrl).ToArray();
+        Assert.Contains(CollisionUrlA, posted);
+        Assert.DoesNotContain(CollisionUrlB, posted);
+        Assert.Single(ParseStreams(handler.ChannelPostBodies.Single()));
+    }
+
+    /// <summary>
+    /// T2 — o mesmo fingerprint correlaciona independentemente de case do host,
+    /// porta por omissão e credenciais. A stream do plano é tratada como
+    /// seleccionada e publicada.
+    /// </summary>
+    [Fact]
+    public async Task Sync_same_fingerprint_correlates_across_case_port_and_credentials()
+    {
+        const string selected = "http://HOST:80/live/alice/secretA/12345";
+        const string planned = "http://host/live/bob/secretB/12345";
+        Assert.Equal(
+            StreamFingerprint.TryComputeFingerprint(selected),
+            StreamFingerprint.TryComputeFingerprint(planned));
+
+        var handler = new SourceSelectionRecordingHandler { NextNewStreamId = 5610 };
+        var (svc, _, state) = BuildApplySvc(handler: handler);
+
+        var decision = NewChannelDecision("same-fp", null, NewStream(planned, 0));
+        var selection = Selection("same-fp", selected);
+
+        await svc.ApplyAsync(Plan(decision), state, selection, new List<FailedReportEntry>(), CancellationToken.None);
+
+        Assert.Single(handler.StreamPostBodies);
+        Assert.Equal(planned, ParseUrl(handler.StreamPostBodies.Single()));
+    }
+
+    /// <summary>
+    /// T3 — para streams existentes, a identidade operacional é o
+    /// <c>ExistingStreamId</c>: a remoção (DELETE) tem de atingir exactamente
+    /// o id 7001, independentemente da forma da URL.
+    /// </summary>
+    [Fact]
+    public async Task Sync_existing_stream_selection_uses_ExistingStreamId_not_url()
+    {
+        const string notSelected = "http://plain.example/other.ts";
+        await SeedSingleOwnershipAsync(7001, 701, StreamOwnership.CrawlerManaged);
+
+        var handler = new SourceSelectionRecordingHandler();
+        handler.ChannelStreamIds[701] = new List<long> { 7001 };
+        var (svc, _, state) = BuildApplySvc(catalog: _resolver, handler: handler);
+
+        var decision = ExistingChannelDecision(
+            701, "existing-id",
+            ExistingUnchanged(notSelected, 7001, 0));
+        var selection = Selection("existing-id", CollisionUrlA);
+
+        await svc.ApplyAsync(Plan(decision), state, selection, new List<FailedReportEntry>(), CancellationToken.None);
+
+        Assert.Equal(new long[] { 7001 }, handler.DeleteStreamIds.OrderBy(x => x).ToArray());
+        Assert.Empty(handler.StreamPostBodies);
+    }
+
+    /// <summary>
+    /// T5 — a selecção continua isolada por
+    /// <see cref="ChannelDecision.CanonicalChannelKey"/>: o mesmo par de URLs
+    /// colidentes sob K2 (sem entrada no artefacto) não é considerado
+    /// seleccionado só porque K1 o é.
+    /// </summary>
+    [Fact]
+    public async Task Sync_colliding_urls_are_isolated_by_canonical_channel_key()
+    {
+        var handler = new SourceSelectionRecordingHandler { NextNewStreamId = 5620, NewChannelId = 9200 };
+        var (svc, _, state) = BuildApplySvc(handler: handler);
+
+        var k1 = NewChannelDecision("K1", null, NewStream(CollisionUrlA, 0));
+        var k2 = NewChannelDecision(
+            "K2", null,
+            NewStream(CollisionUrlA, 0),
+            NewStream(CollisionUrlB, 1));
+        var selection = Selection("K1", CollisionUrlA);
+
+        await svc.ApplyAsync(Plan(k1, k2), state, selection, new List<FailedReportEntry>(), CancellationToken.None);
+
+        Assert.Single(handler.StreamPostBodies);
+        Assert.Equal(CollisionUrlA, ParseUrl(handler.StreamPostBodies.Single()));
+        Assert.Single(handler.ChannelPostBodies);
+    }
+
+    /// <summary>
+    /// T6 — guarda de ownership com URLs colidentes: uma stream existente
+    /// External não seleccionada nunca é removida nem desassociada.
+    /// </summary>
+    [Fact]
+    public async Task Sync_colliding_url_non_selected_external_stream_is_protected()
+    {
+        const string notSelected = "http://plain.example/external.ts";
+        await SeedSingleOwnershipAsync(7001, 702, StreamOwnership.External);
+
+        var handler = new SourceSelectionRecordingHandler();
+        handler.ChannelStreamIds[702] = new List<long> { 7001 };
+        var (svc, _, state) = BuildApplySvc(catalog: _resolver, handler: handler);
+
+        var decision = ExistingChannelDecision(
+            702, "guard-collide",
+            ExistingUnchanged(notSelected, 7001, 0));
+        var selection = Selection("guard-collide", CollisionUrlA);
+
+        await svc.ApplyAsync(Plan(decision), state, selection, new List<FailedReportEntry>(), CancellationToken.None);
+
+        Assert.Empty(handler.DeleteStreamIds);
+        Assert.Empty(handler.PatchBodies);
+    }
+
+    /// <summary>
+    /// T7 — dry-run com URLs colidentes: artefactos sanitizados produzidos e
+    /// zero chamadas HTTP de escrita.
+    /// </summary>
+    [Fact]
+    public async Task Sync_dry_run_with_colliding_urls_writes_artifacts_and_no_write_http()
+    {
+        var playlistPath = Path.Combine(Path.GetTempPath(), $"dry-collide-{Guid.NewGuid():N}.m3u");
+        var outputDir = TempOutputDir();
+        File.WriteAllText(playlistPath, BuildPlaylist(new[] { CollisionUrlA, CollisionUrlB }, "Collide"));
+        try
+        {
+            var handler = new SourceSelectionRecordingHandler();
+            var svc = BuildService(
+                new DispatcharrConfig
+                {
+                    Enabled = true,
+                    BaseUrl = "http://dispatcharr.local",
+                    ApiKey = "PLACEHOLDER-API-KEY",
+                    DryRun = true,
+                    MatchThreshold = 80,
+                },
+                outputDir, handler, catalog: null, matcher: null);
+
+            var selection = Selection("collide-dry", CollisionUrlA);
+            var result = await svc.RunAsync(playlistPath, selection, CancellationToken.None);
+
+            Assert.True(result.DryRun);
+            Assert.NotNull(result.PlanPath);
+            Assert.NotNull(result.ReportPath);
+            Assert.True(File.Exists(result.PlanPath));
+            Assert.True(File.Exists(result.ReportPath));
+            Assert.NotEmpty(Directory.GetFiles(outputDir, "dispatcharr_selection_*.json"));
+
+            Assert.DoesNotContain(handler.Traces, t =>
+                t.StartsWith("POST", StringComparison.Ordinal)
+                || t.StartsWith("PATCH", StringComparison.Ordinal)
+                || t.StartsWith("DELETE", StringComparison.Ordinal));
+        }
+        finally
+        {
+            File.Delete(playlistPath);
+            TestTempDb.CleanupDirectory(outputDir);
+        }
+    }
+
+    /// <summary>
+    /// T8 — guarda arquitectural explícita: as formas sanitizadas das duas URLs
+    /// são iguais, os fingerprints são diferentes, e a decisão de manter segue
+    /// o fingerprint (A seleccionada, B não).
+    /// </summary>
+    [Fact]
+    public async Task Sync_identity_is_the_stream_fingerprint_not_the_sanitized_url()
+    {
+        Assert.Equal(CredentialSanitizer.SanitizeUrl(CollisionUrlA), CredentialSanitizer.SanitizeUrl(CollisionUrlB));
+        Assert.NotEqual(
+            StreamFingerprint.TryComputeFingerprint(CollisionUrlA),
+            StreamFingerprint.TryComputeFingerprint(CollisionUrlB));
+
+        var handler = new SourceSelectionRecordingHandler { NextNewStreamId = 5630 };
+        var (svc, _, state) = BuildApplySvc(handler: handler);
+
+        var decision = NewChannelDecision(
+            "invariant", null,
+            NewStream(CollisionUrlA, 0),
+            NewStream(CollisionUrlB, 1));
+        var selection = Selection("invariant", CollisionUrlA);
+
+        await svc.ApplyAsync(Plan(decision), state, selection, new List<FailedReportEntry>(), CancellationToken.None);
+
+        var posted = handler.StreamPostBodies.Select(ParseUrl).ToArray();
+        Assert.Contains(CollisionUrlA, posted);
+        Assert.DoesNotContain(CollisionUrlB, posted);
+    }
+
     // ---------------- helpers ----------------
 
     private static string TempOutputDir()
@@ -873,6 +1092,21 @@ public class DispatcharrSyncServiceSourceSelectionTests : IAsyncLifetime
                 UpdatedAtUtc = now,
             });
         }
+        await ctx.SaveChangesAsync();
+    }
+
+    private async Task SeedSingleOwnershipAsync(long streamId, long channelId, StreamOwnership ownership)
+    {
+        await using var ctx = _factory.CreateDbContext();
+        var now = DateTime.UtcNow;
+        ctx.DispatcharrStreamOwnerships.Add(new DispatcharrStreamOwnershipEntity
+        {
+            DispatcharrStreamId = streamId,
+            DispatcharrChannelId = channelId,
+            Ownership = ownership,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+        });
         await ctx.SaveChangesAsync();
     }
 
