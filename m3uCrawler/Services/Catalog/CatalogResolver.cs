@@ -1558,7 +1558,7 @@ public sealed class CatalogResolver
 
         // W-REVIEW-02B — channel_sources UNIQUE discrimination. The reload
         // callback detaches the failed Added entity, reloads the existing
-        // row by fingerprint (or URL fallback), and re-issues SaveChanges
+        // row by fingerprint (the only identity key), and re-issues SaveChanges
         // so the alias + review-item changes get committed.
         try
         {
@@ -1730,7 +1730,7 @@ public sealed class CatalogResolver
 
             // W-REVIEW-02B — channel_sources UNIQUE discrimination. The
             // reload callback detaches the failed Added entity, reloads
-            // the existing row by fingerprint (or URL fallback), and
+            // the existing row by fingerprint (the only identity key), and
             // re-issues SaveChanges so the alias + review-item changes
             // (and the canonical, when applicable) get committed even when
             // the channel_sources INSERT was rejected by the new filtered
@@ -1965,9 +1965,9 @@ public sealed class CatalogResolver
     /// <summary>
     /// W-REVIEW-02B — Reload callback for <c>channel_sources</c> UNIQUE violation.
     /// Detaches the uncommitted <see cref="EntityState.Added"/> entry, reloads
-    /// the existing row by fingerprint (preferred) or URL (fallback), and
-    /// re-issues SaveChanges so the alias + review-item changes get committed
-    /// even when the channel_sources INSERT was rejected.
+    /// the existing row by fingerprint (the only identity key; no sanitized-URL
+    /// fallback), and re-issues SaveChanges so the alias + review-item changes
+    /// get committed even when the channel_sources INSERT was rejected.
     /// </summary>
     private static async Task<ChannelSourceEntity?> ReloadChannelSourceOnUniqueAsync(
         ChannelCatalogDbContext context,
@@ -1994,11 +1994,11 @@ public sealed class CatalogResolver
                     && cs.FingerprintVersion == fingerprintVersion,
                 cancellationToken);
         }
-        existing ??= await context.ChannelSources.FirstOrDefaultAsync(
-            cs => cs.CanonicalChannelId == canonicalChannelId
-                && cs.SourceId == sourceId
-                && cs.StreamUrl == sanitizedUrl,
-            cancellationToken);
+        // (D-F3) Sem fallback por URL sanitizada. A violação do unique index
+        // filtrado (`Fingerprint IS NOT NULL`) garante que a row em conflito
+        // transporta um fingerprint; a pesquisa por fingerprint é suficiente.
+        // O parâmetro `sanitizedUrl` mantém-se na assinatura por estabilidade
+        // dos callers, mas não é usado como chave de identidade.
 
         if (existing != null)
         {
@@ -3085,13 +3085,17 @@ public sealed class CatalogResolver
     ///
     /// <para>
     /// <b>W4 — fingerprint e dedup intra-Source.</b> O fingerprint
-    /// (<c>docs/Reestructure/04-PLAYLIST-STREAM.md §4</c>) é calculado
-    /// deterministicamente a partir do <paramref name="streamUrl"/> original.
-    /// Mesma Source + mesmo canal + mesmo fingerprint (+versão) consolidam
-    /// numa única row (actualização de LastSeen/LastTested/metadados). Quando
-    /// o fingerprint não é computável (URL não-http/https) mantém-se o
-    /// comportamento anterior por
-    /// <c>(CanonicalChannelId, SourceId, StreamUrl sanitizado)</c>. Sources
+    /// (<c>sfp1</c>, ver <c>docs/Reestructure/04-PLAYLIST-STREAM.md §4</c>) é
+    /// calculado deterministicamente a partir do <paramref name="streamUrl"/>
+    /// original. A identidade/dedup é
+    /// <c>(CanonicalChannelId, SourceId, Fingerprint, FingerprintVersion)</c>:
+    /// mesma Source + mesmo canal + mesmo fingerprint (+versão) consolidam
+    /// numa única row (actualização de LastSeen/LastTested/metadados).
+    /// <c>ChannelSource.StreamUrl</c> é uma representação sanitizada de
+    /// apresentação/persistência e NUNCA é usada como identidade nem como
+    /// chave de fallback. Rows cuja URL não é fingerprintável (não-http) ou
+    /// rows legacy com <c>Fingerprint IS NULL</c> NÃO são re-correspondidas
+    /// (sem fallback por URL sanitizada): é criada uma nova row. Sources
     /// diferentes nunca são consolidadas.
     /// </para>
     /// </summary>
@@ -3158,13 +3162,10 @@ public sealed class CatalogResolver
                         cancellationToken);
             }
 
-            // 2. Fallback (legacy/não-fingerprintável): comportamento anterior por
-            //    URL sanitizada. Também enriquece uma row legacy sem fingerprint.
-            existing ??= await activeContext.ChannelSources
-                .FirstOrDefaultAsync(cs => cs.CanonicalChannelId == canonicalChannelId
-                                        && cs.SourceId == sourceId
-                                        && cs.StreamUrl == sanitizedUrl,
-                    cancellationToken);
+            // 2. A identidade interna é o fingerprint (`sfp1`). `ChannelSource.StreamUrl`
+            //    é apenas apresentação/persistência e NUNCA é chave de identidade nem
+            //    fallback de dedup. Rows legacy sem fingerprint não são correspondidas
+            //    aqui (ver D-F3); é criada uma nova row.
 
             var now = DateTime.UtcNow;
             if (existing != null)

@@ -138,17 +138,20 @@ public class WaveW4p1SourceSelectionFingerprintResolutionTests : IAsyncLifetime
         Assert.DoesNotContain("password", stored.Fingerprint ?? string.Empty);
     }
 
-    // Test 6 — legacy row sem fingerprint
+    // Test 6 — legacy row sem fingerprint (V2: já não resolve)
     [Fact]
-    public async Task Legacy_row_without_fingerprint_still_resolves_by_sanitized_url()
+    public async Task Legacy_row_without_fingerprint_is_unmatched_by_fingerprint_only_resolution()
     {
         var (channel, source) = await NewChannelAndSourceAsync("w4p1-f");
         await InsertLegacyChannelSourceAsync(channel.Id, source.Id, "http://host/legacy");
 
         var result = await RunStageAsync("http://host/legacy");
 
-        AssertMatchedOn(result, channel.Id, source.Id);
-        Assert.Empty(result.Unmatched);
+        // V2 — identidade = fingerprint. A row legacy não tem fingerprint
+        // persistido e não há fallback por URL sanitizada: sem correspondência.
+        Assert.Empty(result.Selected);
+        Assert.Contains(result.Unmatched, s => s.Url == "http://host/legacy");
+        Assert.Equal(0, result.MatchedChannelCount);
     }
 
     // Test 7 — fingerprints diferentes não se associam
@@ -221,9 +224,9 @@ public class WaveW4p1SourceSelectionFingerprintResolutionTests : IAsyncLifetime
         Assert.Equal(first.Selected[0].Candidate.StreamFingerprint, second.Selected[0].Candidate.StreamFingerprint);
     }
 
-    // Extras — precedência fingerprint > URL sanitizada + fingerprint preenchido
+    // Extras — o fingerprint é a única chave de junção; a URL sanitizada é inerte
     [Fact]
-    public async Task Fingerprint_match_takes_precedence_over_sanitized_url_match()
+    public async Task Fingerprint_match_is_the_only_match()
     {
         var (channelFp, sourceFp) = await NewChannelAndSourceAsync("w4p1-k-fp");
         var (channelLegacy, sourceLegacy) = await NewChannelAndSourceAsync("w4p1-k-legacy");
@@ -232,11 +235,12 @@ public class WaveW4p1SourceSelectionFingerprintResolutionTests : IAsyncLifetime
         await _resolver.RecordChannelSourceAsync(channelFp.Id, sourceFp.Id, url);
 
         // Row legacy (sem fingerprint) com a MESMA URL sanitizada, noutro canal.
+        // É inerte: a resolução não usa a URL sanitizada como chave.
         await InsertLegacyChannelSourceAsync(channelLegacy.Id, sourceLegacy.Id, url);
 
         var result = await RunStageAsync(url);
 
-        // O fingerprint vence: resolve no canal com fingerprint, não no legacy.
+        // Só o fingerprint corresponde: resolve no canal com fingerprint, nunca no legacy.
         var single = Assert.Single(result.Selected);
         Assert.Equal(channelFp.Id, result.Channels.Single().CanonicalChannelId);
         Assert.Equal(sourceFp.Id, single.Candidate.SourceId);

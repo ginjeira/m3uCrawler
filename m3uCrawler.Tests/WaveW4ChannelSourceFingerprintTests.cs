@@ -104,17 +104,21 @@ public class WaveW4ChannelSourceFingerprintTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task Legacy_row_without_fingerprint_uses_sanitized_url_fallback()
+    public async Task Legacy_row_without_fingerprint_is_not_matched_by_sanitized_url()
     {
         var (channel, source) = await NewChannelAndSourceAsync("w4-d");
 
         var first = await _resolver.RecordChannelSourceAsync(channel.Id, source.Id, "not-a-url");
         var second = await _resolver.RecordChannelSourceAsync(channel.Id, source.Id, "not-a-url");
 
-        Assert.Equal(first.Id, second.Id);
+        // V1 — a identidade interna é o fingerprint. Um URL não-fingerprintável
+        // não tem identidade e a URL sanitizada deixou de servir de fallback:
+        // cria-se uma segunda row em vez de consolidar.
+        Assert.NotEqual(first.Id, second.Id);
+        Assert.Null(first.Fingerprint);
         Assert.Null(second.Fingerprint);
         Assert.Null(second.FingerprintVersion);
-        Assert.Equal(1, await CountChannelSourcesAsync(channel.Id, source.Id));
+        Assert.Equal(2, await CountChannelSourcesAsync(channel.Id, source.Id));
     }
 
     [Fact]
@@ -125,7 +129,8 @@ public class WaveW4ChannelSourceFingerprintTests : IAsyncLifetime
         var legacy = await _resolver.RecordChannelSourceAsync(channel.Id, source.Id, "not-a-url");
         Assert.Null(legacy.Fingerprint);
 
-        // URL distinta (não collapsa por fallback) mas fingerprintável.
+        // URL fingerprintável: não colapsa com a row legacy (não há fallback
+        // por URL sanitizada) e é persistida como nova row com fingerprint.
         var enriched = await _resolver.RecordChannelSourceAsync(channel.Id, source.Id, "http://host/a");
 
         Assert.NotEqual(legacy.Id, enriched.Id);
@@ -211,7 +216,7 @@ public class WaveW4ChannelSourceFingerprintTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task Legacy_row_with_null_fingerprint_falls_back_to_normalized_url_in_selection()
+    public async Task Legacy_row_with_null_fingerprint_is_unmatched_in_selection()
     {
         var (channel, source) = await NewChannelAndSourceAsync("w4-i");
 
@@ -250,10 +255,13 @@ public class WaveW4ChannelSourceFingerprintTests : IAsyncLifetime
             streams,
             new SourceSelectionPolicy(MaxSourcesPerChannel: 10, PreferDistinctProviders: false));
 
-        // A row legacy continua a participar; o candidato fica sem fingerprint
-        // e o selector usa a URL normalizada como fallback (critério 6).
-        var selected = Assert.Single(result.Selected);
-        Assert.Null(selected.Candidate.StreamFingerprint);
+        // V2 — a junção é apenas por fingerprint. A row legacy não tem
+        // fingerprint persistido, pelo que a stream não encontra
+        // correspondência (sem fallback por URL sanitizada) e faz pass-through.
+        Assert.Empty(result.Selected);
+        Assert.Empty(result.Channels);
+        Assert.Contains(result.Unmatched, s => s.Url == "http://host/legacy");
+        Assert.Same(streams[0], result.Published.Single());
     }
 
     // ════════════════════════════════════════════════════════════════

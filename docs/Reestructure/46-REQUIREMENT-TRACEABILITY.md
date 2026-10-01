@@ -246,16 +246,16 @@ permanece `Proposed` e **não** foi tratado como autoridade.
 | Política de credenciais (userinfo excluído; query `username`/`password`/`token`/`authorization` removidos; path Xtream mascarado com `<ID>` preservado) | `Matching/StreamFingerprint.cs` (`MaskXtreamPath`, `RemoveCredentialParameters`) | `WaveW4StreamFingerprintTests.cs` (segurança) | COMPLIANT |
 | Serialização `version + "\n" + canonical` + SHA-256 hex minúsculo | `Matching/StreamFingerprint.cs` (`Version = "sfp1"`) | `WaveW4StreamFingerprintTests.cs` (golden vectors independentes) | COMPLIANT |
 | Persistência `Fingerprint`/`FingerprintVersion` em `ChannelSource` (aditiva) | `CatalogEntities.cs`; `ChannelCatalogDbContext.cs`; migração `20260919152739_AddChannelSourceStreamFingerprint` | `WaveW4ChannelSourceFingerprintTests.cs` (migração aditiva) | COMPLIANT |
-| Dedup intra-Source (canal+source+fingerprint+versão); fallback legacy por URL sanitizada; sem cross-Source | `CatalogResolver.RecordChannelSourceAsync` | `WaveW4ChannelSourceFingerprintTests.cs` | COMPLIANT |
-| Critério 6 de Selection alimentado pelo fingerprint persistido (fallback para URL normalizada) | `SourceSelectionStage.cs`; `PlaylistComposerService.cs` | `WaveW4ChannelSourceFingerprintTests.cs`; `SourceSelectionPreviewTests` (adaptado) | COMPLIANT |
+| Dedup intra-Source (canal+source+fingerprint+versão); fallback legacy por URL sanitizada **removido na Wave V1/V2** (identidade fingerprint-only); sem cross-Source | `CatalogResolver.RecordChannelSourceAsync` | `WaveW4ChannelSourceFingerprintTests.cs` | COMPLIANT |
+| Critério 6 de Selection alimentado pelo fingerprint persistido (fallback para URL normalizada **removido na Wave V1/V2**) | `SourceSelectionStage.cs`; `PlaylistComposerService.cs` | `WaveW4ChannelSourceFingerprintTests.cs`; `SourceSelectionPreviewTests` (adaptado) | COMPLIANT |
 | Conflito `16:27`/`32:207` vs `07:48` reconciliado (múltiplas streams; fingerprint distingue) | `04` §4.1/§5, `32` Stream/ChannelSource, `16` §3, `05` §4, `31` DL-108 | `WaveW4ChannelSourceFingerprintTests.cs` (múltiplas streams) | COMPLIANT |
 
 Golden vectors computados **independentemente** (script Python isolado,
 `hashlib.sha256("sfp1\n" + canonical)`) e congelados no teste; não derivados
 do código sob teste. Query preservada por ordem nesta versão.
 
-Limitações: sem backfill em massa de rows legacy (permanecem `null`, com
-fallback na selecção); ADR-0002 não foi promovido nem usado como autoridade.
+Limitações: sem backfill em massa de rows legacy (permanecem `null`); o fallback na
+selecção foi **removido na Wave V1/V2**. ADR-0002 não foi promovido nem usado como autoridade.
 
 Quality gate W4: `dotnet build` 0 erros / 52 avisos (iguais ao baseline);
 `dotnet test` 0 failed / 2365 passed / 1 skipped (baseline 2302/1/0; +63
@@ -268,16 +268,15 @@ Corrige a divergência entre a identidade de consolidação (fingerprint, na per
 Contrato de resolução (precedência):
 
 1. **fingerprint** — `StreamFingerprint.TryComputeFingerprint(runtime.Url)` contra `(FingerprintVersion, Fingerprint)` persistidos;
-2. **legacy sanitized-URL** — `CredentialSanitizer.SanitizeUrl(runtime.Url)` contra `ChannelSource.StreamUrl` (rows sem fingerprint);
-3. **unmatched** — pass-through, sem associação.
+2. **unmatched** — pass-through, sem associação (sem fallback por URL sanitizada).
 
 Regras mantidas: correspondência com `>1 CanonicalChannelId` distinto ⇒ `Ambiguous` + `Unmatched`; empate ⇒ menor `Id`; `SourceId` permanece parte da identidade persistente; nenhuma credencial em diagnostics; `CredentialSanitizer` continua apenas para exposição segura.
 
 | Requirement | Bible/contrato | Implementação | Teste | Estado |
 |---|---|---|---|---|
-| Precedência fingerprint > URL sanitizada na junção do stage | DL-101 crit. 6, 09 §3, 04 §4.1/§5, 16 §3 | `SourceSelectionStage.ResolveHits` (fingerprint-first, fallback legacy) | `WaveW4p1SourceSelectionFingerprintResolutionTests.cs` | COMPLIANT |
+| Resolução fingerprint-only na junção do stage (sem fallback por URL sanitizada; removido na Wave V1/V2) | DL-101 crit. 6, 09 §3, 04 §4.1/§5, 16 §3 | `SourceSelectionStage.ResolveHits` (fingerprint-only) | `WaveW4p1SourceSelectionFingerprintResolutionTests.cs` | COMPLIANT |
 | URLs fingerprint-equivalentes com sanitized diferente resolvem a mesma `ChannelSource` | 04 §5, 32 ChannelSource | `SourceSelectionStage.cs` (`byFingerprint`) | idem (Test 1, scheme case, default port, fragment, query creds) | COMPLIANT |
-| Fallback legacy sem fingerprint | 16 §3 | `SourceSelectionStage.cs` (índice por URL sanitizada) | idem (Test 6) | COMPLIANT |
+| Rows legacy sem fingerprint | 16 §3 | `SourceSelectionStage.cs` — **não** correspondidas (sem fallback por URL sanitizada; removido na Wave V1/V2) | idem (Test 6, adaptado) | COMPLIANT |
 | Isolamento de Source / não escolha arbitrária em colisão entre canais | 07 §5 | regra de ambiguidade existente + índice por fingerprint | idem (Test 8) | COMPLIANT |
 | Determinismo da resolução | DL-101 | índices por execução | idem (Test 10) | COMPLIANT |
 

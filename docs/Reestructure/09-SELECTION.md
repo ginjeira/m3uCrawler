@@ -35,7 +35,7 @@ Ordem base fechada:
 
 Um critério só é usado quando estiver activo/configurado segundo o schema da policy. Se todos os critérios aplicáveis forem iguais, o identificador estável produz a ordem final.
 
-O critério 6 usa o `Fingerprint` persistido em `ChannelSource` (`04-PLAYLIST-STREAM.md §4.1`, `32-DOMAIN-SCHEMA.md`) quando presente; para rows legacy sem fingerprint, usa a URL normalizada como fallback. A ordem fechada dos critérios não é alterada por esta substituição de sinal — apenas o valor comparado no critério 6 passa a ser a representação canónica versionada.
+O critério 6 usa o `Fingerprint` persistido em `ChannelSource` (`04-PLAYLIST-STREAM.md §4.1`, `32-DOMAIN-SCHEMA.md`) como identidade; rows sem fingerprint **não** são correspondidas (sem fallback por URL). A ordem fechada dos critérios não é alterada por esta substituição de sinal — apenas o valor comparado no critério 6 passa a ser a representação canónica versionada.
 
 A ordem acima é uma decisão normativa já fechada em `31-DECISION-LOCK.md` (DL-101). Um ADR pode documentar o racional, mas não pode escolher uma ordem diferente sem alterar primeiro a BÍBLIA.
 

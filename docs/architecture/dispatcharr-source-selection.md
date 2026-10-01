@@ -187,7 +187,7 @@ Telegram runtime: List<M3uStream>  (URL REAL, só em memória)
         │
         ▼
 SourceSelectionStage.ApplyAsync(streams, policy)
-   │  join: CredentialSanitizer.SanitizeUrl(realUrl) ↔ ChannelSource.StreamUrl
+   │  join: StreamFingerprint.TryComputeFingerprint(realUrl) ↔ ChannelSource.Fingerprint/Version
    │  catálogo lido via ListChannelSourcesAsync + ListSourcesAsync (READ-ONLY)
    │  provider := host normalizado da URL real
    ▼
@@ -206,8 +206,12 @@ output/playlist.m3u (URLs reais)  →  DispatcharrSyncService (inalterado)
 
 ### Junção exacta
 
-Chave = `CredentialSanitizer.SanitizeUrl(stream.Url)`, que é a chave de unicidade do
-próprio catálogo (`CatalogResolver.RecordChannelSourceAsync`). Regras:
+Chave = `(StreamFingerprint.Version, StreamFingerprint.TryComputeFingerprint(stream.Url))`,
+comparada com `ChannelSource.Fingerprint`/`FingerprintVersion` persistidos, que é a chave
+de unicidade do próprio catálogo (`CatalogResolver.RecordChannelSourceAsync`). A URL
+sanitizada **nunca** é chave de junção e **não** existe fallback por URL sanitizada.
+Rows com `Fingerprint == null` (legacy/não fingerprintáveis) **não** são correspondidas →
+**Unmatched** (pass-through). Regras:
 
 - `0` correspondências → **Unmatched** (pass-through; não conta para limites);
 - `1` canal canónico → **Matched**;

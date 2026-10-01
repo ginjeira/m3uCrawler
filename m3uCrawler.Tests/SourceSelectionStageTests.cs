@@ -92,7 +92,7 @@ public class SourceSelectionStageTests : IAsyncLifetime
     // ---------------- exact join / projection ----------------
 
     [Fact]
-    public async Task Exact_sanitized_url_match_selects_the_stream()
+    public async Task Exact_stream_url_match_selects_the_stream()
     {
         var source = await NewSourceAsync();
         await RecordAsync(_channelA, source, "http://provider.example/a.ts");
