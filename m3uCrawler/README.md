@@ -300,7 +300,9 @@ A URL interna do candidato Xtream contém credenciais (necessárias para o downl
   - Dashboard — a pré-visualização HTML (`<pre id='playlistPreview'>`) usa `GET /api/playlist/preview` (sanitizado via `CredentialSanitizer.SanitizeM3uContent`); os endpoints `/api/playlist*` mantêm-se funcionais para download explícito.
   - Mensagens de erro — sanitizadas via `CredentialSanitizer.SanitizeUrl` (download de playlist e templates).
 
-`CredentialSanitizer` mascara: `user:password@` em userinfo → `user:***@`; segmentos `user/pass` em `/live/`, `/movie/`, `/series/` → `***/***`; parâmetros `username`, `password` e `token` em query string → `***`. É aplicado em todas as combinações (userinfo + path + query).
+`CredentialSanitizer` mascara: `user:password@` em userinfo → `user:***@`; segmentos `user/pass` em `/live/`, `/movie/`, `/series/` → `***/***`; a forma **bare** de Xtream `scheme://host:port/<username>/<password>/<stream-id>` (sem o marcador `/live|movie|series/`) → `scheme://host:port/***/***/<stream-id>`, preservando scheme, host, porta explícita (e.g. `:8080`) e o stream id; parâmetros `username`, `password` e `token` em query string → `***`. O reconhecimento da forma bare é deliberadamente restritivo — exactamente 3 segmentos de path, os dois primeiros com ≥4 caracteres e o último um stream id numérico (extensão opcional) — pelo que URLs arbitrárias com 3 segmentos (e.g. `/path/to/playlist.m3u8`) não são afectadas. É aplicado em todas as combinações (userinfo + path + query).
+
+A representação sanitizada é usada apenas para apresentação — nunca deve ser usada como identidade interna (ver `AGENTS.md` §2).
 
 A URL raw é mantida em memória apenas durante a execução (para `DownloadPlaylistContentAsync` e para o tester); nunca é persistida em logs nem em ficheiros de diagnóstico.
 

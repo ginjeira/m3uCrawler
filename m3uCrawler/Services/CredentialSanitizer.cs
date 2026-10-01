@@ -22,6 +22,15 @@ namespace m3uCrawler.Services
             @"/(live|movie|series)/[^/\s]+/[^/\s]+",
             RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
+        // W9.A — Forma "bare" do Xtream: scheme://host:port/<username>/<password>/<stream-id>,
+        // sem o marcador /live|movie|series/. Reconhecimento deliberadamente restritivo:
+        // exactamente 3 segmentos de path, os dois primeiros com >= 4 caracteres (credenciais)
+        // e o ultimo um stream id numerico (extensao opcional). URLs arbitrarias com 3 segmentos
+        // cujo ultimo nao e numerico (ex.: /path/to/playlist.m3u8) NAO sao afetadas.
+        private static readonly Regex _bareXtreamPathRegex = new(
+            @"^(https?://[^/\s?#]+)/([^/\s?#]{4,})/([^/\s?#]{4,})/([0-9]+(?:\.[A-Za-z0-9]+)?)(/?)(?=[?#]|$)",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
         // Parâmetros username/password/token em query string.
         private static readonly Regex _queryCredsRegex = new(
             @"([?&])(username|password|token)=([^&\s]*)",
@@ -71,6 +80,7 @@ namespace m3uCrawler.Services
             s = _userInfoRegex.Replace(s, "$1$2:***@");
             s = _pathCredsRegex.Replace(s, "/$1/***/***");
             s = _queryCredsRegex.Replace(s, "$1$2=***");
+            s = _bareXtreamPathRegex.Replace(s, "$1/***/***/$4$5");
             return s;
         }
 
