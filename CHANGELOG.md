@@ -7,6 +7,8 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-10-02
+
 ### 🔧 Corrigido
 - **Wave V1/V2 — remoção da identidade interna baseada em `StreamUrl` sanitizado (`CatalogResolver`, `SourceSelectionStage`) (2026-10-01).**
   - **Problema:** o catálogo e o `SourceSelectionStage` ainda usavam `ChannelSource.StreamUrl` (representação sanitizada) como fallback de identidade — em `RecordChannelSourceAsync`/`ReloadChannelSourceOnUniqueAsync` pelo predicado `StreamUrl == sanitizedUrl` e no stage pelo índice `bySanitizedUrl`. A representação sanitizada colide entre contas distintas que sirvam o mesmo stream id, pelo que não pode ser identidade (D-F3; regra registada em `AGENTS.md` §2).
@@ -17,6 +19,7 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
   - **Problema:** o apply do Dispatcharr determinava a pertença à selecção de fontes (keep/drop, exclusão para remoção e respectivo ownership) comparando **URLs sanitizadas** (`CredentialSanitizer.SanitizeUrl`). Duas contas diferentes que sirvam o mesmo stream id produzem a mesma representação sanitizada, pelo que um stream não selecionado podia ser tratado como selecionado (sobre-retenção/sobre-POST) — a representação sanitizada estava a ser usada como identidade interna, violando a regra registada em `AGENTS.md` §2.
   - **Correcção:** novo `StreamIdentityKey(...)` que usa o fingerprint canónico `sfp1` (`StreamFingerprint.TryComputeFingerprint`) como identidade de matching em `BuildSelectedByKey`, `LoadExcludedStreamOwnershipAsync` e `ComputeEffectiveStreams`; para URLs não fingerprintáveis (não-http) usa a URL RAW. `CanonicalChannelKey` continua a delimitar o scope, `ExistingStreamId` continua a ser a identidade operacional das streams já existentes no Dispatcharr (remoção/ownership) e os guards de ownership e a semântica de dry-run mantêm-se intactos. `CredentialSanitizer` permanece exclusivamente para apresentação/log/erros.
   - **Testes:** `DispatcharrSyncServiceSourceSelectionTests` — 7 novos testes (colisão sanitizada distinguida por identidade; correlação por fingerprint; `ExistingStreamId` como identidade operacional; isolamento por `CanonicalChannelKey`; guard de ownership; dry-run sem writes; guarda arquitectural que falha se a identidade voltar a ser a URL sanitizada). Suites focadas verdes; sem regressões.
+- **W6b2 — fix do teste determinístico de observabilidade do dashboard (2026-10-02).** `WaveW6b2ObservabilityTests.Dashboard_endpoints_return_newly_produced_runs_and_observations` usava uma amostra com `testedAt` fixo em `2026-09-19`, fora do lookback de 7 dias de `/api/catalog/degradation/recent` (bomba-relógio de data); passa a usar uma observação relativa (`DateTime.UtcNow.AddHours(-1)`). Alteração apenas de teste, sem alterações de produção.
 
 ### 🛡️ Correcções / Hardening
 - **Wave 9.A — cobertura da forma "bare" do Xtream em `CredentialSanitizer.SanitizeUrl` (2026-10-01).**
