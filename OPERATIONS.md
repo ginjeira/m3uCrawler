@@ -142,8 +142,9 @@ Campos principais a verificar:
 - `countryMatches` — quantas playlists passaram a validação por país.
 - `playlistsRejected` — quantas foram rejeitadas.
 - `streamsTested`, `streamsWorking`, `streamsFailed` — health do teste de streams.
+- `streamsSkippedAlreadyValidated` — GETs físicos evitados pela deduplicação W-DEDUP (`sfp1` já `Working` neste run).
 - `rejectionReasons` — lista de motivos de rejeição (sanitizados).
-- `discoveredPlaylists` — resumo por playlist (sanitizado).
+- `discoveredPlaylists` — resumo por playlist (sanitizado); cada entrada inclui a proveniência `candidateId`/`messageId`/`messageDateUtc` da mensagem de origem.
 
 ### Endpoint dashboard
 

@@ -542,7 +542,12 @@ Operações do inventário: `start run`, `list candidates`, `candidate details`,
 - **Side effects:** nenhum. **Idempotência:** sim.
 - **Erros:** `{ error: "Sem relatório de execução disponível." }` quando
   o report não existe.
-- **Invariantes:** read-only; nunca cria nem altera o report.
+- **Invariantes:** read-only; nunca cria nem altera o report. Cada item inclui
+  agora a proveniência da mensagem Telegram de origem — `candidateId`, `messageId`
+  e `messageDateUtc` (camelCase), provenientes de `DiscoveredPlaylist`; `null`
+  quando o candidate não veio de uma mensagem enumerada (ex.: `--scan-domain`) ou
+  nas promoções `t.me/c` sem data (só `messageId`). Ver
+  `docs/PROJECT_STATUS.md` §Registo de execução real (2026-10-02).
 - **Implementation reference:** `WebDashboardService.cs:774-786`.
 - **Test reference:** `TBD`.
 - **OPEN/TBD:** schema completo; códigos de erro formalizados.
@@ -553,6 +558,9 @@ Operações do inventário: `start run`, `list candidates`, `candidate details`,
   em `app_settings.json`). GET devolve valores persistidos; POST valida e
   persiste — gate `9C.2` (sessão + CSRF para método mutante)
   `WebDashboardService.cs:810-818` e `HandleDiscoverySettingsEndpointAsync`.
+  O payload inclui `minHistoryHours` (W-HISTWIN, default `0`) a par de
+  `historyHours` (máximo; `[1,1440]`); janela efectiva `min <= idade <= max`.
+  A UI HTML do dashboard ainda **não** expõe `minHistoryHours` (wave futura).
 - **Auth:** sessão/token; **Autorização:** `Administrator` no POST;
   `TBD` para o GET.
 - **CSRF:** obrigatório no POST; `N/A` no GET.

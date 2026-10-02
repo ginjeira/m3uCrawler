@@ -498,6 +498,13 @@ Estimativas:
 
 ### 5.6 Compatibilidade com `RunReport` e `telegram_run_report.json`
 
+> **Nota (2026-10-02).** O congelamento de schema descrito nesta
+> secção aplica-se à wave 9C.4. Waves posteriores voltaram a
+> adicionar campos **aditivos** ao `RunReport` (contador
+> `StreamsSkippedAlreadyValidated`; proveniência em
+> `DiscoveredPlaylists[]`) sem quebrar consumidores existentes —
+> ver §18.9 e `docs/Reestructure/08-VALIDATION.md §6`.
+
 `RunReport` continua imutável quanto ao schema. Adições
 opcionais (mantidas como nullable para retro-compatibilidade):
 
@@ -1579,7 +1586,7 @@ Não tocar: tudo o que está na §14 do plano principal +
 | `startAtUtc` + `EffectiveCronExpression` | apenas `CronExpression` (a UI calcula a expressão) |
 | Acção `runTelegramCycle` | `telegramRun` + `telegramMaintainRun` |
 | Actividades possivelmente persistidas | ring buffer em memória, não persistido |
-| `RunId` em `RunReport` (§12.1) | **não implementado**: `RunReport` permanece inalterado (55 propriedades congeladas por teste) |
+| `RunId` em `RunReport` (§12.1) | **não implementado**: em 9C.4 o `RunReport` permaneceu inalterado (55 propriedades congeladas por teste); waves posteriores adicionaram campos aditivos (sem `RunId`) — ver §18.9 |
 | Sweeper de teste sobre `%TEMP%` global | Sweeper scoped a `%TEMP%\m3uCrawler.Tests.tmp\` (correcção pós-revisão F-001) |
 
 ### 18.8 Não implementado (mantido fora de âmbito)
@@ -1588,3 +1595,12 @@ Não tocar: tudo o que está na §14 do plano principal +
 - ETA / estimativa de duração (§12.4).
 - `StartAtUtc` / hora fixa da primeira execução (§16).
 - Qualquer forma de `live-log tail`.
+
+### 18.9 Actualizações pós-9C.4 (2026-10)
+
+Adições posteriores a 9C.4 na cadeia de observabilidade. Descritas aqui sem novos contratos; o registo canónico de execução é `docs/PROJECT_STATUS.md`.
+
+- **Proveniência mensagem → candidate → playlist.** `CandidatePlaylist` passou a transportar `SourceMessageId`/`SourceMessageDateUtc` e `DiscoveredPlaylist` (em `telegram_run_report.json`) passou a expor `CandidateId`/`MessageId`/`MessageDateUtc` (camelCase) via `GET /api/discovered-playlists`. A cadeia resultante é `run → mensagem (messageId, messageDateUtc, chat em source) → candidateId → estado/workingStreams da playlist`.
+- **`runId` CLI vs `LiveRun`.** Em modo CLI **não** existe `runId` operacional de coordenador: apenas o `runId` de diagnóstico do `PipelineTrace` (processo-scoped, só activo com `M3UCRAWLER_TRACE`). O `runId` operacional (`LiveRun`, criado pelo `RunCoordinator`) só existe em runs via dashboard/scheduler. Os dois **não** são a mesma identidade (ver `docs/Reestructure/13-RUNS.md §1` e DL-124 em `docs/Reestructure/31-DECISION-LOCK.md`).
+- **Contador `StreamsSkippedAlreadyValidated`.** W-DEDUP (2026-10-01) deduplica o GET físico por run (`ValidationKey = sfp1`); `RunReport.StreamsTested` conta apenas validações físicas e os GETs evitados vão para `StreamsSkippedAlreadyValidated`, espelhado em `LiveRunCounts.StreamsSkippedAlreadyValidated` e exposto por `DashboardMetrics.SummarizeRun`. Detalhe normativo em `docs/Reestructure/08-VALIDATION.md §6`.
+- **Janela de histórico Min/Max.** W-HISTWIN introduziu `DiscoverySettings.MinHistoryHours` (default `0`) a par de `HistoryHours` (máximo), com `GET/POST /api/discovery/settings` a devolver/aceitar `minHistoryHours`. O trigger `POST /api/run/start` mantém o contrato antigo (sem `minHistoryHours`; tecto próprio `720h`). A UI HTML do dashboard ainda **não** expõe estes parâmetros (wave futura).

@@ -154,7 +154,7 @@ A pesquisa no Telegram considera apenas mensagens cuja idade satisfaz `MinHistor
 - **Persistência:** mesma SSOT `runtime-data/app_settings.json`, secção `discovery` (`historyHours` + novo `minHistoryHours`). `GET /api/discovery/settings` devolve `minHistoryHours`; `POST /api/discovery/settings` aceita `minHistoryHours` opcional (semântica de patch). O contrato de `/api/run/start` mantém-se e usa a janela persistida.
 - **Validação:** `MinHistoryHours >= 0`, `MaxHistoryHours >= 0` e `MinHistoryHours <= MaxHistoryHours`. Valores inválidos são rejeitados na API (400) e os valores inválidos persistidos são normalizados para o default (`Min → 0`) pelo mecanismo `Sanitize` existente.
 
-A configuração da janela via UI e a integração com Schedule Min/Max ficam para wave futura.
+A configuração da janela pela **UI do dashboard** (a par da integração com Schedule Min/Max) fica para wave futura: o endpoint REST `/api/discovery/settings` já aceita `minHistoryHours` (ver bullet de persistência acima), mas o formulário do dashboard ainda não expõe estes campos.
 
 ### Proveniência da mensagem de origem (candidate → playlist)
 
@@ -1291,8 +1291,9 @@ Uma playlist estrangeira (ex.: apenas canais `La 1`, `Antena 3`, `Telecinco`) é
 
 ## Estado dos testes
 
-- Build: `dotnet build m3uCrawler.sln --configuration Release --no-restore` → **0 warnings, 0 errors**.
-- Testes: `dotnet test m3uCrawler.Tests/m3uCrawler.Tests.csproj --configuration Release --no-build --nologo` — referência operacional; **não** interpretar o número como propriedade permanente da arquitectura. Última validação documentada: **1187 testes passados, 0 falhados, 0 skipped**.
+- Build: `dotnet build m3uCrawler.sln --configuration Release --no-restore` → **0 errors**; o baseline tem warnings pré-existentes (analyzers xUnit) — não introduzir warnings novos.
+- Testes: `dotnet test m3uCrawler.Tests/m3uCrawler.Tests.csproj --configuration Release --no-build --nologo` — referência operacional; **não** interpretar o número como propriedade permanente da arquitectura. Estado medido em **2026-10-02**: 2815 testes, com 1 falha pré-existente conhecida (observabilidade do dashboard, `WaveW6b2ObservabilityTests`) e 1 skipped; ver `docs/PROJECT_STATUS.md`.
+- **Execução real (2026-10-02):** cadeia Telegram→candidate→playlist→Dispatcharr exercitada em runtime (imagem local de `fcd442e`), com janela `--min-history-hours 425 --history-hours 450` e Dispatcharr em **dry-run**; artefactos gerados (playlist M3U, relatórios Telegram, plano/relatório Dispatcharr). Números detalhados em `docs/PROJECT_STATUS.md` (não duplicados aqui).
 - O runner descobre e executa todos os testes; não há testes que passem sem realmente exercitar o comportamento (detector, parser, validação por país com threshold/famílias/falsos-positivos, merge de manutenção).
 - Não há teste de integração de rede (Telegram/HTTP); os testes são unitários e independentes de infra-estrutura externa.
 

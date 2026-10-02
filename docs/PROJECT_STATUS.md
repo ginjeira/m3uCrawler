@@ -3,17 +3,19 @@
 > Ponto de entrada para o estado corrente da implementação (`docs/Reestructure/00-BIBLE.md:30-41`, `:105-128`).
 > Documento derivado: descreve o que foi construído e validado; não redefine conceitos da BÍBLIA.
 > Registos históricos das waves: `docs/project/waves/`.
-> Reconciliação documental: 2026-09-20 — HEAD `780fa01`; ver `BIBLE_IMPLEMENTABILITY_GAP_MANIFEST_1.0.md` Anexos G–T e `docs/Reestructure/46-REQUIREMENT-TRACEABILITY.md`.
+> Reconciliação documental: 2026-10-02 — HEAD `fcd442e`; ver `BIBLE_IMPLEMENTABILITY_GAP_MANIFEST_1.0.md` Anexos G–T e `docs/Reestructure/46-REQUIREMENT-TRACEABILITY.md`.
+> Reconciliação anterior: 2026-09-20 — HEAD `780fa01`.
 
 ## Current State
 - Branch: `feature/phase-9c-first-run-dashboard`
-- HEAD: `780fa0148617c9074146f028cd2fcb61b3a9b50d` (2026-09-20)
+- HEAD: `fcd442ec1ddb7b2bafbc321d387e47afb15e11e5` (2026-10-02)
 - Phase: 9C / 13 — implementação das waves da BÍBLIA (reconstrução)
-- Wave: waves de reconstrução `W1–W5.6` implementadas; `M.4` (snapshot→Run/pipeline) OPEN, sem wave atribuída; `W6b-3` definida e pendente; dívida funcional de reconstrução em aberto (ver `## Functional Debt (reconstruction)`)
-- Status: PARCIALMENTE CONFORME — waves A/B, Onboarding, Admin Password, W1/W2/W3s/W4a/W4b/W5, ADR-0001 (completo — pendente de aprovação), W6a/W6b-1/W6b-2/W6c e waves de reconstrução W1–W5.6 concluídas; `M.4`, W2-FU, C7, Review→Output, gap de `resolve` W5.5 e matriz de rastreabilidade pendentes
+- Wave: waves de reconstrução `W1–W5.6` implementadas; waves pós-reconstrução `W-DEDUP` (`9cffc9b`), `W-HISTWIN` (`5f86ef2`) e Proveniência (`fcd442e`) implementadas, testadas e validadas em execução real (ver `## Waves 2026-10`); `M.4` (snapshot→Run/pipeline) OPEN, sem wave atribuída; `W6b-3` definida e pendente; dívida funcional de reconstrução em aberto (ver `## Functional Debt (reconstruction)`)
+- Status: PARCIALMENTE CONFORME — waves A/B, Onboarding, Admin Password, W1/W2/W3s/W4a/W4b/W5, ADR-0001 (completo — pendente de aprovação), W6a/W6b-1/W6b-2/W6c, waves de reconstrução W1–W5.6 e waves 2026-10 (W-DEDUP/W-HISTWIN/Proveniência) concluídas; `M.4`, C7, Review→Output, gap de `resolve` W5.5 e matriz de rastreabilidade pendentes; W2-FU totalmente fechado
+- Versão/deploy: a release `1.0.1` **não** foi criada e a produção **não** foi actualizada (mantém-se a imagem anterior). A execução real de 2026-10-02 correu num runtime de teste com build local de `fcd442e`.
 - Last validated commit (histórico, wave 9c): `b19d95b` (2026-09-19)
-- Last commit coberto por validação registada: `780fa01` (W5.6 follow-up; gates registados em `46-REQUIREMENT-TRACEABILITY.md` e `BIBLE_IMPLEMENTABILITY_GAP_MANIFEST_1.0.md`, **não re-executados nesta reconciliação documental**)
-- Last validation: build 0 errors / 51 warnings; suite 2186 passed / 0 failed / 1 skipped (total 2187) — registo histórico da wave 9c, anterior às waves de reconstrução
+- Last commit coberto por validação registada: `fcd442e` (Proveniência; build Release 0 errors / 54 warnings; suite 2813 passed / 1 failed conhecida / 1 skipped)
+- Last validation: build Release 0 errors / 54 warnings; suite completa 2815 testes — 2813 passed / 1 failed (conhecida, pré-existente: `WaveW6b2ObservabilityTests.Dashboard_endpoints_return_newly_produced_runs_and_observations`) / 1 skipped (`HttpTimeoutAutopsyTests.LEGACY_PATTERN_blackhole...`)
 
 ## Completed
 | Phase | Wave | Result | Commit | Validation |
@@ -56,6 +58,26 @@ Waves de reconstrução posteriores ao estado 9c registado acima. Gates registad
 | W5.5 | API HTTP de review | `b8c9cda` | 2532 / 1 / 0 | Implementado; gap em `resolve` para `change.type` — ver dívida 8 |
 | W5.6 | Semântica de confiança de matching | `b613502` | 2570 / 1 / 0 | Implementado |
 | W5.6 follow-up (F7-B/F8-B/F9) | Follow-up de confiança de matching | `780fa01` | 2577 / 1 / 0 | Implementado |
+
+## Waves 2026-10
+Waves pós-reconstrução, implementadas, com testes determinísticos e validadas em execução real (ver `## Registo de execução real (2026-10-02)`). Não alteram a BÍBLIA nem os contratos de segurança (sanitização, `sfp1`, ownership).
+
+| Wave | Scope | Commit | State |
+|---|---|---|---|
+| W-DEDUP | Validação física deduplicada por run no caminho de descoberta Telegram: `ValidationKey = sfp1`; `Working` reutilizável; falhas nunca reutilizáveis entre `AccountKey`s; probe físico obrigatório ≥1 por conta elegível; `RunReport.StreamsTested` conta apenas validações físicas e o novo `StreamsSkippedAlreadyValidated` conta os GETs evitados; registo em memória, por run, não persistido. Detalhe normativo em `docs/Reestructure/08-VALIDATION.md §6`. | `9cffc9b` (2026-10-01) | Implementado e validado |
+| W-HISTWIN | Janela de histórico Min/Max: `DiscoverySettings.MinHistoryHours` (default `0`) + `HistoryHours` = máximo; janela inclusiva `Min <= idade <= Max`; cutoffs do mesmo instante UTC por ciclo; paginação inalterada e filtro client-side; validação `Min <= Max` e `HistoryHours ∈ [1,1440]` (tecto alargado 720→1440); CLI `--min-history-hours`; `app_settings.json` → `discovery.minHistoryHours`; `GET/POST /api/discovery/settings` devolvem/aceitam `minHistoryHours`. A UI HTML do dashboard **não** expõe ainda estes parâmetros (wave futura), e `POST /api/run/start` mantém o contrato antigo (sem `minHistoryHours`, tecto próprio 720h). | `5f86ef2` (2026-10-02) | Implementado e validado |
+| Proveniência | `CandidatePlaylist.SourceMessageId`/`SourceMessageDateUtc`; `DiscoveredPlaylist.CandidateId`/`MessageId`/`MessageDateUtc`; helper `ApplyTelegramMessageProvenance` no loop de `ProcessOneTelegramMessageAsync` (source = chatTitle + id + data UTC); herança em `PromoteXtreamAccount` (fan-out HTML herda do pai; promoções `t.me/c` pós-enumeração usam o `messageId` referenciado com data `NULL`); exposto em `telegram_run_report.json` (`discoveredPlaylists`) e em `GET /api/discovered-playlists` (camelCase). Limitações: candidatos que falham antes do parse não geram linha; origem fora de mensagens enumeradas (ex.: `--scan-domain`) → proveniência `null`; `telegram_run_report.json` é sobrescrito por run. | `fcd442e` (2026-10-02) | Implementado e validado |
+
+**Cadeia de observabilidade resultante.** `run → mensagem (messageId, messageDateUtc, chat em source) → candidateId → estado/workingStreams da playlist`. Nota: em modo CLI não existe `runId` operacional de coordenador; existe apenas o `runId` de diagnóstico do `PipelineTrace` (processo-scoped, só activo com `M3UCRAWLER_TRACE`). O `runId` operacional (`LiveRun`) só existe em runs via dashboard/scheduler. Não confundir os dois (ver `docs/Reestructure/13-RUNS.md §1` e `docs/Reestructure/31-DECISION-LOCK.md` DL-124).
+
+## Registo de execução real (2026-10-02)
+Execução real validada a 2026-10-02 num runtime de teste isolado (`/opt/m3ucrawler-first-test`, imagem local `m3ucrawler:first-real-test-fcd442e`, build de `fcd442e`), janela de histórico `Min=425`/`Max=450` horas, Dispatcharr em dry-run, exit 0. **Este registo é o home canónico**; os restantes documentos fazem cross-reference.
+
+- **Contadores do `RunReport`:** `messagesAnalyzed` 296; `candidatesFound` 11; `playlistsDownloaded` 676; `playlistsInvalid` 83; `playlistsRejected` 18; `channelsRecognized` 5264; `streamsExtracted` 16 575 585; `streamsAfterCountryFilter` 76 318; `streamsTested` 865; `streamsWorking` 759; `streamsFailed` 106; `streamsSkippedAlreadyValidated` 15 585; `messagesWithMedia` 44; `messagesWithDocumentMedia` 29; `messagesWithPhotoMedia` 6; `documentDownloadSuccesses` 2; `documentDownloadFailures` 0; `dialogsTotal` 176; `dialogsIncomplete` 0; `dialogErrors` 0.
+- **Artefactos produzidos:** playlist M3U, `telegram_report`, `telegram_run_report`, plano Dispatcharr e relatório Dispatcharr.
+- **Dispatcharr (dry-run):** Matched 20; New channels 4; New streams 5387; Removed 0; Skipped 0; Ambiguous 1; Unchanged 0; Failed 0.
+- **Exemplo de proveniência real** (no `telegram_run_report.json`): `source` "xtream publication"; `candidateId` `00685b14676642258fd9742b64524c86`; `messageId` `110751`; `messageDateUtc` `2026-09-14T01:11:01Z`; `state` `accepted`; `streamCount` 25362; `streamsAfterCountryFilter` 116; `workingStreams` 19. Pelo menos duas playlists derivaram da mesma mensagem `110751`.
+- **Testes determinísticos associados:** `TelegramHistoryWindowBandTests` (W-HISTWIN), `CandidateMessageProvenanceTests` (Proveniência) e extensões a `WaveCDiscoverySettingsTests`; W-DEDUP tem testes próprios desde `9cffc9b`.
 
 ## In Progress
 | Wave | Objective | Status | Branch | Commit |
@@ -171,7 +193,9 @@ Recalibrações normativas (não alteram a BÍBLIA; clarificam leitura):
 
 ## Latest Validation
 
-**Coverage actual (registada, não re-executada):** último commit coberto por validação registada — `780fa01` (W5.6 follow-up); suite `2577 passed / 1 skipped / 0 failed`, conforme registado em `docs/Reestructure/46-REQUIREMENT-TRACEABILITY.md` e no manifest. **Não re-executado nesta wave documental** (nenhum build/run fabricado).
+**Coverage actual:** último commit coberto por validação registada — `fcd442e` (Proveniência); build Release 0 errors / 54 warnings; suite completa 2815 — 2813 passed / 1 failed / 1 skipped (ver abaixo). Mantém-se a registada anteriormente para `780fa01` (W5.6 follow-up; `2577 passed / 1 skipped / 0 failed`) em `docs/Reestructure/46-REQUIREMENT-TRACEABILITY.md` e no manifest.
+
+**Falha conhecida (não escondida):** 1 teste falha de forma pré-existente — `WaveW6b2ObservabilityTests.Dashboard_endpoints_return_newly_produced_runs_and_observations`. Não é regressão das waves 2026-10. O skip é `HttpTimeoutAutopsyTests.LEGACY_PATTERN_blackhole_blocks_until_30s_HttpClient_timeout` (by design).
 
 **Histórico (fase 9c, commit `b19d95b`):**
 - Build Release (`--no-incremental`): 0 errors / 51 warnings.
@@ -182,6 +206,7 @@ Recalibrações normativas (não alteram a BÍBLIA; clarificam leitura):
 ## Next Executable Step
 Não existe passo único: os próximos passos são independentes e nenhum deve iniciar implementação de `M.4` sem Decision Pack ratificado.
 
+0. **Próximo passo previsto (PLANO, não implementado):** expor/configurar no dashboard os parâmetros operacionais em falta — UI HTML para a janela de histórico Min/Max (incl. `minHistoryHours`); só depois preparar a release `1.0.1`. Nada disto está implementado nem publicado: a `1.0.1` **não** existe e a produção **não** foi actualizada.
 1. `M.4` — **OPEN**: ratificar o Decision Pack do wiring do snapshot de `RecognitionPolicy` ao Run/pipeline (desbloqueia o fuzzy W5.3 em produção). Não existe desenho de implementação decidido.
 2. Dívida funcional de reconstrução: C7 (campos de `ReviewItem`); Review→Output (produzir/seleccionar `ChannelSource`/output e re-publicar); gap de `resolve` W5.5 (`externalIdentity`/`channelSource`/`none`); preencher linhas `TBD`/`UNMAPPED` da matriz de rastreabilidade. W2-FU totalmente fechado (W2-FU-1 2026-09-22, W2-FU-2A 2026-09-23, W2-FU-2 2026-09-23 por W2-FU-2-CLOSE — fecho documental sem wiring adicional).
 3. W6b-3 (ligar/esconder funcionalidades inertes: `import-policies`, `canonical-groups`/`group-mappings`, `pending-country-approvals`).
