@@ -357,7 +357,9 @@ namespace m3uCrawler.Services
             if (liveRunProgress is not null)
             {
                 await liveRunProgress.EnterPhaseAsync(
-                    LiveRunPhase.ReadingTelegram, "reading telegram messages", cancellationToken)
+                    LiveRunPhase.ReadingTelegram,
+                    $"reading telegram messages (keyword='{keyword}', window {minHistoryHours}-{historyHours}h)",
+                    cancellationToken)
                     .ConfigureAwait(false);
             }
 
@@ -441,7 +443,11 @@ namespace m3uCrawler.Services
             var validationKeyRegistry = new ValidationKeyRegistry();
             // PHASE 9A.2 (2026-09-16): o validador de accounts reusa o MESMO
             // state/cache/host-tracker que o tester.
-            var accountValidator = new AccountValidator(validationState, tester, validationKeyRegistry);
+            // PHASE W-DASHBOARD — liga o progresso do Live Run ao AccountValidator
+            // (constructor, porque o validator é criado uma vez por run de
+            // descoberta e não há mais nenhum call-site de produção).
+            var accountValidator = new AccountValidator(
+                validationState, tester, validationKeyRegistry, liveRunProgress);
             var maxConcurrentAccounts = validationState.Options.MaxConcurrentAccounts;
             // PHASE 9A.3 (2026-09-16): coordenador GLOBAL por run. A mesma
             // instancia e' partilhada por TODOS os candidate workers deste
@@ -731,6 +737,13 @@ namespace m3uCrawler.Services
                 liveRunProgress.ReportCounts(rep);
                 liveRunProgress.ReportMessage(
                     $"pipeline completed: {rep.StreamsWorking} working / {rep.StreamsTested} tested streams");
+                // PHASE W-DASHBOARD — o sumário entra também no feed de
+                // actividades (além do LastMessage), incluindo as validações
+                // físicas evitadas pela dedup por run.
+                liveRunProgress.ReportActivity(
+                    LiveRunActivityCategory.System,
+                    LiveRunActivityLevel.Info,
+                    $"run completed: {rep.StreamsWorking} working / {rep.StreamsTested} tested / {rep.StreamsSkippedAlreadyValidated} reused-dedup");
             }
             return (working, rep);
         }
@@ -798,6 +811,23 @@ namespace m3uCrawler.Services
                     LiveRunPhase.Downloading,
                     "downloading playlist content",
                     cancellationToken).ConfigureAwait(false);
+                // PHASE W-DASHBOARD — activity de download com proveniência
+                // (candidateId + messageId de origem). A mensagem da fase fica
+                // genérica; a activity identifica o candidate.
+                var downloadMetadata = new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["candidateId"] = candidate.Id,
+                };
+                if (candidate.SourceMessageId.HasValue)
+                {
+                    downloadMetadata["messageId"] = candidate.SourceMessageId.Value
+                        .ToString(CultureInfo.InvariantCulture);
+                }
+                liveRunProgress.ReportActivity(
+                    LiveRunActivityCategory.Playlist,
+                    LiveRunActivityLevel.Info,
+                    $"downloading playlist content ({Display(candidate)})",
+                    downloadMetadata);
             }
             // EXPERIMENT-SERIAL-PER-XTREAM (2026-09-16): se o candidate foi
             // promovido a partir de uma publicacao Xtream (DetectedFrom
@@ -826,12 +856,22 @@ namespace m3uCrawler.Services
             if (liveRunProgress is not null)
             {
                 liveRunProgress.ReportCounts(rep);
+                var playlistMetadata = new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["candidateId"] = candidate.Id,
+                };
+                if (candidate.SourceMessageId.HasValue)
+                {
+                    playlistMetadata["messageId"] = candidate.SourceMessageId.Value
+                        .ToString(CultureInfo.InvariantCulture);
+                }
                 liveRunProgress.ReportActivity(
                     LiveRunActivityCategory.Playlist,
                     content is null ? LiveRunActivityLevel.Warning : LiveRunActivityLevel.Info,
                     content is null
                         ? $"playlist download failed ({Display(candidate)})"
-                        : "playlist content downloaded");
+                        : $"playlist content downloaded ({Display(candidate)})",
+                    playlistMetadata);
             }
 
             // URL sem extensao (.m3u/.m3u8): detetada por heuristica. So' tratada
@@ -890,6 +930,20 @@ namespace m3uCrawler.Services
                                 ParentCandidateId = promoted.Id,
                             }, $"promotedCandidateId={promoted.Id} m3uUrl={CredentialSanitizer.SanitizeUrl(playlistUrl ?? string.Empty)}");
 
+                            // PHASE W-DASHBOARD — fan-out Xtream visível no feed.
+                            if (liveRunProgress is not null)
+                            {
+                                liveRunProgress.ReportActivity(
+                                    LiveRunActivityCategory.Xtream,
+                                    LiveRunActivityLevel.Info,
+                                    $"xtream account promoted: candidate {promoted.Id} (parent {candidate.Id})",
+                                    new Dictionary<string, string>(StringComparer.Ordinal)
+                                    {
+                                        ["candidateId"] = promoted.Id,
+                                        ["parentCandidateId"] = candidate.Id,
+                                    });
+                            }
+
                             // Re-injecta no canal. ChannelWriter.TryWrite e' non-blocking.
                             if (!writer.TryWrite(promoted))
                             {
@@ -934,7 +988,11 @@ namespace m3uCrawler.Services
                     liveRunProgress.ReportActivity(
                         LiveRunActivityCategory.Playlist,
                         LiveRunActivityLevel.Warning,
-                        $"{reason} ({Display(candidate)})");
+                        $"{reason} ({Display(candidate)})",
+                        new Dictionary<string, string>(StringComparer.Ordinal)
+                        {
+                            ["candidateId"] = candidate.Id,
+                        });
                 }
                 return;
             }
@@ -992,6 +1050,16 @@ namespace m3uCrawler.Services
                 await liveRunProgress.EnterPhaseAsync(
                     LiveRunPhase.Validating, "validating streams for country", cancellationToken)
                     .ConfigureAwait(false);
+                // PHASE W-DASHBOARD — quantos streams entram no gate e para
+                // que país, com proveniência do candidate.
+                liveRunProgress.ReportActivity(
+                    LiveRunActivityCategory.Stream,
+                    LiveRunActivityLevel.Info,
+                    $"validating {streams.Count} streams for country '{countryCode}'",
+                    new Dictionary<string, string>(StringComparer.Ordinal)
+                    {
+                        ["candidateId"] = candidate.Id,
+                    });
             }
 
             // Gate per-stream (pipeline per-canal/per-stream, desde 2026-08-30).
@@ -1038,10 +1106,22 @@ namespace m3uCrawler.Services
                 liveRunProgress.ReportCounts(rep);
                 liveRunProgress.ReportMessage(
                     $"tested {rep.StreamsTested}/{rep.StreamsAfterCountryFilter} streams");
+                // PHASE W-DASHBOARD — sumário por playlist com a distinção
+                // física vs reutilizada. Usa a MESMA regra do
+                // AccumulateValidationCounters (LastTested == default =>
+                // reutilizado), extraída para helper testável.
+                var (physical, reused) = CountPhysicalAndReused(tested);
+                var validatedWorking = tested.Count(s => s.IsWorking);
                 liveRunProgress.ReportActivity(
                     LiveRunActivityCategory.Stream,
                     LiveRunActivityLevel.Info,
-                    $"validated {tested.Count(s => s.IsWorking)}/{tested.Count} streams for one playlist");
+                    $"validated {validatedWorking}/{tested.Count} streams (physical {physical}, reused {reused})",
+                    new Dictionary<string, string>(StringComparer.Ordinal)
+                    {
+                        ["candidateId"] = candidate.Id,
+                        ["physical"] = physical.ToString(CultureInfo.InvariantCulture),
+                        ["reused"] = reused.ToString(CultureInfo.InvariantCulture),
+                    });
             }
         }
 
@@ -1524,6 +1604,19 @@ namespace m3uCrawler.Services
                     $"detected {found.Count} candidate(s)",
                     CancellationToken.None).ConfigureAwait(false);
                 liveRunProgress.ReportCounts(report!);
+                // PHASE W-DASHBOARD — a activity Discovering carrega a
+                // proveniência da mensagem de origem em metadata (a mensagem da
+                // fase fica curta; o messageId não entra no texto).
+                liveRunProgress.ReportActivity(
+                    LiveRunActivityCategory.Telegram,
+                    LiveRunActivityLevel.Info,
+                    $"detected {found.Count} candidate(s)",
+                    new Dictionary<string, string>(StringComparer.Ordinal)
+                    {
+                        ["messageId"] = m.ID.ToString(CultureInfo.InvariantCulture),
+                        ["messageDateUtc"] = m.date.ToString("o", CultureInfo.InvariantCulture),
+                        ["chat"] = chatTitle,
+                    });
             }
 
             foreach (var candidate in found)
@@ -1535,6 +1628,18 @@ namespace m3uCrawler.Services
                 // no fim do pipeline; agora definido no momento da producao).
                 if (report != null) report.CandidatesFound++;
                 onCandidateProduced?.Invoke(candidate);
+
+                // PHASE W-DASHBOARD — uma activity por candidate criado, com
+                // a proveniência já aplicada (candidateId/messageId/chat).
+                if (liveRunProgress is not null)
+                {
+                    var (message, metadata) = BuildCandidateCreatedActivity(candidate);
+                    liveRunProgress.ReportActivity(
+                        LiveRunActivityCategory.Telegram,
+                        LiveRunActivityLevel.Info,
+                        message,
+                        metadata);
+                }
             }
         }
 
@@ -2130,6 +2235,54 @@ namespace m3uCrawler.Services
             Interlocked.Add(ref rep._StreamsWorking, working);
             Interlocked.Add(ref rep._StreamsFailed, failed);
             Interlocked.Add(ref rep._StreamsSkippedAlreadyValidated, tested.Count - physical);
+        }
+
+        /// <summary>
+        /// PHASE W-DASHBOARD — separa validações FÍSICAS de REUTILIZADAS para
+        /// uma lista de streams testados. Regra idêntica à usada por
+        /// <see cref="AccumulateValidationCounters"/>: <c>LastTested == default</c>
+        /// significa que a stream foi reutilizada (conhecida Working neste run)
+        /// e não gerou GET físico. Helper puro, testável sem HTTP.
+        /// </summary>
+        internal static (int Physical, int Reused) CountPhysicalAndReused(
+            IReadOnlyList<M3uStream> tested)
+        {
+            int physical = 0, reused = 0;
+            foreach (var s in tested)
+            {
+                if (s.LastTested == default) reused++;
+                else physical++;
+            }
+            return (physical, reused);
+        }
+
+        /// <summary>
+        /// PHASE W-DASHBOARD — mensagem + metadata de proveniência para a
+        /// activity emitida quando um candidate é criado a partir de uma
+        /// mensagem Telegram enumerada. Puro, testável sem rede. Não inclui
+        /// credenciais: <c>chat</c> é o título do chat (Source) e
+        /// <c>messageId</c> só entra quando existe.
+        /// </summary>
+        internal static (string Message, IReadOnlyDictionary<string, string> Metadata) BuildCandidateCreatedActivity(
+            CandidatePlaylist candidate)
+        {
+            var metadata = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["candidateId"] = candidate.Id,
+            };
+            if (candidate.SourceMessageId.HasValue)
+            {
+                metadata["messageId"] = candidate.SourceMessageId.Value
+                    .ToString(CultureInfo.InvariantCulture);
+            }
+            if (!string.IsNullOrEmpty(candidate.Source))
+            {
+                metadata["chat"] = candidate.Source;
+            }
+
+            var message =
+                $"candidate {candidate.Id} created (kind={candidate.Kind}, from={candidate.DetectedFrom})";
+            return (message, metadata);
         }
 
         // Filtra streams existentes re-testados para retencao na playlist.

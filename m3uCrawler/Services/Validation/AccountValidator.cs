@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
+using m3uCrawler.Services.LiveRun;
 using m3uCrawler.Services.Matching;
 
 namespace m3uCrawler.Services.Validation;
@@ -46,15 +47,23 @@ public sealed class AccountValidator
     private readonly M3uTesterService _tester;
     private readonly ValidationKeyRegistry _registry;
 
+    // PHASE W-DASHBOARD — sink opcional de Live Run. A dedup física
+    // (ReusedKnownWorking/probe físico por account) passa a ser visível no
+    // feed sem alterar a sua lógica. null (default) preserva o
+    // comportamento anterior (sem side-effects).
+    private readonly ILiveRunProgress? _progress;
+
     public AccountValidator(
         StreamValidationState state,
         M3uTesterService tester,
-        ValidationKeyRegistry? registry = null)
+        ValidationKeyRegistry? registry = null,
+        ILiveRunProgress? progress = null)
     {
         _state = state ?? throw new ArgumentNullException(nameof(state));
         _tester = tester ?? throw new ArgumentNullException(nameof(tester));
         _options = state.Options;
         _registry = registry ?? new ValidationKeyRegistry();
+        _progress = progress;
     }
 
     /// <summary>Registo de deduplicacao fisica por run.</summary>
@@ -162,6 +171,26 @@ public sealed class AccountValidator
             $"fingerprint={work.AccountId} tested={tested} working={working} " +
             $"failed={failed} shortCircuited={shortCircuited} reused={reused} " +
             $"probe={probeIndex} durationMs={sw.ElapsedMilliseconds}");
+
+        // PHASE W-DASHBOARD — expõe a dedup física no feed do Live Run.
+        // Apenas apresentação: username mascarado (nunca a password) e
+        // contadores. A lógica de decisão (ReusedKnownWorking, probe
+        // obrigatório, ordem) não é tocada.
+        if (_progress is not null)
+        {
+            _progress.ReportActivity(
+                LiveRunActivityCategory.Stream,
+                LiveRunActivityLevel.Info,
+                $"account validation: {tested} physical, {reused} reused, {failed} failed",
+                new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["account"] = logUser,
+                    ["probe"] = probeIndex.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    ["physical"] = tested.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    ["reused"] = reused.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    ["failed"] = failed.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                });
+        }
 
         return new AccountValidationResult(
             work,

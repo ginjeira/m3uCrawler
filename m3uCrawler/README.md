@@ -154,7 +154,7 @@ A pesquisa no Telegram considera apenas mensagens cuja idade satisfaz `MinHistor
 - **Persistência:** mesma SSOT `runtime-data/app_settings.json`, secção `discovery` (`historyHours` + novo `minHistoryHours`). `GET /api/discovery/settings` devolve `minHistoryHours`; `POST /api/discovery/settings` aceita `minHistoryHours` opcional (semântica de patch). O contrato de `/api/run/start` mantém-se e usa a janela persistida.
 - **Validação:** `MinHistoryHours >= 0`, `MaxHistoryHours >= 0` e `MinHistoryHours <= MaxHistoryHours`. Valores inválidos são rejeitados na API (400) e os valores inválidos persistidos são normalizados para o default (`Min → 0`) pelo mecanismo `Sanitize` existente.
 
-A configuração da janela pela **UI do dashboard** (a par da integração com Schedule Min/Max) fica para wave futura: o endpoint REST `/api/discovery/settings` já aceita `minHistoryHours` (ver bullet de persistência acima), mas o formulário do dashboard ainda não expõe estes campos.
+A janela já está configurável na **UI do dashboard**, na vista Descoberta (card "Configuração de descoberta"): `keyword`, `MinHistoryHours`, `HistoryHours`/Max e `MaxStreams`, persistidos via `GET/POST /api/discovery/settings` (ex.: Min 425h / Max 450h ⇒ `425h ≤ idade ≤ 450h`; "Min 0 = sem limite inferior"). A integração com o **Schedule Min/Max** continua para wave futura. Ver "Configuração no Dashboard: o que está exposto e o que não" na secção do Dashboard.
 
 ### Proveniência da mensagem de origem (candidate → playlist)
 
@@ -527,6 +527,8 @@ Cada execução preenche um `RunReport` (em `Models/RunReport.cs`) com os seguin
 
 O relatório é gravado em **`output/telegram_run_report.json`** (UTF-8, `JsonNamingPolicy.CamelCase`) em ambos os modos `--telegram` e `--telegram-maintain` (helper `SaveRunReportAsync` em `Program.cs`).
 
+O contador `streamsSkippedAlreadyValidated` (W-DEDUP) aparece também no histórico de execuções (`GET /api/history`, campo homónimo em `ImportHistoryEntry`) e na UI do dashboard — Live Run (rótulo "Streams reutilizados (W-DEDUP)"), Overview (card + badge) e tabela de Execuções. Entradas de histórico anteriores à W-DASHBOARD mostram `—`.
+
 ## Modo manutenção (`--telegram-maintain`)
 
 O ciclo de manutenção (`Program.cs` → `RunTelegramMaintenanceCycle`):
@@ -574,7 +576,7 @@ O dashboard tem os seguintes separadores principais:
 
 - **Overview**: resumo do sistema com métricas da última execução, carteiras de streams, estado do Dispatcharr e **estado de publicação do catálogo** (DL-130). O card "Publicação do catálogo" consome `GET /api/publication/status` e apresenta os 4 estados (`Pendente` / `Em dia` / `Sem publicação anterior` / `Indisponível`) com badges `warn` / `ok` / `warn` / `muted`; o booleano `publicationPending` chega já calculado pelo backend e não é recalculado no frontend.
 - **Execuções**: histórico detalhado das últimas 72h com métricas por execução.
-- **Descoberta**: playlists descobertas com filtros por estado, origem e país.
+- **Descoberta**: card "Configuração de descoberta" (keyword, janela Min/Max, `MaxStreams`, via `/api/discovery/settings`) e playlists descobertas com filtros por estado, origem e país, incluindo colunas de proveniência MessageId / Data mensagem (UTC) / Candidato.
 - **Canais / Países**: validação da playlist actual por país e gestão das listas de aliases.
 - **Playlist**: visualização da playlist actual com links para download funcional.
 - **Dispatcharr**: estado da última sincronização e detalhes do plano/report.
@@ -1245,6 +1247,25 @@ botão **Run now** e os jobs agendados Telegram. Actualização automática por
 **polling de 3 s** (apenas com a vista activa e sem pedidos sobrepostos). Não
 há SSE/WebSocket, tail de logs nem parsing de `docker logs`.
 
+O feed de actividades (`recentActivities`) transporta agora **`metadata`** (dict opcional de contexto) e as actividades de fase incluem **`runId`**; cada actividade é apresentada com **badge de categoria** e o metadata como `key=value`. O contexto cobre a cadeia completa: leitura do Telegram (`keyword` + janela), mensagem analisada (`messageId`/`messageDateUtc`/`chat`), candidate criado (`candidateId`/`kind`/`from`), promoção Xtream (`candidateId`/`parentCandidateId`), download/parse (`candidateId` + motivo), validação por país e por playlist (**physical N / reused M**), conclusão do run e Dispatcharr (contadores do sync; tipo de erro).
+
+A dedup física W-DEDUP passa a ser visível **sem alterar a sua semântica**: o `AccountValidator` emite uma activity por ronda de conta (`account validation: N physical, M reused, K failed`, com a conta mascarada) e o contador `StreamsSkippedAlreadyValidated` aparece no Live Run, no Overview e no histórico de Execuções.
+
+Limitações: não há evento por stream individual (o ring buffer de 200 tornaria o feed inútil); `requestId` só existe no caminho de download; o `PipelineTrace` (`M3UCRAWLER_TRACE`) continua consola-only e separado do Live Run; em modo CLI não existe `runId` operacional.
+
+### Configuração no Dashboard: o que está exposto e o que não
+
+A vista **Descoberta** expõe a configuração operacional de discovery numa única card (SSOT `app_settings.json#discovery`, via `GET/POST /api/discovery/settings`): `keyword`, `MinHistoryHours` (≥ 0), `HistoryHours`/Max (1–1440) e `MaxStreams` (≥ 1). A janela inclusiva é explicada a partir dos valores (ex.: Min 425h / Max 450h ⇒ `425h ≤ idade ≤ 450h`) e "Min 0 = sem limite inferior (comportamento legacy)". Erros de validação do backend (HTTP 400) surgem inline e, após guardar, o formulário recarrega os valores persistidos.
+
+**Deliberadamente não expostos** (e porquê):
+
+- **Credenciais WTelegram/Dispatcharr** (`api_hash`, `api_key`, username/password) — write-only nos formulários de Setup existentes; o dashboard não as revela. `dispatcharr_username`/`dispatcharr_password`/`session_pathname` são API-only. Segredos nunca em superfícies de leitura.
+- **Flags de deployment/processo** (`--web`, `--web-port`, `--web-token`, `--web-allow-trigger`, `--output-dir`, `--catalog-db`, `--country`) — requerem restart/âmbito de processo, não são configuração de runtime do dashboard.
+- **Modos legacy** (`--bot`, `--loop-hours`, `--fast`, `--scan-domain`).
+- **Constantes técnicas** (timeouts HTTP, `limit=200`, `maxConcurrency=5`, threshold país 3, poll do scheduler 30s, `ExactMatchScore`/`AmbiguityMargin`) — valores de engenharia, não parâmetros operacionais.
+- **`dispatcharrTest`** — estado derivado, não configuração.
+- **Extras Dispatcharr** suportados pela API mas ainda sem form nesta wave: `dispatcharr_match_threshold`, `dispatcharr_target_group_name`, `dispatcharr_alias_file`, `dispatcharr_provider_priority`, `dispatcharr_auto_create_groups` (seguimento).
+
 ## Comportamento funcional
 
 Os cenários abaixo descrevem o comportamento esperado e estão cobertos por testes unitários sempre que possível.
@@ -1292,7 +1313,7 @@ Uma playlist estrangeira (ex.: apenas canais `La 1`, `Antena 3`, `Telecinco`) é
 ## Estado dos testes
 
 - Build: `dotnet build m3uCrawler.sln --configuration Release --no-restore` → **0 errors**; o baseline tem warnings pré-existentes (analyzers xUnit) — não introduzir warnings novos.
-- Testes: `dotnet test m3uCrawler.Tests/m3uCrawler.Tests.csproj --configuration Release --no-build --nologo` — referência operacional; **não** interpretar o número como propriedade permanente da arquitectura. Estado medido em **2026-10-02**: 2815 testes, com 1 falha pré-existente conhecida (observabilidade do dashboard, `WaveW6b2ObservabilityTests`) e 1 skipped; ver `docs/PROJECT_STATUS.md`.
+- Testes: `dotnet test m3uCrawler.Tests/m3uCrawler.Tests.csproj --configuration Release --no-build --nologo` — referência operacional; **não** interpretar o número como propriedade permanente da arquitectura. Estado medido em **2026-10-02** (working tree de W-DASHBOARD): 2827 testes, com 1 falha pré-existente conhecida (observabilidade do dashboard, `WaveW6b2ObservabilityTests`) e 1 skipped; ver `docs/PROJECT_STATUS.md`.
 - **Execução real (2026-10-02):** cadeia Telegram→candidate→playlist→Dispatcharr exercitada em runtime (imagem local de `fcd442e`), com janela `--min-history-hours 425 --history-hours 450` e Dispatcharr em **dry-run**; artefactos gerados (playlist M3U, relatórios Telegram, plano/relatório Dispatcharr). Números detalhados em `docs/PROJECT_STATUS.md` (não duplicados aqui).
 - O runner descobre e executa todos os testes; não há testes que passem sem realmente exercitar o comportamento (detector, parser, validação por país com threshold/famílias/falsos-positivos, merge de manutenção).
 - Não há teste de integração de rede (Telegram/HTTP); os testes são unitários e independentes de infra-estrutura externa.

@@ -5089,6 +5089,7 @@ namespace m3uCrawler.Services
     .badge.err { background: rgba(248, 81, 73, 0.18); color: var(--err); }
     .badge.info { background: rgba(121, 192, 255, 0.18); color: var(--info); }
     .badge.muted { background: rgba(139, 148, 158, 0.18); color: var(--muted); }
+    .badge.lr-cat { font-size: 10px; padding: 1px 6px; background: transparent; }
     .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
     .toolbar select, .toolbar input { background: var(--panel); color: var(--text); border: 1px solid var(--border); padding: 6px 10px; border-radius: 6px; font: inherit; }
     .toolbar button { background: var(--accent); color: white; border: none; padding: 6px 12px; border-radius: 6px; cursor: pointer; font: inherit; }
@@ -5163,6 +5164,29 @@ namespace m3uCrawler.Services
     <!-- DESCOBERTA -->
     <section id='view-discovery' hidden>
       <h2 style='font-size:18px;margin-top:0;'>Descoberta</h2>
+
+      <div class='card' style='margin-bottom:12px;'>
+        <h3 style='font-size:14px;margin-top:0;'>Configuração de descoberta</h3>
+        <div class='toolbar' style='flex-wrap:wrap;'>
+          <label class='muted' for='discoveryKeyword'>Pesquisa</label>
+          <input id='discoveryKeyword' type='text' placeholder='portugal' style='min-width:160px;'>
+          <label class='muted' for='discoveryMinHistoryHours'>Min (h)</label>
+          <input id='discoveryMinHistoryHours' type='number' min='0' step='1' style='width:90px;'>
+          <label class='muted' for='discoveryMaxHistoryHours'>Max (h)</label>
+          <input id='discoveryMaxHistoryHours' type='number' min='1' max='1440' step='1' style='width:90px;'>
+          <label class='muted' for='discoveryMaxStreams'>Máx streams</label>
+          <input id='discoveryMaxStreams' type='number' min='1' step='1' style='width:90px;'>
+          <button id='discoverySettingsSaveBtn'>Guardar</button>
+        </div>
+        <p class='muted' id='discoveryWindowExplainer' style='margin:8px 0 0;'>Janela inclusiva: 0h ≤ idade da mensagem ≤ 24h</p>
+        <div id='discoverySettingsStatus' style='margin-top:6px;'></div>
+        <p class='muted' style='font-size:12px;margin:8px 0 0;'>
+          Limites: Min ≥ 0; Max 1–1440h; Min ≤ Max; MaxStreams ≥ 1.
+          Min 0 = sem limite inferior (comportamento legacy).
+          Valores persistidos em <code>app_settings.json</code> e usados pela CLI, scheduler e runs manuais.
+        </p>
+      </div>
+
       <div class='toolbar'>
         <label class='muted'>Filtro estado:</label>
         <select id='discState'>
@@ -6042,6 +6066,7 @@ namespace m3uCrawler.Services
         const rate = (w + f) > 0 ? (100 * w / (w + f)) : null;
         const sub = rate != null ? (pct(rate) + ' de sucesso · ' + nfmt(w) + ' OK / ' + nfmt(f) + ' KO') : '—';
         cards.push(metricCard('Última: testados / funcionais', nfmt(t) + ' · ' + nfmt(w), sub, helpFor('working')));
+        cards.push(metricCard('Última: reutilizados (W-DEDUP)', nfmt(run.streamsSkippedAlreadyValidated || 0), 'GETs físicos evitados', 'W-DEDUP: streams já Working neste run não são re-testados; apenas a validação física (streamsTested) é contabilizada.'));
         cards.push(metricCard('Última: candidatos', nfmt(run.candidates || 0), 'playlists: ' + nfmt(run.playlistsDownloaded || 0), helpFor('candidates')));
       } else {
         cards.push(metricCard('Última execução (resumo)', '—', 'sem run report disponível', ''));
@@ -6080,6 +6105,7 @@ namespace m3uCrawler.Services
       let math = '<p class="muted">Sem dados do último run.</p>';
       if (run) {
         const w = run.streamsWorking || 0, f = run.streamsFailed || 0, t = run.streamsTested || 0;
+        const skipped = run.streamsSkippedAlreadyValidated || 0;
         const tested = w + f;
         const balanced = tested === t;
         const rate = tested > 0 ? (100 * w / tested) : null;
@@ -6108,6 +6134,7 @@ namespace m3uCrawler.Services
           ${t > 0 ? `
             <p>${nfmt(t)} streams testados = ${nfmt(w)} funcionais + ${nfmt(f)} falhados
               ${balanced ? '' : `<span class='badge warn' title='Funcionais+Falhados ≠ Testados (streams pulados)'>⚠ ${nfmt(t - tested)} não testados / pulados</span>`}
+              ${skipped > 0 ? `<span class='badge info' title='GETs físicos evitados por reutilização de conhecimento Working (W-DEDUP)'>♻ ${nfmt(skipped)} reutilizados (W-DEDUP)</span>` : ''}
             </p>
             <div class='bar' title='${pct(rate ?? 0)} de sucesso'>
               <div class='ok' style='width:${rate}%;'></div>
@@ -6133,6 +6160,7 @@ namespace m3uCrawler.Services
         const ts = new Date(e.timestamp).toLocaleString();
         const modeBadge = `<span class='badge ${e.mode === 'TelegramMaintenance' ? 'info' : 'muted'}'>${e.mode || ''}</span>`;
         const ratio = e.existingRetestedCount > 0 ? (e.existingStillWorkingCount + '/' + e.existingRetestedCount) : '—';
+        const skipped = (typeof e.streamsSkippedAlreadyValidated === 'number') ? e.streamsSkippedAlreadyValidated : '—';
         return `<tr data-idx='${idx}' style='cursor:pointer'>
           <td>${ts}</td>
           <td>${modeBadge}</td>
@@ -6141,11 +6169,12 @@ namespace m3uCrawler.Services
           <td>${e.maxStreams || '—'}</td>
           <td>${e.newFunctionalCount}</td>
           <td>${ratio}</td>
+          <td>${skipped}</td>
           <td>${e.finalPlaylistCount}</td>
         </tr>`;
       }).join('');
       document.getElementById('historyTable').innerHTML =
-        '<table><thead><tr><th>Quando</th><th>Modo</th><th>Pesquisa</th><th>História</th><th>Máx</th><th>Novos</th><th>Retestados</th><th>Total final</th></tr></thead><tbody>' + rows + '</tbody></table>';
+        '<table><thead><tr><th>Quando</th><th>Modo</th><th>Pesquisa</th><th>História</th><th>Máx</th><th>Novos</th><th>Retestados</th><th>Reutilizados (W-DEDUP)</th><th>Total final</th></tr></thead><tbody>' + rows + '</tbody></table>';
       document.querySelectorAll('#historyTable tr[data-idx]').forEach(tr => tr.addEventListener('click', () => showHistoryDetail(parseInt(tr.getAttribute('data-idx'), 10))));
     }
 
@@ -6207,9 +6236,17 @@ namespace m3uCrawler.Services
         const stateBadge = p.state === 'accepted'
           ? '<span class="badge ok">aceite</span>'
           : '<span class="badge err">rejeitada</span>';
+        const msgId = (p.messageId !== null && p.messageId !== undefined) ? ('<code>' + escapeHtml(String(p.messageId)) + '</code>') : '—';
+        const msgDate = p.messageDateUtc ? escapeHtml(fmtUtcDateTime(p.messageDateUtc)) : '—';
+        const candidateId = p.candidateId
+          ? ('<code title="' + escapeHtml(p.candidateId) + '">' + escapeHtml(String(p.candidateId).slice(0, 8)) + '</code>')
+          : '—';
         return `<tr>
           <td>${p.source || '—'}</td>
           <td>${p.name || '—'}</td>
+          <td>${msgId}</td>
+          <td>${msgDate}</td>
+          <td>${candidateId}</td>
           <td>${p.countryDetected || '—'}</td>
           <td>${nfmt(p.channelsRecognized || 0)}</td>
           <td>${nfmt(p.streamCount || 0)}</td>
@@ -6220,8 +6257,81 @@ namespace m3uCrawler.Services
         </tr>`;
       }).join('');
       document.getElementById('discoveryTable').innerHTML = items.length
-        ? `<table><thead><tr><th>Origem</th><th>Nome</th><th>País</th><th>Canais</th><th>Streams</th><th>Após país</th><th>Funcionais</th><th>Estado</th><th>Notas</th></tr></thead><tbody>${rows}</tbody></table>`
+        ? `<table><thead><tr><th>Origem</th><th>Nome</th><th>MessageId</th><th>Data mensagem</th><th>Candidato</th><th>País</th><th>Canais</th><th>Streams</th><th>Após país</th><th>Funcionais</th><th>Estado</th><th>Notas</th></tr></thead><tbody>${rows}</tbody></table>`
         : '<p class="muted">Nenhuma playlist encontrada para os filtros escolhidos.</p>';
+    }
+
+    function fmtUtcDateTime(iso) {
+      if (!iso) return '—';
+      const d = new Date(iso);
+      if (isNaN(d.getTime())) return String(iso);
+      const p = (n) => (n < 10 ? '0' : '') + n;
+      return d.getUTCFullYear() + '-' + p(d.getUTCMonth() + 1) + '-' + p(d.getUTCDate()) + ' ' + p(d.getUTCHours()) + ':' + p(d.getUTCMinutes());
+    }
+
+    function discoverySettingsBadge(kind, message) {
+      const el = document.getElementById('discoverySettingsStatus');
+      if (!el) return;
+      const cls = kind === 'error' ? 'err' : (kind === 'ok' ? 'ok' : 'info');
+      el.innerHTML = "<span class='badge " + cls + "'>" + escapeHtml(message) + "</span>";
+    }
+
+    function updateDiscoveryWindowExplainer() {
+      const minEl = document.getElementById('discoveryMinHistoryHours');
+      const maxEl = document.getElementById('discoveryMaxHistoryHours');
+      const out = document.getElementById('discoveryWindowExplainer');
+      if (!minEl || !maxEl || !out) return;
+      const min = parseInt(minEl.value, 10);
+      const max = parseInt(maxEl.value, 10);
+      out.textContent = 'Janela inclusiva: ' + (isNaN(min) ? '?' : min) + 'h ≤ idade da mensagem ≤ ' + (isNaN(max) ? '?' : max) + 'h';
+    }
+
+    async function loadDiscoverySettings() {
+      const s = await safeFetchJson('/api/discovery/settings', null);
+      if (!s || s.error) {
+        discoverySettingsBadge('error', (s && s.error) ? s.error : 'falha ao carregar configuração');
+        return false;
+      }
+      const kw = document.getElementById('discoveryKeyword');
+      const min = document.getElementById('discoveryMinHistoryHours');
+      const max = document.getElementById('discoveryMaxHistoryHours');
+      const ms = document.getElementById('discoveryMaxStreams');
+      if (kw && s.keyword !== null && s.keyword !== undefined) kw.value = s.keyword;
+      if (min && s.minHistoryHours !== null && s.minHistoryHours !== undefined) min.value = s.minHistoryHours;
+      if (max && s.historyHours !== null && s.historyHours !== undefined) max.value = s.historyHours;
+      if (ms && s.maxStreams !== null && s.maxStreams !== undefined) ms.value = s.maxStreams;
+      updateDiscoveryWindowExplainer();
+      return true;
+    }
+
+    async function saveDiscoverySettings() {
+      const kwEl = document.getElementById('discoveryKeyword');
+      const minEl = document.getElementById('discoveryMinHistoryHours');
+      const maxEl = document.getElementById('discoveryMaxHistoryHours');
+      const msEl = document.getElementById('discoveryMaxStreams');
+      const body = {
+        keyword: kwEl ? kwEl.value.trim() : '',
+        historyHours: maxEl ? parseInt(maxEl.value, 10) : NaN,
+        minHistoryHours: minEl ? parseInt(minEl.value, 10) : NaN,
+        maxStreams: msEl ? parseInt(msEl.value, 10) : NaN
+      };
+      try {
+        const r = await fetch('/api/discovery/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        let resp = null;
+        try { resp = await r.json(); } catch (e) { resp = null; }
+        if (!r.ok) {
+          discoverySettingsBadge('error', (resp && resp.error) ? resp.error : ('HTTP ' + r.status));
+          return;
+        }
+        const reloaded = await loadDiscoverySettings();
+        discoverySettingsBadge(reloaded ? 'info' : 'error', reloaded ? 'guardado' : 'guardado, mas falhou recarregar');
+      } catch (e) {
+        discoverySettingsBadge('error', (e && e.message) ? e.message : 'falha de rede');
+      }
     }
 
     let countryOptions = [];
@@ -8419,7 +8529,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
       switch (name) {
         case 'overview': loadOverview(); break;
         case 'executions': loadHistory(); break;
-        case 'discovery': loadDiscovery(); break;
+        case 'discovery': loadDiscovery(); loadDiscoverySettings(); break;
         case 'countries': loadCountries(); break;
         case 'playlist': loadPlaylist(); break;
         case 'dispatcharr': loadDispatcharr(); break;
@@ -8434,6 +8544,8 @@ const rows = Object.entries(inv).map(([k, v]) => {
     document.querySelectorAll('nav button').forEach(b => { if (!b.dataset.view) return; b.addEventListener('click', () => showView(b.dataset.view)); });
     document.getElementById('countrySelect').addEventListener('change', () => loadCountryValidation());
     ['discState','discSource','discCountry'].forEach(id => document.getElementById(id).addEventListener('change', renderDiscovery));
+    document.getElementById('discoverySettingsSaveBtn').addEventListener('click', saveDiscoverySettings);
+    ['discoveryMinHistoryHours','discoveryMaxHistoryHours'].forEach(id => document.getElementById(id).addEventListener('input', updateDiscoveryWindowExplainer));
 
     showView('overview');
 
@@ -8512,13 +8624,69 @@ const rows = Object.entries(inv).map(([k, v]) => {
 
     function liveRunCountEntries(counts) {
       if (!counts || typeof counts !== 'object') return [];
+      // Rótulos humanos para os contadores conhecidos de LiveRunCounts.
+      // Campos desconhecidos mantêm o nome camelCase cru (nunca inventamos).
+      var labels = {
+        dialogsTotal: 'Diálogos',
+        dialogsIncomplete: 'Diálogos incompletos',
+        messagesAnalyzed: 'Mensagens analisadas',
+        messagesWithMedia: 'Mensagens com media',
+        messagesWithDocumentMedia: 'Mensagens com documento',
+        candidatesFound: 'Candidatos',
+        playlistsDownloaded: 'Playlists descarregadas',
+        playlistsInvalid: 'Playlists inválidas',
+        playlistsPartial: 'Playlists parciais',
+        playlistsRejected: 'Playlists rejeitadas',
+        countryMatches: 'Country matches',
+        acquisitionFailures: 'Falhas de aquisição',
+        acquisitionRetryableFailures: 'Falhas de aquisição retryable',
+        acquisitionTerminalFailures: 'Falhas de aquisição terminais',
+        publicationsDiscovered: 'Publicações descobertas',
+        publicationsResolved: 'Publicações resolvidas',
+        publicationsResolutionFailed: 'Publicações falhadas',
+        publicationsRequiresReview: 'Publicações para revisão',
+        xtreamAccountsDiscovered: 'Contas Xtream descobertas',
+        xtreamAccountsAfterDedup: 'Contas Xtream após dedup',
+        xtreamAccountsForwarded: 'Contas Xtream encaminhadas',
+        channelsRecognized: 'Canais reconhecidos',
+        streamsExtracted: 'Streams extraídos',
+        streamsAfterCountryFilter: 'Streams após filtro de país',
+        streamsRejectedByCountry: 'Streams rejeitados por país',
+        streamsTested: 'Streams testados (físico)',
+        streamsWorking: 'Streams working',
+        streamsFailed: 'Streams falhados',
+        streamsSkippedAlreadyValidated: 'Streams reutilizados (W-DEDUP)',
+        targetPlaylistEntries: 'Entradas da playlist final',
+        existingPlaylistRetested: 'Existentes retestados',
+        dispatcharrSyncAttempted: 'Dispatcharr sync tentadas',
+        dispatcharrSyncCompleted: 'Dispatcharr sync concluídas',
+        dispatcharrSyncFailed: 'Dispatcharr sync falhadas',
+        dispatcharrSyncSkipped: 'Dispatcharr sync ignoradas'
+      };
       var out = [];
       Object.keys(counts).forEach(function (k) {
         var v = counts[k];
         if (typeof v !== 'number' || v === 0) return;
-        out.push([k, v]);
+        out.push([labels[k] || k, v]);
       });
       return out;
+    }
+
+    function liveRunCategoryBadge(category) {
+      if (!category) return '—';
+      var cat = String(category).toLowerCase();
+      var colors = {
+        telegram: 'var(--info)',
+        playlist: 'var(--ok)',
+        stream: 'var(--accent)',
+        xtream: 'var(--warn)',
+        dispatcharr: 'var(--err)',
+        system: 'var(--muted)',
+        phase: 'var(--accent-2)',
+        run: 'var(--info)'
+      };
+      var color = colors[cat] || 'var(--muted)';
+      return "<span class='badge lr-cat' style='color:" + color + ";border:1px solid " + color + ";'>" + escapeHtml(cat) + "</span>";
     }
 
     function renderLiveRun(data) {
@@ -8593,11 +8761,24 @@ const rows = Object.entries(inv).map(([k, v]) => {
           actsEl.textContent = 'Sem actividades disponíveis (o feed é em memória e não é persistido).';
         } else {
           var lastActs = acts.slice(-25).reverse();
-          actsEl.innerHTML = "<table><thead><tr><th>Quando</th><th>Nível</th><th>Mensagem</th></tr></thead><tbody>" +
+          actsEl.innerHTML = "<table><thead><tr><th>Quando</th><th>Nível</th><th>Categoria</th><th>Mensagem</th></tr></thead><tbody>" +
             lastActs.map(function (a) {
               var cls = a.level === 'error' ? 'badge err' : (a.level === 'warning' ? 'badge warn' : 'badge muted');
+              var metaHtml = '';
+              var meta = a.metadata;
+              if (meta && typeof meta === 'object') {
+                var parts = Object.keys(meta).map(function (k) {
+                  var v = meta[k];
+                  if (v === null || v === undefined) return '';
+                  var s = String(v);
+                  if (s.length > 80) s = s.slice(0, 80) + '…';
+                  return "<span class='muted' style='margin-right:8px;'><code>" + escapeHtml(k) + "</code>=<span>" + escapeHtml(s) + "</span></span>";
+                }).filter(function (x) { return x; });
+                if (parts.length) metaHtml = "<div style='font-size:11px;margin-top:2px;'>" + parts.join('') + "</div>";
+              }
               return "<tr><td>" + escapeHtml(tsLocal(a.timestampUtc)) + "</td><td><span class='" + cls + "'>" +
-                escapeHtml(a.level || 'info') + "</span></td><td>" + escapeHtml(a.message || '') + "</td></tr>";
+                escapeHtml(a.level || 'info') + "</span></td><td>" + liveRunCategoryBadge(a.category) + "</td><td>" +
+                escapeHtml(a.message || '') + metaHtml + "</td></tr>";
             }).join('') + "</tbody></table>";
         }
       }

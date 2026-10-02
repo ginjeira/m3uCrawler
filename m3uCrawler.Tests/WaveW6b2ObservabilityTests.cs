@@ -269,8 +269,9 @@ public class WaveW6b2ObservabilityTests : IAsyncLifetime
         var run = Assert.Single(await _resolver.ListSyncRunsAsync());
 
         var key = $"w6b2-dash-{Guid.NewGuid():N}".Substring(0, 32);
+        var healthyObservedAt = DateTime.UtcNow.AddHours(-1);
         var stream = MakeStream("RTP 1", "http://x.example/rtp1-dash.ts",
-            working: true, testedAt: FixedValidationUtc, responseTime: 111);
+            working: true, testedAt: healthyObservedAt, responseTime: 111);
         await NewIngestor().IngestAsync(new[] { stream }, key, "Telegram", "pt");
         var cs = await SingleChannelSourceAsync(key);
 

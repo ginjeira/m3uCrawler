@@ -308,6 +308,7 @@ public sealed class RunPublicationService : IRunPublicationService
             StreamsTested = report.StreamsTested,
             StreamsWorking = report.StreamsWorking,
             StreamsFailed = report.StreamsFailed,
+            StreamsSkippedAlreadyValidated = report.StreamsSkippedAlreadyValidated,
         };
     }
 

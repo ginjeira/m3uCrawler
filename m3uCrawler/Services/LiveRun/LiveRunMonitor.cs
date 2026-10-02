@@ -313,6 +313,10 @@ public sealed class LiveRunMonitor : ILiveRunProgress
             {
                 ["phase"] = phase.ToString(),
                 ["phaseIndex"] = ((int)phase).ToString(System.Globalization.CultureInfo.InvariantCulture),
+                // PHASE W-DASHBOARD — o monitor conhece o runId; incluí-lo aqui
+                // permite ao dashboard correlacionar atividades de fase com a
+                // execução sem depender do snapshot.
+                ["runId"] = RunId,
             }));
     }
 

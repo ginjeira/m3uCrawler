@@ -528,9 +528,14 @@ Operações do inventário: `start run`, `list candidates`, `candidate details`,
   quando o report não existe (`WebDashboardService.cs:793-795`).
 - **Invariantes:** dedup por `(source, name)`, ordenação determinística
   (`DeduplicateBySourceName`); leitura de `telegram_run_report.json`
-  (`outputDir`). Sem mutação.
-- **Implementation reference:** `WebDashboardService.cs:789-808`.
-- **Test reference:** `TBD`.
+  (`outputDir`). Sem mutação. Cada item (`DiscoveredPlaylistSummary`) inclui a
+  proveniência do **representante** do grupo — `candidateId`, `messageId` e
+  `messageDateUtc` (camelCase): o primeiro valor não-nulo da lista
+  (`CandidateId` não-nulo; `MessageId`/`MessageDateUtc` com valor), portanto
+  `null` quando nenhuma entrada do grupo a tem. W-DASHBOARD (2026-10-02).
+- **Implementation reference:** `WebDashboardService.cs:789-808`;
+  `DashboardMetrics.DeduplicateBySourceName` (proveniência).
+- **Test reference:** `DashboardMetricsTests` (extensão).
 - **OPEN/TBD:** schema completo do payload; códigos de erro formalizados
   (actualmente texto livre); autenticação exacta.
 
@@ -560,7 +565,8 @@ Operações do inventário: `start run`, `list candidates`, `candidate details`,
   `WebDashboardService.cs:810-818` e `HandleDiscoverySettingsEndpointAsync`.
   O payload inclui `minHistoryHours` (W-HISTWIN, default `0`) a par de
   `historyHours` (máximo; `[1,1440]`); janela efectiva `min <= idade <= max`.
-  A UI HTML do dashboard ainda **não** expõe `minHistoryHours` (wave futura).
+  A UI HTML do dashboard expõe estes campos (a par de `keyword` e `maxStreams`)
+  desde a W-DASHBOARD (2026-10-02), na vista Descoberta.
 - **Auth:** sessão/token; **Autorização:** `Administrator` no POST;
   `TBD` para o GET.
 - **CSRF:** obrigatório no POST; `N/A` no GET.
@@ -935,7 +941,24 @@ Operações do inventário: `start`, `cancel`, `status`, `history`, `artifacts`.
   (`WebDashboardService.cs:573-955`); `artifacts` **NÃO IMPLEMENTADO**
   (`46:84`).
 - **Invariantes (contratuais):** read-only; sanitização de artifacts
-  (DL-020).
+  (DL-020). Sem secrets — nomes de conta mascarados e URLs sanitizadas
+  (`LiveRunSanitizer`).
+- **`GET /api/run/status` — `recentActivities` (W-DASHBOARD, 2026-10-02).** Cada
+  activity inclui `category` e `metadata` (dict **opcional** string→string de
+  contexto; omitido/`null` quando não há metadados). As activities de fase
+  incluem `runId` no `metadata`. Contexto típico: `messageId`/`messageDateUtc`/`chat`,
+  `candidateId`/`parentCandidateId`, `physical`/`reused`, `account` (mascarado),
+  `errorType` e contadores do sync Dispatcharr. O `metadata` passa pelo
+  `LiveRunSanitizer` no feed. A vista Live Run renderiza `category` como badge e
+  `metadata` como `key=value`.
+- **`GET /api/history` (W-DASHBOARD, 2026-10-02).** Cada `ImportHistoryEntry`
+  inclui `streamsSkippedAlreadyValidated` (camelCase, aditivo, default `0`) —
+  GETs físicos evitados pela dedup W-DEDUP. Entradas persistidas antes da
+  W-DASHBOARD não têm o campo e a UI mostra `—`.
+- **Implementation reference:** `m3uCrawler/Services/LiveRun/LiveRunApiContracts.cs`
+  (`metadata`), `m3uCrawler/Models/ImportHistoryEntry.cs`
+  (`StreamsSkippedAlreadyValidated`), `m3uCrawler/Services/WebDashboardService.cs`.
+- **Test reference:** `LiveRunActivityMetadataTests`, `DashboardMetricsTests`.
 - **OPEN/TBD:** paths/métodos/schema para cada; códigos de erro; formato
   de artifact.
 

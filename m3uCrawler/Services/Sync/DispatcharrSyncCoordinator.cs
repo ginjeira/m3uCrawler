@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Globalization;
 using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
@@ -257,7 +259,8 @@ public sealed class DispatcharrSyncCoordinator
                         liveRunProgress.ReportActivity(
                             LiveRunActivityCategory.Dispatcharr,
                             LiveRunActivityLevel.Info,
-                            "dispatcharr sync completed (legacy)");
+                            "dispatcharr sync completed (legacy)",
+                            BuildCountsMetadata(syncResult));
                     }
                     return new DispatcharrSyncOutcome(
                         DispatcharrSyncStatus.Succeeded,
@@ -272,7 +275,11 @@ public sealed class DispatcharrSyncCoordinator
                         liveRunProgress.ReportActivity(
                             LiveRunActivityCategory.Dispatcharr,
                             LiveRunActivityLevel.Error,
-                            "dispatcharr sync failed (legacy)");
+                            "dispatcharr sync failed (legacy)",
+                            new Dictionary<string, string>(StringComparer.Ordinal)
+                            {
+                                ["errorType"] = ex.GetType().Name,
+                            });
                     }
                     Console.WriteLine($"⚠️ Falha na sincronização Dispatcharr (legacy): {ex.Message}");
                     return new DispatcharrSyncOutcome(DispatcharrSyncStatus.Failed, ex.GetType().Name);
@@ -330,7 +337,8 @@ public sealed class DispatcharrSyncCoordinator
                 liveRunProgress.ReportActivity(
                     LiveRunActivityCategory.Dispatcharr,
                     LiveRunActivityLevel.Info,
-                    "dispatcharr sync completed");
+                    "dispatcharr sync completed",
+                    BuildCountsMetadata(syncResult));
             }
             return new DispatcharrSyncOutcome(
                 DispatcharrSyncStatus.Succeeded,
@@ -345,10 +353,34 @@ public sealed class DispatcharrSyncCoordinator
                 liveRunProgress.ReportActivity(
                     LiveRunActivityCategory.Dispatcharr,
                     LiveRunActivityLevel.Error,
-                    "dispatcharr sync failed");
+                    "dispatcharr sync failed",
+                    new Dictionary<string, string>(StringComparer.Ordinal)
+                    {
+                        ["errorType"] = ex.GetType().Name,
+                    });
             }
             Console.WriteLine($"⚠️ Falha na sincronização Dispatcharr: {ex.Message}");
             return new DispatcharrSyncOutcome(DispatcharrSyncStatus.Failed, ex.GetType().Name);
         }
+    }
+
+    /// <summary>
+    /// PHASE W-DASHBOARD — metadata de contadores do sync para o feed do Live
+    /// Run. Apenas números; devolve null quando o outcome não traz report
+    /// detalhado (ex.: caminho legacy sem resultado). Nunca inclui
+    /// credenciais.
+    /// </summary>
+    private static IReadOnlyDictionary<string, string>? BuildCountsMetadata(DispatcharrSyncResult? result)
+    {
+        if (result?.Report?.Counts is not { } counts) return null;
+        return new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["matched"] = counts.Matched.ToString(CultureInfo.InvariantCulture),
+            ["newChannels"] = counts.NewChannels.ToString(CultureInfo.InvariantCulture),
+            ["newStreams"] = counts.NewStreams.ToString(CultureInfo.InvariantCulture),
+            ["removed"] = counts.RemovedStreams.ToString(CultureInfo.InvariantCulture),
+            ["ambiguous"] = counts.Ambiguous.ToString(CultureInfo.InvariantCulture),
+            ["failed"] = counts.Failed.ToString(CultureInfo.InvariantCulture),
+        };
     }
 }

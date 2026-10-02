@@ -157,6 +157,16 @@ Campos principais a verificar:
 | `GET /api/playlist_temp` | Playlist temp funcional | **Não** |
 | `GET /api/playlist/preview` | Pré-visualização | **Sim** (`SanitizeM3uContent`) |
 
+### Configuração e diagnóstico pelo dashboard
+
+**Janela Min/Max, keyword e MaxStreams** configuram-se na vista **Descoberta**, card "Configuração de descoberta" (sem editar `app_settings.json` à mão):
+
+1. Abrir a vista Descoberta; o formulário carrega os valores persistidos via `GET /api/discovery/settings`.
+2. Preencher `Pesquisa` (keyword), `Min (h)`, `Max (h)` e `Máx streams` e premir **Guardar** (`POST /api/discovery/settings`). A linha sob o formulário mostra a janela inclusiva resultante (ex.: "425h ≤ idade da mensagem ≤ 450h").
+3. Limites: Min ≥ 0; Max 1–1440h; Min ≤ Max; MaxStreams ≥ 1. Erros de validação (HTTP 400) aparecem inline e o formulário recarrega os valores efectivamente persistidos. `Min 0` = sem limite inferior (comportamento legacy). Os valores são usados pela CLI, scheduler e runs manuais (`POST /api/run/start` mantém o contrato antigo, tecto próprio 720h).
+
+**Live Run como diagnóstico.** O feed de actividades mostra o contexto por evento — `category` (badge) e `metadata` em `key=value`. Sequência típica a seguir: leitura do Telegram (`keyword` + janela) → mensagem analisada (`messageId`/`chat`) → candidate criado (`candidateId`) → promoção Xtream (`parentCandidateId`) → download (`candidateId` + motivo em caso de falha) → validação por playlist (`physical N / reused M`) → conclusão/dispatcharr. Para W-DEDUP, cada ronda de conta gera `account validation: N physical, M reused, K failed` (conta mascarada) e o contador `StreamsSkippedAlreadyValidated` aparece no Live Run, no card/badge do Overview ("N reutilizados (W-DEDUP)") e na tabela de Execuções.
+
 ---
 
 ## 5. Diagnóstico de falhas

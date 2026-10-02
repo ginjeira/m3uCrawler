@@ -260,6 +260,11 @@ internal static class LiveRunApiMappings
                 category = a.Category.ToString().ToLowerInvariant(),
                 level = a.Level.ToString().ToLowerInvariant(),
                 message = a.Message,
+                // PHASE W-DASHBOARD — o contexto operacional (proveniência do
+                // candidate, account mascarada, contadores por playlist) viaja
+                // aqui. null quando a activity não tem metadados. Os valores já
+                // vêm sanitizados do feed (LiveRunSanitizer.Metadata).
+                metadata = a.Metadata,
             });
         }
         return items;

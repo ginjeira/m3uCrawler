@@ -143,7 +143,8 @@ public class WebDashboardServiceTests
             NewFunctionalCount = 10,
             ExistingRetestedCount = 20,
             ExistingStillWorkingCount = 15,
-            FinalPlaylistCount = 25
+            FinalPlaylistCount = 25,
+            StreamsSkippedAlreadyValidated = 3
         };
 
         var json = JsonSerializer.Serialize(entry, DashboardJsonOptions);
@@ -157,6 +158,7 @@ public class WebDashboardServiceTests
         Assert.Contains("\"existingRetestedCount\"", json);
         Assert.Contains("\"existingStillWorkingCount\"", json);
         Assert.Contains("\"finalPlaylistCount\"", json);
+        Assert.Contains("\"streamsSkippedAlreadyValidated\": 3", json);
         Assert.DoesNotContain("\"Timestamp\"", json);
         Assert.DoesNotContain("\"HistoryHours\"", json);
     }
