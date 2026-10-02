@@ -24,10 +24,20 @@ public sealed class DiscoverySettings
     public const int DefaultHistoryHours = 24;
 
     /// <summary>Mínimo aceite para <see cref="HistoryHours"/>.</summary>
-    public const int MinHistoryHours = 1;
+    public const int MinValidHistoryHours = 1;
 
-    /// <summary>Máximo aceite para <see cref="HistoryHours"/> (30 dias).</summary>
-    public const int MaxHistoryHours = 24 * 30;
+    /// <summary>
+    /// Máximo aceite para <see cref="HistoryHours"/> (60 dias). É o
+    /// limite superior (Max) da janela Min/Max e o tecto que suporta as
+    /// faixas de teste até 1000h.
+    /// </summary>
+    public const int MaxValidHistoryHours = 24 * 60;
+
+    /// <summary>
+    /// Default do limite mínimo da janela; 0 equivale ao comportamento
+    /// legacy (apenas o limite superior).
+    /// </summary>
+    public const int DefaultMinHistoryHours = 0;
 
     /// <summary>Limite de streams padrão por ciclo.</summary>
     public const int DefaultMaxStreams = 500;
@@ -45,8 +55,18 @@ public sealed class DiscoverySettings
     /// <summary>Termo de pesquisa padrão.</summary>
     public const string DefaultKeyword = "portugal";
 
-    /// <summary>Janela de pesquisa Telegram, em horas. Default: 24.</summary>
+    /// <summary>
+    /// Limite superior (Max) da janela de pesquisa Telegram, em horas.
+    /// Default: 24.
+    /// </summary>
     public int HistoryHours { get; set; } = DefaultHistoryHours;
+
+    /// <summary>
+    /// Limite mínimo (em horas) da idade das mensagens a processar.
+    /// Janela efectiva: <c>MinHistoryHours &lt;= idade &lt;= HistoryHours</c>.
+    /// Default: 0 — comportamento legacy (apenas o limite superior).
+    /// </summary>
+    public int MinHistoryHours { get; set; } = DefaultMinHistoryHours;
 
     /// <summary>Limite de streams testadas por ciclo. Default: 500.</summary>
     public int MaxStreams { get; set; } = DefaultMaxStreams;
@@ -57,6 +77,7 @@ public sealed class DiscoverySettings
     public DiscoverySettings Clone() => new()
     {
         HistoryHours = HistoryHours,
+        MinHistoryHours = MinHistoryHours,
         MaxStreams = MaxStreams,
         Keyword = Keyword,
     };
@@ -68,9 +89,14 @@ public sealed class DiscoverySettings
     /// </summary>
     public void Sanitize()
     {
-        if (HistoryHours < MinHistoryHours || HistoryHours > MaxHistoryHours)
+        if (HistoryHours < MinValidHistoryHours || HistoryHours > MaxValidHistoryHours)
         {
             HistoryHours = DefaultHistoryHours;
+        }
+
+        if (MinHistoryHours < 0 || MinHistoryHours > HistoryHours)
+        {
+            MinHistoryHours = DefaultMinHistoryHours;
         }
 
         if (MaxStreams < MinMaxStreams)
@@ -89,9 +115,21 @@ public sealed class DiscoverySettings
     /// </summary>
     public bool TryValidate(out string? error)
     {
-        if (HistoryHours < MinHistoryHours || HistoryHours > MaxHistoryHours)
+        if (HistoryHours < MinValidHistoryHours || HistoryHours > MaxValidHistoryHours)
         {
-            error = $"historyHours deve estar entre {MinHistoryHours} e {MaxHistoryHours}.";
+            error = $"historyHours deve estar entre {MinValidHistoryHours} e {MaxValidHistoryHours}.";
+            return false;
+        }
+
+        if (MinHistoryHours < 0)
+        {
+            error = "minHistoryHours deve ser >= 0.";
+            return false;
+        }
+
+        if (MinHistoryHours > HistoryHours)
+        {
+            error = $"minHistoryHours deve ser <= historyHours ({HistoryHours}).";
             return false;
         }
 
@@ -124,7 +162,7 @@ public sealed class DiscoverySettings
             effective.Keyword = keyword.Trim();
         }
 
-        if (historyHours is >= MinHistoryHours and <= MaxHistoryHours)
+        if (historyHours is >= MinValidHistoryHours and <= MaxValidHistoryHours)
         {
             effective.HistoryHours = historyHours.Value;
         }
@@ -132,6 +170,14 @@ public sealed class DiscoverySettings
         if (maxStreams is >= MinMaxStreams)
         {
             effective.MaxStreams = maxStreams.Value;
+        }
+
+        // Janela invertida após override do limite superior cai no
+        // comportamento legacy (sem limite inferior) — nunca numa
+        // janela vazia.
+        if (effective.MinHistoryHours > effective.HistoryHours)
+        {
+            effective.MinHistoryHours = DefaultMinHistoryHours;
         }
 
         return effective;

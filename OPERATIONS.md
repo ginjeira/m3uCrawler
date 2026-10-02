@@ -38,6 +38,8 @@ docker exec m3ucrawler ls /opt/playlists/playlist.m3u
 docker inspect --format '{{index .Config.Cmd}}' m3ucrawler | tr ',' '\n'
 ```
 
+> **Isolar faixas temporais do histórico (testes de janelas):** usar `--min-history-hours N --history-hours M` (ex.: `384→720`) selecciona apenas mensagens com idade entre N e M horas, sem reprocessar o histórico recente. `--min-history-hours 0` é o comportamento por omissão. Detalhe em `m3uCrawler/README.md` § "Janela de histórico da pesquisa Telegram (Min/Max)".
+
 > **Instalação nova:** `wtelegram.config`/`session.dat` podem ainda não
 > existir. Nesse caso o processo **não reinicia em loop** — o dashboard fica
 > acessível e a autenticação Telegram é feita em `Setup → Telegram`. Após

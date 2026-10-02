@@ -103,7 +103,8 @@ As opções abaixo são as efectivamente reconhecidas pelo `Program.cs`. Opçõe
 |---|---|
 | `--telegram` | Activa o modo de pesquisa via Telegram (com termo opcional seguido). |
 | `--telegram-maintain` | Activa o ciclo de manutenção (ver secção "Modo manutenção"). |
-| `--history-hours N` | Janela temporal para a pesquisa no Telegram (padrão: 48h). |
+| `--history-hours N` | Limite superior (Max) da janela temporal para a pesquisa no Telegram (padrão: 24h; máximo: 1440h). |
+| `--min-history-hours N` | Limite inferior (em horas) da idade das mensagens (padrão: 0 = comportamento legacy). |
 | `--max-streams N` | Limite de streams a testar por playlist. |
 | `--country CODIGO` | Código do país alvo para validação (padrão: `pt`). |
 | `--domain DOMINIO` | Filtra resultados para o domínio/subdomínio indicado. |
@@ -142,6 +143,18 @@ O pipeline reconhece candidatos Xtream Codes sem depender de keyword:
 - **URL de playlist Xtream** do tipo `http://host/get.php?type=m3u_plus` (ou `type=m3u`) — `IsXtreamPlaylistUrl` reconhece directamente e cria um candidato `RequiresContentVerification`.
 
 Estes candidatos são tratados exactamente como os outros: passam pelo mesmo gate de verificação de conteúdo (`#EXTM3U`), validação por país, extracção e teste de streams — **não há uma segunda pipeline paralela**. A descoberta permanece independente de keyword.
+
+### Janela de histórico da pesquisa Telegram (Min/Max)
+
+A pesquisa no Telegram considera apenas mensagens cuja idade satisfaz `MinHistoryHours <= idade da mensagem <= MaxHistoryHours`, onde `MaxHistoryHours` é o parâmetro/settings `HistoryHours` **já existente** e `MinHistoryHours` é o novo limite inferior (default `0`). Os dois limites são **inclusivos**: idade igual ao mínimo ou ao máximo é aceite.
+
+- `--history-hours N` continua a definir o limite superior (Max), com o comportamento actual (`floor` 1; tecto 1440h = 60 dias).
+- `--min-history-hours N` define o limite inferior (≥ 0). `MinHistoryHours = 0` equivale ao comportamento legacy (`0 <= idade <= Max`), sem excluir mensagens recentes.
+- **Isolar faixas temporais do histórico** (útil para testes reproduzíveis de janelas): `--min-history-hours 384 --history-hours 720` considera apenas mensagens com idade entre 384h e 720h, sem reprocessar o histórico recente. Outros exemplos de faixas: 0→384, 720→1000.
+- **Persistência:** mesma SSOT `runtime-data/app_settings.json`, secção `discovery` (`historyHours` + novo `minHistoryHours`). `GET /api/discovery/settings` devolve `minHistoryHours`; `POST /api/discovery/settings` aceita `minHistoryHours` opcional (semântica de patch). O contrato de `/api/run/start` mantém-se e usa a janela persistida.
+- **Validação:** `MinHistoryHours >= 0`, `MaxHistoryHours >= 0` e `MinHistoryHours <= MaxHistoryHours`. Valores inválidos são rejeitados na API (400) e os valores inválidos persistidos são normalizados para o default (`Min → 0`) pelo mecanismo `Sanitize` existente.
+
+A configuração da janela via UI e a integração com Schedule Min/Max ficam para wave futura.
 
 ## Parsing M3U (contrato W3)
 
@@ -472,7 +485,7 @@ Cada execução preenche um `RunReport` (em `Models/RunReport.cs`) com os seguin
 |---|---|
 | `StartedAt` / `FinishedAt` / `DurationMs` | Tempos da execução. |
 | `Status` | `pending` / `running` / `completed`. |
-| `MessagesAnalyzed` | Mensagens do Telegram dentro da janela `--history-hours`. |
+| `MessagesAnalyzed` | Mensagens do Telegram dentro da janela de histórico (entre `MinHistoryHours` e `HistoryHours`). |
 | `CandidatesFound` | Candidatos a playlist detectados. |
 | `PlaylistsDownloaded` | Playlists cujo conteúdo foi obtido com sucesso. |
 | `PlaylistsInvalid` | Playlists indisponíveis, vazias ou cujo conteúdo não é `#EXTM3U` (para candidatos "inspect"). |

@@ -26,6 +26,15 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
   - **Documentação:** `m3uCrawler/README.md` (enumeração das formas cobertas) e `AGENTS.md` §2 (invariante: representações sanitizadas são apenas de apresentação, nunca identidade interna primária).
 
 ### ✨ Adicionado
+- **História/janela de pesquisa Telegram em faixas Min/Max (2026-10-02).**
+  - **Objectivo:** isolar faixas temporais do histórico Telegram (ex.: 384→720h) para tornar reproduzíveis os testes de janelas — janelas diferentes produzem conjuntos de candidatos significativamente diferentes — sem reprocessar todo o histórico desde 0h.
+  - **Semântica:** `MinHistoryHours <= idade da mensagem <= MaxHistoryHours`, onde o Max é o `HistoryHours` existente; limites inclusivos; `MinHistoryHours = 0` equivale ao comportamento anterior.
+  - **Configuração:** novo campo `discovery.minHistoryHours` em `app_settings.json`, novo CLI `--min-history-hours N` e novo campo opcional `minHistoryHours` em `POST /api/discovery/settings` (`GET` devolve-o). `--history-hours` e o contrato de `/api/run/start` ficam inalterados.
+  - **Validação:** `MinHistoryHours >= 0`, `MaxHistoryHours >= 0` e `MinHistoryHours <= MaxHistoryHours`; inválidos rejeitados na API (400) e normalizados no store (`Sanitize`); tecto de `historyHours` alargado de 720 para 1440h (60 dias) para suportar faixas até 1000h+.
+  - **Implementação:** cutoffs Min/Max derivados do mesmo instante UTC por ciclo (invariante R1 preservado); `EnumerateDialogHistoryAsync` salta mensagens mais recentes que o mínimo sem terminar a paginação; wrappers/overloads legados mantêm o default `minHistoryHours = 0`.
+  - **Sem alterações a:** W-DEDUP, validação de streams, concorrência, resolução Xtream, aquisição/download, timeouts, Dispatcharr, `RunReport`. A configuração da janela na UI e o Schedule Min/Max ficam para wave futura.
+  - **Testes:** nova suite determinística de bandas (`TelegramHistoryWindowBandTests`) e extensões de settings/endpoint (`WaveCDiscoverySettingsTests`).
+  - **Documentação:** `m3uCrawler/README.md`, `DEPLOYMENT.md`, `OPERATIONS.md`.
 - **W-DEDUP — Deduplicação da validação física por run no discovery Telegram (2026-10-01).**
   - **Objectivo:** reduzir os GETs físicos repetidos quando várias contas do mesmo endpoint servem o mesmo canal, sem fundir contas, sem perder canais e sem fabricar observações históricas.
   - **Novo componente:** `ValidationKeyRegistry` (`m3uCrawler/Services/Validation/ValidationKeyRegistry.cs`) — registo de validação física de escopo **por run**, em memória, thread-safe (`ConcurrentDictionary` + `Interlocked`), **não persistido** (sem schema/migration, nada em `runtime-data`). Reset implícito a cada run (nova instância); `Reset()` existe para uso explícito. Estados: `InProgress`, `Working`, `FailedTerminal`, `FailedTransient`.

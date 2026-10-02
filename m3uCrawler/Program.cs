@@ -378,18 +378,27 @@ namespace m3uCrawler
                 int? cliHistoryHours = null;
                 var historyArg = GetOptionValue(args, "--history-hours");
                 if (int.TryParse(historyArg, out int parsedHistoryHours)
-                    && parsedHistoryHours >= DiscoverySettings.MinHistoryHours)
+                    && parsedHistoryHours >= DiscoverySettings.MinValidHistoryHours)
                 {
-                    cliHistoryHours = Math.Min(parsedHistoryHours, DiscoverySettings.MaxHistoryHours);
+                    cliHistoryHours = Math.Min(parsedHistoryHours, DiscoverySettings.MaxValidHistoryHours);
+                }
+
+                int? cliMinHistoryHours = null;
+                var minHistoryArg = GetOptionValue(args, "--min-history-hours");
+                if (int.TryParse(minHistoryArg, out int parsedMinHistoryHours)
+                    && parsedMinHistoryHours >= 0)
+                {
+                    cliMinHistoryHours = Math.Min(parsedMinHistoryHours, DiscoverySettings.MaxValidHistoryHours);
                 }
 
                 // CLI alimenta a mesma configuração: só persiste o que foi
                 // explicitamente indicado; os restantes campos mantêm-se.
-                if (!string.IsNullOrWhiteSpace(cliTerm) || cliMaxStreams.HasValue || cliHistoryHours.HasValue)
+                if (!string.IsNullOrWhiteSpace(cliTerm) || cliMaxStreams.HasValue || cliHistoryHours.HasValue || cliMinHistoryHours.HasValue)
                 {
                     var persistedForWrite = appSettingsStore.Load();
                     if (!string.IsNullOrWhiteSpace(cliTerm)) persistedForWrite.Discovery.Keyword = cliTerm!;
                     if (cliHistoryHours.HasValue) persistedForWrite.Discovery.HistoryHours = cliHistoryHours.Value;
+                    if (cliMinHistoryHours.HasValue) persistedForWrite.Discovery.MinHistoryHours = cliMinHistoryHours.Value;
                     if (cliMaxStreams.HasValue) persistedForWrite.Discovery.MaxStreams = cliMaxStreams.Value;
                     appSettingsStore.Save(persistedForWrite);
                 }
@@ -400,8 +409,16 @@ namespace m3uCrawler
                 string term = resolvedDiscovery.Keyword;
                 int telegramMaxStreams = resolvedDiscovery.MaxStreams;
                 int telegramHistoryHours = resolvedDiscovery.HistoryHours;
+                int telegramMinHistoryHours = resolvedDiscovery.MinHistoryHours;
                 Console.WriteLine($"🔎 Termo de pesquisa Telegram: {term}");
-                Console.WriteLine($"🕒 Janela de pesquisa Telegram: últimas {telegramHistoryHours}h");
+                if (telegramMinHistoryHours > 0)
+                {
+                    Console.WriteLine($"🕒 Janela de pesquisa Telegram: mensagens com idade entre {telegramMinHistoryHours}h e {telegramHistoryHours}h");
+                }
+                else
+                {
+                    Console.WriteLine($"🕒 Janela de pesquisa Telegram: últimas {telegramHistoryHours}h");
+                }
                 Console.WriteLine($"🎯 Limite de streams Telegram: {telegramMaxStreams}");
 
 
@@ -528,6 +545,7 @@ namespace m3uCrawler
                             maxConcurrency: 5,
                             maxUrlsToTest: effectiveDiscovery.MaxStreams,
                             historyHours: effectiveDiscovery.HistoryHours,
+                            minHistoryHours: effectiveDiscovery.MinHistoryHours,
                             countryCode: countryCode,
                             countriesDir: countriesDirectory,
                             pipelineIngestor: pipelineIngestor,
@@ -546,6 +564,7 @@ namespace m3uCrawler
                         effectiveDiscovery.MaxStreams,
                         domainFilter,
                         effectiveDiscovery.HistoryHours,
+                        effectiveDiscovery.MinHistoryHours,
                         args,
                         pipelineIngestor,
                         countryCode,
@@ -698,6 +717,7 @@ namespace m3uCrawler
                                 cycleDiscovery.MaxStreams,
                                 domainFilter,
                                 cycleDiscovery.HistoryHours,
+                                cycleDiscovery.MinHistoryHours,
                                 args,
                                 pipelineIngestor,
                                 countryCode,
@@ -735,6 +755,7 @@ namespace m3uCrawler
                                 maxConcurrency: 5,
                                 maxUrlsToTest: cycleDiscovery.MaxStreams,
                                 historyHours: cycleDiscovery.HistoryHours,
+                                minHistoryHours: cycleDiscovery.MinHistoryHours,
                                 countryCode: countryCode,
                                 countriesDir: countriesDirectory,
                                 pipelineIngestor: pipelineIngestor,
@@ -942,7 +963,7 @@ namespace m3uCrawler
                 
                 // Filter out known options from args to get search term
                 var searchArgs = new List<string>();
-                var skipWithValue = new HashSet<string> { "--max-streams", "--domain", "--web-port", "--web-token", "--bot-token", "--loop-hours", "--history-hours", "--max-results", "--user", "--pass" };
+                var skipWithValue = new HashSet<string> { "--max-streams", "--domain", "--web-port", "--web-token", "--bot-token", "--loop-hours", "--history-hours", "--min-history-hours", "--max-results", "--user", "--pass" };
                 for (int i = 0; i < args.Length; i++)
                 {
                     if (skipWithValue.Contains(args[i]))
@@ -1099,7 +1120,8 @@ namespace m3uCrawler
             Console.WriteLine("  --bot-token TOKEN Token do bot Telegram (também via M3U_BOT_TOKEN); obrigatorio com --bot");
             Console.WriteLine("  --scan-domain D   Faz scan direto ao domínio para procurar playlists (sem Telegram)");
             Console.WriteLine("  --telegram-maintain Mantém output/playlist.m3u com base no Telegram e remove links mortos");
-            Console.WriteLine("  --history-hours N Janela (em horas) para pesquisar mensagens no Telegram (padrão: 24)");
+            Console.WriteLine("  --history-hours N Limite superior (em horas) da janela de pesquisa Telegram (padrão: 24; máximo: 1440)");
+            Console.WriteLine("  --min-history-hours N Limite inferior (em horas) da idade das mensagens (padrão: 0 = legacy)");
             Console.WriteLine("  --loop-hours N    Repete execução a cada N horas (ex: 24)");
             Console.WriteLine("  --fast            Modo alta performance (20 conexões paralelas)");
             Console.WriteLine("  --high-performance Mesmo que --fast");
@@ -1348,6 +1370,7 @@ namespace m3uCrawler
             int telegramMaxStreams,
             string? domainFilter,
             int telegramHistoryHours,
+            int telegramMinHistoryHours,
             string[] args,
             PipelineIngestionService? pipelineIngestor,
             string countryCode = "pt",
@@ -1370,6 +1393,7 @@ namespace m3uCrawler
                 maxConcurrency: 5,
                 maxUrlsToTest: telegramMaxStreams,
                 historyHours: telegramHistoryHours,
+                minHistoryHours: telegramMinHistoryHours,
                 countryCode: countryCode,
                 countriesDir: countriesDir,
                 report: new RunReport(),

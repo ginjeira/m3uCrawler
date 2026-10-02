@@ -337,7 +337,8 @@ Lista das flags que afectam o comportamento do container, com referência ao hel
 | `--web-token TOKEN` | `Program.cs:44` | Bearer token para `Authorization` no dashboard. **Recomendado em produção.** `HttpListener` usa `CryptographicOperations.FixedTimeEquals` para timing-attack safety. |
 | `--telegram` | `Program.cs:73` | Activa o pipeline Telegram. |
 | `--telegram-maintain` | `Program.cs:139` | Modo manutenção (preserva `playlist.m3u`; ver `AGENTS.md`). |
-| `--history-hours N` | `Program.cs:131-137` | Janela de pesquisa Telegram (padrão: `48`, cap `24*30`). |
+| `--history-hours N` | `Program.cs:131-137` | Limite superior (Max) da janela de pesquisa Telegram (padrão: `24`, cap `1440`h = 60 dias). |
+| `--min-history-hours N` | `Program.cs` | Limite inferior (Min) da idade das mensagens da janela de pesquisa Telegram (padrão: `0` = comportamento legacy). |
 | `--loop-hours N` | `Program.cs:141-145` | Repete a cada N horas (loop infinito). |
 | `--max-streams N` | `Program.cs:124-128` (Telegram) / `:310-315` (scan-domain) | Limite de streams a testar (padrão Telegram: `500`, cap `5000`). |
 | `--country CODE` | config regional | País a usar na validação (ex.: `pt`). |

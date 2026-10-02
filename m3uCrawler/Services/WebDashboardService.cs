@@ -4305,6 +4305,9 @@ namespace m3uCrawler.Services
         [JsonPropertyName("historyHours")]
         public int? HistoryHours { get; set; }
 
+        [JsonPropertyName("minHistoryHours")]
+        public int? MinHistoryHours { get; set; }
+
         [JsonPropertyName("maxStreams")]
         public int? MaxStreams { get; set; }
 
@@ -9917,6 +9920,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
                 var current = store.Load();
                 var candidate = current.Discovery.Clone();
                 if (payload.HistoryHours.HasValue) candidate.HistoryHours = payload.HistoryHours.Value;
+                if (payload.MinHistoryHours.HasValue) candidate.MinHistoryHours = payload.MinHistoryHours.Value;
                 if (payload.MaxStreams.HasValue) candidate.MaxStreams = payload.MaxStreams.Value;
                 if (payload.Keyword is not null) candidate.Keyword = payload.Keyword;
 
@@ -9932,6 +9936,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
                 var beforeDiscovery = new
                 {
                     historyHours = current.Discovery.HistoryHours,
+                    minHistoryHours = current.Discovery.MinHistoryHours,
                     maxStreams = current.Discovery.MaxStreams,
                     keyword = current.Discovery.Keyword,
                 };
@@ -9942,6 +9947,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
                     new
                     {
                         historyHours = saved.Discovery.HistoryHours,
+                        minHistoryHours = saved.Discovery.MinHistoryHours,
                         maxStreams = saved.Discovery.MaxStreams,
                         keyword = saved.Discovery.Keyword,
                     },

@@ -343,7 +343,8 @@ namespace m3uCrawler.Services
             PipelineIngestionService? pipelineIngestor = null,
             string? pipelineSourceKey = null,
             ILiveRunProgress? liveRunProgress = null,
-            CancellationToken cancellationToken = default)
+            CancellationToken cancellationToken = default,
+            int minHistoryHours = 0)
         {
             var rep = report ?? new RunReport();
             rep.StartedAt = DateTime.UtcNow;
@@ -367,7 +368,7 @@ namespace m3uCrawler.Services
             var trace = _trace ?? m3uCrawler.Services.Validation.NullTraceSink.Instance;
             var runCtx = new m3uCrawler.Services.Validation.TraceContext { };
             trace.Information(m3uCrawler.Services.Validation.TraceCategory.RunStart, runCtx,
-                $"keyword='{keyword}' limit={limit} maxConcurrency={maxConcurrency} maxUrlsToTest={maxUrlsToTest} historyHours={historyHours} countryCode={countryCode}");
+                $"keyword='{keyword}' limit={limit} maxConcurrency={maxConcurrency} maxUrlsToTest={maxUrlsToTest} historyHours={historyHours} countryCode={countryCode} minHistoryHours={minHistoryHours}");
             trace.Information(m3uCrawler.Services.Validation.TraceCategory.RunParameters, runCtx,
                 $"source=Telegram countriesDir={countriesDir ?? "<default>"} pipelineIngestor={(pipelineIngestor != null ? "set" : "null")} pipelineSourceKey={pipelineSourceKey ?? "<null>"}");
 
@@ -555,6 +556,7 @@ namespace m3uCrawler.Services
                 messagesAnalyzed = await SearchM3UInTelegramInternal(
                     keyword, limit, historyHours, rep,
                     liveRunProgress: liveRunProgress,
+                    minHistoryHours: minHistoryHours,
                     onCandidateProduced: c =>
                     {
                         // PHASE-OBSERVABILITY: ChannelEnqueue event.
@@ -1057,7 +1059,8 @@ namespace m3uCrawler.Services
         private async Task<int> SearchM3UInTelegramInternal(
             string keyword, int limit = 200, int historyHours = 24, RunReport? report = null,
             Action<CandidatePlaylist>? onCandidateProduced = null,
-            ILiveRunProgress? liveRunProgress = null)
+            ILiveRunProgress? liveRunProgress = null,
+            int minHistoryHours = 0)
         {
             var candidates = new List<CandidatePlaylist>();
             // Publicacoes descobertas em qualquer mensagem: referencias Telegram
@@ -1105,7 +1108,15 @@ namespace m3uCrawler.Services
             // por dialogo. Agora o cutoff e' calculado UMA unica vez antes de iterar.
             // Se um dialogo demora muito a processar, mensagens no limite da janela
             // continuam elegiveis.
-            var cycleCutoff = DateTime.UtcNow.AddHours(-historyHours);
+            var cycleStartUtc = DateTime.UtcNow;
+            var cycleCutoff = cycleStartUtc.AddHours(-historyHours);
+            // W-HISTWIN (2026-10-02): limite inferior da janela (idade mínima).
+            // Derivado do MESMO instante cycleStartUtc para preservar o
+            // invariante R1 (um único par de cutoffs por ciclo). null = sem
+            // limite inferior (minHistoryHours = 0, comportamento legacy).
+            DateTime? cycleMinCutoff = minHistoryHours > 0
+                ? cycleStartUtc.AddHours(-minHistoryHours)
+                : null;
             if (report != null) report.DialogsTotal = dialogList.Length;
 
             foreach (var dialog in dialogList)
@@ -1178,7 +1189,8 @@ namespace m3uCrawler.Services
                             await ProcessOneTelegramMessageAsync(
                                 msg, chatTitle, report, discoveredPublications, candidates,
                                 onCandidateProduced, liveRunProgress);
-                        });
+                        },
+                        minCutoffDate: cycleMinCutoff);
                 }
                 catch (WTelegram.WTException ex) when (ex.Message.Contains("FLOOD_WAIT"))
                 {
@@ -1242,13 +1254,20 @@ namespace m3uCrawler.Services
         //   - resolvedPeer: ignorado (mantido por simetria da API anterior);
         //     a identificacao real do peer ja' foi feita no caller.
         //   - chatTitle: identificador legivel (usado apenas em logs).
-        //   - cutoffDate: cutoff temporal UNICO por ciclo (R1).
+        //   - cutoffDate: cutoff temporal UNICO por ciclo (R1). Limite
+        //     superior (Max) da janela; limites inclusivos.
         //   - pageFetcher: delegate que devolve a proxima pagina de
         //     mensagens para um dado offsetId. Pode lancar excepcoes
         //     (RpcError, IOException, FLOOD_WAIT, etc.).
         //   - onMessage: callback async invocado por cada mensagem que
         //     passou o filtro temporal. NAO e' invocado para mensagens
-        //     anteriores ao cutoff.
+        //     anteriores ao cutoff nem para mensagens mais recentes que
+        //     minCutoffDate.
+        //   - minCutoffDate: limite inferior (Min) opcional da janela,
+        //     tambem inclusivo. Mensagens mais recentes que este valor
+        //     sao saltadas SEM terminar a paginacao (a ordem e'
+        //     descendente; as mensagens dentro da faixa vem a seguir).
+        //     null = sem limite inferior (comportamento legacy).
         //
         // Comportamento:
         //   - Paginas sao obtidas em batches de 100.
@@ -1266,7 +1285,8 @@ namespace m3uCrawler.Services
             string chatTitle,
             DateTime cutoffDate,
             Func<int, Task<Messages_MessagesBase?>> pageFetcher,
-            Func<Message, Task> onMessage)
+            Func<Message, Task> onMessage,
+            DateTime? minCutoffDate = null)
         {
             int offsetId = 0;
             bool reachedCutoff = false;
@@ -1300,6 +1320,15 @@ namespace m3uCrawler.Services
                     {
                         reachedCutoff = true;
                         break;
+                    }
+
+                    // W-HISTWIN: limite inferior da janela. Mensagens mais recentes
+                    // que o mínimo são saltadas SEM terminar a paginação (a ordem é
+                    // descendente; as mensagens dentro da faixa vêm a seguir).
+                    // Limites inclusivos: m.date == minCutoffDate é aceite (idade == Min).
+                    if (minCutoffDate.HasValue && m.date > minCutoffDate.Value)
+                    {
+                        continue;
                     }
 
                     await onMessage(m);

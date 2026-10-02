@@ -142,14 +142,15 @@ public class WaveCDiscoverySettingsTests : IAsyncLifetime
     [Fact]
     public void DiscoverySettings_sanitizes_above_max_history_hours()
     {
-        var settings = new DiscoverySettings { HistoryHours = DiscoverySettings.MaxHistoryHours + 1 };
+        var settings = new DiscoverySettings { HistoryHours = DiscoverySettings.MaxValidHistoryHours + 1 };
         settings.Sanitize();
         Assert.Equal(DiscoverySettings.DefaultHistoryHours, settings.HistoryHours);
     }
 
     [Theory]
     [InlineData(0, 500, "portugal", false)]
-    [InlineData(721, 500, "portugal", false)]
+    [InlineData(721, 500, "portugal", true)]
+    [InlineData(1441, 500, "portugal", false)]
     [InlineData(1, 500, "portugal", true)]
     [InlineData(720, 500, "portugal", true)]
     [InlineData(24, 0, "portugal", false)]
@@ -172,6 +173,79 @@ public class WaveCDiscoverySettingsTests : IAsyncLifetime
         {
             Assert.False(string.IsNullOrWhiteSpace(error));
         }
+    }
+
+    [Fact]
+    public void DiscoverySettings_default_min_history_hours_is_zero()
+    {
+        var settings = new DiscoverySettings();
+        Assert.Equal(0, settings.MinHistoryHours);
+        Assert.Equal(DiscoverySettings.DefaultMinHistoryHours, settings.MinHistoryHours);
+    }
+
+    // Nota: a linha (0, 0, true) do plano colide com o invariante
+    // MinValidHistoryHours = 1 (historyHours = 0 é inválido, como já
+    // documenta DiscoverySettings_validate_enforces_ranges). Usa-se
+    // (0, 1, true) para exercitar "min = 0 aceite com o menor max válido".
+    [Theory]
+    [InlineData(0, 384, true)]
+    [InlineData(384, 720, true)]
+    [InlineData(720, 1000, true)]
+    [InlineData(0, 1, true)]
+    [InlineData(-1, 24, false)]
+    [InlineData(400, 384, false)]
+    [InlineData(1001, 1000, false)]
+    public void DiscoverySettings_validate_enforces_min_max_window(
+        int min, int max, bool expectedValid)
+    {
+        var settings = new DiscoverySettings
+        {
+            MinHistoryHours = min,
+            HistoryHours = max,
+            MaxStreams = 500,
+            Keyword = "portugal",
+        };
+
+        var valid = settings.TryValidate(out var error);
+
+        Assert.Equal(expectedValid, valid);
+        if (!expectedValid)
+        {
+            Assert.False(string.IsNullOrWhiteSpace(error));
+        }
+    }
+
+    [Fact]
+    public void DiscoverySettings_sanitizes_inverted_or_negative_min_to_zero()
+    {
+        var negative = new DiscoverySettings { MinHistoryHours = -5, HistoryHours = 24 };
+        negative.Sanitize();
+        Assert.Equal(0, negative.MinHistoryHours);
+
+        var inverted = new DiscoverySettings { MinHistoryHours = 800, HistoryHours = 100 };
+        inverted.Sanitize();
+        Assert.Equal(0, inverted.MinHistoryHours);
+        Assert.Equal(100, inverted.HistoryHours);
+    }
+
+    [Fact]
+    public void AppSettingsStore_persists_min_history_hours_round_trip()
+    {
+        var store = NewStore();
+        var settings = store.Load();
+        settings.Discovery = new DiscoverySettings
+        {
+            MinHistoryHours = 384,
+            HistoryHours = 720,
+            MaxStreams = 321,
+            Keyword = "iptv custom",
+        };
+        store.Save(settings);
+
+        var reloaded = new AppSettingsStore(_runtimeDataDir).Load();
+
+        Assert.Equal(384, reloaded.Discovery.MinHistoryHours);
+        Assert.Equal(720, reloaded.Discovery.HistoryHours);
     }
 
     // ==================== Precedência / resolução ====================
@@ -220,6 +294,36 @@ public class WaveCDiscoverySettingsTests : IAsyncLifetime
         Assert.Equal("persistido", invalidOverrides.Keyword);
         Assert.Equal(72, invalidOverrides.HistoryHours);
         Assert.Equal(900, invalidOverrides.MaxStreams);
+    }
+
+    [Fact]
+    public void Provider_resolve_resets_min_when_max_override_inverts_window()
+    {
+        var store = NewStore();
+        var provider = NewProvider();
+
+        var persisted = store.Load();
+        persisted.Discovery = new DiscoverySettings
+        {
+            MinHistoryHours = 400,
+            HistoryHours = 720,
+            MaxStreams = 500,
+            Keyword = "portugal",
+        };
+        store.Save(persisted);
+
+        var inverted = provider.Resolve(null, 100, null);
+        Assert.Equal(0, inverted.MinHistoryHours);
+        Assert.Equal(100, inverted.HistoryHours);
+
+        var compatiblePersisted = store.Load();
+        compatiblePersisted.Discovery.MinHistoryHours = 384;
+        compatiblePersisted.Discovery.HistoryHours = 720;
+        store.Save(compatiblePersisted);
+
+        var compatible = provider.Resolve(null, 720, null);
+        Assert.Equal(384, compatible.MinHistoryHours);
+        Assert.Equal(720, compatible.HistoryHours);
     }
 
     [Fact]
@@ -465,10 +569,83 @@ public class WaveCDiscoverySettingsTests : IAsyncLifetime
 
         var response = await PostWithCsrfAsync(
             harness, csrf,
-            JsonSerializer.Serialize(new { historyHours = 721, maxStreams = 100, keyword = "x" }));
+            JsonSerializer.Serialize(new { historyHours = 1441, maxStreams = 100, keyword = "x" }));
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
         Assert.Contains("historyHours", await response.Content.ReadAsStringAsync());
+    }
+
+    [Fact]
+    public async Task Get_discovery_settings_returns_min_history_hours()
+    {
+        var store = NewStore();
+        var settings = store.Load();
+        settings.Discovery = new DiscoverySettings
+        {
+            MinHistoryHours = 384,
+            HistoryHours = 720,
+            MaxStreams = 444,
+            Keyword = "guardado",
+        };
+        store.Save(settings);
+
+        var harness = StartHarness(withAuth: true);
+        await ReachReadyAndLoginAsync(harness);
+
+        var get = await harness.Client.GetAsync("/api/discovery/settings");
+        Assert.Equal(HttpStatusCode.OK, get.StatusCode);
+        using var doc = JsonDocument.Parse(await get.Content.ReadAsStringAsync());
+        Assert.Equal(384, doc.RootElement.GetProperty("minHistoryHours").GetInt32());
+        Assert.Equal(720, doc.RootElement.GetProperty("historyHours").GetInt32());
+    }
+
+    [Fact]
+    public async Task Post_discovery_settings_persists_min_and_max_window()
+    {
+        var harness = StartHarness(withAuth: true);
+        var csrf = await ReachReadyAndLoginAsync(harness);
+
+        var valid = await PostWithCsrfAsync(
+            harness, csrf,
+            JsonSerializer.Serialize(new { historyHours = 720, minHistoryHours = 384, maxStreams = 100, keyword = "novo" }));
+        Assert.Equal(HttpStatusCode.OK, valid.StatusCode);
+        using (var doc = JsonDocument.Parse(await valid.Content.ReadAsStringAsync()))
+        {
+            Assert.Equal(384, doc.RootElement.GetProperty("minHistoryHours").GetInt32());
+            Assert.Equal(720, doc.RootElement.GetProperty("historyHours").GetInt32());
+        }
+
+        var persisted = new AppSettingsStore(_runtimeDataDir).Load().Discovery;
+        Assert.Equal(384, persisted.MinHistoryHours);
+        Assert.Equal(720, persisted.HistoryHours);
+    }
+
+    [Fact]
+    public async Task Post_discovery_settings_rejects_min_above_max()
+    {
+        var harness = StartHarness(withAuth: true);
+        var csrf = await ReachReadyAndLoginAsync(harness);
+
+        var response = await PostWithCsrfAsync(
+            harness, csrf,
+            JsonSerializer.Serialize(new { historyHours = 384, minHistoryHours = 500 }));
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Contains("minHistoryHours", await response.Content.ReadAsStringAsync());
+    }
+
+    [Fact]
+    public async Task Post_discovery_settings_rejects_negative_min()
+    {
+        var harness = StartHarness(withAuth: true);
+        var csrf = await ReachReadyAndLoginAsync(harness);
+
+        var response = await PostWithCsrfAsync(
+            harness, csrf,
+            JsonSerializer.Serialize(new { minHistoryHours = -1 }));
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Contains("minHistoryHours", await response.Content.ReadAsStringAsync());
     }
 
     [Fact]
