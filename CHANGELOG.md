@@ -26,6 +26,12 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
   - **Documentação:** `m3uCrawler/README.md` (enumeração das formas cobertas) e `AGENTS.md` §2 (invariante: representações sanitizadas são apenas de apresentação, nunca identidade interna primária).
 
 ### ✨ Adicionado
+- **Proveniência da mensagem Telegram no relatório de descoberta (2026-10-02).**
+  - **Objectivo:** correlacionar operacionalmente `Run → Mensagem Telegram (id, data/hora, chat) → Candidate → Resultado`, complementando a janela Min/Max do histórico para testes temporais auditáveis.
+  - **Modelo:** `CandidatePlaylist` ganha `SourceMessageId`/`SourceMessageDateUtc`; `DiscoveredPlaylist` ganha `CandidateId`/`MessageId`/`MessageDateUtc`, aplicados a partir da mensagem enumerada e herdados pelos candidatos Xtream derivados (`PromoteXtreamAccount`); promoções de referências `t.me/c/...` ficam com `messageId` (mensagem referenciada) e data nula.
+  - **Exposição:** os campos aparecem em `output/telegram_run_report.json` (`discoveredPlaylists`) e em `GET /api/discovered-playlists` — sem novo artefacto, endpoint ou UI.
+  - **Limitações documentadas:** candidatos que falham antes do parse não geram linha em `discoveredPlaylists`; proveniência nula fora do caminho de mensagens enumeradas (ex.: `--scan-domain`).
+  - **Sem alterações a:** W-DEDUP, validação de streams, concorrência, resolução Xtream, aquisição, Dispatcharr, trace.
 - **História/janela de pesquisa Telegram em faixas Min/Max (2026-10-02).**
   - **Objectivo:** isolar faixas temporais do histórico Telegram (ex.: 384→720h) para tornar reproduzíveis os testes de janelas — janelas diferentes produzem conjuntos de candidatos significativamente diferentes — sem reprocessar todo o histórico desde 0h.
   - **Semântica:** `MinHistoryHours <= idade da mensagem <= MaxHistoryHours`, onde o Max é o `HistoryHours` existente; limites inclusivos; `MinHistoryHours = 0` equivale ao comportamento anterior.

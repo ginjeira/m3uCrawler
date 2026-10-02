@@ -877,7 +877,11 @@ namespace m3uCrawler.Services
                         xIdx++;
 
                         var playlistUrl = acc.M3uUrl ?? BuildXtreamPlaylistUrl(acc);
-                        var promoted = PromoteXtreamAccount(playlistUrl, candidate.Url ?? string.Empty);
+                        var promoted = PromoteXtreamAccount(
+                            playlistUrl,
+                            candidate.Url ?? string.Empty,
+                            candidate.SourceMessageId,
+                            candidate.SourceMessageDateUtc);
                         if (promoted != null)
                         {
                             resTrace.Information(m3uCrawler.Services.Validation.TraceCategory.CandidatePromoted, new m3uCrawler.Services.Validation.TraceContext
@@ -958,7 +962,10 @@ namespace m3uCrawler.Services
                 Name = Display(candidate),
                 CountryDetected = analysis.IsTargetCountry ? countryCode : string.Empty,
                 ChannelsRecognized = analysis.RecognizedChannelCount,
-                State = analysis.IsTargetCountry ? "accepted" : "rejected"
+                State = analysis.IsTargetCountry ? "accepted" : "rejected",
+                CandidateId = candidate.Id,
+                MessageId = candidate.SourceMessageId,
+                MessageDateUtc = candidate.SourceMessageDateUtc,
             };
 
             if (!analysis.IsTargetCountry)
@@ -1234,7 +1241,9 @@ namespace m3uCrawler.Services
                     foreach (var acc in res.XtreamAccounts)
                     {
                         var playlistUrl = acc.M3uUrl ?? BuildXtreamPlaylistUrl(acc);
-                        var promoted = PromoteXtreamAccount(playlistUrl, res.ReferenceUrl);
+                        // W-HISTWIN-PROV: a mensagem de origem é a t.me/c referenciada (res.MessageId);
+                        // a data não está disponível na resolução — fica null.
+                        var promoted = PromoteXtreamAccount(playlistUrl, res.ReferenceUrl, res.MessageId);
                         if (promoted != null)
                         {
                             candidates.Add(promoted);
@@ -1519,7 +1528,7 @@ namespace m3uCrawler.Services
 
             foreach (var candidate in found)
             {
-                candidate.Source = chatTitle;
+                ApplyTelegramMessageProvenance(candidate, chatTitle, m.ID, m.date);
                 candidates.Add(candidate);
                 // Candidados devem ser contados incrementalmente (consistente com
                 // a semantica anterior: rep.CandidatesFound = candidates.Count
@@ -1527,6 +1536,19 @@ namespace m3uCrawler.Services
                 if (report != null) report.CandidatesFound++;
                 onCandidateProduced?.Invoke(candidate);
             }
+        }
+
+        // ==== W-HISTWIN-PROV (2026-10-02): proveniência mensagem → candidate ====
+        // Isolado em helper interno estático para ser testado sem rede (mesmo
+        // padrão de EnumerateDialogHistoryAsync). Aplica a proveniência da
+        // mensagem Telegram de origem a um candidate: chat title (Source),
+        // id e data/hora UTC da mensagem.
+        internal static void ApplyTelegramMessageProvenance(
+            CandidatePlaylist candidate, string chatTitle, long messageId, DateTime messageDateUtc)
+        {
+            candidate.Source = chatTitle;
+            candidate.SourceMessageId = messageId;
+            candidate.SourceMessageDateUtc = messageDateUtc;
         }
 
         // ==== Registo de dialogo incompleto (R2) ====
@@ -2305,8 +2327,14 @@ namespace m3uCrawler.Services
         /// entrar no pipeline Xtream/M3U existente. O Source e' o URL publico da
         /// publicacao (sem credenciais) para que DiscoveredPlaylists/RunReport nao
         /// exponham segredos.
+        /// A proveniência da mensagem de origem (id/data) é herdada dos parâmetros opcionais;
+        /// o Source mantém o URL público da publicação (sem credenciais).
         /// </summary>
-        internal static CandidatePlaylist? PromoteXtreamAccount(string? playlistUrl, string publicationUrl)
+        internal static CandidatePlaylist? PromoteXtreamAccount(
+            string? playlistUrl,
+            string publicationUrl,
+            long? sourceMessageId = null,
+            DateTime? sourceMessageDateUtc = null)
         {
             if (string.IsNullOrWhiteSpace(playlistUrl)) return null;
             return new CandidatePlaylist
@@ -2315,7 +2343,9 @@ namespace m3uCrawler.Services
                 Url = playlistUrl,
                 Source = $"xtream publication: {publicationUrl}",
                 DetectedFrom = "xtream publication",
-                RequiresContentVerification = true
+                RequiresContentVerification = true,
+                SourceMessageId = sourceMessageId,
+                SourceMessageDateUtc = sourceMessageDateUtc
             };
         }
 

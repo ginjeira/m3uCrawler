@@ -192,7 +192,10 @@ public class WebDashboardServiceTests
             ChannelsRecognized = 5,
             StreamCount = 100,
             WorkingStreams = 80,
-            State = "ok"
+            State = "ok",
+            CandidateId = "c1",
+            MessageId = 42,
+            MessageDateUtc = new DateTime(2026, 10, 2, 12, 0, 0, DateTimeKind.Utc)
         };
 
         var json = JsonSerializer.Serialize(item, DashboardJsonOptions);
@@ -204,6 +207,9 @@ public class WebDashboardServiceTests
         Assert.Contains("\"streamCount\"", json);
         Assert.Contains("\"workingStreams\"", json);
         Assert.Contains("\"state\"", json);
+        Assert.Contains("\"candidateId\"", json);
+        Assert.Contains("\"messageId\"", json);
+        Assert.Contains("\"messageDateUtc\"", json);
         Assert.DoesNotContain("\"CountryDetected\"", json);
         Assert.DoesNotContain("\"WorkingStreams\"", json);
     }

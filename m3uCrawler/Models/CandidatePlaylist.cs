@@ -28,5 +28,20 @@ namespace m3uCrawler.Models
         /// HTTP tem de ser confirmado como #EXTM3U antes de o candidato ser tratado como playlist.
         /// </summary>
         public bool RequiresContentVerification { get; set; }
+
+        /// <summary>
+        /// W-HISTWIN-PROV (2026-10-02): id da mensagem Telegram de origem (m.ID).
+        /// null quando o candidate não veio de uma mensagem enumerada
+        /// (ex.: --scan-domain) — a proveniência é opt-in por origem.
+        /// </summary>
+        public long? SourceMessageId { get; set; }
+
+        /// <summary>
+        /// W-HISTWIN-PROV (2026-10-02): data/hora UTC da mensagem Telegram de origem
+        /// (m.date, UTC por contrato WTelegram). null nos mesmos casos de
+        /// <see cref="SourceMessageId"/> e nas promoções t.me/c resolvidas
+        /// pós-enumeração (a resolução não devolve a data da mensagem).
+        /// </summary>
+        public DateTime? SourceMessageDateUtc { get; set; }
     }
 }

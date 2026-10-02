@@ -47,6 +47,15 @@ namespace m3uCrawler.Models
 
         public int WorkingStreams { get; set; }
         public string State { get; set; } = string.Empty;
+
+        // W-HISTWIN-PROV (2026-10-02): proveniência da mensagem Telegram de origem do
+        // candidate que gerou esta playlist, para permitir reconstruir
+        // Run → mensagem (id, data, chat em Source) → candidate → resultado.
+        // null quando o candidate não veio de uma mensagem enumerada (ex.: --scan-domain)
+        // ou nas promoções t.me/c (id presente, data não disponível na resolução).
+        public string? CandidateId { get; set; }
+        public long? MessageId { get; set; }
+        public DateTime? MessageDateUtc { get; set; }
     }
 
     /// <summary>

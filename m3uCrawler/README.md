@@ -156,6 +156,31 @@ A pesquisa no Telegram considera apenas mensagens cuja idade satisfaz `MinHistor
 
 A configuração da janela via UI e a integração com Schedule Min/Max ficam para wave futura.
 
+### Proveniência da mensagem de origem (candidate → playlist)
+
+Cada `DiscoveredPlaylist` exposto em `output/telegram_run_report.json` (lista `discoveredPlaylists`) e em `GET /api/discovered-playlists` passa a incluir a proveniência da mensagem Telegram que originou o candidate:
+
+- `candidateId` — identifica o `CandidatePlaylist` de origem;
+- `messageId` — id da mensagem Telegram de origem;
+- `messageDateUtc` — data/hora UTC dessa mensagem; o título do chat continua em `source` (para candidatos Xtream derivados, `source` permanece o URL público da publicação, comportamento inalterado).
+
+A regra de correlação é:
+
+```text
+Run → Mensagem (id, data/hora UTC, chat) → Candidate → Resultado (state/workingStreams)
+```
+
+Permite reconstruir operacionalmente a cadeia completa sem novo artefacto, endpoint ou UI.
+
+Limitações actuais (estado honesto):
+
+- candidates que falham **antes** do parse (download falhado, conteúdo não-`#EXTM3U`, parse inválido) não geram `DiscoveredPlaylist` — existem apenas como contadores/`rejectionReasons`, sem linha de proveniência;
+- candidates promovidos de referências `t.me/c/...` resolvidas pós-enumeração têm `messageId` (a mensagem referenciada) mas `messageDateUtc` nulo (a resolução não devolve a data);
+- candidates fora do caminho de mensagens enumeradas (ex.: `--scan-domain`) têm proveniência nula;
+- `telegram_run_report.json` é sobrescrito a cada run.
+
+**Ligação à janela Min/Max** (ver secção anterior): correlacionar cada candidate com a data/hora da mensagem que o originou permite confirmar que os candidates de uma faixa vêm exactamente das mensagens dessa faixa, tornando os testes de janelas auditáveis e reproduzíveis. Nota operacional: como `telegram_run_report.json` é sobrescrito a cada execução, copiar o ficheiro após cada run para comparar faixas Min/Max lado-a-lado.
+
 ## Parsing M3U (contrato W3)
 
 O parsing de playlists está centralizado em `m3uCrawler/Services/M3uParserService.cs`, com o contrato normativo em `docs/Reestructure/04-PLAYLIST-STREAM.md` §7. Todos os consumidores (pipeline Telegram, `PlaylistReader`, `PlaylistManagerService`) convergem neste contrato.
