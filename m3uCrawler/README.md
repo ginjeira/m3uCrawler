@@ -1355,7 +1355,53 @@ O formulário de criação/actualização inclui um auxiliar de frequência/hora
 
 ### Limitação operacional conhecida (processo)
 
-O scheduler só existe enquanto o processo estiver vivo e o runner só é arrancado com `--web`. Num arranque `--telegram --web` **sem** `--loop-hours` e **sem** `--telegram-maintain`, o processo conclui o ciclo Telegram e termina, fazendo parar o dashboard e o scheduler. Como manter o runtime vivo é uma **decisão em aberto** para uma wave futura; esta limitação é registada aqui, sem alteração de comportamento nesta wave.
+Resolvida (W-LIFECYCLE-IMPLEMENTATION, 2026-10-02): o processo é residente com `--web`, independentemente de `--loop-hours`. Ver § "Processo residente e shutdown" abaixo.
+
+## Processo residente e shutdown
+
+### Residência do processo
+
+Com `--web`, o processo é residente: Dashboard, Scheduler (`ScheduledJobRunner`) e RunCoordinator (`LiveRunHost`) partilham o MESMO processo. Depois de um ciclo Telegram one-shot, o processo continua vivo e o Dashboard/Scheduler continuam disponíveis para execuções agendadas (cron) e manuais (botão "Run now").
+
+Cenários de lifecycle:
+
+| Comando | Ciclo Telegram | Processo termina? |
+|---|---|---|
+| `--telegram` (sem `--web`) | 1 ciclo | **Sim** — one-shot preservado (COMPORTAMENTO CLI) |
+| `--telegram --web` (sem `--telegram-maintain`) | 1 ciclo | **Não** — residente |
+| `--telegram-maintain --web` (sem `--loop-hours`) | 1 ciclo (se READY) | **Não** — residente |
+| `--telegram --web --loop-hours N` | Ciclos a cada N horas | **Não** — residente pelo loop (semântica inalterada) |
+| `--web` (sem `--telegram`) | — | **Não** — residente (dashboard standalone) |
+| `--telegram --web` + lifecycle não READY | **não acontece** | **Não** — residente com Dashboard disponível para Setup |
+
+Às 4 situações residentes corresponde um único padrão em `Program.cs`, extraído no helper `AwaitResidentDashboardAsync(webTask, automationHost, …)`, que espera pelo `webTask` (que termina quando o token de processo for cancelado ou o listener colapse) e, no fim, faz `Dispose()` do host do Scheduler. O `TestTempDb`-equivalente de teste é `ProgramLifecycleResidencyTests`.
+
+### Shutdown coerente
+
+O processo tem um `CancellationTokenSource` partilhado (`processCts`) criado no arranque e propagado ao `HttpListener` do Dashboard; os sinais documentados são:
+
+- **Ctrl+C / SIGINT:** capturado por `Console.CancelKeyPress`; `e.Cancel = true` e inicio do shutdown ordenado.
+- **SIGTERM / `docker stop` / systemd:** capturado via `AppDomain.CurrentDomain.ProcessExit`.
+
+A sequência de shutdown é sempre a mesma:
+
+1. **Sinalizar:** `processCts.Cancel()` — o token global é cancelado; novas execuções agendadas/manuais são bloqueadas.
+2. **Scheduler:** `automationHost.StopAsync()` — `CancellationTokenSource` interno do runner é cancelado, propagando cancellation às acções em curso que o respeitem. Existe limite de drain documentado de **10 segundos** — se uma action em curso não respeitar cancellation, o shutdown termina por força e o log regista explicitamente `Scheduler não terminou dentro do limite` (nunca mascaredo como saída normal).
+3. **Dashboard:** `WebDashboardService.StopDashboard()` — para o `HttpListener`, desbloqueia o `GetContextAsync()` pendente e permite que o loop termine sem registar qualquer `ObjectDisposedException` como falha.
+4. **Sair:** `Main` juntamente com o `webTask` no caminho residente, faz `Dispose()` do scheduler host, devolve normalmente.
+
+A ordem de sinalização é Única: se Ctrl+C e SIGTERM chegam em simultâneo, o shutdown corre só uma vez (contador interlocked).
+
+Sem Generic Host, sem Kestrel, sem `IHostedService`: o mecanismo é nativo (`CancellationTokenSource`, `Console.CancelKeyPress`, `AppDomain.CurrentDomain.ProcessExit`) e não introduz uma nova abstracção de hosting. Preserva o invariante do `AGENTS.md` §2 — o `HttpListener` é arrancado no top-level de `Main`, e a respetiva autenticação com `--web-token` não é alterada.
+
+### Papel de `--loop-hours` nesta wave
+
+A semântica de `--loop-hours N` NÃO foi alterada nesta wave (nem o `docker-compose.yml` do repo, que continua com `--loop-hours 24`). É ainda um mecanismo de recorrência CLI válido e independente do novo mecanismo de residency:
+
+- `--loop-hours N` mantém o **processo** vivo entre ciclos (não pelo Dashboard, mas pelo próprio `do/while` CLI).
+- O Scheduler pode também agendar ciclos Telegram (`telegramRun` / `telegramMaintainRun`), mas **nunca em simultâneo** com uma execução CLI em curso — a proteção por CAS do `RunCoordinator` garante que só um ciclo corre de cada vez (409 `already-running` / `blocked:already-running`).
+
+Uma wave posterior (**não esta**) poderá avaliar retirar `--loop-hours` do compose, deixando o Scheduler como único motor de cadência — só depois de validado em runtime, com um job Telegram persistido em `scheduled_jobs`.
 
 ## Comportamento funcional
 

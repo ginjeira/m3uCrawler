@@ -72,6 +72,11 @@ namespace m3uCrawler
             // Default: false. Sem esta flag, POST /api/run/start devolve
             // 503 web-allow-trigger-disabled (regra congelada).
             bool webAllowTrigger = webEnabled && args.Contains("--web-allow-trigger");
+
+            // Lifecycle do processo residente: token partilhado entre
+            // Dashboard, Scheduler e mecanismo de shutdown (Ctrl+C / SIGTERM).
+            var processCts = new System.Threading.CancellationTokenSource();
+
             Task? webTask = null;
             CatalogResolver? webCatalogResolver = null;
             ScheduledAutomationHost? automationHost = null;
@@ -251,6 +256,7 @@ namespace m3uCrawler
                         capabilityGate: new ActionCapabilityGate(operationalReadiness));
                     WebDashboardService.SetScheduledActions(automationHost.RegisteredActions);
                     automationHost.Start();
+                    Console.WriteLine("📅 Scheduler iniciado (polling de scheduled jobs).");
                     Console.WriteLine(
                         $"🕒 ScheduledJobRunner activo ({automationHost.RegisteredActions.Count} actions registadas).");
                 }
@@ -259,7 +265,7 @@ namespace m3uCrawler
                     Console.WriteLine($"⚠️ Catálogo não disponível para o dashboard: {ex.Message}");
                 }
 
-                webTask = WebDashboardService.RunDashboardAsync(dashboardOutputDir, webPort, dashboardHistoryService, webToken, CancellationToken.None);
+                webTask = WebDashboardService.RunDashboardAsync(dashboardOutputDir, webPort, dashboardHistoryService, webToken, processCts.Token);
                 _ = webTask.ContinueWith(t =>
                 {
                     if (t.IsFaulted && t.Exception != null)
@@ -269,23 +275,88 @@ namespace m3uCrawler
                 }, TaskContinuationOptions.OnlyOnFaulted);
             }
 
-            // PHASE 12 — Shutdown limpo: Ctrl+C pára o runner antes da app sair.
-            if (automationHost is not null)
+            // Lifecycle — Shutdown coerente: Ctrl+C e SIGTERM sinalizam o
+            // token do processo, depois fazem drain do Scheduler (com
+            // limite documentado para actions que não respeitam
+            // cancellation), e por fim param o listener do Dashboard. Esta
+            // ordem evita tarefas órfãs e garante que GetContextAsync()
+            // não fica bloqueado indefinidamente.
+            //
+            // Limite de drain do Scheduler: se uma action pendurar e não
+            // respeitar cancellation, o shutdown termina por timeout e é
+            // registado explicitamente como terminado por força — nunca
+            // mascarado como shutdown normal silencioso.
+            const int SchedulerDrainTimeoutSeconds = 10;
+            int shutdownInvocationCount = 0;
+
+            void CoherentShutdown(string reason)
             {
-                ConsoleCancelEventHandler cancelHandler = (_, e) =>
+                int invocation = System.Threading.Interlocked.Increment(ref shutdownInvocationCount);
+                if (invocation > 1)
                 {
-                    e.Cancel = true;
+                    return; // Shutdown já em curso; sinal único.
+                }
+
+                Console.WriteLine($"🛑 Shutdown solicitado ({reason}).");
+
+                // 1-2) Sinalizar o token global e impedir novos trabalhos.
+                processCts.Cancel();
+                Console.WriteLine("🛑 Token de processo cancelado; novas execuções bloqueadas.");
+
+                // 3-4) Pedir ao Scheduler para parar; drain cooperativo das
+                //       actions em curso (recebem o token do runner).
+                if (automationHost is not null)
+                {
+                    Console.WriteLine("🛑 Scheduler stopping...");
                     try
                     {
-                        automationHost.StopAsync().GetAwaiter().GetResult();
+                        var stopTask = automationHost.StopAsync();
+                        if (!stopTask.Wait(SchedulerDrainTimeoutSeconds * 1000))
+                        {
+                            Console.WriteLine(
+                                "🛑 ⚠️ Scheduler não terminou dentro do limite de drain " +
+                                $"({SchedulerDrainTimeoutSeconds}s). Shutdown continua por força — " +
+                                "o Main não aguarda mais pelo runner.");
+                        }
+                        else
+                        {
+                            Console.WriteLine("🛑 Scheduler stopping... parado.");
+                        }
                     }
                     catch (Exception ex)
                     {
                         Console.WriteLine($"⚠️ Erro ao parar ScheduledJobRunner: {ex.Message}");
                     }
-                };
-                Console.CancelKeyPress += cancelHandler;
+                }
+
+                // 5) Parar o HttpListener — desbloqueia GetContextAsync()
+                //    pendente e permite que o webTask devolva.
+                try
+                {
+                    WebDashboardService.StopDashboard();
+                    Console.WriteLine("🛑 Dashboard stopping... listener parado.");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"⚠️ Erro ao parar listener do dashboard: {ex.Message}");
+                }
+
+                Console.WriteLine("🛑 Shutdown: cleanup orquestrado concluído; Main vai terminar.");
             }
+
+            // Ctrl+C: sinaliza ao mecanismo de lifecycle — o shutdown
+            // ordenado corre no callback sincronamente, mantendo o processo
+            // vivo até cleanup estar concluído.
+            ConsoleCancelEventHandler cancelHandler = (_, e) =>
+            {
+                e.Cancel = true;
+                CoherentShutdown("Ctrl+C");
+            };
+            Console.CancelKeyPress += cancelHandler;
+
+            // SIGTERM (docker stop, kill -TERM, systemd): ProcessExit corre
+            // sincronamente e dá a oportunidade de cleanup ordenado.
+            AppDomain.CurrentDomain.ProcessExit += (s, e) => CoherentShutdown("SIGTERM/ProcessExit");
 
             if (args.Contains("--telegram"))
             {
@@ -647,18 +718,9 @@ namespace m3uCrawler
                     // Aqui apenas não corremos o ciclo CLI imediato.
                     if (webEnabled && webTask is not null)
                     {
-                        Console.WriteLine(
-                            $"🌐 Dashboard activo em http://+:{webPort}/ (Telegram pendente de Setup).");
-                        try
-                        {
-                            await webTask;
-                        }
-                        catch (Exception ex)
-                        {
-                            Console.WriteLine($"❌ Dashboard task falhou: {ex.GetBaseException().Message}");
-                        }
-
-                        automationHost?.Dispose();
+                        await AwaitResidentDashboardAsync(webTask, automationHost,
+                            $"🌐 Dashboard activo em http://+:{webPort}/ (Telegram pendente de Setup). " +
+                            "CTRL+C para encerrar.");
                     }
 
                     return;
@@ -672,6 +734,12 @@ namespace m3uCrawler
                             $"⛔ automatic discovery blocked: not configured (state={configurationGate.State.ToWireName()})");
                         if (loopHours <= 0)
                         {
+                            if (webEnabled && webTask is not null)
+                            {
+                                await AwaitResidentDashboardAsync(webTask, automationHost,
+                                    "⛔ Discovery automática bloqueada (lifecycle não READY). " +
+                                    $"Processo residente activo: Dashboard+Scheduler em http://+:{webPort}/. CTRL+C para encerrar.");
+                            }
                             return;
                         }
                         Console.WriteLine();
@@ -783,6 +851,18 @@ namespace m3uCrawler
                     }
                 }
                 while (loopHours > 0);
+
+                // Lifecycle residente — O ciclo Telegram one-shot terminou
+                // (loopHours == 0). COM --web, o processo permanece vivo:
+                // Dashboard + Scheduler + LiveRunHost continuam disponíveis
+                // para execuções agendadas/manuais. SEM --web, termina
+                // imediatamente (comportamento CLI one-shot preservado).
+                if (webEnabled && webTask is not null)
+                {
+                    await AwaitResidentDashboardAsync(webTask, automationHost,
+                        $"🌐 Ciclo Telegram concluído. Processo residente activo: " +
+                        $"Dashboard+Scheduler em http://+:{webPort}/. CTRL+C para encerrar.");
+                }
 
                 return;
             }
@@ -940,10 +1020,8 @@ namespace m3uCrawler
             // modo M3U8-search legacy (prompts interactivos).
             if (webEnabled && webTask is not null)
             {
-                Console.WriteLine("🌐 Modo dashboard standalone activo. Aguardando pedidos em http://+:" + webPort + "/");
-                try { await webTask; }
-                catch (Exception ex) { Console.WriteLine($"❌ Dashboard task falhou: {ex.GetBaseException().Message}"); }
-                automationHost?.Dispose();
+                await AwaitResidentDashboardAsync(webTask, automationHost,
+                    $"🌐 Modo dashboard standalone activo. Aguardando pedidos em http://+:{webPort}/. CTRL+C para encerrar.");
                 return;
             }
 
@@ -1155,6 +1233,41 @@ namespace m3uCrawler
             }
 
             return null;
+        }
+
+        /// <summary>
+        /// Lifecycle residente — mantém o processo vivo enquanto o
+        /// Dashboard/Scheduler estiverem activos. Junta-se ao webTask
+        /// (que termina quando o token de processo for cancelado ou o
+        /// listener for parado) e depois liberta o Scheduler. É o padrão
+        /// único usado nos QUATRO caminhos residentes:
+        ///   - <c>--telegram --web</c> com Telegram pendente de Setup;
+        ///   - <c>--telegram --web --telegram-maintain</c> com lifecycle
+        ///     não READY (discovery automática bloqueada, loopHours==0);
+        ///   - <c>--telegram --web</c> após o ciclo one-shot (loopHours==0);
+        ///   - <c>--web</c> standalone.
+        /// </summary>
+        internal static async Task AwaitResidentDashboardAsync(
+            Task? webTask,
+            ScheduledAutomationHost? automationHost,
+            string modeMessage)
+        {
+            Console.WriteLine(modeMessage);
+            if (webTask is null)
+            {
+                return;
+            }
+
+            try
+            {
+                await webTask;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"❌ Dashboard task falhou: {ex.GetBaseException().Message}");
+            }
+
+            automationHost?.Dispose();
         }
 
         /// <summary>

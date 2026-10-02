@@ -7,6 +7,13 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Unreleased]
 
+### ✨ Adicionado
+- **W-LIFECYCLE-IMPLEMENTATION — processo residente com Dashboard + Scheduler no mesmo processo (2026-10-02).**
+  - **Residency:** com `--telegram --web` (e sem `--loop-hours`), o processo NÃO termina depois do ciclo Telegram: Dashboard, Scheduler (`ScheduledJobRunner`) e RunCoordinator permanecem disponíveis para execuções agendadas e manuais. O fim do ciclo Telegram one-shot apenas passa a deixar o processo vivo quando `--web` está activo (padrão `AwaitResidentDashboardAsync`, reutilizado em 4 caminhos: Telegram pendente de Setup, discovery automática bloqueada com `loopHours==0`, ciclo one-shot concluído, dashboard standalone).
+  - **Shutdown coerente:** `Ctrl+C` e `SIGTERM` (via `AppDomain.CurrentDomain.ProcessExit`) sinalizam um `CancellationTokenSource` de processo partilhado; o token propaga-se ao `HttpListener` do Dashboard (novo `StopDashboard()`), e o Scheduler recebe `StopAsync()` com limite de drain documentado (10 s — se uma action pendurada não respeitar cancellation, o shutdown regista explicitamente que terminou por força, nunca mascarado como saída normal). Só o callback sinaliza; o Main faz o cleanup/drain.
+  - **Mudanças mínimas:** sem Generic Host, sem Kestrel, sem novo endpoint, sem novo sistema de scheduler/RunCoordinator. `--loop-hours` mantém a semântica actual (não alterada nesta wave); `--telegram` sem `--web` continua one-shot; o `docker-compose.yml` do repo continua com `--loop-hours 24` (sem alteração nesta wave).
+  - **Testes:** 15 novos testes (`ProgramLifecycleResidencyTests`) que cobrem (a) o helper `AwaitResidentDashboardAsync` com webTask nula/completa/falhada/cancelada; (b) `StopDashboard()` determinístico; (c) caracterização do wiring (4 call-sites nos caminhos residentes); (d) lifecycle do Scheduler: Start/Stop com e sem jobs, com action que lança, com action cooperativa que respeita cancellation e shutdown dentro do limite; (e) concorrência Manual vs Scheduler no mesmo `RunCoordinator` (CAS serializado). Sem dependência de rede real.
+
 ### 🔧 Corrigido
 - **W-SCHEDULER-FIX-AND-UX — correcções do separador Scheduled Jobs (2026-10-02).**
   - **Status HTTP dos endpoints de scheduled jobs:** erros de validação passam a devolver `400` (antes `200`) e recursos inexistentes `404`, com corpo `{error}`; deixam de existir respostas `404`/`400` sem corpo nos endpoints `DELETE /api/catalog/scheduled-jobs/{id}`, `PUT /api/catalog/scheduled-jobs/{id}/enabled` e `POST /api/catalog/scheduled-jobs`.

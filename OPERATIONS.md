@@ -102,9 +102,10 @@ Iniciando m3uCrawler...
 ... (espera de --loop-hours 24)
 ```
 
-Para forçar um ciclo fora do horário (sem reiniciar o container):
+Para disparar um ciclo fora do horário (sem reiniciar o container) tem de existir `--web-allow-trigger` no `command` do compose:
 
-- A abordagem correcta é reiniciar o container. O `entrypoint` é o início de cada ciclo, não há forma de "disparar" um ciclo individual sem reiniciar.
+- **Dashboard → "Run now"** (`POST /api/run/start`, botão de execução manual): dispara imediatamente um ciclo de descoberta no mesmo processo. Devolve `409` quando já há um run em curso.
+- **Dashboard → Scheduled Jobs** (quando existe job `telegramMaintainRun`/`telegramRun` em `scheduled_jobs`): o runner corre o job no próximo slot cron. Ver `m3uCrawler/README.md` § "Scheduler / Scheduled Jobs".
 - Em caso de necessidade operacional, parar e subir:
   ```bash
   docker compose restart m3ucrawler

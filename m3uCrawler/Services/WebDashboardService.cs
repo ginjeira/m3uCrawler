@@ -66,6 +66,11 @@ namespace m3uCrawler.Services
         private static DispatcharrSyncCoordinator? _dispatcharrSyncCoordinator;
         private static DispatcharrConcurrencyGate? _dispatcharrConcurrencyGate;
 
+        // Lifecycle do processo residente — listener do dashboard
+        // registado no arranque e parado no shutdown coerente (Ctrl+C /
+        // SIGTERM), para que GetContextAsync() não fique bloqueado.
+        private static HttpListener? _dashboardListener;
+
         /// <summary>
         /// PHASE 9C.2 (S1-E) — Indica que o Dashboard corre num contexto
         /// explicitamente standalone/testes, onde a ausência simultânea de
@@ -211,9 +216,33 @@ namespace m3uCrawler.Services
                 ? Path.Combine(Directory.GetCurrentDirectory(), "runtime-data")
                 : _runtimeDataDirOverride!;
 
+        /// <summary>
+        /// Lifecycle — Para o listener do dashboard de forma coerente
+        /// (Ctrl+C / SIGTERM). Usado pelo mecanismo de shutdown de
+        /// Program.Main; desbloqueia o <c>GetContextAsync()</c> pendente.
+        /// </summary>
+        public static void StopDashboard()
+        {
+            var listener = _dashboardListener;
+            if (listener is null)
+            {
+                return;
+            }
+
+            try
+            {
+                listener.Stop();
+            }
+            catch (Exception ex) when (ex is ObjectDisposedException or HttpListenerException or InvalidOperationException)
+            {
+                // Esperado durante shutdown ordenado; não é uma falha.
+            }
+        }
+
         public static async Task RunDashboardAsync(string outputDir, int port, ImportHistoryService historyService, string? webToken = null, CancellationToken cancellationToken = default)
         {
             var listener = new HttpListener();
+            _dashboardListener = listener;
             var prefix = $"http://+:{port}/";
             listener.Prefixes.Add(prefix);
             listener.AuthenticationSchemes = AuthenticationSchemes.Anonymous;
@@ -234,20 +263,43 @@ namespace m3uCrawler.Services
                 return;
             }
 
-            while (!cancellationToken.IsCancellationRequested)
+            try
+            {
+                while (!cancellationToken.IsCancellationRequested)
+                {
+                    HttpListenerContext? context;
+                    try
+                    {
+                        context = await listener.GetContextAsync();
+                    }
+                    catch (Exception ex) when (
+                        cancellationToken.IsCancellationRequested
+                        || ex is ObjectDisposedException
+                        || (ex is HttpListenerException hle && hle.ErrorCode == 995))
+                    {
+                        // Shutdown ordenado: listener parado ou processo
+                        // encerrado. Não é uma falha da aplicação.
+                        break;
+                    }
+
+                    _ = Task.Run(async () => await HandleRequestAsync(context, outputDir, historyService, webToken));
+                }
+            }
+            finally
             {
                 try
                 {
-                    var context = await listener.GetContextAsync();
-                    _ = Task.Run(async () => await HandleRequestAsync(context, outputDir, historyService, webToken));
+                    listener.Stop();
                 }
-                catch (Exception ex)
+                catch (Exception ex) when (ex is ObjectDisposedException or HttpListenerException or InvalidOperationException)
                 {
-                    Console.WriteLine($"❌ Erro no dashboard web: {ex.Message}");
+                    // Esperado no shutdown: já parado pelo StopDashboard().
+                }
+                if (ReferenceEquals(_dashboardListener, listener))
+                {
+                    _dashboardListener = null;
                 }
             }
-
-            listener.Stop();
         }
 
         /// <summary>
