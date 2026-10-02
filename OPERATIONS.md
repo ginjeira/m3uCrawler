@@ -121,9 +121,9 @@ Todos os artefactos ficam em `/opt/m3ucrawler/runtime-data/output/` (no host) �
 |---|---|
 | `output/telegram_run_report.json` | `RunReport` da última execução (camelCase). É o diagnóstico principal. |
 | `output/telegram_maintain_report.json` | Detalhe adicional do ciclo de manutenção. |
-| `output/playlist.m3u` | Playlist consolidada após merge (modo manutenção). Persiste entre ciclos. |
-| `output/playlist_temp.m3u` | Streams funcionais do ciclo actual (modo manutenção). |
-| `output/telegram_playlist_<timestamp>.m3u` | Saída de uma pesquisa `--telegram` ad-hoc. |
+| `output/playlist.m3u` | Playlist funcional (nome fixo). Escrita pelo ciclo de manutenção e pelas acções agendadas de output (`discoverM3u`, `validatePlaylist`, `generatePlaylist`); lida pelo sync Dispatcharr. Persiste entre ciclos e nunca é apagada por ausência de novos candidatos. |
+| `output/playlist_temp.m3u` | **Exclusivo do ciclo de manutenção Telegram** (`--telegram-maintain`): reinicializada para `#EXTM3U` no início do ciclo e repovoada com os novos streams funcionais; não é renomeada. Um ciclo Telegram único **não** a escreve. |
+| `output/telegram_playlist_<timestamp>.m3u` | Saída de um **ciclo Telegram único** (`--telegram` sem `--telegram-maintain`); não escreve `playlist.m3u` nem `playlist_temp.m3u`. A pesquisa M3U legacy escreve `playlist_<timestamp>.m3u`. |
 | `output/telegram_report_<timestamp>.json` | Relatório JSON de uma pesquisa `--telegram` ad-hoc. |
 | `output/import_history.json` | Histórico persistente. |
 
@@ -257,6 +257,8 @@ docker compose logs --tail=500 m3ucrawler | grep -iE 'tester|test.*stream|ms$|ti
 # 4. Se o problema for persistente (>2 ciclos consecutivos), investigar manualmente um stream:
 docker exec -it m3ucrawler sh -c 'cat /opt/playlists/playlist_temp.m3u | head -5'
 # Pegar num URL e testar fora do container com curl.
+# Nota: playlist_temp.m3u só é escrita pelo ciclo de manutenção (--telegram-maintain).
+# Um ciclo Telegram único deixa telegram_playlist_<timestamp>.m3u em vez disso.
 ```
 
 **Acção correctiva**: aumentar `PlaylistManagerService` não é trivial (é código). Para reduzir falsos negativos temporariamente, considerar reduzir `--max-streams` ou desactivar `--fast` no `docker-compose.yml`.

@@ -109,10 +109,11 @@ namespace m3uCrawler.Services
 
         /// <summary>
         /// Regista a lista de <see cref="IScheduledAction"/> resolvidas
-        /// pelo <c>ScheduledAutomationHost</c> para que o formulário
-        /// de Scheduled Jobs apresente opções válidas. Mantém-se
-        /// retro-compatibilidade: se não for chamado, o formulário
-        /// aceita qualquer <c>actionName</c> livre.
+        /// pelo <c>ScheduledAutomationHost</c>. O registry alimenta tanto a
+        /// lista de opções apresentada no formulário de Scheduled Jobs como
+        /// a validação do <c>actionName</c> no POST. Mantém-se
+        /// retro-compatibilidade: se não for chamado (registry vazio), o
+        /// formulário aceita qualquer <c>actionName</c> livre.
         /// </summary>
         public static void SetScheduledActions(IEnumerable<IScheduledAction> actions)
         {
@@ -2408,10 +2409,17 @@ namespace m3uCrawler.Services
             if (requestPath.Equals("/api/scheduled-actions", StringComparison.OrdinalIgnoreCase)
                 && context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
             {
-                var names = _scheduledActions is null
-                    ? Array.Empty<string>()
-                    : _scheduledActions.Select(a => a.Name).ToArray();
-                await WriteJsonAsync(context.Response, names);
+                var actions = _scheduledActions is null
+                    ? Array.Empty<object>()
+                    : _scheduledActions.Select(a => (object)new
+                    {
+                        name = a.Name,
+                        description = a.Description,
+                        capabilities = a.RequiredCapabilities.ToString(),
+                        requiresTelegram = a.RequiredCapabilities.HasFlag(ScheduledActionCapabilities.Telegram),
+                        requiresDispatcharr = a.RequiredCapabilities.HasFlag(ScheduledActionCapabilities.Dispatcharr),
+                    }).ToArray();
+                await WriteJsonAsync(context.Response, actions);
                 return;
             }
             if (requestPath.Equals("/api/catalog/scheduled-jobs", StringComparison.OrdinalIgnoreCase))
@@ -2430,8 +2438,16 @@ namespace m3uCrawler.Services
                         var payload = JsonSerializer.Deserialize<ScheduledJobPayload>(body, JsonOptions);
                         if (payload == null || string.IsNullOrWhiteSpace(payload.Name) || string.IsNullOrWhiteSpace(payload.CronExpression) || string.IsNullOrWhiteSpace(payload.ActionName))
                         {
-                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
-                            await WriteJsonAsync(context.Response, new { error = "Payload inválido: Name, CronExpression e ActionName obrigatórios." });
+                            await WriteJsonAsync(context.Response, new { error = "Payload inválido: Name, CronExpression e ActionName obrigatórios." }, HttpStatusCode.BadRequest);
+                            return;
+                        }
+                        // O registry de acções alimenta também a validação do
+                        // actionName. Quando não está wired (null/vazio) não
+                        // rejeitamos: preserva o comportamento legacy/testes.
+                        if (_scheduledActions is { Count: > 0 }
+                            && !_scheduledActions.Any(a => string.Equals(a.Name, payload.ActionName, StringComparison.OrdinalIgnoreCase)))
+                        {
+                            await WriteJsonAsync(context.Response, new { error = $"ActionName inválido: '{payload.ActionName}'." }, HttpStatusCode.BadRequest);
                             return;
                         }
                         var saved = await _catalogResolver.UpsertScheduledJobAsync(
@@ -2441,8 +2457,7 @@ namespace m3uCrawler.Services
                     }
                     catch (Exception ex)
                     {
-                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
-                        await WriteJsonAsync(context.Response, new { error = ex.Message });
+                        await WriteJsonAsync(context.Response, new { error = ex.Message }, HttpStatusCode.BadRequest);
                         return;
                     }
                 }
@@ -2460,14 +2475,13 @@ namespace m3uCrawler.Services
                     {
                         if (!long.TryParse(segments[0], out var jid))
                         {
-                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
-                            await WriteJsonAsync(context.Response, new { error = "ID inválido." });
+                            await WriteJsonAsync(context.Response, new { error = "ID inválido." }, HttpStatusCode.BadRequest);
                             return;
                         }
                         var ok = await _catalogResolver.DeleteScheduledJobAsync(jid);
                         if (!ok)
                         {
-                            context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                            await WriteJsonAsync(context.Response, new { error = "Scheduled job não encontrado." }, HttpStatusCode.NotFound);
                             return;
                         }
                         await WriteJsonAsync(context.Response, new { deleted = true, id = jid });
@@ -2478,7 +2492,7 @@ namespace m3uCrawler.Services
                 {
                     if (!long.TryParse(segments[0], out var jid))
                     {
-                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                        await WriteJsonAsync(context.Response, new { error = "ID inválido." }, HttpStatusCode.BadRequest);
                         return;
                     }
                     try
@@ -2488,13 +2502,13 @@ namespace m3uCrawler.Services
                         var payload = JsonSerializer.Deserialize<ScheduledJobEnablePayload>(body, JsonOptions);
                         if (payload == null)
                         {
-                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "Payload inválido." }, HttpStatusCode.BadRequest);
                             return;
                         }
                         var ok = await _catalogResolver.SetScheduledJobEnabledAsync(jid, payload.IsEnabled);
                         if (!ok)
                         {
-                            context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                            await WriteJsonAsync(context.Response, new { error = "Scheduled job não encontrado." }, HttpStatusCode.NotFound);
                             return;
                         }
                         await WriteJsonAsync(context.Response, new { updated = true, id = jid, isEnabled = payload.IsEnabled });
@@ -2502,8 +2516,7 @@ namespace m3uCrawler.Services
                     }
                     catch (Exception ex)
                     {
-                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
-                        await WriteJsonAsync(context.Response, new { error = ex.Message });
+                        await WriteJsonAsync(context.Response, new { error = ex.Message }, HttpStatusCode.BadRequest);
                         return;
                     }
                 }
@@ -5720,6 +5733,7 @@ namespace m3uCrawler.Services
           <div id='scheduledJobsTable'></div>
           <div style='margin-top:16px;'>
             <h4 style='margin:0 0 8px 0;'>Novo / actualizar job</h4>
+            <p class='muted' style='margin:0 0 8px 0;font-size:12px;'>Upsert por <strong>Name</strong>: o mesmo nome actualiza o job existente; um nome diferente cria um novo job.</p>
             <div style='display:grid;gap:8px;grid-template-columns:1fr 1fr 1fr 1fr;'>
               <div>
                 <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Name (único)</label>
@@ -5727,16 +5741,26 @@ namespace m3uCrawler.Services
               </div>
               <div>
                 <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Cron (5 campos)</label>
-                <input data-sched-create='cron' placeholder='ex: 0 * * * *' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                <input data-sched-create='cron' placeholder='ex: 0 * * * *' oninput='updateSchedCronStatus()' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                <div id='schedCronStatus' style='margin-top:4px;font-size:11px;color:var(--muted);'></div>
+                <div style='margin-top:6px;font-size:11px;color:var(--muted);background:var(--panel-2);border:1px solid var(--border);border-radius:6px;padding:6px 8px;'>
+                  <div style='font-weight:600;margin-bottom:4px;'>Ajuda cron (5 campos, UTC)</div>
+                  <pre style='margin:0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre;line-height:1.35;'>* * * * *
+│ │ │ │ │
+│ │ │ │ └── dia da semana (0-6, 0=Domingo)
+│ │ │ └──── mês (1-12)
+│ │ └────── dia do mês (1-31)
+│ └──────── hora (0-23)
+└────────── minuto (0-59)</pre>
+                  <div style='margin-top:4px;'>Ranges: minuto 0-59, hora 0-23, dia do mês 1-31, mês 1-12, dia da semana 0-6. Operadores: <code>*</code> (e <code>?</code>), listas <code>a,b</code>, ranges <code>a-b</code>, steps <code>*/n</code>, <code>a-b/n</code>, <code>a/n</code>. Timezone: UTC. Sem <code>L/W/#</code> e sem nomes de meses/dias.</div>
+                  <div style='margin-top:4px;'>São suportados exactamente <b>5 campos</b>. Expressões com <b>6 campos</b>, incluindo <b>segundos</b>, <b>não são suportadas</b>.</div>
+                  <div style='margin-top:4px;'>Exemplos: <code>0 8 * * *</code> = todos os dias às 08:00; <code>0 */6 * * *</code> = de 6 em 6 horas; <code>30 2 * * 1</code> = segunda-feira às 02:30.</div>
+                </div>
               </div>
               <div>
                 <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Action Name</label>
-                <input data-sched-create='action' placeholder='ex: discoverTelegram' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
-                <select data-sched-create='action-select' style='display:none;width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'></select>
-              <div>
-                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Action Name</label>
-                <input data-sched-create='action' placeholder='ex: discoverTelegram' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
-                <select data-sched-create='action-select' style='display:none;width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'></select>
+                <select data-sched-create='action' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'></select>
+                <div id='schedActionsHelp' style='margin-top:4px;font-size:11px;color:var(--muted);'></div>
               </div>
               <div>
                 <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Activo</label>
@@ -5746,8 +5770,41 @@ namespace m3uCrawler.Services
                 </select>
               </div>
             </div>
-            <div style='margin-top:10px;display:flex;gap:8px;'>
+            <div style='margin-top:10px;display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;'>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Frequência</label>
+                <select id='schedFreqKind' onchange='applySchedFrequency()' style='background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                  <option value='manual'>Manual (cron)</option>
+                  <option value='daily'>Todos os dias</option>
+                  <option value='hours'>A cada N horas</option>
+                  <option value='weekly'>Semanal</option>
+                </select>
+              </div>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Hora</label>
+                <input id='schedFreqTime' type='time' value='08:00' onchange='applySchedFrequency()' style='background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              </div>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>N (horas)</label>
+                <input id='schedFreqHours' type='number' min='1' max='23' value='6' oninput='applySchedFrequency()' style='width:80px;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              </div>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Dia da semana</label>
+                <select id='schedFreqWeekday' onchange='applySchedFrequency()' style='background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                  <option value='1'>Segunda-feira</option>
+                  <option value='2'>Terça-feira</option>
+                  <option value='3'>Quarta-feira</option>
+                  <option value='4'>Quinta-feira</option>
+                  <option value='5'>Sexta-feira</option>
+                  <option value='6'>Sábado</option>
+                  <option value='0'>Domingo</option>
+                </select>
+              </div>
+              <button type='button' class='secondary' onclick='applySchedFrequency()'>Aplicar frequência</button>
+            </div>
+            <div style='margin-top:10px;display:flex;gap:8px;align-items:center;'>
               <button onclick='submitCreateScheduledJob()'>Guardar</button>
+              <span id='schedFormStatus' style='font-size:12px;'></span>
             </div>
           </div>
         </div>
@@ -7774,14 +7831,30 @@ const rows = Object.entries(inv).map(([k, v]) => {
     }
 
     async function loadScheduledActions() {
-      const actions = await safeFetchJson('/api/scheduled-actions', []);
-      if (!actions || actions.length === 0) return;
-      const input = document.querySelector("[data-sched-create='action']");
-      const select = document.querySelector("[data-sched-create='action-select']");
-      if (!input || !select) return;
-      select.innerHTML = actions.map(a => `<option value='${escapeHtml(a)}'>${escapeHtml(a)}</option>`).join('');
-      input.style.display = 'none';
-      select.style.display = 'block';
+      const raw = await safeFetchJson('/api/scheduled-actions', []);
+      const list = Array.isArray(raw) ? raw : [];
+      const actions = list.map(a => (typeof a === 'string')
+        ? { name: a, description: '', capabilities: '' }
+        : { name: (a && a.name) || '', description: (a && a.description) || '', capabilities: (a && a.capabilities) || '' });
+      window.__schedActions = actions;
+      const select = document.querySelector("[data-sched-create=action]");
+      const help = document.getElementById('schedActionsHelp');
+      if (select) {
+        select.innerHTML = actions.length
+          ? actions.map(a => `<option value='${escapeHtml(a.name)}'>${escapeHtml(a.name)}</option>`).join('')
+          : "<option value=''>sem actions registadas</option>";
+      }
+      if (help) {
+        if (!actions.length) {
+          help.innerHTML = '<div style="margin-top:4px;">Sem actions registadas.</div>';
+        } else {
+          help.innerHTML = actions.map(a => {
+            const caps = a.capabilities ? ` <span class="muted">[${escapeHtml(a.capabilities)}]</span>` : '';
+            const desc = a.description ? ` — ${escapeHtml(a.description)}` : '';
+            return `<div style="margin:2px 0;"><code>${escapeHtml(a.name)}</code>${caps}${desc}</div>`;
+          }).join('');
+        }
+      }
     }
     async function loadScheduledJobs() {
       const list = await safeFetchJson('/api/catalog/scheduled-jobs', []);
@@ -7805,35 +7878,161 @@ const rows = Object.entries(inv).map(([k, v]) => {
     }
 
     async function submitCreateScheduledJob() {
-      const actionInput = document.querySelector("[data-sched-create='action']");
-      const actionSelect = document.querySelector("[data-sched-create='action-select']");
-      const actionName = (actionSelect && actionSelect.style.display !== 'none')
-        ? actionSelect.value.trim()
-        : actionInput.value.trim();
+      const nameEl = document.querySelector("[data-sched-create=name]");
+      const cronEl = document.querySelector("[data-sched-create=cron]");
+      const actionEl = document.querySelector("[data-sched-create=action]");
+      const enabledEl = document.querySelector("[data-sched-create=enabled]");
       const payload = {
-        name: document.querySelector("[data-sched-create='name']").value.trim(),
-        cronExpression: document.querySelector("[data-sched-create='cron']").value.trim(),
-        actionName: actionName,
-        isEnabled: document.querySelector("[data-sched-create='enabled']").value === 'true',
+        name: nameEl ? nameEl.value.trim() : '',
+        cronExpression: cronEl ? cronEl.value.trim() : '',
+        actionName: actionEl ? actionEl.value.trim() : '',
+        isEnabled: enabledEl ? enabledEl.value === 'true' : true,
       };
       if (!payload.name || !payload.cronExpression || !payload.actionName) {
-        alert('Name, Cron e Action são obrigatórios.'); return;
+        setSchedFormStatus('Name, Cron e Action são obrigatórios.', false); return;
       }
+      const cronCheck = validateSchedCron(payload.cronExpression);
+      if (!cronCheck.ok) { setSchedFormStatus(cronCheck.message, false); return; }
       const r = await fetch('/api/catalog/scheduled-jobs', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
       if (r.ok) {
-        document.querySelector("[data-sched-create='name']").value = '';
-        document.querySelector("[data-sched-create='cron']").value = '';
-        actionInput.value = '';
-        if (actionSelect) actionSelect.value = '';
+        if (nameEl) nameEl.value = '';
+        if (cronEl) cronEl.value = '';
+        if (enabledEl) enabledEl.value = 'true';
+        updateSchedCronStatus();
+        await loadScheduledActions();
+        if (actionEl && actionEl.options.length > 0) actionEl.selectedIndex = 0;
+        setSchedFormStatus(`Guardado: action '${payload.actionName}' com cron '${payload.cronExpression}'. Upsert por Name: o mesmo Name actualiza o job existente.`, true);
         await loadScheduledJobs();
       } else {
-        const err = await r.json();
-        alert('Erro: ' + (err.error || r.status));
+        const msg = await readErrorBody(r);
+        setSchedFormStatus('Erro: ' + msg, false);
       }
+    }
+
+    async function readErrorBody(r) {
+      try {
+        const txt = await r.text();
+        if (txt) {
+          try { const body = JSON.parse(txt); if (body && body.error) return body.error; } catch (e) { /* not JSON */ }
+          return txt;
+        }
+      } catch (e) { /* body indisponível */ }
+      return 'HTTP ' + r.status;
+    }
+    function setSchedFormStatus(msg, ok) {
+      const el = document.getElementById('schedFormStatus');
+      if (!el) return;
+      el.textContent = msg;
+      el.style.color = ok ? 'var(--ok)' : 'var(--err)';
+    }
+    function schedParseScalar(token, min, max) {
+      if (token === '*') return min;
+      if (!/^\d+$/.test(token)) return null;
+      const n = parseInt(token, 10);
+      return (n >= min && n <= max) ? n : null;
+    }
+    function schedParseField(field, min, max) {
+      if (field === '*' || field === '?') return true;
+      const bits = field.split(',');
+      for (const bit of bits) {
+        if (!bit) return false;
+        if (bit.indexOf('-') >= 0 && bit.indexOf('/') < 0) {
+          const idx = bit.indexOf('-');
+          const lo = schedParseScalar(bit.slice(0, idx), min, max);
+          const hi = schedParseScalar(bit.slice(idx + 1), min, max);
+          if (lo === null || hi === null || hi < lo) return false;
+          continue;
+        }
+        const parts = bit.split('/');
+        if (parts.length === 1) {
+          if (schedParseScalar(parts[0], min, max) === null) return false;
+        } else if (parts.length === 2) {
+          const rangeToken = parts[0];
+          if (rangeToken !== '*') {
+            if (rangeToken.indexOf('-') >= 0) {
+              const idx = rangeToken.indexOf('-');
+              const lo = schedParseScalar(rangeToken.slice(0, idx), min, max);
+              const hi = schedParseScalar(rangeToken.slice(idx + 1), min, max);
+              if (lo === null || hi === null || hi < lo) return false;
+            } else if (schedParseScalar(rangeToken, min, max) === null) {
+              return false;
+            }
+          }
+          if (!/^\d+$/.test(parts[1]) || parseInt(parts[1], 10) <= 0) return false;
+        } else {
+          return false;
+        }
+      }
+      return true;
+    }
+    function validateSchedCron(expr) {
+      const trimmed = (expr || '').trim();
+      if (!trimmed) return { ok: false, message: 'Introduza uma expressão cron.' };
+      const fields = trimmed.split(/\s+/);
+      if (fields.length === 6) return { ok: false, message: 'São suportados exactamente 5 campos; 6 campos com segundos não são suportados.' };
+      if (fields.length !== 5) return { ok: false, message: `Cron deve ter 5 campos (minuto hora dia-do-mês mês dia-da-semana); recebido ${fields.length}.` };
+      const ranges = [[0, 59], [0, 23], [1, 31], [1, 12], [0, 6]];
+      const names = ['minuto', 'hora', 'dia do mês', 'mês', 'dia da semana'];
+      for (let i = 0; i < 5; i++) {
+        if (!schedParseField(fields[i], ranges[i][0], ranges[i][1])) {
+          return { ok: false, message: `Campo ${names[i]} inválido: '${fields[i]}' (esperado ${ranges[i][0]}-${ranges[i][1]}).` };
+        }
+      }
+      return { ok: true, message: describeSchedCron(fields) };
+    }
+    function schedPad2(n) { return String(n).padStart(2, '0'); }
+    const schedWeekdays = { 0: 'domingo', 1: 'segunda-feira', 2: 'terça-feira', 3: 'quarta-feira', 4: 'quinta-feira', 5: 'sexta-feira', 6: 'sábado' };
+    function describeSchedCron(fields) {
+      const min = fields[0], hour = fields[1], dom = fields[2], mon = fields[3], dow = fields[4];
+      const hoursStep = hour.match(/^\*\/(\d+)$/);
+      if (/^\d+$/.test(min) && hoursStep) {
+        const n = parseInt(hoursStep[1], 10);
+        return `de ${n} em ${n} horas`;
+      }
+      if (/^\d+$/.test(min) && /^\d+$/.test(hour) && dom === '*' && mon === '*' && dow === '*') {
+        return `todos os dias às ${schedPad2(hour)}:${schedPad2(min)}`;
+      }
+      if (/^\d+$/.test(min) && /^\d+$/.test(hour) && dom === '*' && /^\d+$/.test(dow) && schedWeekdays[parseInt(dow, 10)]) {
+        return `${schedWeekdays[parseInt(dow, 10)]} às ${schedPad2(hour)}:${schedPad2(min)}`;
+      }
+      return 'cron válido (UTC)';
+    }
+    function updateSchedCronStatus() {
+      const input = document.querySelector("[data-sched-create=cron]");
+      const el = document.getElementById('schedCronStatus');
+      if (!input || !el) return;
+      const res = validateSchedCron(input.value);
+      el.textContent = res.message;
+      el.style.color = res.ok ? 'var(--ok)' : 'var(--err)';
+    }
+    function applySchedFrequency() {
+      const kindEl = document.getElementById('schedFreqKind');
+      const timeEl = document.getElementById('schedFreqTime');
+      const hoursEl = document.getElementById('schedFreqHours');
+      const weekdayEl = document.getElementById('schedFreqWeekday');
+      const cronEl = document.querySelector("[data-sched-create=cron]");
+      if (!kindEl || !cronEl) return;
+      const kind = kindEl.value;
+      if (kind === 'manual') return;
+      const timeVal = (timeEl && timeEl.value) ? timeEl.value : '08:00';
+      const timeBits = timeVal.split(':');
+      const hh = parseInt(timeBits[0], 10) || 0;
+      const mm = parseInt(timeBits[1], 10) || 0;
+      if (kind === 'daily') {
+        cronEl.value = `${mm} ${hh} * * *`;
+      } else if (kind === 'hours') {
+        let n = parseInt(hoursEl && hoursEl.value, 10);
+        if (!n || n < 1) n = 1;
+        if (n > 23) n = 23;
+        cronEl.value = `${mm} */${n} * * *`;
+      } else if (kind === 'weekly') {
+        cronEl.value = `${mm} ${hh} * * ${(weekdayEl && weekdayEl.value) || '1'}`;
+      }
+      updateSchedCronStatus();
     }
 
     async function toggleScheduledJob(id, next) {
@@ -7843,14 +8042,14 @@ const rows = Object.entries(inv).map(([k, v]) => {
         body: JSON.stringify({ isEnabled: next }),
       });
       if (r.ok) { await loadScheduledJobs(); }
-      else { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
+      else { const msg = await readErrorBody(r); setSchedFormStatus('Erro: ' + msg, false); }
     }
 
     async function deleteScheduledJob(id) {
       if (!confirm('Eliminar o scheduled job #' + id + '?')) return;
       const r = await fetch('/api/catalog/scheduled-jobs/' + id, { method: 'DELETE' });
       if (r.ok) { await loadScheduledJobs(); }
-      else { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
+      else { const msg = await readErrorBody(r); setSchedFormStatus('Erro: ' + msg, false); }
     }
 
     async function loadMatchingAudits() {

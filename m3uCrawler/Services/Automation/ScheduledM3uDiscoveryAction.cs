@@ -58,6 +58,9 @@ public sealed class ScheduledM3uDiscoveryAction : IScheduledAction
 
     public string Name => ActionName;
 
+    public string Description =>
+        "Descoberta M3U8 por pesquisa web (M3uCrawlerService) seguida de validação; publica as streams funcionais em <output-dir>/playlist.m3u. O termo e o limite vêm de ScheduledActionOptions. Substitui a playlist funcional e faz pedidos HTTP externos.";
+
     /// <summary>
     /// Discovery M3U escreve a playlist funcional; não depende do Telegram
     /// nem do catálogo canónico.

@@ -7,6 +7,19 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 
 ## [Unreleased]
 
+### 🔧 Corrigido
+- **W-SCHEDULER-FIX-AND-UX — correcções do separador Scheduled Jobs (2026-10-02).**
+  - **Status HTTP dos endpoints de scheduled jobs:** erros de validação passam a devolver `400` (antes `200`) e recursos inexistentes `404`, com corpo `{error}`; deixam de existir respostas `404`/`400` sem corpo nos endpoints `DELETE /api/catalog/scheduled-jobs/{id}`, `PUT /api/catalog/scheduled-jobs/{id}/enabled` e `POST /api/catalog/scheduled-jobs`.
+  - **Validação de `ActionName`:** com o scheduler ligado (`--web` arranca o `ScheduledAutomationHost`), um `ActionName` desconhecido é rejeitado com `400`; sem registry ligado (contexto standalone) mantém-se o campo livre retrocompatível.
+  - **UI do formulário de Scheduled Jobs:** removido o bloco HTML duplicado do campo *Action Name*, corrigido o `<select>` de acções registadas e o reset/repopulação dos campos após guardar; adicionada ajuda de cron (regras dos 5 campos) e um auxiliar de frequência/hora, mantendo o campo cron manual.
+
+### ✨ Adicionado
+- **`GET /api/scheduled-actions` devolve metadados descritivos (2026-10-02).** Passa de `string[]` (apenas nomes) para um array de objectos `{ name, description, capabilities, requiresTelegram, requiresDispatcharr }`; `capabilities` é a representação textual de `ScheduledActionCapabilities`.
+
+### 📝 Documentação
+- **Scheduler / Scheduled Jobs documentado em `m3uCrawler/README.md`:** endpoints e semântica HTTP, upsert pelo `Name`, validação de `ActionName`, contrato de `/api/scheduled-actions`, regras da expressão cron de 5 campos (com diagrama, operadores, UTC e rejeição de 6 campos com segundos), tabela das 6 acções registadas, neutralização de cron inválido e limitação de processo (scheduler só com `--web`).
+- **Propriedade dos artefactos clarificada:** `m3uCrawler/README.md` §"Ficheiros gerados" e `OPERATIONS.md` §4 distinguem `playlist.m3u`, `playlist_temp.m3u` (exclusivo do ciclo de manutenção) e `telegram_playlist_<ts>.m3u` (ciclo Telegram único).
+
 ## [1.0.1] - 2026-10-02
 
 ### 🔧 Corrigido

@@ -48,6 +48,9 @@ public sealed class ScheduledValidationAction : IScheduledAction
 
     public string Name => ActionName;
 
+    public string Description =>
+        "Re-testa todas as streams de <output-dir>/playlist.m3u e reescreve o ficheiro mantendo apenas as que respondem. Se a playlist estiver ausente ou vazia, não a esvazia. Faz pedidos HTTP externos (probes).";
+
     /// <summary>
     /// Re-testa a playlist funcional; não depende do Telegram.
     /// </summary>

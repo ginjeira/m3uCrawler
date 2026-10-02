@@ -580,7 +580,7 @@ O dashboard tem os seguintes separadores principais:
 - **Canais / Países**: validação da playlist actual por país e gestão das listas de aliases.
 - **Playlist**: visualização da playlist actual com links para download funcional.
 - **Dispatcharr**: estado da última sincronização e detalhes do plano/report.
-- **Catálogo**: gestão completa do catálogo de canais (ver secção abaixo).
+- **Catálogo**: gestão completa do catálogo de canais, incluindo o separador **Scheduled Jobs** (jobs cron persistentes; ver secção "Scheduler / Scheduled Jobs").
 - **Setup**: onboarding pós-bootstrap — banner `⚠️ SETUP REQUIRED`, prontidão por componente, config/autenticação Telegram e config/teste Dispatcharr (ver secção "Onboarding / Setup operacional").
 - **Diagnóstico**: inventário de ficheiros, RunReport completo e glossário de métricas.
 
@@ -597,6 +597,7 @@ O catálogo (`ChannelCatalogDbContext`, SQLite em `/data/channel-catalog.db`) ge
 | **Reviews** | Itens de revisão do Dispatcharr (decisões ambíguas ou uncertainas pendentes de decisão humana). |
 | **Sync Runs** | Histórico de sincronizações Dispatcharr com contadores de created/merged/protected/removed. |
 | **Pending** | Canais que geraram dúvida no country-level targeting e aguardam decisão manual (ver secção seguinte). |
+| **Scheduled Jobs** | Jobs agendados persistentes (tabela SQLite `scheduled_jobs`): cron de 5 campos, acção, activo, último/próximo tick e último resultado. Ver secção "Scheduler / Scheduled Jobs". |
 
 ### Pending Country Approvals
 
@@ -1266,6 +1267,96 @@ A vista **Descoberta** expõe a configuração operacional de discovery numa ún
 - **`dispatcharrTest`** — estado derivado, não configuração.
 - **Extras Dispatcharr** suportados pela API mas ainda sem form nesta wave: `dispatcharr_match_threshold`, `dispatcharr_target_group_name`, `dispatcharr_alias_file`, `dispatcharr_provider_priority`, `dispatcharr_auto_create_groups` (seguimento).
 
+## Scheduler / Scheduled Jobs
+
+O separador **Scheduled Jobs** do dashboard (dentro do **Catálogo**) gere jobs persistentes na tabela SQLite `scheduled_jobs`. Cada job tem `Name` único, `CronExpression` de 5 campos, `ActionName`, `IsEnabled` e os campos observáveis `LastRunAtUtc` / `NextRunAtUtc` / `LastResult`. O `ScheduledJobRunner` calcula o próximo tick a partir da expressão e é o único componente que dispara as acções.
+
+O runner só é arrancado quando `--web` é passado (bootstrap do `ScheduledAutomationHost`), pelo que o scheduler depende do dashboard estar activo no processo. As duas acções Telegram (`telegramRun` / `telegramMaintainRun`) e a vista "Live Run" estão descritas em **Live Run Monitor** §"Arranque agendado (sem `StartAtUtc`)"; esta secção é a referência canónica para a API, o cron e as restantes acções.
+
+### Endpoints
+
+| Método e path | Comportamento |
+|---|---|
+| `GET /api/scheduled-actions` | Lista as acções registadas no registry do scheduler (contrato abaixo). Sem registry ligado devolve `[]`. |
+| `GET /api/catalog/scheduled-jobs` | Lista todos os jobs persistidos. |
+| `POST /api/catalog/scheduled-jobs` | Cria ou actualiza (upsert) um job pelo `Name`. |
+| `PUT /api/catalog/scheduled-jobs/{id}/enabled` | Liga/desliga o job (`{ "isEnabled": true|false }`). |
+| `DELETE /api/catalog/scheduled-jobs/{id}` | Elimina o job. |
+
+Semântica HTTP:
+
+- payload válido → `200` com o job (POST/PUT) ou `{ "deleted": true, "id": … }` (DELETE);
+- erro de validação → `400` com corpo `{ "error": "…" }`;
+- recurso inexistente → `404` com corpo `{ "error": "…" }`.
+
+**Upsert pelo `Name`.** O `POST` procura um job com o mesmo `Name`: se existir, actualiza `cronExpression`/`actionName`/`isEnabled` e recalcula `nextRunAtUtc`; se não existir, cria um novo. Um `Name` diferente cria sempre um job novo — o `POST` não faz update por `id`.
+
+**Validação de `ActionName`.** Com o scheduler ligado (o `--web` arranca o `ScheduledAutomationHost`), o `ActionName` é validado contra as acções registadas; um nome desconhecido devolve `400`. Sem registry ligado (contexto standalone, ex.: `--web` sem scheduler) não há validação de `ActionName` — mantém-se o campo livre retrocompatível.
+
+### Contrato de `GET /api/scheduled-actions`
+
+Devolve um array de objectos (antes era `string[]` com apenas os nomes):
+
+```json
+[
+  {
+    "name": "discoverM3u",
+    "description": "Descoberta M3U8 por pesquisa web …",
+    "capabilities": "Output",
+    "requiresTelegram": false,
+    "requiresDispatcharr": false
+  }
+]
+```
+
+- `capabilities` é a representação textual de `ScheduledActionCapabilities` (`None`, `Output`, `Catalog`, `Telegram`, `Dispatcharr`), podendo combinar quando a acção exige mais do que uma.
+- `requiresTelegram` / `requiresDispatcharr` são atalhos booleanos que indicam se a acção depende da sessão Telegram autenticada / do Dispatcharr activo.
+
+### Expressão cron (5 campos)
+
+O parser (`CronExpression`) aceita **exactamente 5 campos**, na ordem `minuto hora dia-do-mês mês dia-da-semana`:
+
+```
+* * * * *
+│ │ │ │ │
+│ │ │ │ └── dia da semana (0-6, 0=Domingo)
+│ │ │ └──── mês (1-12)
+│ │ └────── dia do mês (1-31)
+│ └──────── hora (0-23)
+└────────── minuto (0-59)
+```
+
+- Intervalos válidos: minuto `0-59`; hora `0-23`; dia-do-mês `1-31`; mês `1-12`; dia-da-semana `0-6` (`0` = Domingo).
+- Operadores: `*` (wildcard; `?` é aceite e equivalente a `*`), listas `a,b`, ranges `a-b`, steps `*/n`, `a-b/n` e `a/n`.
+- **Não** suporta `L`, `W`, `#` nem nomes (`JAN`, `MON`) — só números. Timezone: **UTC**.
+- **6 campos com segundos NÃO são suportados**: o parser rejeita e devolve `Cron deve ter 5 campos, recebido 6.`
+- Semântica dia-do-mês vs dia-da-semana: se ambos os campos estiverem restringidos → **OU**; se um estiver em wildcard → **E** (semântica cron padrão).
+
+Exemplos: `0 8 * * *` (todos os dias às 08:00 UTC); `0 */6 * * *` (de 6 em 6 horas); `30 2 * * 1` (segunda-feira às 02:30 UTC).
+
+### Acções registadas
+
+| `ActionName` | Descrição | Capabilities |
+|---|---|---|
+| `discoverM3u` | Descoberta M3U8 por pesquisa web (`M3uCrawlerService`) seguida de validação; publica as streams funcionais em `<output-dir>/playlist.m3u`. O termo e o limite vêm de `ScheduledActionOptions`. Substitui a playlist funcional e faz pedidos HTTP externos. | `Output` |
+| `validatePlaylist` | Re-testa todas as streams de `<output-dir>/playlist.m3u` e reescreve o ficheiro mantendo apenas as que respondem. Se a playlist estiver ausente ou vazia, não a esvazia. Faz pedidos HTTP externos (probes). | `Output` |
+| `generatePlaylist` | Compõe `<output-dir>/playlist.m3u` a partir de uma `OrderingList` do catálogo canónico. O nome do job `generatePlaylist:<id>` seleciona a lista; sem id válido usa a primeira lista (regista fallback). Não faz pedidos externos. | `Catalog` + `Output` |
+| `syncDispatcharr` | Sincroniza `<output-dir>/playlist.m3u` com o Dispatcharr via `DispatcharrSyncCoordinator`. Respeita `dispatcharr_enabled` e `dispatcharr_dry_run`; decisões ambíguas nunca são aplicadas automaticamente. Só chama a API Dispatcharr se activo e fora de dry-run. | `Dispatcharr` |
+| `telegramRun` | Ciclo Telegram (descoberta + validação) via `RunCoordinator`, com a configuração de Discovery persistida. Escreve `telegram_playlist_<timestamp>.m3u` e relatórios (não substitui `playlist.m3u`) e corre o sync Dispatcharr se activo. Requer sessão Telegram autenticada. | `Telegram` |
+| `telegramMaintainRun` | Ciclo Telegram em modo manutenção: re-testa `playlist.m3u`, preserva streams working/retryable e incorpora novas descobertas em `playlist.m3u` (usa `playlist_temp.m3u` como artefacto intermédio). Requer sessão Telegram autenticada. | `Telegram` |
+
+### Cron inválido num job persistido
+
+Um cron inválido gravado em `scheduled_jobs` é neutralizado de forma segura no tick: o job não executa, `LastResult` fica `invalid-cron:<expr>` e `NextRunAtUtc` fica `null`; o tick continua e os restantes jobs correm. Reconfigurar o job (upsert no dashboard) recalcula o `NextRunAtUtc` e re-arma o agendamento.
+
+### Formulário: frequência simples e cron manual
+
+O formulário de criação/actualização inclui um auxiliar de frequência/hora que compõe a expressão de 5 campos; o campo de cron manual continua disponível para expressões arbitrárias. A validação da expressão acontece no `POST` (`400` com corpo `{error}`) e no upsert do catálogo.
+
+### Limitação operacional conhecida (processo)
+
+O scheduler só existe enquanto o processo estiver vivo e o runner só é arrancado com `--web`. Num arranque `--telegram --web` **sem** `--loop-hours` e **sem** `--telegram-maintain`, o processo conclui o ciclo Telegram e termina, fazendo parar o dashboard e o scheduler. Como manter o runtime vivo é uma **decisão em aberto** para uma wave futura; esta limitação é registada aqui, sem alteração de comportamento nesta wave.
+
 ## Comportamento funcional
 
 Os cenários abaixo descrevem o comportamento esperado e estão cobertos por testes unitários sempre que possível.
@@ -1347,11 +1438,13 @@ m3uCrawler/
 
 ## Ficheiros gerados
 
-- `output/playlist_temp.m3u` — Novos streams funcionais do ciclo (manutenção).
-- `output/playlist.m3u` — Playlist consolidada após merge (manutenção).
-- `output/telegram_run_report.json` — `RunReport` da última execução (camelCase).
-- `output/telegram_playlist_<timestamp>.m3u` e `output/telegram_report_<timestamp>.json` — Saída de uma pesquisa `--telegram` ad-hoc.
-- `output/telegram_maintain_report.json` — Relatório do ciclo de manutenção.
+Directório de output = `--output-dir` (padrão `output`); em produção o Compose monta-o em `/opt/playlists` (ver `DEPLOYMENT.md`). A propriedade de cada artefacto é importante:
+
+- `output/playlist.m3u` — **Playlist funcional** (nome fixo). Escrita/reescrita pelo ciclo de manutenção Telegram (`--telegram-maintain`) e pelas acções agendadas `discoverM3u`, `validatePlaylist` (in place) e `generatePlaylist`. É lida pelo `syncDispatcharr` / `--dispatcharr-sync` (default) e servida por `/api/playlist` (raw) e `/api/playlist/preview` (sanitizada). O código nunca a apaga; a manutenção nunca remove streams existentes só por não haver novos candidatos.
+- `output/playlist_temp.m3u` — **Apenas do ciclo de manutenção Telegram**. É reinicializada para `#EXTM3U` no início do ciclo e recebe os novos streams funcionais; **não** é renomeada e permanece no disco após o ciclo. Servida por `/api/playlist_temp` (raw) e `/api/playlist_temp/preview` (sanitizada) e listada em `/api/output/inventory`.
+- `output/telegram_playlist_<timestamp>.m3u` e `output/telegram_report_<timestamp>.json` — Saída de um **ciclo Telegram único** (`--telegram` **sem** `--telegram-maintain`). Este modo **não** escreve `playlist.m3u` nem `playlist_temp.m3u`. A pesquisa M3U interactiva legacy escreve `playlist_<timestamp>.m3u`.
+- `output/telegram_run_report.json` — `RunReport` da última execução (camelCase; sobrescrito a cada run em ambos os modos).
+- `output/telegram_maintain_report.json` — Relatório adicional do ciclo de manutenção.
 - `output/import_history.json` — Histórico persistente.
 - `output/dispatcharr_selection_<timestamp>.json` — Artefacto da selecção de fontes (Wave 13-6), escrito pelo sync Dispatcharr **antes** do branch dry-run/apply (o dry-run também o produz). As URLs são sanitizadas (`CredentialSanitizer.SanitizeUrl`); nunca contém credenciais.
 

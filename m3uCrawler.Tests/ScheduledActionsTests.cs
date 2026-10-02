@@ -68,6 +68,21 @@ public class ScheduledActionsTests : IAsyncLifetime
     }
 
     [Fact]
+    public void Registered_actions_expose_non_empty_description_and_distinct_names()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"sched-out-{Guid.NewGuid():N}");
+        using var host = ScheduledAutomationHost.Build(
+            _resolver, tempDir, DispatcharrConfig.Disabled());
+
+        Assert.Equal(6, host.RegisteredActions.Count);
+        Assert.All(host.RegisteredActions, a =>
+            Assert.False(string.IsNullOrWhiteSpace(a.Description), $"{a.Name} sem Description."));
+        Assert.Equal(
+            6,
+            host.RegisteredActions.Select(a => a.Name).Distinct(StringComparer.Ordinal).Count());
+    }
+
+    [Fact]
     public async Task ScheduledAutomationHost_runner_is_idempotent_on_repeated_Start()
     {
         var tempDir = Path.Combine(Path.GetTempPath(), $"sched-out-{Guid.NewGuid():N}");

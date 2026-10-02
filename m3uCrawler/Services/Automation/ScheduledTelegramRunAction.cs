@@ -69,6 +69,10 @@ public sealed class ScheduledTelegramRunAction : IScheduledAction
         ? TelegramMaintainActionName
         : TelegramActionName;
 
+    public string Description => _mode == LiveRunMode.TelegramMaintain
+        ? "Ciclo Telegram em modo manutenção: re-testa playlist.m3u, preserva streams working/retryable e incorpora novas descobertas em playlist.m3u (usa playlist_temp.m3u como artefacto intermédio). Requer sessão Telegram autenticada."
+        : "Ciclo Telegram (descoberta + validação) via RunCoordinator, com a configuração de Discovery persistida. Escreve telegram_playlist_<timestamp>.m3u e relatórios (não substitui playlist.m3u) e corre o sync Dispatcharr se activo. Requer sessão Telegram autenticada.";
+
     /// <summary>
     /// Discovery Telegram exige sessão autenticada. O gate por capacidade
     /// não enfraquece este requisito: só as acções Telegram o declaram.

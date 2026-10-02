@@ -18,6 +18,9 @@ public interface IScheduledAction
 {
     string Name { get; }
 
+    /// <summary>Descrição humana curta apresentada no Dashboard.</summary>
+    string Description => string.Empty;
+
     /// <summary>
     /// Capacidades operacionais exigidas por esta acção. Default
     /// <see cref="ScheduledActionCapabilities.None"/>: verificado apenas o

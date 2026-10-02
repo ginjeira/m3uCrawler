@@ -112,6 +112,9 @@ public sealed class ScheduledDispatcharrSyncAction : IScheduledAction
 
     public string Name => ActionName;
 
+    public string Description =>
+        "Sincroniza <output-dir>/playlist.m3u com o Dispatcharr via DispatcharrSyncCoordinator. Respeita dispatcharr_enabled e dispatcharr_dry_run; decisões ambíguas nunca são aplicadas automaticamente. Só chama a API Dispatcharr se activo e fora de dry-run.";
+
     /// <summary>
     /// Sincronização requer Dispatcharr activo e válido (quando activado).
     /// Não depende do Telegram.

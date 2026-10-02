@@ -49,6 +49,9 @@ public sealed class ScheduledPlaylistGenerationAction : IScheduledAction, IJobAw
 
     public string Name => ActionName;
 
+    public string Description =>
+        "Compõe <output-dir>/playlist.m3u a partir de uma OrderingList do catálogo canónico. O nome do job 'generatePlaylist:<id>' seleciona a lista; sem id válido usa a primeira lista, e um id válido inexistente regista fallback para a primeira lista. Não faz pedidos externos.";
+
     /// <summary>
     /// Composição usa o catálogo canónico e escreve o output.
     /// </summary>
