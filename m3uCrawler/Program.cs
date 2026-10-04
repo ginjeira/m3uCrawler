@@ -603,6 +603,22 @@ namespace m3uCrawler
                     catalogForIngestion,
                     dispatcharrSyncCoordinator);
 
+                // W6 — Expor a sincronização Dispatcharr ao Dashboard. É o
+                // MESMO coordenador que serve o RunPublicationService, para
+                // não existir um segundo caminho/source-of-truth. O gate
+                // dedicado serializa os pedidos HTTP /dry-run e /sync
+                // (segunda tentativa concorrente → 409). Additivo: o
+                // comportamento do RunPublicationService e do scheduler
+                // permanece inalterado. Em --web standalone (sem --telegram)
+                // não há coordenador e os endpoints respondem 503
+                // dispatcharr-unavailable — o que é o esperado.
+                if (webEnabled)
+                {
+                    WebDashboardService.SetDispatcharrSync(
+                        dispatcharrSyncCoordinator,
+                        new DispatcharrConcurrencyGate());
+                }
+
                 // Wave W2 — Executor único da Live Run Telegram. Faz a
                 // discovery e delega a cauda no publicationService. É o
                 // mesmo executor usado pelo dashboard e pelo scheduler (via

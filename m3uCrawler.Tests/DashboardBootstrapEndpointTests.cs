@@ -758,7 +758,8 @@ public class DashboardBootstrapEndpointTests : IAsyncLifetime
             IAuditService? auditService = null,
             DispatcharrConnectionTestStore? dispatcharrTestStore = null,
             DispatcharrSyncCoordinator? dispatcharrSyncCoordinator = null,
-            DispatcharrConcurrencyGate? dispatcharrConcurrencyGate = null)
+            DispatcharrConcurrencyGate? dispatcharrConcurrencyGate = null,
+            string? runtimeDataDir = null)
         {
             var port = GetFreePort();
             var listener = new HttpListener();
@@ -784,6 +785,13 @@ public class DashboardBootstrapEndpointTests : IAsyncLifetime
 
                     try
                     {
+                        // W6 — Isolar o directório de país por harness, sem
+                        // tocar no runtime-data real (o scope repõe o valor
+                        // anterior no fim de cada pedido).
+                        using var runtimeDataScope = runtimeDataDir is null
+                            ? null
+                            : new WebDashboardService.StaticRuntimeDataDirScope(runtimeDataDir);
+
                         // Handler sequencial: mantém determinismo de cookies/estado.
                         if (standalone)
                         {

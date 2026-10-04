@@ -474,7 +474,9 @@ Recomendação: código novo que precise de uma decisão de país por playlist d
 
 ### Gestão de listas por país
 
-A gestão dos ficheiros de aliases por país é feita por `CountryChannelListService` (`runtime-data/countries/<code>.json`), exposta no dashboard em `/api/countries`, `/api/country`, `/api/country/validate` e `/api/country/save`. A API deste serviço é preservada.
+A gestão dos ficheiros de aliases por país é feita por `CountryChannelListService` (`runtime-data/countries/<code>.json`), exposta no dashboard em `/api/countries`, `/api/country` (GET/DELETE), `/api/country/validate` e `/api/country/save`. A API deste serviço é preservada.
+
+**W6 — decisão de âmbito:** o país é **configuração/validação**, não uma entidade de domínio (não existe entidade `Country`). O separador **Canais / Países** permite criar/editar/eliminar a configuração (`POST /api/country/save`, `DELETE /api/country`) e validar a playlist actual; não é um CRUD de entidade. O `DeleteCountry(string code)` elimina `<code>.json` e devolve `bool` (`true` se existia). O `displayName` amigável é preservado no save da UI (não é sobrescrito por `code.toUpperCase()`).
 
 ## Parser M3U (`M3uParserService`)
 
@@ -560,7 +562,8 @@ O dashboard (`Services/WebDashboardService.cs`, `HttpListener`) serve a UI em `h
 | `/api/countries` | Lista de países configurados. |
 | `/api/country?country=pt` | Detalhe de um país (canais). |
 | `/api/country/validate?country=pt` | **Validação de `output/playlist.m3u` usando `AnalyzePlaylist` com threshold 3** (alinhada com o pipeline). Devolve `isMatch` (= `IsTargetCountry`), `matchedAliases`, `recognizedChannelCount`, `threshold`, `totalChannels`, `playlistLength`, `sample`. |
-| `/api/country/save` (POST) | Grava a lista de canais de um país. |
+| `/api/country/save` (POST) | Grava a lista de canais de um país (preserva o `displayName` enviado). |
+| `/api/country?country=pt` (DELETE) | **W6** — Elimina a configuração do país (`runtime-data/countries/<code>.json`). `200` quando eliminado, `404` quando ausente. Não altera a playlist publicada. |
 | `/api/playlist` / `/api/playlist_temp` | **Funcional**: conteúdo textual das playlists com URLs reais (necessário para reprodução Xtream). Usar para download explícito. |
 | `/api/playlist/preview` / `/api/playlist_temp/preview` | **Diagnóstico**: mesmo conteúdo com URLs sanitizadas (`CredentialSanitizer.SanitizeM3uContent`). Usado pela pré-visualização HTML para nunca expor credenciais. |
 | `/api/run-report` | `RunReport` da última execução (sanitizado). |
@@ -1108,8 +1111,20 @@ Bootstrap → Admin → Setup Required → Telegram → Dispatcharr → Sources 
 | `/api/telegram/auth/status` | GET | Estado do login (`state`, `userName`, `detail`, `configured`). |
 | `/api/dispatcharr/config` | GET/POST | Lê/grava `enabled`, `base_url`, `dry_run` e credenciais (nunca devolvidas). |
 | `/api/dispatcharr/test` | POST | Teste de ligação read-only (`GET /api/core/version/`). |
+| `/api/dispatcharr/dry-run` | POST | **W6** — Gera `MatchPlan` + `SyncReport` sem escrever no Dispatcharr. Corpo `{ "playlistPath": "playlist.m3u" }` (caminho relativo resolvido sob o output dir). Devolve `{status, mode:"dry-run", planPath, reportPath, counts{...}}`. |
+| `/api/dispatcharr/sync` | POST | **W6** — Aplica a sincronização (mutação real no Dispatcharr, sujeita a `dispatcharr_enabled`/`dispatcharr_dry_run`). Mesmo contrato, `mode:"sync"`. |
 
 Todos os `POST` são métodos mutantes e, em `UserAuth`, exigem `X-CSRF-Token`.
+
+O separador **Dispatcharr** do Dashboard expõe dois botões: **Dry Run** (sem confirmação)
+e **Sync Dispatcharr** (confirmação forte, pois é uma mutação real), com guarda de
+busy/anti-duplo-clique, apresentação de `counts`/`planPath`/`reportPath` e erro real do
+backend. O wiring de produção (`Program.cs`) regista o **mesmo** `DispatcharrSyncCoordinator`
+do `RunPublicationService` com o dashboard via `WebDashboardService.SetDispatcharrSync`
+(mais um `DispatcharrConcurrencyGate`, que devolve `409 concurrency-conflict` a pedidos
+concorrentes). Em `--web` **standalone** (sem `--telegram`) não há coordenador ligado e
+ambos os endpoints respondem `503 dispatcharr-unavailable` — o que é o comportamento
+esperado. Nunca são expostas credenciais.
 
 ### Autenticação Telegram interactiva
 

@@ -232,6 +232,20 @@ namespace m3uCrawler.Services
                 : _runtimeDataDirOverride!;
 
         /// <summary>
+        /// W6 — Directório das configurações de país
+        /// (<c>runtime-data/countries</c>). Deriva de
+        /// <see cref="ResolveRuntimeDataDir"/>, pelo que os testes isolam os
+        /// endpoints <c>/api/countries</c>, <c>/api/country</c>,
+        /// <c>/api/country/save</c>, <c>/api/country/validate</c> e
+        /// <c>DELETE /api/country</c> via
+        /// <see cref="StaticRuntimeDataDirScope"/> sem tocar no
+        /// <c>runtime-data</c> real. Em produção o override é nulo e o
+        /// caminho é idêntico ao histórico.
+        /// </summary>
+        private static string ResolveCountriesDir() =>
+            Path.Combine(ResolveRuntimeDataDir(), "countries");
+
+        /// <summary>
         /// Lifecycle — Para o listener do dashboard de forma coerente
         /// (Ctrl+C / SIGTERM). Usado pelo mecanismo de shutdown de
         /// Program.Main; desbloqueia o <c>GetContextAsync()</c> pendente.
@@ -767,9 +781,18 @@ namespace m3uCrawler.Services
                 return;
             }
 
+            // W6 — Decisão de âmbito para "Canais / Países": o país NÃO é uma
+            // entidade de domínio (não existe entidade `Country`). É
+            // configuração/validação: ficheiros JSON de aliases em
+            // `runtime-data/countries/<code>.json` geridos por
+            // `CountryChannelListService`. Por isso o separador é uma
+            // ferramenta de configuração/validação (criar/editar/eliminar
+            // configs + validar a playlist), não um CRUD de entidade. A
+            // identidade persistida continua em `CanonicalChannelEntity` e a
+            // validação em `CountryChannelValidator`.
             if (requestPath.Equals("/api/countries", StringComparison.OrdinalIgnoreCase))
             {
-                var service = new CountryChannelListService(Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries"));
+                var service = new CountryChannelListService(ResolveCountriesDir());
                 await WriteJsonAsync(context.Response, service.GetAllCountries());
                 return;
             }
@@ -779,12 +802,41 @@ namespace m3uCrawler.Services
                 var countryCode = context.Request.QueryString["country"];
                 if (string.IsNullOrWhiteSpace(countryCode))
                 {
-                    await WriteJsonAsync(context.Response, new { error = "Parâmetro country é obrigatório." });
-                    context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                    // W6 — usar o overload com status: o overload anterior
+                    // escrevia o corpo com 200 e só depois fixava o status,
+                    // que já não tinha efeito (masking P1). Agora 400 é real.
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = "Parâmetro country é obrigatório." },
+                        HttpStatusCode.BadRequest);
                     return;
                 }
 
-                var service = new CountryChannelListService(Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries"));
+                var service = new CountryChannelListService(ResolveCountriesDir());
+
+                // W6 — DELETE /api/country?country=<code>: remove a config de
+                // país (`runtime-data/countries/<code>.json`). 200 quando
+                // eliminada; 404 quando ausente. A leitura (GET) preserva o
+                // comportamento anterior.
+                if (context.Request.HttpMethod.Equals("DELETE", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!service.DeleteCountry(countryCode))
+                    {
+                        await WriteJsonAsync(
+                            context.Response,
+                            new { error = "Configuração de país não encontrada." },
+                            HttpStatusCode.NotFound);
+                        return;
+                    }
+
+                    await WriteJsonAsync(context.Response, new
+                    {
+                        country = countryCode.Trim().ToLowerInvariant(),
+                        deleted = true,
+                    });
+                    return;
+                }
+
                 await WriteJsonAsync(context.Response, service.GetCountry(countryCode));
                 return;
             }
@@ -792,10 +844,10 @@ namespace m3uCrawler.Services
             if (requestPath.Equals("/api/country/validate", StringComparison.OrdinalIgnoreCase))
             {
                 var countryCode = context.Request.QueryString["country"] ?? "pt";
-                var countryList = new CountryChannelListService(Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries"));
+                var countryList = new CountryChannelListService(ResolveCountriesDir());
                 var affinityMembers = await LoadCountryAffinityMembersAsync();
                 var validator = new CountryChannelValidator(
-                    Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries"),
+                    ResolveCountriesDir(),
                     affinityMembers);
                 var playlistPath = Path.Combine(outputDir, "playlist.m3u");
                 var playlistText = File.Exists(playlistPath) ? await File.ReadAllTextAsync(playlistPath, Encoding.UTF8) : string.Empty;
@@ -832,7 +884,7 @@ namespace m3uCrawler.Services
                         return;
                     }
 
-                    var service = new CountryChannelListService(Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries"));
+                    var service = new CountryChannelListService(ResolveCountriesDir());
                     service.SaveCountry(country);
                     await WriteJsonAsync(context.Response, country);
                     return;
@@ -1880,17 +1932,35 @@ namespace m3uCrawler.Services
                 return;
             }
 
+            // W6 — sub-rotas de decisão: /{id}/approve e /{id}/reject.
+            // O parser anterior fazia TryParse sobre "5/approve" (falhava
+            // sempre → 400 antes de chegar ao ramo approve/reject), deixando
+            // ApprovePendingCountryApprovalAsync/RejectPendingCountryApprovalAsync
+            // inalcançáveis por HTTP. Aqui separam-se os segmentos e lê-se o
+            // id do penúltimo segmento e a acção do último.
             if (requestPath.StartsWith("/api/catalog/pending-country-approvals/", StringComparison.OrdinalIgnoreCase))
             {
-                var idStr = requestPath.Substring("/api/catalog/pending-country-approvals/".Length);
-                if (!long.TryParse(idStr, out var pendingId))
+                if (!context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = "Método não permitido." },
+                        HttpStatusCode.MethodNotAllowed);
+                    return;
+                }
+
+                var segments = requestPath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+                // .../pending-country-approvals/{id}/{approve|reject}
+                if (segments.Length < 2 || !long.TryParse(segments[^2], out var pendingId))
                 {
                     context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
                     await WriteJsonAsync(context.Response, new { error = "ID inválido." });
                     return;
                 }
 
-                if (requestPath.EndsWith("/approve", StringComparison.OrdinalIgnoreCase))
+                var action = segments[^1];
+                if (action.Equals("approve", StringComparison.OrdinalIgnoreCase))
                 {
                     var approved = await _catalogResolver.ApprovePendingCountryApprovalAsync(pendingId);
                     if (approved == null)
@@ -1908,7 +1978,7 @@ namespace m3uCrawler.Services
                     return;
                 }
 
-                if (requestPath.EndsWith("/reject", StringComparison.OrdinalIgnoreCase))
+                if (action.Equals("reject", StringComparison.OrdinalIgnoreCase))
                 {
                     var rejected = await _catalogResolver.RejectPendingCountryApprovalAsync(pendingId);
                     if (rejected == null)
@@ -5465,14 +5535,22 @@ namespace m3uCrawler.Services
     <!-- CANAIS / PAÍSES -->
     <section id='view-countries' hidden>
       <h2 style='font-size:18px;margin-top:0;'>Canais / Países</h2>
-      <h3 style='font-size:14px;'>Validação da playlist atual</h3>
+      <p class='muted'>Configuração e validação por país. Os países vivem como ficheiros de aliases
+      (<code>runtime-data/countries/&lt;code&gt;.json</code>); este separador gere essa configuração e
+      valida a playlist actual — não é um CRUD de uma entidade de domínio.</p>
+      <h3 style='font-size:14px;'>Validação da playlist actual</h3>
       <div class='toolbar'>
         <label class='muted'>País:</label>
         <select id='countrySelect'></select>
         <button class='secondary' onclick='loadCountryValidation()'>Re-validar</button>
       </div>
       <div id='countryValidationResult'></div>
-      <h3 style='font-size:14px;margin-top:24px;'>Listas de canais por país (editáveis)</h3>
+      <h3 style='font-size:14px;margin-top:24px;'>Configuração de canais por país</h3>
+      <div class='toolbar' style='margin-bottom:8px;'>
+        <input id='newCountryCode' placeholder='código (ex: es)' style='width:140px;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+        <input id='newCountryName' placeholder='nome (ex: Espanha)' style='width:200px;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+        <button class='secondary' onclick='createCountry()'>Novo país</button>
+      </div>
       <div id='countrySection'></div>
     </section>
 
@@ -5494,6 +5572,14 @@ namespace m3uCrawler.Services
     <!-- DISPATCHARR -->
     <section id='view-dispatcharr' hidden>
       <h2 style='font-size:18px;margin-top:0;'>Dispatcharr</h2>
+      <div class='card' style='margin-bottom:12px;'>
+        <div class='toolbar'>
+          <button id='dispatcharrDryRunBtn' onclick='runDispatcharrDryRun()'>Dry Run</button>
+          <button id='dispatcharrSyncBtn' class='secondary' style='color:var(--err);' onclick='runDispatcharrSync()'>Sync Dispatcharr</button>
+          <span class='muted'>Dry Run gera o plano sem escrever no Dispatcharr; Sync aplica as alterações (mutação real).</span>
+        </div>
+        <div id='dispatcharrActionStatus' class='muted' style='margin-top:8px;'></div>
+      </div>
       <div id='dispatcharrOverview'></div>
       <h3 style='font-size:14px;margin-top:24px;'>Detalhes da última sincronização</h3>
       <div id='dispatcharrDetail'></div>
@@ -6722,7 +6808,10 @@ namespace m3uCrawler.Services
         <div class='card' style='margin-bottom:12px;'>
           <h3>${c.displayName || c.country}</h3>
           <textarea id='country-${c.country}' rows='6'>${(c.channels || []).join('\n')}</textarea>
-          <div style='margin-top:8px;'><button class='secondary' data-country='${c.country}'>Guardar</button></div>
+          <div style='margin-top:8px;'>
+            <button class='secondary' data-country='${c.country}' data-displayname='${escapeAttr(c.displayName || c.country)}'>Guardar</button>
+            <button class='secondary' style='color:var(--err);' data-delete-country='${c.country}'>Eliminar</button>
+          </div>
         </div>`).join('');
       document.getElementById('countrySection').innerHTML = countryCards;
       document.querySelectorAll('button[data-country]').forEach(btn => {
@@ -6730,11 +6819,38 @@ namespace m3uCrawler.Services
           const code = btn.getAttribute('data-country');
           const t = document.getElementById(`country-${code}`);
           const channels = t.value.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
-          const r = await fetch('/api/country/save', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ country: code, displayName: code.toUpperCase(), channels }) });
+          // W6 — Preservar o displayName amigável existente; não o
+          // substituir por code.toUpperCase().
+          const displayName = btn.getAttribute('data-displayname') || code;
+          const r = await fetch('/api/country/save', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ country: code, displayName, channels }) });
           if (r.ok) { alert('Lista guardada.'); await loadCountries(); } else { alert('Erro: ' + (await r.text())); }
         });
       });
+      document.querySelectorAll('button[data-delete-country]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const code = btn.getAttribute('data-delete-country');
+          if (!confirm(`Eliminar a configuração de país '${code}'? A playlist publicada não é alterada.`)) return;
+          const r = await fetch('/api/country?country=' + encodeURIComponent(code), { method: 'DELETE' });
+          if (r.ok) { await loadCountries(); }
+          else { alert('Erro: ' + r.status + ' ' + (await r.text())); }
+        });
+      });
       await loadCountryValidation();
+    }
+
+    async function createCountry() {
+      const code = (document.getElementById('newCountryCode').value || '').trim().toLowerCase();
+      const displayName = (document.getElementById('newCountryName').value || '').trim();
+      if (!code) { alert('Código de país é obrigatório.'); return; }
+      const r = await fetch('/api/country/save', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ country: code, displayName: displayName, channels: [] })
+      });
+      if (!r.ok) { alert('Erro: ' + r.status + ' ' + (await r.text())); return; }
+      document.getElementById('newCountryCode').value = '';
+      document.getElementById('newCountryName').value = '';
+      await loadCountries();
     }
 
     async function loadCountryValidation() {
@@ -6831,6 +6947,74 @@ const rows = Object.entries(inv).map(([k, v]) => {
           Ver <code>dispatcharr_plan_*.json</code> e <code>dispatcharr_report_*.json</code> mais recentes.
           Estes ficheiros nunca contêm credenciais em claro (sanitização automática).</p>
         </div>`;
+    }
+
+    // W6 — Acções Dispatcharr (Dry Run / Sync). O payload usa o produto
+    // canónico `playlist.m3u`; o handler server-side resolve-o sob o
+    // outputDir. Um único flag de busy evita cliques concorrentes. Nunca
+    // são expostas credenciais: só mode/status/counts e paths.
+    let dispatcharrActionBusy = false;
+
+    function setDispatcharrActionBusy(busy, label) {
+      dispatcharrActionBusy = busy;
+      const dry = document.getElementById('dispatcharrDryRunBtn');
+      const sync = document.getElementById('dispatcharrSyncBtn');
+      if (dry) dry.disabled = busy;
+      if (sync) sync.disabled = busy;
+      const status = document.getElementById('dispatcharrActionStatus');
+      if (status && label !== undefined) status.textContent = label;
+    }
+
+    function renderDispatcharrActionResult(mode, r) {
+      const target = document.getElementById('dispatcharrActionStatus');
+      if (!target) return;
+      const c = (r && r.counts) ? r.counts : null;
+      const counts = c
+        ? `matched=${nfmt(c.matched||0)} · novosCanais=${nfmt(c.newChannels||0)} · novosStreams=${nfmt(c.newStreams||0)} · removidos=${nfmt(c.removedStreams||0)} · ignorados=${nfmt(c.skipped||0)} · ambíguos=${nfmt(c.ambiguous||0)} · inalterados=${nfmt(c.unchanged||0)} · falhas=${nfmt(c.failed||0)}`
+        : 'sem contagens';
+      const badge = mode === 'dry-run' ? 'info' : 'warn';
+      target.innerHTML =
+        `<span class='badge ${badge}'>${escapeHtml(mode)}</span> ${escapeHtml(r && r.status ? r.status : '—')} · ${counts}` +
+        (r && r.planPath ? `<br><span class='row-counts'>plano: <code>${escapeHtml(r.planPath)}</code></span>` : '') +
+        (r && r.reportPath ? `<br><span class='row-counts'>relatório: <code>${escapeHtml(r.reportPath)}</code></span>` : '');
+    }
+
+    async function runDispatcharrAction(path, mode) {
+      if (dispatcharrActionBusy) return;
+      setDispatcharrActionBusy(true, mode === 'dry-run' ? 'A executar Dry Run…' : 'A sincronizar Dispatcharr…');
+      try {
+        const r = await fetch(path, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ playlistPath: 'playlist.m3u' })
+        });
+        let body = null;
+        try { body = await r.json(); } catch (e) { body = null; }
+        if (!r.ok) {
+          const status = document.getElementById('dispatcharrActionStatus');
+          const code = (body && (body.error || body.message)) ? (body.error || body.message) : ('HTTP ' + r.status);
+          const detail = (body && body.message && body.message !== code) ? (' · ' + body.message) : '';
+          if (status) status.innerHTML = `<span class='badge err'>erro</span> ${escapeHtml(code)}${escapeHtml(detail)}`;
+          return;
+        }
+        renderDispatcharrActionResult(mode, body || {});
+      } catch (e) {
+        const status = document.getElementById('dispatcharrActionStatus');
+        if (status) status.innerHTML = `<span class='badge err'>erro</span> ${escapeHtml(e && e.message ? e.message : 'falha de rede')}`;
+      } finally {
+        setDispatcharrActionBusy(false);
+        await loadDispatcharr();
+      }
+    }
+
+    async function runDispatcharrDryRun() {
+      await runDispatcharrAction('/api/dispatcharr/dry-run', 'dry-run');
+    }
+
+    async function runDispatcharrSync() {
+      if (dispatcharrActionBusy) return;
+      if (!confirm('SYNC DISPATCHARR é uma mutação REAL e potencialmente destrutiva: cria, actualiza e remove canais/streams no Dispatcharr. Confirmar a sincronização?')) return;
+      await runDispatcharrAction('/api/dispatcharr/sync', 'sync');
     }
 
     async function loadDiagnostics() {
@@ -9706,6 +9890,9 @@ const rows = Object.entries(inv).map(([k, v]) => {
     window.removeAliasFromDetail = removeAliasFromDetail;
     window.loadHistory = loadHistory;
     window.loadCountryValidation = loadCountryValidation;
+    window.createCountry = createCountry;
+    window.runDispatcharrDryRun = runDispatcharrDryRun;
+    window.runDispatcharrSync = runDispatcharrSync;
     window.loadChannelSources = loadChannelSources;
     window.submitCreateSource = submitCreateSource;
     window.deleteSource = deleteSource;
@@ -10362,11 +10549,18 @@ const rows = Object.entries(inv).map(([k, v]) => {
             }
 
             // (4) Path traversal guard — playlistPath tem de estar dentro de outputDir.
+            //     W6 — Um caminho relativo (ex.: "playlist.m3u", o produto
+            //     canónico do pipeline W2 consumido pelo Dispatcharr) é
+            //     resolvido a partir de outputDir. Caminhos absolutos mantêm
+            //     a regra anterior: têm de estar contidos em outputDir.
             string normalizedPlaylist;
             try
             {
                 var fullOutputDir = Path.GetFullPath(outputDir);
-                normalizedPlaylist = Path.GetFullPath(playlistPath);
+                var candidatePlaylist = Path.IsPathRooted(playlistPath)
+                    ? playlistPath
+                    : Path.Combine(fullOutputDir, playlistPath);
+                normalizedPlaylist = Path.GetFullPath(candidatePlaylist);
                 if (!normalizedPlaylist.StartsWith(
                         fullOutputDir + Path.DirectorySeparatorChar,
                         StringComparison.OrdinalIgnoreCase)

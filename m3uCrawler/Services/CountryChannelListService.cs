@@ -9,6 +9,17 @@ namespace m3uCrawler.Services
         public List<string> Channels { get; set; } = new();
     }
 
+    /// <summary>
+    /// W6 — O país é <b>configuração/validação</b>, não uma entidade de
+    /// domínio: não existe entidade <c>Country</c> na base de dados. Cada
+    /// país vive como um ficheiro JSON de aliases em
+    /// <c>runtime-data/countries/&lt;code&gt;.json</c>. Este serviço é a
+    /// única fonte de verdade para criar/ler/actualizar/eliminar essa
+    /// configuração; a validação da playlist é feita por
+    /// <see cref="CountryChannelValidator"/> sobre a mesma configuração.
+    /// O separador "Canais / Países" do Dashboard é, por isso, uma
+    /// ferramenta de configuração/validação e não um CRUD de país.
+    /// </summary>
     public class CountryChannelListService
     {
         private static readonly JsonSerializerOptions ReadOptions = new() { PropertyNameCaseInsensitive = true };
@@ -104,6 +115,30 @@ namespace m3uCrawler.Services
             var filePath = Path.Combine(_rootDirectory, $"{normalizedCountry}.json");
             var json = JsonSerializer.Serialize(country, new JsonSerializerOptions { WriteIndented = true });
             File.WriteAllText(filePath, json);
+        }
+
+        /// <summary>
+        /// W6 — Elimina a configuração de país
+        /// (<c>&lt;code&gt;.json</c>). Devolve <c>true</c> quando um ficheiro
+        /// foi eliminado; <c>false</c> quando não existia (ou o código é
+        /// vazio). Não toca na playlist publicada nem no catálogo.
+        /// </summary>
+        public bool DeleteCountry(string countryCode)
+        {
+            var normalized = NormalizeCountryCode(countryCode);
+            if (string.IsNullOrWhiteSpace(normalized))
+            {
+                return false;
+            }
+
+            var filePath = Path.Combine(_rootDirectory, $"{normalized}.json");
+            if (!File.Exists(filePath))
+            {
+                return false;
+            }
+
+            File.Delete(filePath);
+            return true;
         }
 
         public string GetCountryDirectory() => _rootDirectory;

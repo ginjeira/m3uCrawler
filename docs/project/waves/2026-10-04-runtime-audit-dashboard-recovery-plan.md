@@ -4,7 +4,7 @@
 > waves de recuperação `W1–W7`. Subordinado à BÍBLIA (`docs/Reestructure/00-BIBLE.md:30-41`, `:105-128`);
 > não redefine conceitos normativos nem implementa nada.
 >
-> **Estado:** `W1`, `W2`, `W3`, `W4` e `W5` **CONCLUÍDAS** (2026-10-04); `W6–W7` **PENDENTES**. Este documento mantém o plano original; o progresso é registado em `docs/PROJECT_STATUS.md`.
+> **Estado:** `W1`, `W2`, `W3`, `W4`, `W5` e `W6` **CONCLUÍDAS** (2026-10-04); `W7` **PENDENTE**. Este documento mantém o plano original; o progresso é registado em `docs/PROJECT_STATUS.md`.
 >
 > **Cross-reference:** estado corrente e prioridades em `docs/PROJECT_STATUS.md` (secção
 > "Waves 2026-10 — recuperação pós-auditoria runtime") e `ROADMAP.md` (§ "Em curso"). Índice de waves
@@ -244,6 +244,12 @@ Se for mantido como entidade funcional, implementar CRUD completo.
 
 **Corrigir também:** Revalidar; restantes botões mortos; funcionalidades sem implementação
 correspondente.
+
+**Estado:** **CONCLUÍDA** (2026-10-04).
+- **Dispatcharr UI:** botões **Dry Run** e **Sync Dispatcharr**, com confirmação forte antes do Sync (real/destrutivo), estado *busy*/anti-duplo-clique, resultado (mode/status/counts/planPath/reportPath) e erros reais; envia `{ playlistPath: "playlist.m3u" }` (canónico da W2). **Wiring de produção:** `Program.cs` regista o coordenador no Dashboard (`SetDispatcharrSync`, o MESMO do `RunPublicationService`); em `--web` standalone sem `--telegram` não há coordenador → 503 esperado.
+- **Countries (Opção B):** países são **configuração/aliases em JSON** (`runtime-data/countries/*.json`), sem entidade de domínio → mantido como ferramenta de configuração/validação; `Re-validar` já funcional (W1); corrigida a preservação do `displayName`; adicionados "Novo país" e "Eliminar" (`CountryChannelListService.DeleteCountry` + `DELETE /api/country`, 200/404).
+- **Rota morta corrigida:** `POST /api/catalog/pending-country-approvals/{id}/approve|reject` (parsing por segmentos; 400/404/405).
+- Restantes controlos auditados: funcionais; endpoints sem UI ficam documentados (não são "botões mortos"). Testes: `WaveW6*`. Ver `CHANGELOG.md`.
 
 ### W7 — Auditoria final end-to-end
 
