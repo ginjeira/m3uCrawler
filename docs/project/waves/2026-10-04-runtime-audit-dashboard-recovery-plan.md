@@ -4,7 +4,7 @@
 > waves de recuperação `W1–W7`. Subordinado à BÍBLIA (`docs/Reestructure/00-BIBLE.md:30-41`, `:105-128`);
 > não redefine conceitos normativos nem implementa nada.
 >
-> **Estado:** `W1`, `W2` e `W3` **CONCLUÍDAS** (2026-10-04); `W4–W7` **PENDENTES**. Este documento mantém o plano original; o progresso é registado em `docs/PROJECT_STATUS.md`.
+> **Estado:** `W1`, `W2`, `W3` e `W4` **CONCLUÍDAS** (2026-10-04); `W5–W7` **PENDENTES**. Este documento mantém o plano original; o progresso é registado em `docs/PROJECT_STATUS.md`.
 >
 > **Cross-reference:** estado corrente e prioridades em `docs/PROJECT_STATUS.md` (secção
 > "Waves 2026-10 — recuperação pós-auditoria runtime") e `ROADMAP.md` (§ "Em curso"). Índice de waves
@@ -200,6 +200,12 @@ Regressão em `WaveW3HttpSemanticsTests` (404 para GET/POST/PUT/DELETE em rota i
 
 **Critério:** não considerar suficiente o facto de a API funcionar; cada funcionalidade deve ser
 **testada através do Dashboard**.
+
+**Estado:** **CONCLUÍDA** (2026-10-04).
+- **Scheduler:** adicionada edição pela UI (botão **Editar** por linha; prefill do formulário com o `Name` **bloqueado**, reutilizando o upsert-por-Name já existente; botão **Limpar / Novo**; reset/reload/feedback mantidos) e **auditabilidade** nas rotas de criar/upsert, enable/disable e eliminar (`catalog.scheduled-job.*`).
+- **Ordering:** novo `PUT /api/catalog/ordering-lists/{id}` + `CatalogResolver.UpdateOrderingListAsync` (edita `Name`/`Country`/`Description`/`IsEnabled`; `Key` imutável; validação; 400/404; audit `catalog.ordering-list.update`) e formulário de edição na UI; corrigido o silêncio de erros em `toggleOrderingItem`/`removeOrderingItem`.
+- **Canonical Channels:** o formulário de criação passa a servir também de **edição** (`editChannelInline` abre o formulário com `Key` bloqueado), expondo **todos** os campos suportados — DisplayName, Country, **EditorialCategory**, **EditorialGroup**, PublicationPolicy, IsEnabled (aliases só na criação) — que antes só existiam em `prompt()` parcial.
+- Handlers novos exportados para `window` (regressão W1 mantida). Testes: `WaveW4OrderingHttpTests`, `WaveW4ChannelAdminHttpTests`, `WaveW4UiHtmlTests` + extensões a `ScheduledJobsEndpointTests`/`WaveW3HttpSemanticsTests`. Ver `CHANGELOG.md`.
 
 ### W5 — Reviews + Alias → Affinity
 

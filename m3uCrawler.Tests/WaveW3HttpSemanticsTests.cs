@@ -3,6 +3,7 @@ using System.IO;
 using System.Net;
 using System.Net.Http;
 using System.Text;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using m3uCrawler.Services;
@@ -135,20 +136,32 @@ public sealed class WaveW3HttpSemanticsTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task Ordering_put_without_route_returns_404_or_405_not_hang()
+    public async Task Ordering_put_now_routes_and_updates_metadata()
     {
-        // W3 não implementa o PUT de Ordering (isso é W4); apenas garante que
-        // um método/rota sem implementação responde e não fica pendurado.
-        using var request = new HttpRequestMessage(HttpMethod.Put, "/api/catalog/ordering-lists/1")
+        // W3 garantia que um PUT sem rota respondia e não ficava pendurado.
+        // W4 implementou a rota: aqui confirma-se que o pedido é consumido e
+        // devolve 200 (rota existe), sem hang. A cobertura detalhada da
+        // validação vive em WaveW4OrderingHttpTests.
+        var created = await Client.PostAsync(
+            "/api/catalog/ordering-lists",
+            Json($"{{\"key\":\"w3-put-{Guid.NewGuid():N}\",\"name\":\"W3\",\"isEnabled\":true}}"),
+            ShortToken());
+        Assert.Equal(HttpStatusCode.Created, created.StatusCode);
+
+        long id;
+        using (var doc = JsonDocument.Parse(await created.Content.ReadAsStringAsync()))
         {
-            Content = Json("{}"),
+            id = doc.RootElement.GetProperty("id").GetInt64();
+        }
+
+        using var request = new HttpRequestMessage(HttpMethod.Put, $"/api/catalog/ordering-lists/{id}")
+        {
+            Content = Json("{\"name\":\"W3 Actualizado\",\"isEnabled\":false}"),
         };
 
         var response = await Client.SendAsync(request, ShortToken());
 
-        Assert.True(
-            response.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.MethodNotAllowed,
-            $"esperado 404 ou 405, obtido {(int)response.StatusCode}");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
     }
 
     // ===================== STATUS (regressão de masking) =====================

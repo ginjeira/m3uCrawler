@@ -162,4 +162,54 @@ public class ScheduledJobsEndpointTests : IAsyncLifetime
         Assert.True(first.TryGetProperty("requiresTelegram", out _));
         Assert.True(first.TryGetProperty("requiresDispatcharr", out _));
     }
+
+    // === W4 — mutações de scheduled jobs (list-after-mutation) ===
+
+    private async Task<long> CreateJobAsync(string name)
+    {
+        var created = await _harness!.Client.PostAsync(
+            "/api/catalog/scheduled-jobs",
+            Json($"{{\"name\":\"{name}\",\"cronExpression\":\"*/5 * * * *\",\"actionName\":\"discoverM3u\",\"isEnabled\":true}}"));
+        Assert.Equal(HttpStatusCode.OK, created.StatusCode);
+        using var doc = JsonDocument.Parse(await created.Content.ReadAsStringAsync());
+        return doc.RootElement.GetProperty("id").GetInt64();
+    }
+
+    [Fact]
+    public async Task Put_enabled_updates_job_and_get_reflects()
+    {
+        var id = await CreateJobAsync($"job-toggle-{Guid.NewGuid():N}");
+
+        var update = await _harness!.Client.PutAsync(
+            $"/api/catalog/scheduled-jobs/{id}/enabled",
+            Json("{\"isEnabled\":false}"));
+        Assert.Equal(HttpStatusCode.OK, update.StatusCode);
+
+        var listed = await _harness.Client.GetAsync("/api/catalog/scheduled-jobs");
+        using var doc = JsonDocument.Parse(await listed.Content.ReadAsStringAsync());
+        var job = doc.RootElement.EnumerateArray().Single(e => e.GetProperty("id").GetInt64() == id);
+        Assert.False(job.GetProperty("isEnabled").GetBoolean());
+    }
+
+    [Fact]
+    public async Task Put_enabled_null_payload_returns_400()
+    {
+        var update = await _harness!.Client.PutAsync(
+            "/api/catalog/scheduled-jobs/1/enabled",
+            Json("null"));
+        Assert.Equal(HttpStatusCode.BadRequest, update.StatusCode);
+    }
+
+    [Fact]
+    public async Task Delete_existing_job_returns_200_and_get_reflects()
+    {
+        var id = await CreateJobAsync($"job-delete-{Guid.NewGuid():N}");
+
+        var delete = await _harness!.Client.DeleteAsync($"/api/catalog/scheduled-jobs/{id}");
+        Assert.Equal(HttpStatusCode.OK, delete.StatusCode);
+
+        var listed = await _harness.Client.GetAsync("/api/catalog/scheduled-jobs");
+        using var doc = JsonDocument.Parse(await listed.Content.ReadAsStringAsync());
+        Assert.DoesNotContain(doc.RootElement.EnumerateArray(), e => e.GetProperty("id").GetInt64() == id);
+    }
 }

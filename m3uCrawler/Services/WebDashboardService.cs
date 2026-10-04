@@ -1995,6 +1995,43 @@ namespace m3uCrawler.Services
                         await WriteJsonAsync(context.Response, new { deleted = true, id = listId });
                         return;
                     }
+                    if (context.Request.HttpMethod.Equals("PUT", StringComparison.OrdinalIgnoreCase))
+                    {
+                        try
+                        {
+                            using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
+                            var body = await reader.ReadToEndAsync();
+                            var payload = JsonSerializer.Deserialize<OrderingListUpdatePayload>(body, JsonOptions);
+                            if (payload == null || string.IsNullOrWhiteSpace(payload.Name))
+                            {
+                                context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                                await WriteJsonAsync(context.Response, new { error = "Payload inválido: Name é obrigatório." });
+                                return;
+                            }
+                            var beforeList = await _catalogResolver.GetOrderingListAsync(listId, includeItems: false);
+                            var updated = await _catalogResolver.UpdateOrderingListAsync(
+                                listId, payload.Name, payload.Country, payload.Description,
+                                payload.IsEnabled ?? true);
+                            if (updated == null)
+                            {
+                                context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                                await WriteJsonAsync(context.Response, new { error = $"OrderingList #{listId} não encontrada." });
+                                return;
+                            }
+                            await RecordAuditAsync(auditActor, "catalog.ordering-list.update", "ordering-list",
+                                listId.ToString(),
+                                beforeList is null ? null : OrderingListSummaryToJson(beforeList),
+                                OrderingListSummaryToJson(updated), AuditResult.Success);
+                            await WriteJsonAsync(context.Response, new { updated = true, id = listId });
+                            return;
+                        }
+                        catch (Exception ex)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = ex.Message });
+                            return;
+                        }
+                    }
                 }
 
                 if (segments.Length == 2 && segments[1].Equals("duplicate", StringComparison.OrdinalIgnoreCase)
@@ -2526,6 +2563,8 @@ namespace m3uCrawler.Services
                         }
                         var saved = await _catalogResolver.UpsertScheduledJobAsync(
                             payload.Name, payload.CronExpression, payload.ActionName, payload.IsEnabled);
+                        await RecordAuditAsync(auditActor, "catalog.scheduled-job.upsert", "scheduled-job",
+                            saved.Id.ToString(), null, ScheduledJobToJson(saved), AuditResult.Success);
                         await WriteJsonAsync(context.Response, ScheduledJobToJson(saved));
                         return;
                     }
@@ -2555,9 +2594,13 @@ namespace m3uCrawler.Services
                         var ok = await _catalogResolver.DeleteScheduledJobAsync(jid);
                         if (!ok)
                         {
+                            await RecordAuditAsync(auditActor, "catalog.scheduled-job.delete", "scheduled-job",
+                                jid.ToString(), null, null, AuditResult.Failure, "not-found");
                             await WriteJsonAsync(context.Response, new { error = "Scheduled job não encontrado." }, HttpStatusCode.NotFound);
                             return;
                         }
+                        await RecordAuditAsync(auditActor, "catalog.scheduled-job.delete", "scheduled-job",
+                            jid.ToString(), new { id = jid }, null, AuditResult.Success);
                         await WriteJsonAsync(context.Response, new { deleted = true, id = jid });
                         return;
                     }
@@ -2582,9 +2625,13 @@ namespace m3uCrawler.Services
                         var ok = await _catalogResolver.SetScheduledJobEnabledAsync(jid, payload.IsEnabled);
                         if (!ok)
                         {
+                            await RecordAuditAsync(auditActor, "catalog.scheduled-job.enabled", "scheduled-job",
+                                jid.ToString(), null, null, AuditResult.Failure, "not-found");
                             await WriteJsonAsync(context.Response, new { error = "Scheduled job não encontrado." }, HttpStatusCode.NotFound);
                             return;
                         }
+                        await RecordAuditAsync(auditActor, "catalog.scheduled-job.enabled", "scheduled-job",
+                            jid.ToString(), null, new { id = jid, isEnabled = payload.IsEnabled }, AuditResult.Success);
                         await WriteJsonAsync(context.Response, new { updated = true, id = jid, isEnabled = payload.IsEnabled });
                         return;
                     }
@@ -4753,6 +4800,15 @@ namespace m3uCrawler.Services
         [JsonPropertyName("isEnabled")] public bool IsEnabled { get; set; } = true;
     }
 
+    // W4 — actualização de metadados de uma ordering list (Key imutável).
+    private sealed class OrderingListUpdatePayload
+    {
+        [JsonPropertyName("name")] public string? Name { get; set; }
+        [JsonPropertyName("country")] public string? Country { get; set; }
+        [JsonPropertyName("description")] public string? Description { get; set; }
+        [JsonPropertyName("isEnabled")] public bool? IsEnabled { get; set; }
+    }
+
     private sealed class OrderingListDuplicatePayload
     {
         [JsonPropertyName("newKey")] public string? NewKey { get; set; }
@@ -5466,7 +5522,7 @@ namespace m3uCrawler.Services
           </div>
           <div id='createChannelForm' hidden style='margin-bottom:16px;'>
             <div class='card'>
-              <h3>Novo Canal Canónico</h3>
+              <h3 id='createChannelTitle'>Novo Canal Canónico</h3>
               <div style='display:grid;gap:10px;grid-template-columns:1fr 1fr;'>
                 <div>
                   <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Key (slug único, imutável)</label>
@@ -5520,13 +5576,13 @@ namespace m3uCrawler.Services
                     <option value='false'>não</option>
                   </select>
                 </div>
-                <div style='grid-column:1/-1;'>
+                <div id='newChannelAliasesBlock' style='grid-column:1/-1;'>
                   <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Aliases normalizados (um por linha)</label>
                   <textarea id='newChannelAliases' rows='4' placeholder='rtp memoria' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;resize:vertical;'></textarea>
                 </div>
               </div>
               <div style='margin-top:10px;display:flex;gap:8px;'>
-                <button onclick='submitCreateChannel()'>Guardar</button>
+                <button id='createChannelSubmitBtn' onclick='submitCreateChannel()'>Guardar</button>
                 <button class='secondary' onclick='hideCreateChannelForm()'>Cancelar</button>
               </div>
             </div>
@@ -5728,6 +5784,34 @@ namespace m3uCrawler.Services
             </div>
             <div style='margin-top:10px;display:flex;gap:8px;'>
               <button onclick='submitCreateOrderingList()'>Guardar</button>
+            </div>
+          </div>
+          <div id='orderingEditForm' hidden style='margin-top:16px;'>
+            <h4 style='margin:0 0 8px 0;'>Editar lista</h4>
+            <div style='display:grid;gap:8px;grid-template-columns:1fr 1fr 1fr;'>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Nome</label>
+                <input data-ordering-edit='name' placeholder='ex: PT Principal' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              </div>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>País (ISO)</label>
+                <input data-ordering-edit='country' placeholder='pt' maxlength='10' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              </div>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Activo</label>
+                <select data-ordering-edit='enabled' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                  <option value='true'>sim</option>
+                  <option value='false'>não</option>
+                </select>
+              </div>
+            </div>
+            <div style='margin-top:8px;'>
+              <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Descrição</label>
+              <textarea data-ordering-edit='description' rows='2' placeholder='opcional' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;resize:vertical;'></textarea>
+            </div>
+            <div style='margin-top:10px;display:flex;gap:8px;'>
+              <button onclick='saveOrderingListEdit()'>Guardar</button>
+              <button class='secondary' onclick='cancelOrderingListEdit()'>Cancelar</button>
             </div>
           </div>
         </div>
@@ -5947,6 +6031,7 @@ namespace m3uCrawler.Services
             </div>
             <div style='margin-top:10px;display:flex;gap:8px;align-items:center;'>
               <button onclick='submitCreateScheduledJob()'>Guardar</button>
+              <button class='secondary' onclick='newScheduledJob()'>Limpar / Novo</button>
               <span id='schedFormStatus' style='font-size:12px;'></span>
             </div>
           </div>
@@ -6780,6 +6865,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
 
     let _channelsCache = [];
     let _selectedChannelId = null;
+    let _editingChannelId = null;
 
     async function loadCatalogChannels() {
       const channels = await safeFetchJson('/api/catalog/channels', []);
@@ -6979,28 +7065,22 @@ const rows = Object.entries(inv).map(([k, v]) => {
     async function editChannelInline(channelId) {
       const c = _channelsCache.find(x => x.id === channelId);
       if (!c) return;
-      const newDisplay = prompt('Display Name:', c.displayName);
-      if (newDisplay == null) return;
-      const newCountry = prompt('País (vazio = global):', c.country || '');
-      if (newCountry == null) return;
-      const payload = {
-        displayName: newDisplay,
-        country: newCountry.trim() || null,
-        editorialCategory: c.editorialCategory,
-        editorialGroup: c.editorialGroup,
-        publicationPolicy: c.publicationPolicy,
-        isEnabled: c.isEnabled
-      };
-      const r = await fetch('/api/catalog/channels/' + channelId, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-      if (r.ok) await reloadChannelDetail(channelId);
-      else {
-        const err = await r.json();
-        alert('Erro: ' + (err.error || r.status));
-      }
+      _editingChannelId = channelId;
+      document.getElementById('newChannelDisplayName').value = c.displayName || '';
+      document.getElementById('newChannelCountry').value = c.country || '';
+      document.getElementById('newChannelCategory').value = c.editorialCategory || 'Live';
+      document.getElementById('newChannelGroup').value = c.editorialGroup || 'PortugalLive';
+      document.getElementById('newChannelPolicy').value = c.publicationPolicy || 'CreateEligible';
+      document.getElementById('newChannelEnabled').value = String(!!c.isEnabled);
+      const keyEl = document.getElementById('newChannelKey');
+      keyEl.value = c.key || '';
+      keyEl.readOnly = true;
+      document.getElementById('newChannelAliasesBlock').hidden = true;
+      document.getElementById('createChannelTitle').textContent = 'Editar Canal Canónico';
+      document.getElementById('createChannelSubmitBtn').textContent = 'Guardar alterações';
+      const form = document.getElementById('createChannelForm');
+      form.hidden = false;
+      form.scrollIntoView({ behavior: 'smooth' });
     }
 
     async function deleteChannel(channelId) {
@@ -7019,7 +7099,10 @@ const rows = Object.entries(inv).map(([k, v]) => {
     }
 
     function showCreateChannelForm() {
-      document.getElementById('newChannelKey').value = '';
+      _editingChannelId = null;
+      const keyEl = document.getElementById('newChannelKey');
+      keyEl.value = '';
+      keyEl.readOnly = false;
       document.getElementById('newChannelDisplayName').value = '';
       document.getElementById('newChannelCountry').value = '';
       document.getElementById('newChannelCategory').value = 'Live';
@@ -7027,20 +7110,56 @@ const rows = Object.entries(inv).map(([k, v]) => {
       document.getElementById('newChannelPolicy').value = 'CreateEligible';
       document.getElementById('newChannelEnabled').value = 'true';
       document.getElementById('newChannelAliases').value = '';
+      document.getElementById('newChannelAliasesBlock').hidden = false;
+      document.getElementById('createChannelTitle').textContent = 'Novo Canal Canónico';
+      document.getElementById('createChannelSubmitBtn').textContent = 'Guardar';
       document.getElementById('createChannelForm').hidden = false;
       document.getElementById('createChannelForm').scrollIntoView({ behavior: 'smooth' });
     }
-    function hideCreateChannelForm() { document.getElementById('createChannelForm').hidden = true; }
+    function hideCreateChannelForm() {
+      document.getElementById('createChannelForm').hidden = true;
+      _editingChannelId = null;
+    }
 
     async function submitCreateChannel() {
+      const editingId = _editingChannelId;
+      const displayName = document.getElementById('newChannelDisplayName').value.trim();
+      const country = (document.getElementById('newChannelCountry').value || '').trim() || null;
+      const editorialCategory = document.getElementById('newChannelCategory').value;
+      const editorialGroup = document.getElementById('newChannelGroup').value;
+      const publicationPolicy = document.getElementById('newChannelPolicy').value;
+      const isEnabled = document.getElementById('newChannelEnabled').value === 'true';
+
+      if (editingId != null) {
+        if (!displayName) { alert('Display Name é obrigatório.'); return; }
+        const updatePayload = { displayName, country, editorialCategory, editorialGroup, publicationPolicy, isEnabled };
+        const r = await fetch('/api/catalog/channels/' + editingId, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(updatePayload)
+        });
+        if (r.ok) {
+          hideCreateChannelForm();
+          await loadCatalogChannels();
+          _selectedChannelId = editingId;
+          renderChannelsTable();
+          renderChannelDetail();
+          if (typeof loadCatalog === 'function') loadCatalog();
+        } else {
+          const err = await r.json();
+          alert('Erro: ' + (err.error || r.status));
+        }
+        return;
+      }
+
       const payload = {
         key: document.getElementById('newChannelKey').value.trim(),
-        displayName: document.getElementById('newChannelDisplayName').value.trim(),
-        country: (document.getElementById('newChannelCountry').value || '').trim() || null,
-        editorialCategory: document.getElementById('newChannelCategory').value,
-        editorialGroup: document.getElementById('newChannelGroup').value,
-        publicationPolicy: document.getElementById('newChannelPolicy').value,
-        isEnabled: document.getElementById('newChannelEnabled').value === 'true',
+        displayName,
+        country,
+        editorialCategory,
+        editorialGroup,
+        publicationPolicy,
+        isEnabled,
         aliases: document.getElementById('newChannelAliases').value.split(/\r?\n/).map(a => a.trim()).filter(Boolean),
       };
       if (!payload.key) { alert('Key é obrigatória.'); return; }
@@ -7346,12 +7465,59 @@ const rows = Object.entries(inv).map(([k, v]) => {
         <td>${l.itemCount || 0}</td>
         <td>${l.isEnabled ? '<span class="badge ok">sim</span>' : '<span class="badge err">não</span>'}</td>
         <td>
+          <button class='secondary' onclick='editOrderingList(${l.id})'>Editar</button>
           <button class='secondary' onclick='previewOrderingList(${l.id})'>Preview</button>
           <button class='secondary' onclick='duplicateOrderingList(${l.id}, "${escapeHtml(l.key)}")'>Duplicar</button>
           <button class='secondary' style='color:var(--err);' onclick='deleteOrderingList(${l.id})'>Eliminar</button>
         </td>
       </tr>`).join('');
       document.getElementById('orderingListsTable').innerHTML = `<table><thead><tr><th>#</th><th>Key</th><th>Nome</th><th>País</th><th>Items</th><th>Activo</th><th>Acções</th></tr></thead><tbody>${rows}</tbody></table>`;
+    }
+
+    let _orderingEditingId = null;
+
+    function editOrderingList(id) {
+      const l = _orderingListsCache.find(x => x.id === id);
+      if (!l) return;
+      document.querySelector("[data-ordering-edit='name']").value = l.name || '';
+      document.querySelector("[data-ordering-edit='country']").value = l.country || '';
+      document.querySelector("[data-ordering-edit='description']").value = l.description || '';
+      document.querySelector("[data-ordering-edit='enabled']").value = String(!!l.isEnabled);
+      _orderingEditingId = id;
+      const form = document.getElementById('orderingEditForm');
+      form.hidden = false;
+      form.scrollIntoView({ behavior: 'smooth' });
+    }
+
+    function cancelOrderingListEdit() {
+      const form = document.getElementById('orderingEditForm');
+      if (form) form.hidden = true;
+      _orderingEditingId = null;
+    }
+
+    async function saveOrderingListEdit() {
+      if (_orderingEditingId == null) return;
+      const id = _orderingEditingId;
+      const payload = {
+        name: document.querySelector("[data-ordering-edit='name']").value.trim(),
+        country: (document.querySelector("[data-ordering-edit='country']").value || '').trim() || null,
+        description: (document.querySelector("[data-ordering-edit='description']").value || '').trim() || null,
+        isEnabled: document.querySelector("[data-ordering-edit='enabled']").value === 'true',
+      };
+      if (!payload.name) { alert('Nome é obrigatório.'); return; }
+      const r = await fetch('/api/catalog/ordering-lists/' + id, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (r.ok) {
+        cancelOrderingListEdit();
+        await loadOrderingLists();
+        if (_orderingListDetailCache && _orderingListDetailCache.id === id) await openOrderingList(id);
+      } else {
+        const err = await r.json();
+        alert('Erro: ' + (err.error || r.status));
+      }
     }
 
     async function submitCreateOrderingList() {
@@ -7484,12 +7650,14 @@ const rows = Object.entries(inv).map(([k, v]) => {
         body: JSON.stringify({ isEnabled: next }),
       });
       if (r.ok && _orderingListDetailCache) await openOrderingList(_orderingListDetailCache.id);
+      else if (!r.ok) { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
     }
 
     async function removeOrderingItem(itemId) {
       if (!confirm('Remover o item?')) return;
       const r = await fetch('/api/catalog/ordering-items/' + itemId, { method: 'DELETE' });
       if (r.ok && _orderingListDetailCache) await openOrderingList(_orderingListDetailCache.id);
+      else if (!r.ok) { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
     }
 
     async function loadGlobalPriority() {
@@ -7999,8 +8167,12 @@ const rows = Object.entries(inv).map(([k, v]) => {
         }
       }
     }
+    let _schedEditingId = null;
+    let _schedJobsCache = [];
+
     async function loadScheduledJobs() {
       const list = await safeFetchJson('/api/catalog/scheduled-jobs', []);
+      _schedJobsCache = Array.isArray(list) ? list : [];
       if (!Array.isArray(list)) { document.getElementById('scheduledJobsTable').innerHTML = '<p class="muted">Erro.</p>'; return; }
       if (!list.length) { document.getElementById('scheduledJobsTable').innerHTML = '<p class="muted">Sem jobs agendados.</p>'; return; }
       const rows = list.map(j => `<tr>
@@ -8013,11 +8185,49 @@ const rows = Object.entries(inv).map(([k, v]) => {
         <td>${j.nextRunAtUtc ? tsLocal(j.nextRunAtUtc) : '—'}</td>
         <td>${escapeHtml(j.lastResult || '—')}</td>
         <td>
+          <button class='secondary' onclick='editScheduledJob(${j.id})'>Editar</button>
           <button class='secondary' onclick='toggleScheduledJob(${j.id}, ${!j.isEnabled})'>${j.isEnabled ? 'Desactivar' : 'Activar'}</button>
           <button class='secondary' style='color:var(--err);' onclick='deleteScheduledJob(${j.id})'>Eliminar</button>
         </td>
       </tr>`).join('');
       document.getElementById('scheduledJobsTable').innerHTML = `<table><thead><tr><th>#</th><th>Name</th><th>Cron</th><th>Action</th><th>Activo</th><th>Último</th><th>Próximo</th><th>Resultado</th><th>Acções</th></tr></thead><tbody>${rows}</tbody></table>`;
+    }
+
+    function editScheduledJob(id) {
+      const job = _schedJobsCache.find(x => x.id === id);
+      if (!job) return;
+      const nameEl = document.querySelector("[data-sched-create=name]");
+      const cronEl = document.querySelector("[data-sched-create=cron]");
+      const actionEl = document.querySelector("[data-sched-create=action]");
+      const enabledEl = document.querySelector("[data-sched-create=enabled]");
+      if (nameEl) { nameEl.value = job.name || ''; nameEl.readOnly = true; }
+      if (cronEl) cronEl.value = job.cronExpression || '';
+      if (actionEl) {
+        if (!Array.from(actionEl.options).some(o => o.value === job.actionName)) {
+          const opt = document.createElement('option');
+          opt.value = job.actionName;
+          opt.textContent = job.actionName;
+          actionEl.appendChild(opt);
+        }
+        actionEl.value = job.actionName;
+      }
+      if (enabledEl) enabledEl.value = String(!!job.isEnabled);
+      _schedEditingId = id;
+      updateSchedCronStatus();
+      const form = document.querySelector("[data-sched-create=name]");
+      if (form && form.scrollIntoView) form.scrollIntoView({ behavior: 'smooth' });
+      setSchedFormStatus('A editar job #' + id + ' (Name bloqueado). Guardar actualiza este job.', true);
+    }
+
+    function newScheduledJob() {
+      _schedEditingId = null;
+      const nameEl = document.querySelector("[data-sched-create=name]");
+      const cronEl = document.querySelector("[data-sched-create=cron]");
+      const enabledEl = document.querySelector("[data-sched-create=enabled]");
+      if (nameEl) { nameEl.value = ''; nameEl.readOnly = false; }
+      if (cronEl) cronEl.value = '';
+      if (enabledEl) enabledEl.value = 'true';
+      updateSchedCronStatus();
     }
 
     async function submitCreateScheduledJob() {
@@ -8042,7 +8252,8 @@ const rows = Object.entries(inv).map(([k, v]) => {
         body: JSON.stringify(payload),
       });
       if (r.ok) {
-        if (nameEl) nameEl.value = '';
+        _schedEditingId = null;
+        if (nameEl) { nameEl.value = ''; nameEl.readOnly = false; }
         if (cronEl) cronEl.value = '';
         if (enabledEl) enabledEl.value = 'true';
         updateSchedCronStatus();
@@ -9275,9 +9486,14 @@ const rows = Object.entries(inv).map(([k, v]) => {
     window.updateSchedCronStatus = updateSchedCronStatus;
     window.applySchedFrequency = applySchedFrequency;
     window.submitCreateScheduledJob = submitCreateScheduledJob;
+    window.editScheduledJob = editScheduledJob;
+    window.newScheduledJob = newScheduledJob;
     window.toggleScheduledJob = toggleScheduledJob;
     window.deleteScheduledJob = deleteScheduledJob;
     window.submitCreateOrderingList = submitCreateOrderingList;
+    window.editOrderingList = editOrderingList;
+    window.saveOrderingListEdit = saveOrderingListEdit;
+    window.cancelOrderingListEdit = cancelOrderingListEdit;
     window.openOrderingList = openOrderingList;
     window.previewOrderingList = previewOrderingList;
     window.duplicateOrderingList = duplicateOrderingList;

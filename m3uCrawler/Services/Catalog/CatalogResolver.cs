@@ -3324,6 +3324,34 @@ public sealed class CatalogResolver
         return entity;
     }
 
+    /// <summary>
+    /// W4 — actualiza os metadados de uma <see cref="OrderingListEntity"/>
+    /// existente. A <c>Key</c> é imutável; só <c>Name</c>, <c>Country</c>,
+    /// <c>Description</c> e <c>IsEnabled</c> são alteráveis.
+    /// </summary>
+    public async Task<OrderingListEntity?> UpdateOrderingListAsync(
+        long id, string name, string? country, string? description, bool isEnabled,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.InvalidInput, "Name é obrigatório.");
+        }
+
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var entity = await context.OrderingLists.FirstOrDefaultAsync(l => l.Id == id, cancellationToken);
+        if (entity == null) return null;
+
+        entity.Name = name.Trim();
+        entity.Country = string.IsNullOrWhiteSpace(country) ? null : country.Trim();
+        entity.Description = string.IsNullOrWhiteSpace(description) ? null : description.Trim();
+        entity.IsEnabled = isEnabled;
+        entity.UpdatedAtUtc = DateTime.UtcNow;
+        await context.SaveChangesAsync(cancellationToken);
+        return entity;
+    }
+
     public async Task<OrderingListEntity> DuplicateOrderingListAsync(
         long sourceListId, string newKey, string? newName = null,
         CancellationToken cancellationToken = default)
