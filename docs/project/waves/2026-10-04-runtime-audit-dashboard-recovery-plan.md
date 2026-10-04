@@ -4,7 +4,7 @@
 > waves de recuperação `W1–W7`. Subordinado à BÍBLIA (`docs/Reestructure/00-BIBLE.md:30-41`, `:105-128`);
 > não redefine conceitos normativos nem implementa nada.
 >
-> **Estado:** `W1` e `W2` **CONCLUÍDAS** (2026-10-04); `W3–W7` **PENDENTES**. Este documento mantém o plano original; o progresso é registado em `docs/PROJECT_STATUS.md`.
+> **Estado:** `W1`, `W2` e `W3` **CONCLUÍDAS** (2026-10-04); `W4–W7` **PENDENTES**. Este documento mantém o plano original; o progresso é registado em `docs/PROJECT_STATUS.md`.
 >
 > **Cross-reference:** estado corrente e prioridades em `docs/PROJECT_STATUS.md` (secção
 > "Waves 2026-10 — recuperação pós-auditoria runtime") e `ROADMAP.md` (§ "Em curso"). Índice de waves
@@ -181,6 +181,12 @@ histórico + manutenção só canónico). Não foi feita execução real control
 - rotas inexistentes devem responder `404/405` e **nunca** ficar penduradas;
 - completar/validar contratos HTTP necessários;
 - adicionar testes de regressão.
+
+**Estado:** **CONCLUÍDA** (2026-10-04). Correçcão **transversal** em `WebDashboardService`, sem patches endpoint a endpoint e sem alterar a arquitectura `HttpListener`:
+(1) `WriteJsonAsync`/`WriteTextAsync` passam a **preservar** o status já fixado pelo chamador (parâmetro `HttpStatusCode?`; só sobrescreve quando explícito) — elimina o mascaramento 4xx→200;
+(2) `HandleRequestAsync` corre agora dentro de `try/catch/finally` com rastreio de respostas escritas (`ConditionalWeakTable`), garantindo que **nenhum** pedido fica pendurado: rota não-root não correspondida → `404` JSON (nunca o HTML do Dashboard), ramos que fixam um status de erro (ex.: 405) sem corpo devolvem esse status, e excepções não tratadas → `500` (log mínimo: método/path/tipo);
+(3) a página do Dashboard só é servida na raiz.
+Regressão em `WaveW3HttpSemanticsTests` (404 para GET/POST/PUT/DELETE em rota inexistente; 405 em método não suportado; 404 non-root; `/` continua HTML; API válida continua JSON; 201/400/404/409 preservados; `PUT` de Ordering → 404/405 sem hang).
 
 ### W4 — Scheduler + Ordering + Canonical Channels
 

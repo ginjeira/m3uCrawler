@@ -71,6 +71,21 @@ namespace m3uCrawler.Services
         // SIGTERM), para que GetContextAsync() não fique bloqueado.
         private static HttpListener? _dashboardListener;
 
+        // W3 — Rastreio de respostas já escritas. O HttpListenerResponse só é
+        // fechado pelos helpers de escrita; um `return` sem escrita (rota/método
+        // não correspondido, ou ramo que fixa um status de erro) deixaria o
+        // cliente pendurado indefinidamente. O `HandleRequestAsync` usa este
+        // marcador num `finally` para garantir sempre uma resposta. Usa-se
+        // ConditionalWeakTable para não reter respostas (chave fraca).
+        private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<HttpListenerResponse, object> _writtenResponses = new();
+        private static readonly object _writtenResponseMarker = new();
+
+        private static void MarkResponseWritten(HttpListenerResponse response)
+            => _writtenResponses.AddOrUpdate(response, _writtenResponseMarker);
+
+        private static bool WasResponseWritten(HttpListenerResponse response)
+            => _writtenResponses.TryGetValue(response, out _);
+
         /// <summary>
         /// PHASE 9C.2 (S1-E) — Indica que o Dashboard corre num contexto
         /// explicitamente standalone/testes, onde a ausência simultânea de
@@ -561,6 +576,13 @@ namespace m3uCrawler.Services
         {
             var requestPath = context.Request.Url?.AbsolutePath ?? "/";
             var query = context.Request.Url?.Query ?? string.Empty;
+
+            // W3 — Todo o encaminhamento/resposta corre dentro deste try: o
+            // catch e o finally garantem que QUALQUER pedido termina com uma
+            // resposta fechada (sem hangs) e que o status fixado pelo handler
+            // nunca é mascarado.
+            try
+            {
 
             // Protecção opcional por token partilhado: se --web-token foi configurado,
             // todos os endpoints exigem o token via header Authorization: Bearer
@@ -3541,7 +3563,60 @@ namespace m3uCrawler.Services
                 return;
             }
 
-            await WriteHtmlAsync(context.Response, BuildHtmlPage());
+            if (isRootPath)
+            {
+                // W3 — A página do Dashboard só é servida na raiz. Qualquer
+                // outro path não correspondido NÃO pode devolver HTML 200 como
+                // se fosse uma API válida.
+                await WriteHtmlAsync(context.Response, BuildHtmlPage());
+                return;
+            }
+
+            // W3 — Rota não correspondida (não-root): 404 JSON. O `finally`
+            // abaixo é a rede de segurança para ramos que fixam um status de
+            // erro (ex.: 405) sem escrever corpo.
+            await WriteJsonAsync(
+                context.Response,
+                new { error = "not-found", path = requestPath },
+                HttpStatusCode.NotFound);
+            }
+            catch (Exception ex)
+            {
+                // W3 — Última linha de defesa: uma excepção não tratada não pode
+                // deixar o pedido pendurado. Log mínimo (método/path/tipo da
+                // excepção), sem mensagem (pode conter segredos/URLs com
+                // credenciais). A resposta não revela detalhes internos.
+                if (!WasResponseWritten(context.Response))
+                {
+                    Console.WriteLine($"❌ HTTP {context.Request.HttpMethod} {requestPath}: {ex.GetType().Name}");
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = "internal-error" },
+                        HttpStatusCode.InternalServerError);
+                }
+            }
+            finally
+            {
+                if (!WasResponseWritten(context.Response))
+                {
+                    if (context.Response.StatusCode == (int)HttpStatusCode.OK)
+                    {
+                        // Sem status fixado e sem resposta: rota não correspondida.
+                        await WriteJsonAsync(
+                            context.Response,
+                            new { error = "not-found", path = requestPath },
+                            HttpStatusCode.NotFound);
+                    }
+                    else
+                    {
+                        // O handler fixou um status (ex.: 405) mas não escreveu
+                        // corpo. WriteJsonAsync sem status preserva-o.
+                        await WriteJsonAsync(
+                            context.Response,
+                            new { error = "request-not-completed", status = context.Response.StatusCode, path = requestPath });
+                    }
+                }
+            }
         }
 
         private sealed class ValidationTestPayload
@@ -4231,14 +4306,23 @@ namespace m3uCrawler.Services
             };
         }
 
-        private static async Task WriteJsonAsync(HttpListenerResponse response, object data, HttpStatusCode statusCode = HttpStatusCode.OK)
+        // W3 — `statusCode` é opcional: quando omitido, PRESERVA o status já
+        // fixado pelo chamador (ex.: `Response.StatusCode = BadRequest` antes de
+        // escrever o corpo). Antes, o default `OK` repunha sempre 200 e mascarava
+        // erros determinados pelos endpoints. Só sobrescreve quando o chamador
+        // passa um status explícito.
+        private static async Task WriteJsonAsync(HttpListenerResponse response, object data, HttpStatusCode? statusCode = null)
         {
-            response.StatusCode = (int)statusCode;
+            if (statusCode.HasValue)
+            {
+                response.StatusCode = (int)statusCode.Value;
+            }
             var json = JsonSerializer.Serialize(data, JsonOptions);
             response.ContentType = "application/json; charset=utf-8";
             var buffer = Encoding.UTF8.GetBytes(json);
             response.ContentLength64 = buffer.Length;
             await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
+            MarkResponseWritten(response);
             response.Close();
         }
 
@@ -4273,13 +4357,19 @@ namespace m3uCrawler.Services
             }
         }
 
-        private static async Task WriteTextAsync(HttpListenerResponse response, string text, HttpStatusCode statusCode = HttpStatusCode.OK, string contentType = "text/plain; charset=utf-8")
+        // W3 — `statusCode` opcional: quando omitido, PRESERVA o status já
+        // fixado pelo chamador (ver WriteJsonAsync).
+        private static async Task WriteTextAsync(HttpListenerResponse response, string text, HttpStatusCode? statusCode = null, string contentType = "text/plain; charset=utf-8")
         {
-            response.StatusCode = (int)statusCode;
+            if (statusCode.HasValue)
+            {
+                response.StatusCode = (int)statusCode.Value;
+            }
             response.ContentType = contentType;
             var buffer = Encoding.UTF8.GetBytes(text);
             response.ContentLength64 = buffer.Length;
             await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
+            MarkResponseWritten(response);
             response.Close();
         }
 
@@ -4289,6 +4379,7 @@ namespace m3uCrawler.Services
             var buffer = Encoding.UTF8.GetBytes(html);
             response.ContentLength64 = buffer.Length;
             await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
+            MarkResponseWritten(response);
             response.Close();
         }
 
@@ -9356,6 +9447,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
         {
             response.StatusCode = (int)HttpStatusCode.Found;
             response.RedirectLocation = location;
+            MarkResponseWritten(response);
             response.Close();
         }
 
