@@ -62,10 +62,10 @@ em produção; W5.3 dependente de `M.4` (produção chama `ResolveAsync` com `po
 resolve gap (`externalIdentity`/`channelSource`/`none` → 422); Review→Output não ligado;
 `C7` **OPEN**; `M.4` **OPEN**.
 
-## Plano de recuperação pós-auditoria runtime (2026-10-04) — planeamento
+## Plano de recuperação pós-auditoria runtime (2026-10-04) — execução
 
 A auditoria runtime de 2026-10-04 (HEAD `cf0e314`, runtime `m3ucrawler-first-test`) e o plano de
 waves de recuperação `W1–W7` estão em
 [`2026-10-04-runtime-audit-dashboard-recovery-plan.md`](2026-10-04-runtime-audit-dashboard-recovery-plan.md).
-Registo de **planeamento**: `W1` implementada (2026-10-04); `W2–W7` pendentes. Próxima prioridade:
-**W2** (pipeline de playlists/Dispatcharr, antecipada). Estado corrente em `docs/PROJECT_STATUS.md`.
+Registo de **execução**: `W1` e `W2` implementadas (2026-10-04); `W3–W7` pendentes. Próxima
+prioridade: **W3** (HTTP/API transversal). Estado corrente em `docs/PROJECT_STATUS.md`.

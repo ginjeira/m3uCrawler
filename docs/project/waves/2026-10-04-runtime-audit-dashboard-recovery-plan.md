@@ -4,7 +4,7 @@
 > waves de recuperação `W1–W7`. Subordinado à BÍBLIA (`docs/Reestructure/00-BIBLE.md:30-41`, `:105-128`);
 > não redefine conceitos normativos nem implementa nada.
 >
-> **Estado:** `W1` **CONCLUÍDA** (2026-10-04); `W2–W7` **PENDENTES**. Este documento mantém o plano original; o progresso é registado em `docs/PROJECT_STATUS.md`.
+> **Estado:** `W1` e `W2` **CONCLUÍDAS** (2026-10-04); `W3–W7` **PENDENTES**. Este documento mantém o plano original; o progresso é registado em `docs/PROJECT_STATUS.md`.
 >
 > **Cross-reference:** estado corrente e prioridades em `docs/PROJECT_STATUS.md` (secção
 > "Waves 2026-10 — recuperação pós-auditoria runtime") e `ROADMAP.md` (§ "Em curso"). Índice de waves
@@ -156,6 +156,21 @@ Dispatcharr.
 
 **NÃO misturar nesta wave:** scheduler; ordering; canonical CRUD; reviews; affinity; countries;
 redesign geral do Dashboard.
+
+**Estado:** **CONCLUÍDA** (2026-10-04). Implementação mínima no serviço único de publicação
+(`RunPublicationService.PublishAsync`): deduplicação por URL (OrdinalIgnoreCase, mantendo a
+primeira ocorrência) → escrita atómica do intermédio `playlist_temp.m3u` **antes** de qualquer
+filtro/validação/matching → selecção inalterada → escrita atómica do canónico final
+`playlist.m3u` → o Dispatcharr passa a receber **`playlist.m3u`** (nunca o timestamped). O
+`telegram_playlist_<timestamp>.m3u` continua a ser escrito no caminho normal como
+histórico/técnico; no ciclo de manutenção (`PlaylistFileName="playlist.m3u"`, coincidente com o
+canónico) deixa de haver escrita duplicada e o `RunPublicationService` passa a ser o **único**
+dono de `playlist_temp.m3u` (removida a truncagem/escrita manual em `Program.cs`). Testes em
+`WaveW2CanonicalPipelineTests` (dedup no intermédio; final = saída da selecção; separação
+temp/final; Dispatcharr consome `playlist.m3u` via dry-run com transporte falso; timestamped
+histórico + manutenção só canónico). Não foi feita execução real controlada contra Dispatcharr
+(sem rede) — a cadeia foi validada por integração determinística. Ver `docs/PROJECT_STATUS.md` e
+`CHANGELOG.md`.
 
 ### W3 — HTTP/API transversal
 

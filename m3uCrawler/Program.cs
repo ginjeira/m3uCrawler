@@ -1491,14 +1491,10 @@ namespace m3uCrawler
             ILiveRunProgress? liveRunProgress = null,
             CancellationToken cancellationToken = default)
         {
-            var tempPath = Path.Combine(outputDir, "playlist_temp.m3u");
             var mainPath = Path.Combine(outputDir, "playlist.m3u");
 
             Console.WriteLine();
             Console.WriteLine("🧹 Início do ciclo de manutenção Telegram...");
-
-            // Limpa sempre a playlist temporária no início do ciclo.
-            await File.WriteAllTextAsync(tempPath, "#EXTM3U" + Environment.NewLine, Encoding.UTF8);
 
             var (freshStreams, runReport) = await scraper.SearchAndTestM3UInTelegramAsync(
                 term,
@@ -1525,10 +1521,6 @@ namespace m3uCrawler
                     .ToList();
                 Console.WriteLine($"🌐 Após filtro de domínio: {freshStreams.Count}/{beforeFilter} streams");
             }
-
-            await playlistManager.SaveToM3uPlaylist(freshStreams, tempPath);
-            Console.WriteLine($"🔔 Novos canais funcionais em playlist_temp.m3u: {freshStreams.Count}");
-            Console.WriteLine($"   • Escrito: {tempPath}");
 
             var existingMain = await playlistManager.LoadFromM3uPlaylist(mainPath);
             Console.WriteLine($"📄 playlist.m3u atual: {existingMain.Count} stream(s) a retestar");
@@ -1647,9 +1639,9 @@ namespace m3uCrawler
 
             Console.WriteLine("✅ Ciclo concluído.");
             Console.WriteLine($"   • Mantidas de playlist.m3u: {stillWorkingMain.Count}");
-            Console.WriteLine($"   • Novas funcionais de playlist_temp.m3u: {freshStreams.Count(s => s.IsWorking)}");
+            Console.WriteLine($"   • Novas funcionais descobertas: {freshStreams.Count(s => s.IsWorking)}");
             Console.WriteLine($"   • Total final em playlist.m3u: {published.Published.Count}");
-            Console.WriteLine($"   • playlist_temp.m3u: {tempPath}");
+            Console.WriteLine($"   • playlist_temp.m3u: {published.IntermediatePlaylistPath}");
             Console.WriteLine($"   • playlist.m3u: {mainPath}");
             Console.WriteLine($"   • Relatório de execução: {Path.Combine(outputDir, "telegram_run_report.json")}");
         }

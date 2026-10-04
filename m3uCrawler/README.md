@@ -531,23 +531,23 @@ O contador `streamsSkippedAlreadyValidated` (W-DEDUP) aparece também no histór
 
 ## Modo manutenção (`--telegram-maintain`)
 
-O ciclo de manutenção (`Program.cs` → `RunTelegramMaintenanceCycle`):
+O ciclo de manutenção (`Program.cs` → `RunTelegramMaintenanceCycle`) delega a cauda no
+`RunPublicationService` (o mesmo serviço do single-cycle):
 
-1. Limpa `output/playlist_temp.m3u` no início do ciclo.
-2. Corre o pipeline (`SearchAndTestM3UInTelegramAsync`) e obtém os novos streams funcionais (`freshStreams`).
-3. Carrega `output/playlist.m3u` existente e **retesta** cada stream (`M3uTesterService`).
-4. Faz o merge de `stillWorkingMain` (retestados e ainda funcionais) com `freshStreams` via `TelegramScraperService.MergeStreams` (deduplicação por URL; prioriza working).
-5. Escreve o resultado em `output/playlist.m3u` e o relatório de manutenção em `output/telegram_maintain_report.json`.
-6. Actualiza o histórico (`ImportHistoryService.RecordImportAsync`).
-7. Grava o `RunReport` em `output/telegram_run_report.json`.
+1. Corre o pipeline (`SearchAndTestM3UInTelegramAsync`) e obtém os novos streams funcionais (`freshStreams`).
+2. Carrega `output/playlist.m3u` existente e **retesta** cada stream (`M3uTesterService`).
+3. Faz o merge de `stillWorkingMain` (retestados e ainda funcionais) com `freshStreams` via `TelegramScraperService.MergeStreams` (deduplicação por URL; prioriza working).
+4. Passa o resultado a `RunPublicationService.PublishAsync` (com `PlaylistFileName="playlist.m3u"`): o serviço deduplica por URL, escreve o intermédio `output/playlist_temp.m3u` (estado normalizado/deduplicado, **antes** da selecção) e o canónico `output/playlist.m3u`, e grava o relatório de manutenção em `output/telegram_maintain_report.json`.
+5. Actualiza o histórico (`ImportHistoryService.RecordImportAsync`).
+6. Grava o `RunReport` em `output/telegram_run_report.json`.
 
 Regras importantes:
 
 - **Sem novos candidatos** (`CandidatesFound == 0`) → `MergeStreams(stillWorkingMain, [])` devolve `stillWorkingMain`, pelo que **`playlist.m3u` mantém os streams anteriores**. A ausência de novas descobertas **não** é interpretada como ausência de streams válidos.
-- **Candidatos sem playlists válidas** (todas rejeitadas por país/ formato) → o mesmo: streams existentes preservados; `playlist_temp.m3u` fica praticamente vazia.
+- **Candidatos sem playlists válidas** (todas rejeitadas por país/ formato) → o mesmo: streams existentes preservados; `playlist_temp.m3u` reflecte o merge preservado (não fica vazia enquanto houver streams existentes).
 - **Novos streams** → adicionados, dedup por URL, sem duplicar.
-- `playlist.m3u` e `playlist_temp.m3u` são sempre produzidos no fim do ciclo.
-- **Não existe nenhum caminho** no ciclo em que uma execução vazia apague uma playlist funcional existente: a única escrita em `mainPath` recebe `finalStreams`, que inclui sempre `stillWorkingMain`.
+- `playlist.m3u` e `playlist_temp.m3u` são sempre produzidos no fim do ciclo, pelo `RunPublicationService` (dono único de ambos).
+- **Não existe nenhum caminho** no ciclo em que uma execução vazia apague uma playlist funcional existente: a escrita canónica recebe `finalStreams`, que inclui sempre `stillWorkingMain`.
 
 ## Dashboard (`WebDashboardService`)
 
@@ -1342,8 +1342,8 @@ Exemplos: `0 8 * * *` (todos os dias às 08:00 UTC); `0 */6 * * *` (de 6 em 6 ho
 | `validatePlaylist` | Re-testa todas as streams de `<output-dir>/playlist.m3u` e reescreve o ficheiro mantendo apenas as que respondem. Se a playlist estiver ausente ou vazia, não a esvazia. Faz pedidos HTTP externos (probes). | `Output` |
 | `generatePlaylist` | Compõe `<output-dir>/playlist.m3u` a partir de uma `OrderingList` do catálogo canónico. O nome do job `generatePlaylist:<id>` seleciona a lista; sem id válido usa a primeira lista (regista fallback). Não faz pedidos externos. | `Catalog` + `Output` |
 | `syncDispatcharr` | Sincroniza `<output-dir>/playlist.m3u` com o Dispatcharr via `DispatcharrSyncCoordinator`. Respeita `dispatcharr_enabled` e `dispatcharr_dry_run`; decisões ambíguas nunca são aplicadas automaticamente. Só chama a API Dispatcharr se activo e fora de dry-run. | `Dispatcharr` |
-| `telegramRun` | Ciclo Telegram (descoberta + validação) via `RunCoordinator`, com a configuração de Discovery persistida. Escreve `telegram_playlist_<timestamp>.m3u` e relatórios (não substitui `playlist.m3u`) e corre o sync Dispatcharr se activo. Requer sessão Telegram autenticada. | `Telegram` |
-| `telegramMaintainRun` | Ciclo Telegram em modo manutenção: re-testa `playlist.m3u`, preserva streams working/retryable e incorpora novas descobertas em `playlist.m3u` (usa `playlist_temp.m3u` como artefacto intermédio). Requer sessão Telegram autenticada. | `Telegram` |
+| `telegramRun` | Ciclo Telegram (descoberta + validação) via `RunCoordinator`, com a configuração de Discovery persistida. Publica `playlist.m3u` (canónico, input do Dispatcharr) e o intermédio `playlist_temp.m3u`; mantém `telegram_playlist_<timestamp>.m3u` como histórico/técnico. Escreve também os relatórios e corre o sync Dispatcharr se activo. Requer sessão Telegram autenticada. | `Telegram` |
+| `telegramMaintainRun` | Ciclo Telegram em modo manutenção: re-testa `playlist.m3u`, preserva streams working/retryable e incorpora novas descobertas em `playlist.m3u`; o `RunPublicationService` produz o intermédio `playlist_temp.m3u` (normalizado/deduplicado) e o canónico final. Requer sessão Telegram autenticada. | `Telegram` |
 
 ### Cron inválido num job persistido
 
@@ -1486,9 +1486,9 @@ m3uCrawler/
 
 Directório de output = `--output-dir` (padrão `output`); em produção o Compose monta-o em `/opt/playlists` (ver `DEPLOYMENT.md`). A propriedade de cada artefacto é importante:
 
-- `output/playlist.m3u` — **Playlist funcional** (nome fixo). Escrita/reescrita pelo ciclo de manutenção Telegram (`--telegram-maintain`) e pelas acções agendadas `discoverM3u`, `validatePlaylist` (in place) e `generatePlaylist`. É lida pelo `syncDispatcharr` / `--dispatcharr-sync` (default) e servida por `/api/playlist` (raw) e `/api/playlist/preview` (sanitizada). O código nunca a apaga; a manutenção nunca remove streams existentes só por não haver novos candidatos.
-- `output/playlist_temp.m3u` — **Apenas do ciclo de manutenção Telegram**. É reinicializada para `#EXTM3U` no início do ciclo e recebe os novos streams funcionais; **não** é renomeada e permanece no disco após o ciclo. Servida por `/api/playlist_temp` (raw) e `/api/playlist_temp/preview` (sanitizada) e listada em `/api/output/inventory`.
-- `output/telegram_playlist_<timestamp>.m3u` e `output/telegram_report_<timestamp>.json` — Saída de um **ciclo Telegram único** (`--telegram` **sem** `--telegram-maintain`). Este modo **não** escreve `playlist.m3u` nem `playlist_temp.m3u`. A pesquisa M3U interactiva legacy escreve `playlist_<timestamp>.m3u`.
+- `output/playlist.m3u` — **Playlist canónica final** (nome fixo). É escrita/reescrita atómicamente pelo `RunPublicationService` em todos os caminhos de publicação Telegram (ciclo único `--telegram`, manutenção `--telegram-maintain`, `POST /api/run/start` e `telegramRun` agendado) e pelas acções agendadas `discoverM3u`, `validatePlaylist` (in place) e `generatePlaylist`. É o input do `syncDispatcharr` / `--dispatcharr-sync` (default) e servida por `/api/playlist` (raw) e `/api/playlist/preview` (sanitizada). O código nunca a apaga; a manutenção nunca remove streams existentes só por não haver novos candidatos.
+- `output/playlist_temp.m3u` — **Intermédio canónico normalizado/deduplicado**, escrito atómicamente pelo `RunPublicationService` **antes** do filtro de domínio, do country gate e da selecção de fontes. Contém o conjunto descoberto após dedup por URL e pode conter streams que a selecção rejeita no resultado final. É produzido em todos os caminhos de publicação Telegram (incluindo a manutenção); **não** é renomeado. Servido por `/api/playlist_temp` (raw) e `/api/playlist_temp/preview` (sanitizada) e listado em `/api/output/inventory`.
+- `output/telegram_playlist_<timestamp>.m3u` e `output/telegram_report_<timestamp>.json` — Artefactos **históricos/técnicos** de um ciclo Telegram. O timestamped é produzido pelo caminho normal (ciclo único e `telegramRun` agendado) a partir do resultado final; o Dispatcharr **nunca** o consome (consome `playlist.m3u`). Quando o nome final coincide com o canónico (modo manutenção), não é escrito. A pesquisa M3U interactiva legacy escreve `playlist_<timestamp>.m3u`.
 - `output/telegram_run_report.json` — `RunReport` da última execução (camelCase; sobrescrito a cada run em ambos os modos).
 - `output/telegram_maintain_report.json` — Relatório adicional do ciclo de manutenção.
 - `output/import_history.json` — Histórico persistente.

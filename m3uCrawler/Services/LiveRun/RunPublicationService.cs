@@ -39,10 +39,19 @@ public sealed class RunPublicationRequest
     public string HistoryMode { get; init; } = "TelegramSearch";
 
     /// <summary>
-    /// Nome do ficheiro M3U. <c>null</c> usa
-    /// <c>telegram_playlist_&lt;timestamp&gt;.m3u</c> (single cycle).
+    /// Nome do ficheiro M3U histórico/override final. <c>null</c> usa
+    /// <c>telegram_playlist_&lt;timestamp&gt;.m3u</c> (single cycle). O
+    /// artefacto canónico final é sempre <c>playlist.m3u</c>; este nome é
+    /// apenas o histórico/técnico (ou o próprio canónico, no caso da
+    /// manutenção, onde coincide).
     /// </summary>
     public string? PlaylistFileName { get; init; }
+
+    /// <summary>
+    /// Nome do ficheiro M3U intermédio (normalizado/deduplicado, antes da
+    /// selecção). <c>null</c> usa <c>playlist_temp.m3u</c>.
+    /// </summary>
+    public string? PlaylistTempFileName { get; init; }
 
     /// <summary>
     /// Nome do ficheiro de relatório JSON. <c>null</c> usa
@@ -81,6 +90,11 @@ public sealed class RunPublicationRequest
 /// <summary>
 /// Resultado da publicação. Os caminhos apontam para os artefactos
 /// efectivamente publicados (já atómicos).
+/// <see cref="PlaylistPath"/> é o canónico final (<c>playlist.m3u</c>),
+/// consumido pelo Dispatcharr. <see cref="IntermediatePlaylistPath"/> é o
+/// intermédio normalizado/deduplicado (<c>playlist_temp.m3u</c>).
+/// <see cref="HistoricalPlaylistPath"/> é o artefacto histórico/técnico
+/// (ex.: <c>telegram_playlist_&lt;timestamp&gt;.m3u</c>).
 /// </summary>
 public sealed record RunPublicationResult(
     IReadOnlyList<M3uStream> Published,
@@ -88,7 +102,9 @@ public sealed record RunPublicationResult(
     string PlaylistPath,
     string JsonReportPath,
     string RunReportPath,
-    DispatcharrSyncOutcome Dispatcharr);
+    DispatcharrSyncOutcome Dispatcharr,
+    string IntermediatePlaylistPath,
+    string HistoricalPlaylistPath);
 
 /// <summary>
 /// Contrato do serviço de publicação única de um ciclo Telegram.
@@ -172,7 +188,22 @@ public sealed class RunPublicationService : IRunPublicationService
     {
         ArgumentNullException.ThrowIfNull(request);
         var report = request.Report ?? new RunReport();
-        var streams = request.Streams.ToList();
+
+        // ---- P14a — Normalização/deduplicação (W2) ----
+        // O timestamp é calculado uma única vez por publicação, de modo que
+        // o mesmo snapshot produza os mesmos nomes e conteúdos. A
+        // deduplicação por URL (OrdinalIgnoreCase, mantendo a primeira
+        // ocorrência e a ordem) define o estado intermédio.
+        var streams = DeduplicateByUrl(request.Streams);
+        var generatedAt = _clock();
+        var timestamp = generatedAt.ToString("yyyyMMdd_HHmmss");
+        var intermediateCount = streams.Count;
+
+        // ---- P14a — Intermédio canónico (W2) ----
+        // playlist_temp.m3u representa o estado normalizado/deduplicado
+        // ANTES de qualquer filtro/validação/matching/rejeição.
+        var tempPath = ResolveArtifactPath(request.PlaylistTempFileName, "playlist_temp.m3u");
+        await _playlistManager.SaveToM3uPlaylistAtomic(streams, tempPath, generatedAt).ConfigureAwait(false);
 
         // ---- Filtro de domínio (pré-country gate) ----
         if (!string.IsNullOrWhiteSpace(request.DomainFilter))
@@ -228,23 +259,35 @@ public sealed class RunPublicationService : IRunPublicationService
         }
         streams = selection.Published.ToList();
 
-        // ---- P14 — Composição/publicação atómica ----
-        var generatedAt = _clock();
-        var timestamp = generatedAt.ToString("yyyyMMdd_HHmmss");
-        var playlistPath = ResolveArtifactPath(request.PlaylistFileName, $"telegram_playlist_{timestamp}.m3u");
+        // ---- P14b — Composição/publicação atómica final ----
+        // playlist.m3u é o canónico final consumido pelo Dispatcharr; o
+        // artefacto histórico/técnico (telegram_playlist_<ts>.m3u, ou o
+        // override de manutenção) só é escrito quando não coincide com o
+        // canónico.
+        var canonicalPath = Path.Combine(_outputDir, "playlist.m3u");
+        var historicalPath = ResolveArtifactPath(request.PlaylistFileName, $"telegram_playlist_{timestamp}.m3u");
         var jsonReportPath = ResolveArtifactPath(request.JsonReportFileName, $"telegram_report_{timestamp}.json");
         var runReportPath = Path.Combine(_outputDir, "telegram_run_report.json");
 
-        await _playlistManager.SaveToM3uPlaylistAtomic(streams, playlistPath, generatedAt).ConfigureAwait(false);
+        await _playlistManager.SaveToM3uPlaylistAtomic(streams, canonicalPath, generatedAt).ConfigureAwait(false);
+        if (!PathsEqual(historicalPath, canonicalPath))
+        {
+            await _playlistManager.SaveToM3uPlaylistAtomic(streams, historicalPath, generatedAt).ConfigureAwait(false);
+        }
         await _playlistManager.SaveToJsonReport(streams, jsonReportPath, generatedAt).ConfigureAwait(false);
         await SaveRunReportAsync(runReportPath, report).ConfigureAwait(false);
 
         if (request.Verbose)
         {
             Console.WriteLine($"\n✨ Arquivos gerados:");
-            Console.WriteLine($"   • Playlist: {playlistPath}");
+            Console.WriteLine($"   • Playlist intermédia: {tempPath}");
+            Console.WriteLine($"   • Playlist canónica:   {canonicalPath}");
+            Console.WriteLine($"   • Histórico:           {historicalPath}");
             Console.WriteLine($"   • Relatório: {jsonReportPath}");
             Console.WriteLine($"   • Relatório de execução: {runReportPath}");
+            Console.WriteLine(
+                $"   • Streams: intermédio={intermediateCount} final={streams.Count} " +
+                $"removidos={intermediateCount - streams.Count}");
             if (streams.Count == 0)
             {
                 Console.WriteLine("❌ Nenhum stream funcional encontrado no Telegram.");
@@ -252,11 +295,13 @@ public sealed class RunPublicationService : IRunPublicationService
         }
 
         // ---- P15 — Dispatcharr (dry_run respeitado pelo serviço de sync) ----
+        // O Dispatcharr consome SEMPRE o canónico final (playlist.m3u), nunca
+        // o artefacto histórico/timestamped.
         var dispatcharrSelection = selection.Applied
             ? DispatcharrSourceSelectionFactory.FromStageResult(selection, policies, _utcClock())
             : null;
         var dispatcharrOutcome = await _dispatcharr.RunAsync(
-            playlistPath,
+            canonicalPath,
             _outputDir,
             _catalog,
             dispatcharrSelection,
@@ -271,11 +316,39 @@ public sealed class RunPublicationService : IRunPublicationService
         return new RunPublicationResult(
             Published: streams,
             Selection: selection,
-            PlaylistPath: playlistPath,
+            PlaylistPath: canonicalPath,
             JsonReportPath: jsonReportPath,
             RunReportPath: runReportPath,
-            Dispatcharr: dispatcharrOutcome);
+            Dispatcharr: dispatcharrOutcome,
+            IntermediatePlaylistPath: tempPath,
+            HistoricalPlaylistPath: historicalPath);
     }
+
+    /// <summary>
+    /// Normalização/deduplicação por URL (<see cref="StringComparer.OrdinalIgnoreCase"/>),
+    /// mantendo a primeira ocorrência e a ordem original. É a única
+    /// deduplicação aplicada pelo serviço e define o conteúdo de
+    /// <c>playlist_temp.m3u</c>.
+    /// </summary>
+    private static List<M3uStream> DeduplicateByUrl(IReadOnlyList<M3uStream> streams)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var result = new List<M3uStream>(streams.Count);
+        foreach (var stream in streams)
+        {
+            if (seen.Add(stream.Url))
+            {
+                result.Add(stream);
+            }
+        }
+        return result;
+    }
+
+    private static bool PathsEqual(string a, string b)
+        => string.Equals(
+            Path.GetFullPath(a),
+            Path.GetFullPath(b),
+            StringComparison.OrdinalIgnoreCase);
 
     private string ResolveArtifactPath(string? explicitName, string defaultName)
         => string.IsNullOrWhiteSpace(explicitName)
