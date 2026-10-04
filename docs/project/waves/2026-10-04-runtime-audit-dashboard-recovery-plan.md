@@ -4,7 +4,7 @@
 > waves de recuperação `W1–W7`. Subordinado à BÍBLIA (`docs/Reestructure/00-BIBLE.md:30-41`, `:105-128`);
 > não redefine conceitos normativos nem implementa nada.
 >
-> **Estado:** `W1`, `W2`, `W3` e `W4` **CONCLUÍDAS** (2026-10-04); `W5–W7` **PENDENTES**. Este documento mantém o plano original; o progresso é registado em `docs/PROJECT_STATUS.md`.
+> **Estado:** `W1`, `W2`, `W3`, `W4` e `W5` **CONCLUÍDAS** (2026-10-04); `W6–W7` **PENDENTES**. Este documento mantém o plano original; o progresso é registado em `docs/PROJECT_STATUS.md`.
 >
 > **Cross-reference:** estado corrente e prioridades em `docs/PROJECT_STATUS.md` (secção
 > "Waves 2026-10 — recuperação pós-auditoria runtime") e `ROADMAP.md` (§ "Em curso"). Índice de waves
@@ -222,6 +222,12 @@ Regressão em `WaveW3HttpSemanticsTests` (404 para GET/POST/PUT/DELETE em rota i
 - adicionar o canonical/alias member correspondente;
 - **nunca** criar Affinities duplicadas;
 - reflectir a alteração no separador **Afinidades**.
+
+**Estado:** **CONCLUÍDA** (2026-10-04).
+- **Lista activa:** `GET /api/catalog/reviews` e `GET /api/reviews` excluem por omissão `Resolved`/`Ignored` (histórico via `?state=`; legacy aceita `?includeResolved=true`); a UI deixa de mostrar itens terminais.
+- **Aprovação estruturada:** removida a cadeia de `prompt()`; painel `#reviewApproveModal` com **Add Alias / Create Channel / Excluir**; Add Alias com `<select>` de canais canónicos (`GET /api/catalog/channels`); formulário completo de canal reutilizado da W4 (modo review) com **Display Name** e **IsEnabled**.
+- **Add Alias → Affinity:** `CatalogResolver.EnsureChannelAffinityMemberCoreAsync` (mesmo contexto/transacção do chamador) invocado em `ApplyAddAliasAsync` e `ApplyCreateChannelAsync`: reutiliza a affinity de canal existente ou cria **exactamente uma**; acrescenta o membro de forma idempotente.
+- `ReviewChannelSpec.IsEnabled` propagado até `ApplyCreateChannelAsync`. Testes: `WaveW5AliasAffinityTests`, `WaveW5ReviewListAndCreateTests`, `WaveW5UiHtmlTests`. Ver `CHANGELOG.md`.
 
 ### W6 — Dispatcharr UI + Countries + restantes funcionalidades
 

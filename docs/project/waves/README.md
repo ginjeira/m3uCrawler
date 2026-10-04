@@ -67,5 +67,5 @@ resolve gap (`externalIdentity`/`channelSource`/`none` → 422); Review→Output
 A auditoria runtime de 2026-10-04 (HEAD `cf0e314`, runtime `m3ucrawler-first-test`) e o plano de
 waves de recuperação `W1–W7` estão em
 [`2026-10-04-runtime-audit-dashboard-recovery-plan.md`](2026-10-04-runtime-audit-dashboard-recovery-plan.md).
-Registo de **execução**: `W1`, `W2`, `W3` e `W4` implementadas (2026-10-04); `W5–W7` pendentes. Próxima
-prioridade: **W5** (Reviews + Alias→Affinity). Estado corrente em `docs/PROJECT_STATUS.md`.
+Registo de **execução**: `W1`–`W5` implementadas (2026-10-04); `W6–W7` pendentes. Próxima
+prioridade: **W6** (Dispatcharr UI + Countries). Estado corrente em `docs/PROJECT_STATUS.md`.

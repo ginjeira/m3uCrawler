@@ -1515,8 +1515,40 @@ namespace m3uCrawler.Services
                         HttpStatusCode.MethodNotAllowed);
                     return;
                 }
+
+                // W5 — Por omissão a lista mostra apenas itens activos
+                // (Open/InReview); Resolved/Ignored são histórico, acessível
+                // explicitamente via ?state= ou ?includeResolved=true.
+                var reviewQuery = context.Request.QueryString;
+                ReviewItemState? stateFilter = null;
+                var rawState = reviewQuery["state"];
+                if (!string.IsNullOrWhiteSpace(rawState))
+                {
+                    if (!Enum.TryParse<ReviewItemState>(rawState.Trim(), ignoreCase: true, out var parsed)
+                        || !Enum.IsDefined(parsed))
+                    {
+                        await WriteJsonAsync(context.Response, new { error = "state inválido." },
+                            HttpStatusCode.BadRequest);
+                        return;
+                    }
+                    stateFilter = parsed;
+                }
+                var includeResolved = string.Equals(
+                    reviewQuery["includeResolved"], "true", StringComparison.OrdinalIgnoreCase);
+
                 var reviews = await _catalogResolver.ListAllReviewItemsAsync();
-                await WriteJsonAsync(context.Response, reviews.Select(r => new
+                IEnumerable<ReviewItemEntity> filtered = reviews;
+                if (stateFilter is not null)
+                {
+                    filtered = reviews.Where(r => r.State == stateFilter.Value);
+                }
+                else if (!includeResolved)
+                {
+                    filtered = reviews.Where(r =>
+                        r.State != ReviewItemState.Resolved && r.State != ReviewItemState.Ignored);
+                }
+
+                await WriteJsonAsync(context.Response, filtered.Select(r => new
                 {
                     id = r.Id,
                     fingerprint = r.Fingerprint,
@@ -1640,7 +1672,7 @@ namespace m3uCrawler.Services
                         return;
                     }
                     channelSpec = new ReviewChannelSpec(
-                        ch.Key!, ch.Name!, ch.Country, editorialCategory, editorialGroup, publicationPolicy);
+                        ch.Key!, ch.Name!, ch.Country, editorialCategory, editorialGroup, publicationPolicy, ch.IsEnabled);
                 }
                 else if (action == ReviewApprovalAction.AddAlias
                     && string.IsNullOrWhiteSpace(payload?.CanonicalChannelKey))
@@ -3844,7 +3876,15 @@ namespace m3uCrawler.Services
             IEnumerable<ReviewItemEntity> filtered = all;
             if (stateFilter is not null)
             {
+                // Filtro explícito (inclui estados terminais para histórico).
                 filtered = all.Where(r => r.State == stateFilter.Value);
+            }
+            else
+            {
+                // W5 — Por omissão a lista activa exclui estados terminais
+                // (Resolved/Ignored); o histórico obtém-se via ?state=.
+                filtered = all.Where(r =>
+                    r.State != ReviewItemState.Resolved && r.State != ReviewItemState.Ignored);
             }
 
             var page = filtered
@@ -4063,7 +4103,7 @@ namespace m3uCrawler.Services
                         return;
                     }
                     channelSpec = new ReviewChannelSpec(
-                        ch.Key!, ch.Name!, ch.Country, editorialCategory, editorialGroup, publicationPolicy);
+                        ch.Key!, ch.Name!, ch.Country, editorialCategory, editorialGroup, publicationPolicy, ch.IsEnabled);
                     break;
 
                 default:
@@ -4603,6 +4643,9 @@ namespace m3uCrawler.Services
 
         [JsonPropertyName("publicationPolicy")]
         public string? PublicationPolicy { get; set; }
+
+        [JsonPropertyName("isEnabled")]
+        public bool? IsEnabled { get; set; }
     }
 
     private static bool TryParseOptionalEnum<TEnum>(string? raw, out TEnum? value)
@@ -5686,6 +5729,50 @@ namespace m3uCrawler.Services
           <button class='secondary' onclick='loadCatalogReviews()'>Recarregar</button>
         </div>
         <div id='catalogReviewsTable'></div>
+
+        <!-- W5 — Aprovação estruturada (sem prompt). Duas/três escolhas explícitas. -->
+        <div id='reviewApproveModal' hidden style='margin-top:16px;'>
+          <div class='card'>
+            <h3 id='reviewApproveTitle'>Aprovar Review</h3>
+            <p class='muted' id='reviewApproveSubject'></p>
+            <div id='reviewApproveActions' style='display:flex;gap:8px;flex-wrap:wrap;'>
+              <button onclick='selectReviewAction("add-alias")'>Add Alias</button>
+              <button class='secondary' onclick='selectReviewAction("create-channel")'>Create Channel</button>
+              <button class='secondary' onclick='selectReviewAction("exclude")'>Excluir</button>
+              <button class='secondary' onclick='closeReviewApproveModal()'>Cancelar</button>
+            </div>
+
+            <div id='reviewApproveAddAlias' hidden style='margin-top:12px;display:grid;gap:10px;grid-template-columns:1fr 1fr;'>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Canal canónico existente</label>
+                <select id='reviewAliasChannel' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                  <option value=''>— escolher canal —</option>
+                </select>
+              </div>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Alias (identidade observada)</label>
+                <input id='reviewAliasValue' type='text' placeholder='identidade normalizada' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              </div>
+              <div style='grid-column:1/-1;display:flex;gap:8px;margin-top:4px;'>
+                <button onclick='submitReviewAliasApproval()'>Confirmar Add Alias</button>
+                <button class='secondary' onclick='closeReviewApproveModal()'>Cancelar</button>
+              </div>
+            </div>
+
+            <div id='reviewApproveExclude' hidden style='margin-top:12px;display:grid;gap:10px;'>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Razão da exclusão</label>
+                <input id='reviewExcludeReason' type='text' placeholder='excluído por decisão administrativa' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              </div>
+              <div style='display:flex;gap:8px;'>
+                <button onclick='submitReviewExclude()'>Confirmar Exclusão</button>
+                <button class='secondary' onclick='closeReviewApproveModal()'>Cancelar</button>
+              </div>
+            </div>
+
+            <p id='reviewApproveStatus' class='muted' style='margin-top:10px;'></p>
+          </div>
+        </div>
       </div>
 
       <!-- TAB: Sync Runs -->
@@ -6866,6 +6953,11 @@ const rows = Object.entries(inv).map(([k, v]) => {
     let _channelsCache = [];
     let _selectedChannelId = null;
     let _editingChannelId = null;
+    // W5 — estado do fluxo de aprovação de Review e do formulário de
+    // criação em modo Review.
+    let _pendingReviewFingerprint = null;
+    let _pendingReviewIdentity = '';
+    let _reviewChannelFingerprint = null;
 
     async function loadCatalogChannels() {
       const channels = await safeFetchJson('/api/catalog/channels', []);
@@ -7066,6 +7158,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
       const c = _channelsCache.find(x => x.id === channelId);
       if (!c) return;
       _editingChannelId = channelId;
+      _reviewChannelFingerprint = null;
       document.getElementById('newChannelDisplayName').value = c.displayName || '';
       document.getElementById('newChannelCountry').value = c.country || '';
       document.getElementById('newChannelCategory').value = c.editorialCategory || 'Live';
@@ -7100,6 +7193,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
 
     function showCreateChannelForm() {
       _editingChannelId = null;
+      _reviewChannelFingerprint = null;
       const keyEl = document.getElementById('newChannelKey');
       keyEl.value = '';
       keyEl.readOnly = false;
@@ -7119,6 +7213,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
     function hideCreateChannelForm() {
       document.getElementById('createChannelForm').hidden = true;
       _editingChannelId = null;
+      _reviewChannelFingerprint = null;
     }
 
     async function submitCreateChannel() {
@@ -7148,6 +7243,45 @@ const rows = Object.entries(inv).map(([k, v]) => {
         } else {
           const err = await r.json();
           alert('Erro: ' + (err.error || r.status));
+        }
+        return;
+      }
+
+      // W5 — Modo Review: o formulário W4 é reutilizado, mas a criação é
+      // declarada como mudança de catálogo na aprovação da Review.
+      const reviewFingerprint = _reviewChannelFingerprint;
+      if (reviewFingerprint) {
+        const key = document.getElementById('newChannelKey').value.trim();
+        if (!key) { alert('Key é obrigatória.'); return; }
+        if (!displayName) { alert('Display Name é obrigatório.'); return; }
+        const aliases = document.getElementById('newChannelAliases').value.split(/\r?\n/).map(a => a.trim()).filter(Boolean);
+        const reviewBody = {
+          action: 'create-channel',
+          channel: {
+            key,
+            name: displayName,
+            country,
+            editorialCategory,
+            editorialGroup,
+            publicationPolicy,
+            isEnabled,
+          },
+        };
+        if (aliases.length) reviewBody.alias = aliases[0];
+        const rr = await fetch('/api/catalog/reviews/' + encodeURIComponent(reviewFingerprint) + '/approve', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(reviewBody)
+        });
+        if (rr.ok) {
+          hideCreateChannelForm();
+          await loadCatalogChannels();
+          loadCatalogTab('reviews');
+          loadCatalogReviews();
+          if (typeof loadCatalog === 'function') loadCatalog();
+        } else {
+          const err = await rr.json().catch(() => ({}));
+          alert('Erro: ' + (err.error || rr.status));
         }
         return;
       }
@@ -7299,15 +7433,15 @@ const rows = Object.entries(inv).map(([k, v]) => {
     async function loadCatalogReviews() {
       const reviews = await safeFetchJson('/api/catalog/reviews', []);
       if (!Array.isArray(reviews)) { document.getElementById('catalogReviewsTable').innerHTML = '<p class="muted">Erro ao carregar reviews.</p>'; return; }
-      const open = reviews.filter(r => r.state === 'Open');
-      document.getElementById('reviewsCount').textContent = `${open.length} em open · ${reviews.length} total.`;
-      if (!reviews.length) { document.getElementById('catalogReviewsTable').innerHTML = '<p class="muted">Nenhum item de revisão.</p>'; return; }
-      const rows = reviews.map(r => {
+      // O endpoint devolve apenas itens activos (Open/InReview) por omissão;
+      // estados terminais ficam no histórico e não são apresentados aqui.
+      const active = reviews.filter(r => r.state !== 'Resolved' && r.state !== 'Ignored');
+      document.getElementById('reviewsCount').textContent = `${active.length} activo(s).`;
+      if (!active.length) { document.getElementById('catalogReviewsTable').innerHTML = '<p class="muted">Nenhum item de revisão activo.</p>'; return; }
+      const rows = active.map(r => {
         const stateBadge = r.state === 'Open' ? '<span class="badge warn">Open</span>'
-          : r.state === 'InReview' ? '<span class="badge warn">InReview</span>'
-          : r.state === 'Resolved' ? '<span class="badge ok">Resolved</span>'
-          : '<span class="badge err">Ignored</span>';
-        const actions = r.state === 'Open'
+          : '<span class="badge warn">InReview</span>';
+        const actions = (r.state === 'Open' || r.state === 'InReview')
           ? `<button style='padding:4px 8px;' onclick='approveReview("${r.fingerprint.replace(/"/g, '\\"')}","${(r.normalizedIdentity || '').replace(/"/g, '\\"')}")'>Approve</button>
              <button class='secondary' style='padding:4px 8px;' onclick='excludeReview("${r.fingerprint.replace(/"/g, '\\"')}")'>Exclude</button>`
           : '—';
@@ -8769,44 +8903,139 @@ const rows = Object.entries(inv).map(([k, v]) => {
       else { alert('Erro: ' + r.status); }
     }
 
-    async function approveReview(fingerprint, normalizedIdentity) {
-      // W6b-1 — a aprovação declara explicitamente a mudança de catálogo.
-      const action = prompt("Acção de catálogo: 'add-alias' (canal existente) ou 'create-channel' (novo canal canónico).", "add-alias");
-      if (!action) return;
-      const body = { action: action.trim() };
-      if (body.action === 'add-alias') {
-        const key = prompt("Key do canal canónico existente:");
-        if (!key) return;
-        body.canonicalChannelKey = key.trim();
-      } else if (body.action === 'create-channel') {
-        const key = prompt("Key do novo canal canónico:");
-        if (!key) return;
-        const name = prompt("Nome do novo canal canónico:", normalizedIdentity || key);
-        if (!name) return;
-        body.channel = { key: key.trim(), name: name.trim() };
-      } else {
-        alert('Acção desconhecida: ' + action);
-        return;
+    // W5 — Aprovação estruturada: sem prompt, com escolha explícita
+    // Add Alias / Create Channel / Excluir e dropdown de canais existentes.
+    function approveReview(fingerprint, normalizedIdentity) {
+      _pendingReviewFingerprint = fingerprint;
+      _pendingReviewIdentity = normalizedIdentity || '';
+      document.getElementById('reviewApproveTitle').textContent = 'Aprovar Review';
+      document.getElementById('reviewApproveSubject').textContent = normalizedIdentity || fingerprint;
+      document.getElementById('reviewApproveStatus').textContent = '';
+      document.getElementById('reviewApproveActions').hidden = false;
+      document.getElementById('reviewApproveAddAlias').hidden = true;
+      document.getElementById('reviewApproveExclude').hidden = true;
+      document.getElementById('reviewApproveModal').hidden = false;
+      loadReviewAliasChannels();
+      document.getElementById('reviewApproveModal').scrollIntoView({ behavior: 'smooth' });
+    }
+
+    async function loadReviewAliasChannels() {
+      const channels = await safeFetchJson('/api/catalog/channels', []);
+      const sel = document.getElementById('reviewAliasChannel');
+      if (!sel) return;
+      const current = sel.value;
+      sel.innerHTML = '<option value="">— escolher canal —</option>' + (Array.isArray(channels) ? channels : [])
+        .map(c => `<option value="${escapeAttr(c.key)}">${escapeHtml(c.displayName || c.key)} (${escapeHtml(c.key)})</option>`)
+        .join('');
+      if (current) sel.value = current;
+    }
+
+    function selectReviewAction(action) {
+      const actionsEl = document.getElementById('reviewApproveActions');
+      const addAliasEl = document.getElementById('reviewApproveAddAlias');
+      const excludeEl = document.getElementById('reviewApproveExclude');
+      const statusEl = document.getElementById('reviewApproveStatus');
+      actionsEl.hidden = true;
+      addAliasEl.hidden = true;
+      excludeEl.hidden = true;
+      statusEl.textContent = '';
+      if (action === 'add-alias') {
+        document.getElementById('reviewApproveTitle').textContent = 'Add Alias';
+        const aliasInput = document.getElementById('reviewAliasValue');
+        if (aliasInput && !aliasInput.value) aliasInput.value = _pendingReviewIdentity || '';
+        addAliasEl.hidden = false;
+        loadReviewAliasChannels();
+      } else if (action === 'exclude') {
+        document.getElementById('reviewApproveTitle').textContent = 'Excluir Review';
+        const reasonEl = document.getElementById('reviewExcludeReason');
+        if (reasonEl && !reasonEl.value) reasonEl.value = 'excluído por decisão administrativa';
+        excludeEl.hidden = false;
+      } else if (action === 'create-channel') {
+        showCreateChannelFormForReview();
       }
+    }
+
+    async function submitReviewAliasApproval() {
+      const fingerprint = _pendingReviewFingerprint;
+      if (!fingerprint) return;
+      const key = document.getElementById('reviewAliasChannel').value;
+      const alias = (document.getElementById('reviewAliasValue').value || '').trim();
+      const statusEl = document.getElementById('reviewApproveStatus');
+      if (!key) { statusEl.textContent = 'Selecione o canal canónico existente.'; return; }
+      statusEl.textContent = 'A aplicar…';
+      const body = { action: 'add-alias', canonicalChannelKey: key };
+      if (alias) body.alias = alias;
       const r = await fetch('/api/catalog/reviews/' + encodeURIComponent(fingerprint) + '/approve', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
       });
-      if (r.ok) { loadCatalogReviews(); loadCatalog(); }
-      else { const t = await r.text(); alert('Erro: ' + r.status + ' ' + t); }
+      if (r.ok) {
+        closeReviewApproveModal();
+        loadCatalogReviews(); loadCatalog();
+      } else {
+        const err = await r.json().catch(() => ({}));
+        statusEl.textContent = 'Erro: ' + (err.error || r.status);
+      }
     }
 
-    async function excludeReview(fingerprint) {
-      const reason = prompt("Razão da exclusão:", "excluído por decisão administrativa");
-      if (reason === null) return;
+    async function submitReviewExclude() {
+      const fingerprint = _pendingReviewFingerprint;
+      if (!fingerprint) return;
+      const reason = (document.getElementById('reviewExcludeReason').value || '').trim();
+      const statusEl = document.getElementById('reviewApproveStatus');
+      if (!reason) { statusEl.textContent = 'A razão é obrigatória.'; return; }
+      statusEl.textContent = 'A excluir…';
       const r = await fetch('/api/catalog/reviews/' + encodeURIComponent(fingerprint) + '/exclude', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'exclude', reason: reason })
       });
-      if (r.ok) { loadCatalogReviews(); loadCatalog(); }
-      else { const t = await r.text(); alert('Erro: ' + r.status + ' ' + t); }
+      if (r.ok) {
+        closeReviewApproveModal();
+        loadCatalogReviews(); loadCatalog();
+      } else {
+        const err = await r.json().catch(() => ({}));
+        statusEl.textContent = 'Erro: ' + (err.error || r.status);
+      }
+    }
+
+    function showCreateChannelFormForReview() {
+      _reviewChannelFingerprint = _pendingReviewFingerprint;
+      _editingChannelId = null;
+      const keyEl = document.getElementById('newChannelKey');
+      keyEl.value = '';
+      keyEl.readOnly = false;
+      document.getElementById('newChannelDisplayName').value = _pendingReviewIdentity || '';
+      document.getElementById('newChannelCountry').value = '';
+      document.getElementById('newChannelCategory').value = 'Live';
+      document.getElementById('newChannelGroup').value = 'PortugalLive';
+      document.getElementById('newChannelPolicy').value = 'CreateEligible';
+      document.getElementById('newChannelEnabled').value = 'true';
+      document.getElementById('newChannelAliases').value = _pendingReviewIdentity || '';
+      document.getElementById('newChannelAliasesBlock').hidden = false;
+      document.getElementById('createChannelTitle').textContent = 'Novo Canal Canónico (a partir de Review)';
+      document.getElementById('createChannelSubmitBtn').textContent = 'Criar e aprovar';
+      document.getElementById('reviewApproveModal').hidden = true;
+      loadCatalogTab('channels');
+      const form = document.getElementById('createChannelForm');
+      form.hidden = false;
+      form.scrollIntoView({ behavior: 'smooth' });
+    }
+
+    function closeReviewApproveModal() {
+      document.getElementById('reviewApproveModal').hidden = true;
+      _pendingReviewFingerprint = null;
+      _pendingReviewIdentity = '';
+      document.getElementById('reviewApproveStatus').textContent = '';
+      document.getElementById('reviewApproveActions').hidden = false;
+      document.getElementById('reviewApproveAddAlias').hidden = true;
+      document.getElementById('reviewApproveExclude').hidden = true;
+    }
+
+    function excludeReview(fingerprint) {
+      approveReview(fingerprint, '');
+      selectReviewAction('exclude');
     }
 
     document.querySelectorAll('#catalogTabs button').forEach(b => b.addEventListener('click', () => loadCatalogTab(b.dataset.ctab)));
@@ -9125,6 +9354,10 @@ const rows = Object.entries(inv).map(([k, v]) => {
     window.deleteRule = deleteRule;
     window.approveReview = approveReview;
     window.excludeReview = excludeReview;
+    window.selectReviewAction = selectReviewAction;
+    window.submitReviewAliasApproval = submitReviewAliasApproval;
+    window.submitReviewExclude = submitReviewExclude;
+    window.closeReviewApproveModal = closeReviewApproveModal;
     window.loadAffinityGroups = loadAffinityGroups;
     window.showAddAffinityForm = showAddAffinityForm;
     window.hideAddAffinityForm = hideAddAffinityForm;
@@ -9461,6 +9694,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
     // `DashboardInlineHandlerScopeTests` (que impede novo HTML inline a
     // chamar funções fora do escopo global).
     window.showCreateChannelForm = showCreateChannelForm;
+    window.showCreateChannelFormForReview = showCreateChannelFormForReview;
     window.hideCreateChannelForm = hideCreateChannelForm;
     window.submitCreateChannel = submitCreateChannel;
     window.selectChannel = selectChannel;

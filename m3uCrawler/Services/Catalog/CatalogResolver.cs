@@ -1001,6 +1001,99 @@ public sealed class CatalogResolver
     }
 
     /// <summary>
+    /// W5 — Garante que <paramref name="normalizedMember"/> pertence à
+    /// Channel affinity do canal canónico <paramref name="canonicalChannelKey"/>,
+    /// criando o grupo (cardinalidade 0..1 por canal) quando ainda não
+    /// existe. Opera sobre o <paramref name="context"/> recebido para
+    /// participar na transacção do chamador; <b>não</b> faz SaveChanges.
+    ///
+    /// <para>
+    /// Idempotente: repetir com o mesmo membro não duplica o grupo nem o
+    /// membro. O canal tem de existir (caso contrário
+    /// <see cref="ChannelAdministrationError.ChannelNotFound"/>).
+    /// </para>
+    /// </summary>
+    private static async Task EnsureChannelAffinityMemberCoreAsync(
+        ChannelCatalogDbContext context,
+        string canonicalChannelKey,
+        string normalizedMember,
+        DateTime now,
+        CancellationToken ct)
+    {
+        var member = ChannelNormalizer.Normalize(normalizedMember);
+        if (member.Length == 0) return;
+
+        var key = (canonicalChannelKey ?? string.Empty).Trim();
+        var channel = await context.CanonicalChannels
+            .FirstOrDefaultAsync(c => c.Key == key, ct);
+        if (channel == null)
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.ChannelNotFound,
+                $"Canal canónico '{key}' não encontrado.");
+        }
+
+        var group = await context.AffinityGroups
+            .Include(g => g.Members)
+            .FirstOrDefaultAsync(g => g.Kind == AffinityKind.Channel && g.CanonicalChannelKey == key, ct);
+
+        if (group == null)
+        {
+            var name = string.IsNullOrWhiteSpace(channel.DisplayName) ? key : channel.DisplayName;
+            group = new AffinityGroupEntity
+            {
+                Name = name,
+                Kind = AffinityKind.Channel,
+                CanonicalChannelKey = key,
+                CanonicalChannelId = channel.Id,
+                CreatedAtUtc = now,
+                UpdatedAtUtc = now,
+                Members = new List<AffinityMemberEntity>
+                {
+                    new()
+                    {
+                        NormalizedMember = member,
+                        Kind = AffinityKind.Channel,
+                        CreatedAtUtc = now,
+                    },
+                },
+            };
+            context.AffinityGroups.Add(group);
+            return;
+        }
+
+        var exists = group.Members.Any(m =>
+            m.Kind == AffinityKind.Channel &&
+            string.Equals(m.NormalizedMember, member, StringComparison.Ordinal));
+        if (!exists)
+        {
+            group.Members.Add(new AffinityMemberEntity
+            {
+                NormalizedMember = member,
+                Kind = AffinityKind.Channel,
+                CreatedAtUtc = now,
+            });
+            group.UpdatedAtUtc = now;
+        }
+    }
+
+    /// <summary>
+    /// W5 — Wrapper público de <see cref="EnsureChannelAffinityMemberCoreAsync"/>
+    /// que abre o seu próprio contexto e persiste. Usado por testes e por
+    /// consumidores fora da transacção de aprovação.
+    /// </summary>
+    public async Task EnsureChannelAffinityMemberAsync(
+        string canonicalChannelKey,
+        string normalizedMember,
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        await EnsureChannelAffinityMemberCoreAsync(
+            context, canonicalChannelKey, normalizedMember, DateTime.UtcNow, cancellationToken);
+        await context.SaveChangesAsync(cancellationToken);
+    }
+
+    /// <summary>
     /// Limpa e deduplica os membros de uma afinidade. Membros de
     /// uma <see cref="AffinityKind.Channel"/> affinity são
     /// normalizados via <see cref="ChannelNormalizer.Normalize"/>
@@ -1548,6 +1641,10 @@ public sealed class CatalogResolver
             catalogueChanged = true;
         }
 
+        // W5 — Add Alias alimenta exactamente UMA Channel affinity do
+        // canal aprovado, no mesmo contexto/transacção (idempotente).
+        await EnsureChannelAffinityMemberCoreAsync(context, channel.Key, alias, now, cancellationToken);
+
         ApplyLegacyResolveTransition(item, channel.Id, now);
 
         // W-REVIEW-02 — materializar ChannelSource no mesmo DbContext
@@ -1663,7 +1760,7 @@ public sealed class CatalogResolver
                     EditorialCategory = spec.EditorialCategory ?? EditorialCategory.Live,
                     EditorialGroup = spec.EditorialGroup ?? CanonicalEditorialGroup.Other,
                     PublicationPolicy = spec.PublicationPolicy ?? PublicationPolicy.CreateEligible,
-                    IsEnabled = true,
+                    IsEnabled = spec.IsEnabled ?? true,
                     CreatedAtUtc = createdNow,
                     UpdatedAtUtc = createdNow,
                 };
@@ -1718,6 +1815,10 @@ public sealed class CatalogResolver
                 channel.UpdatedAtUtc = now;
                 aliasCreated = true;
             }
+
+            // W5 — Create Channel alimenta exactamente UMA Channel affinity
+            // do canal criado, no mesmo contexto/transacção (idempotente).
+            await EnsureChannelAffinityMemberCoreAsync(context, channel.Key, alias, now, cancellationToken);
 
             ApplyLegacyResolveTransition(item, channel.Id, now);
 
