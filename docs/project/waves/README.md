@@ -67,6 +67,5 @@ resolve gap (`externalIdentity`/`channelSource`/`none` → 422); Review→Output
 A auditoria runtime de 2026-10-04 (HEAD `cf0e314`, runtime `m3ucrawler-first-test`) e o plano de
 waves de recuperação `W1–W7` estão em
 [`2026-10-04-runtime-audit-dashboard-recovery-plan.md`](2026-10-04-runtime-audit-dashboard-recovery-plan.md).
-Registo de **planeamento**: nenhuma wave implementada (todas `PENDENTE`). Prioridades imediatas:
-**W1** (UI/IIFE/handlers) e **W2** (pipeline de playlists/Dispatcharr, antecipada). Estado corrente
-em `docs/PROJECT_STATUS.md`.
+Registo de **planeamento**: `W1` implementada (2026-10-04); `W2–W7` pendentes. Próxima prioridade:
+**W2** (pipeline de playlists/Dispatcharr, antecipada). Estado corrente em `docs/PROJECT_STATUS.md`.

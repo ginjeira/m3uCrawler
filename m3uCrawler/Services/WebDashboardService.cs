@@ -9149,6 +9149,63 @@ const rows = Object.entries(inv).map(([k, v]) => {
 
     window.startLiveRun = startLiveRun;
     window.loadLiveRun = loadLiveRun;
+
+    // W1 — Restauro de escopo dos handlers inline. O script principal está
+    // dentro de uma IIFE, pelo que as funções declaradas aqui não são
+    // globais. Os atributos inline do HTML (onclick/onchange/oninput)
+    // resolvem os nomes em escopo global; qualquer função não exportada
+    // lança `ReferenceError` e o clique não faz nada. Este bloco re-exporta
+    // os handlers restantes para `window`. Coberto pela regressão
+    // `DashboardInlineHandlerScopeTests` (que impede novo HTML inline a
+    // chamar funções fora do escopo global).
+    window.showCreateChannelForm = showCreateChannelForm;
+    window.hideCreateChannelForm = hideCreateChannelForm;
+    window.submitCreateChannel = submitCreateChannel;
+    window.selectChannel = selectChannel;
+    window.editChannelInline = editChannelInline;
+    window.deleteChannel = deleteChannel;
+    window.toggleChannelEnabled = toggleChannelEnabled;
+    window.toggleChannelPolicy = toggleChannelPolicy;
+    window.addAliasFromDetail = addAliasFromDetail;
+    window.removeAliasFromDetail = removeAliasFromDetail;
+    window.loadHistory = loadHistory;
+    window.loadCountryValidation = loadCountryValidation;
+    window.loadChannelSources = loadChannelSources;
+    window.submitCreateSource = submitCreateSource;
+    window.deleteSource = deleteSource;
+    window.toggleChannelSource = toggleChannelSource;
+    window.deleteChannelSource = deleteChannelSource;
+    window.loadChannelPriority = loadChannelPriority;
+    window.saveChannelPriority = saveChannelPriority;
+    window.saveGlobalPriority = saveGlobalPriority;
+    window.loadValidationPolicy = loadValidationPolicy;
+    window.saveValidationPolicy = saveValidationPolicy;
+    window.runValidationTest = runValidationTest;
+    window.updateSchedCronStatus = updateSchedCronStatus;
+    window.applySchedFrequency = applySchedFrequency;
+    window.submitCreateScheduledJob = submitCreateScheduledJob;
+    window.toggleScheduledJob = toggleScheduledJob;
+    window.deleteScheduledJob = deleteScheduledJob;
+    window.submitCreateOrderingList = submitCreateOrderingList;
+    window.openOrderingList = openOrderingList;
+    window.previewOrderingList = previewOrderingList;
+    window.duplicateOrderingList = duplicateOrderingList;
+    window.deleteOrderingList = deleteOrderingList;
+    window.addOrderingItem = addOrderingItem;
+    window.moveOrderingItem = moveOrderingItem;
+    window.toggleOrderingItem = toggleOrderingItem;
+    window.removeOrderingItem = removeOrderingItem;
+    window.submitCreateGroup = submitCreateGroup;
+    window.deleteCanonicalGroup = deleteCanonicalGroup;
+    window.submitCreateGroupMapping = submitCreateGroupMapping;
+    window.deleteGroupMapping = deleteGroupMapping;
+    window.saveImportPolicy = saveImportPolicy;
+    window.loadDegradation = loadDegradation;
+    window.loadMatchingAudits = loadMatchingAudits;
+    window.loadSyncRunSteps = loadSyncRunSteps;
+    window.loadPendingCountryApprovals = loadPendingCountryApprovals;
+    window.approvePendingCountryApproval = approvePendingCountryApproval;
+    window.rejectPendingCountryApproval = rejectPendingCountryApproval;
   })();
   </script>
 </body>

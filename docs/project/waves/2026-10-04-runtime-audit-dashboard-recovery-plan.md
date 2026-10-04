@@ -4,7 +4,7 @@
 > waves de recuperação `W1–W7`. Subordinado à BÍBLIA (`docs/Reestructure/00-BIBLE.md:30-41`, `:105-128`);
 > não redefine conceitos normativos nem implementa nada.
 >
-> **Estado:** nenhuma das waves `W1–W7` foi implementada. Este documento é uma intenção de trabalho.
+> **Estado:** `W1` **CONCLUÍDA** (2026-10-04); `W2–W7` **PENDENTES**. Este documento mantém o plano original; o progresso é registado em `docs/PROJECT_STATUS.md`.
 >
 > **Cross-reference:** estado corrente e prioridades em `docs/PROJECT_STATUS.md` (secção
 > "Waves 2026-10 — recuperação pós-auditoria runtime") e `ROADMAP.md` (§ "Em curso"). Índice de waves
@@ -130,6 +130,8 @@ implementação deve ser convertida para *event listeners* sem dependência de g
 **regressão** que impeça voltar a introduzir handlers HTML que não estejam disponíveis.
 
 **NÃO resolver nesta wave** os restantes problemas funcionais descobertos (§2.2, §3).
+
+**Estado:** **CONCLUÍDA** (2026-10-04). Abordagem **A** — re-exportação explícita para `window` (coerente com os exports já existentes) dos **48** handlers que faltavam; sem refactor do Dashboard e sem alterar endpoints/contratos. Regressão `DashboardInlineHandlerScopeTests` (cobre a classe: percorre todos os handlers inline do HTML renderizado e exige `window.<fn>` para cada função chamada). Validado em browser real sem `ReferenceError`. Ver `docs/PROJECT_STATUS.md` e `CHANGELOG.md`.
 
 ### W2 — Pipeline de playlists / Dispatcharr
 
