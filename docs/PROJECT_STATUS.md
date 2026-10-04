@@ -3,6 +3,7 @@
 > Ponto de entrada para o estado corrente da implementação (`docs/Reestructure/00-BIBLE.md:30-41`, `:105-128`).
 > Documento derivado: descreve o que foi construído e validado; não redefine conceitos da BÍBLIA.
 > Registos históricos das waves: `docs/project/waves/`.
+> Auditoria runtime + plano de recuperação: 2026-10-04 — HEAD `cf0e314`; ver `docs/project/waves/2026-10-04-runtime-audit-dashboard-recovery-plan.md` e a secção "Waves 2026-10 — recuperação pós-auditoria runtime".
 > Reconciliação documental: 2026-10-02 — HEAD `675521b`; ver `BIBLE_IMPLEMENTABILITY_GAP_MANIFEST_1.0.md` Anexos G–T e `docs/Reestructure/46-REQUIREMENT-TRACEABILITY.md`.
 > Reconciliação anterior: 2026-09-20 — HEAD `780fa01`.
 
@@ -12,7 +13,8 @@
 - Phase: 9C / 13 — implementação das waves da BÍBLIA (reconstrução)
 - Wave: waves de reconstrução `W1–W5.6` implementadas; waves pós-reconstrução `W-DEDUP` (`9cffc9b`), `W-HISTWIN` (`5f86ef2`) e Proveniência (`fcd442e`) implementadas, testadas e validadas em execução real, e `W-DASHBOARD` (`675521b`) implementada, commitada e com testes determinísticos verdes (não validada em execução real; ver `## Waves 2026-10`); `M.4` (snapshot→Run/pipeline) OPEN, sem wave atribuída; `W6b-3` definida e pendente; dívida funcional de reconstrução em aberto (ver `## Functional Debt (reconstruction)`)
 - Status: PARCIALMENTE CONFORME — waves A/B, Onboarding, Admin Password, W1/W2/W3s/W4a/W4b/W5, ADR-0001 (completo — pendente de aprovação), W6a/W6b-1/W6b-2/W6c, waves de reconstrução W1–W5.6 e waves 2026-10 (W-DEDUP/W-HISTWIN/Proveniência) concluídas; W-DASHBOARD commitada (`675521b`); `M.4`, C7, Review→Output, gap de `resolve` W5.5 e matriz de rastreabilidade pendentes; W2-FU totalmente fechado
-- Versão/deploy: a release `1.0.1` foi **preparada localmente** (commit de release + tag anotada `v1.0.1`, sem push); o push e a actualização de produção **não** foram feitos (a produção mantém a imagem anterior). A execução real de 2026-10-02 correu num runtime de teste com build local de `fcd442e`.
+- Auditoria runtime (2026-10-04, HEAD `cf0e314`): concluída contra um runtime real (`m3ucrawler-first-test`, `192.168.68.142:5000`, imagem `ghcr.io/ginjeira/m3ucrawler@sha256:0920462…`), com Playwright + API autenticada + BD. **CONFIRMADO:** regressão transversal de escopo JavaScript (IIFE) que torna ~46 handlers inline da UI inoperacionais (`ReferenceError`), e problemas independentes de pipeline/HTTP/UX. Plano de recuperação `W1–W7` em `docs/project/waves/2026-10-04-runtime-audit-dashboard-recovery-plan.md`; **W1 (UI/IIFE) e W2 (pipeline de playlists/Dispatcharr) são as prioridades imediatas** (W2 deliberadamente antecipada para não deixar o Dispatcharr sem dados). Nenhuma wave `W1–W7` implementada (**PENDENTE**).
+- Versão/deploy: a release `1.0.1` foi **preparada localmente** (commit de release + tag anotada `v1.0.1`, sem push); o push e a actualização de produção **não** foram feitos (a produção mantém a imagem anterior). A execução real de 2026-10-02 correu num runtime de teste com build local de `fcd442e`. (Nota 2026-10-04: o runtime de teste `m3ucrawler-first-test` foi subsequentemente actualizado para a imagem publicada de `cf0e314`, pinada por digest — ver a secção "Waves 2026-10 — recuperação pós-auditoria runtime".)
 - Last validated commit (histórico, wave 9c): `b19d95b` (2026-09-19)
 - Last commit coberto por validação registada: `675521b` (W-DASHBOARD; build Release 0 errors / 54 warnings; suite 2826 passed / 0 failed / 1 skipped)
 - Last validation (2026-10-02, HEAD `675521b`): build Release 0 errors / 54 warnings (baseline); suite completa 2827 testes — 2826 passed / 0 failed / 1 skipped (`HttpTimeoutAutopsyTests.LEGACY_PATTERN_blackhole...`, by design). A falha pré-existente `WaveW6b2ObservabilityTests.Dashboard_endpoints_return_newly_produced_runs_and_observations` (bomba-relógio de data) foi corrigida no commit de release (fix apenas de teste). Testes novos de W-DASHBOARD: 5 HTML (`WebDashboardWaveDashboardHtmlTests`), 6 de metadata/actividades (`LiveRunActivityMetadataTests`) e extensões a `DashboardMetricsTests` e camelCase de `ImportHistoryEntry`.
@@ -79,6 +81,19 @@ Execução real validada a 2026-10-02 num runtime de teste isolado (`/opt/m3ucra
 - **Dispatcharr (dry-run):** Matched 20; New channels 4; New streams 5387; Removed 0; Skipped 0; Ambiguous 1; Unchanged 0; Failed 0.
 - **Exemplo de proveniência real** (no `telegram_run_report.json`): `source` "xtream publication"; `candidateId` `00685b14676642258fd9742b64524c86`; `messageId` `110751`; `messageDateUtc` `2026-09-14T01:11:01Z`; `state` `accepted`; `streamCount` 25362; `streamsAfterCountryFilter` 116; `workingStreams` 19. Pelo menos duas playlists derivaram da mesma mensagem `110751`.
 - **Testes determinísticos associados:** `TelegramHistoryWindowBandTests` (W-HISTWIN), `CandidateMessageProvenanceTests` (Proveniência) e extensões a `WaveCDiscoverySettingsTests`; W-DEDUP tem testes próprios desde `9cffc9b`.
+
+## Waves 2026-10 — recuperação pós-auditoria runtime (2026-10-04)
+Secção de **planeamento**. Nenhuma wave abaixo foi implementada; todas estão **PENDENTE** (distinguir de "concluída"). Âmbito completo, critérios de aceitação e rastreabilidade problema→wave em `docs/project/waves/2026-10-04-runtime-audit-dashboard-recovery-plan.md`. **W1 e W2 são as prioridades imediatas; W2 é deliberadamente antecipada** para não deixar o Dispatcharr sem alimentação normal enquanto as waves de UI decorrem.
+
+| Wave | Scope | Estado |
+|---|---|---|
+| W1 | Dashboard JS/IIFE/handlers: restaurar funcionalidades mortas por `ReferenceError` (canonical channels, scheduler, ordering, source groups, country validation, …); adicionar regressão que impeça handlers HTML sem escopo | **PENDENTE** (prioridade imediata) |
+| W2 | Pipeline de playlists/Dispatcharr: `RUN → normalização/deduplicação → playlist_temp.m3u → filtros/validação/matching/rejeição/publicação → playlist.m3u → Dispatcharr`; Dispatcharr consome `playlist.m3u`; timestamped preservado como histórico | **PENDENTE** (prioritária, antecipada) |
+| W3 | HTTP/API transversal: `WriteJsonAsync` não mascara status; erros chegam como 4xx/5xx; rotas inexistentes respondem 404/405 (sem hangs) | **PENDENTE** |
+| W4 | Scheduler + Ordering + Canonical Channels end-to-end (criar/editar/eliminar/persistência/apresentação/auditabilidade), testados **pelo Dashboard** | **PENDENTE** |
+| W5 | Reviews (resolvidos desaparecem; Approve estruturado; Create Channel com formulário completo; Add Alias com selecção de canais) + Alias→Affinity (uma só Affinity, membro idempotente) | **PENDENTE** |
+| W6 | Dispatcharr UI (Dry Run/Sync com resultado e erros) + Countries (decidir CRUD vs validação) + restantes botões mortos | **PENDENTE** |
+| W7 | Auditoria final end-to-end contra runtime real controlado | **PENDENTE** |
 
 ## In Progress
 | Wave | Objective | Status | Branch | Commit |
@@ -205,6 +220,8 @@ Recalibrações normativas (não alteram a BÍBLIA; clarificam leitura):
 - Flaky conhecidos que passam isoladamente (28/28): `XtreamAccountLockManagerTests`, `Phase93AccountGateCoordinatorTests`.
 
 ## Next Executable Step
+> **Prioridade imediata (2026-10-04):** executar `W1` (restaurar os handlers da UI) e, em seguida, `W2` (pipeline de playlists/Dispatcharr). Ver § "Waves 2026-10 — recuperação pós-auditoria runtime" e o plano em `docs/project/waves/2026-10-04-runtime-audit-dashboard-recovery-plan.md`. `W2` é antecipada para restabelecer a alimentação do Dispatcharr.
+
 Não existe passo único: os próximos passos são independentes e nenhum deve iniciar implementação de `M.4` sem Decision Pack ratificado.
 
 0. **A release `1.0.1` está preparada LOCALMENTE** (commit de release + tag anotada `v1.0.1`; W-DASHBOARD já commitada em `675521b`). O passo seguinte passa a ser **publicar (push do branch e da tag) e, depois, actualizar a produção** — wave separada. A `1.0.1` ainda **não** foi publicada remotamente e a produção **não** foi actualizada.

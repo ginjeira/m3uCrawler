@@ -61,3 +61,12 @@ não ratifica decisões — `M.4` permanece **OPEN**.
 em produção; W5.3 dependente de `M.4` (produção chama `ResolveAsync` com `policy: null`); W5.5
 resolve gap (`externalIdentity`/`channelSource`/`none` → 422); Review→Output não ligado;
 `C7` **OPEN**; `M.4` **OPEN**.
+
+## Plano de recuperação pós-auditoria runtime (2026-10-04) — planeamento
+
+A auditoria runtime de 2026-10-04 (HEAD `cf0e314`, runtime `m3ucrawler-first-test`) e o plano de
+waves de recuperação `W1–W7` estão em
+[`2026-10-04-runtime-audit-dashboard-recovery-plan.md`](2026-10-04-runtime-audit-dashboard-recovery-plan.md).
+Registo de **planeamento**: nenhuma wave implementada (todas `PENDENTE`). Prioridades imediatas:
+**W1** (UI/IIFE/handlers) e **W2** (pipeline de playlists/Dispatcharr, antecipada). Estado corrente
+em `docs/PROJECT_STATUS.md`.
