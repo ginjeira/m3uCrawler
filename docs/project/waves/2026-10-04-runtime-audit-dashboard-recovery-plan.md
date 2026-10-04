@@ -4,7 +4,7 @@
 > waves de recuperação `W1–W7`. Subordinado à BÍBLIA (`docs/Reestructure/00-BIBLE.md:30-41`, `:105-128`);
 > não redefine conceitos normativos nem implementa nada.
 >
-> **Estado:** `W1`, `W2`, `W3`, `W4`, `W5` e `W6` **CONCLUÍDAS** (2026-10-04); `W7` **PENDENTE**. Este documento mantém o plano original; o progresso é registado em `docs/PROJECT_STATUS.md`.
+> **Estado:** `W1`–`W6` **CONCLUÍDAS** (2026-10-04); `W7` **PARCIAL / NÃO CONCLUÍDA** (código + harness + runtime local da imagem W6 validados; deployment no servidor, Run Telegram real e Dry/Sync reais **não validados** — ver §W7). Este documento mantém o plano original; o progresso é registado em `docs/PROJECT_STATUS.md`.
 >
 > **Cross-reference:** estado corrente e prioridades em `docs/PROJECT_STATUS.md` (secção
 > "Waves 2026-10 — recuperação pós-auditoria runtime") e `ROADMAP.md` (§ "Em curso"). Índice de waves
@@ -258,6 +258,19 @@ correspondente.
 **Validar:** todas as funcionalidades visíveis; todas as rotas; todos os handlers; estados de erro;
 persistência; scheduler; ordering; canonical channels; reviews; aliases; affinities; countries;
 playlists; Dispatcharr; output inventory; observabilidade; documentação.
+
+**Estado:** **PARCIAL / NÃO CONCLUÍDA** (2026-10-04).
+
+- **VALIDADO:**
+  - suite completa (`2933 passed / 0 failed / 1 skipped`) e build Release (**0 errors / 54 warnings**);
+  - **runtime local isolado da imagem W6** (`m3ucrawler:first-real-test-9a6815c`): container residente; `/api/version` = `9a6815cb1780b5a47622253b742079625b57bfe9`; `/` → bootstrap (302→200); bootstrap + login + clientes autenticados; `GET /api/catalog/channels` / `/api/scheduled-actions` / `/api/countries` → 200; criar canal `TEST-E2E-W7` → 201 e eliminar → 200; rota inexistente → 404; `POST /api/dispatcharr/dry-run` → 503 `dispatcharr-unavailable` (esperado em `--web` sem `--telegram`). Nada no servidor foi tocado.
+- **NÃO VALIDADO (blockers):**
+  - **deployment** da imagem W6 no servidor — o utilizador SSH `kilo-m3ucrawler` não tem acesso ao Docker daemon e não há credenciais GHCR para publicar;
+  - **Run Telegram real** → `playlist_temp.m3u` / `playlist.m3u` → Dispatcharr (exige o runtime do servidor com credenciais reais);
+  - **Scheduler real** (job disparado) e **Ordering/Reviews/Alias→Affinity** no runtime real (cobertura apenas por testes/harness);
+  - **Dispatcharr Sync real** — **não autorizado** nesta wave.
+- **Observação do runtime em produção de teste (imagem `cf0e314`, pré-W1..W6):** residente há ~1d21h, mas **sem `playlist.m3u`/`playlist_temp.m3u`** e com **run #18 parado** (`TerminalStatus=0`/"Unknown", em *validating streams* desde `2026-10-04T11:54Z`) — comportamento **pré-W2**, não uma regressão das waves.
+- **Para concluir W7:** deploy controlado da imagem W6 no servidor (com rollback registado), Run controlada + Dry Run; Sync real **apenas com autorização explícita**.
 
 ## 5. Ordem e prioridade
 
