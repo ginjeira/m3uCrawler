@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using m3uCrawler.Models;
 using m3uCrawler.Services;
 using m3uCrawler.Services.Catalog;
+using m3uCrawler.Services.Configuration;
 using m3uCrawler.Services.Matching;
 using m3uCrawler.Services.Validation;
 using Microsoft.Extensions.DependencyInjection;
@@ -50,7 +51,12 @@ public sealed class ScheduledAutomationHost : IDisposable
         string outputDir,
         DispatcharrConfig dispatcharrConfig,
         TimeSpan? pollInterval = null,
-        Action<ScheduledActionOptions>? configureOptions = null)
+        Action<ScheduledActionOptions>? configureOptions = null,
+        IConfigurationGate? gate = null,
+        LiveRun.LiveRunHost? liveRunHost = null,
+        Func<DispatcharrConfig>? dispatcharrConfigLoader = null,
+        DiscoverySettingsProvider? discoverySettings = null,
+        IActionCapabilityGate? capabilityGate = null)
     {
         var options = new ScheduledActionOptions { OutputDir = outputDir };
         configureOptions?.Invoke(options);
@@ -66,15 +72,38 @@ public sealed class ScheduledAutomationHost : IDisposable
         // 9A-PROD-WIRING: tester criado via factory a partir de um
         // state partilhado. Singleton no DI garante que cache e
         // HostFailureTracker sobrevivem entre execuções agendadas.
-        sc.AddSingleton(_ => StreamValidationTesterFactory.CreateTester(
-            TryLoadSharedValidationState() ?? StreamValidationTesterFactory.CreateIsolatedState()));
+        // Wave C — o state fica registado para que as acções possam
+        // recarregar a policy a cada run (ReloadPolicy) e recriar o
+        // tester com as options frescas.
+        sc.AddSingleton<StreamValidationState>(_ =>
+            TryLoadSharedValidationState() ?? StreamValidationTesterFactory.CreateIsolatedState());
+        sc.AddSingleton(sp => StreamValidationTesterFactory.CreateTester(
+            sp.GetRequiredService<StreamValidationState>()));
         sc.AddSingleton(new PlaylistComposerService(catalog.GetFactory()));
         sc.AddSingleton<AliasResolver>(_ => AliasResolver.FromFile(dispatcharrConfig.AliasFile));
 
         sc.AddSingleton<IScheduledAction, ScheduledM3uDiscoveryAction>();
         sc.AddSingleton<IScheduledAction, ScheduledValidationAction>();
         sc.AddSingleton<IScheduledAction, ScheduledPlaylistGenerationAction>();
-        sc.AddSingleton<IScheduledAction, ScheduledDispatcharrSyncAction>();
+
+        // Wave C — O sync agendado relê a config Dispatcharr em cada run
+        // (paridade com o caminho CLI). Sem loader explícito usa-se o
+        // snapshot injectado (comportamento anterior, usado em testes).
+        sc.AddSingleton<IScheduledAction>(sp => new ScheduledDispatcharrSyncAction(
+            sp.GetRequiredService<DispatcharrConfig>(),
+            sp.GetRequiredService<ScheduledActionOptions>(),
+            sp.GetRequiredService<CatalogResolver>(),
+            transport: null,
+            configLoader: dispatcharrConfigLoader));
+
+        // PHASE 9C.4 (subwave 5) — Execução Telegram agendada. Converge no
+        // RunCoordinator único (Source=Scheduler). Se o host não tiver
+        // coordinator configurado, a acção devolve um resultado seguro.
+        // Wave C — os parâmetros vêm da configuração de discovery persistida.
+        sc.AddSingleton<IScheduledAction>(
+            new ScheduledTelegramRunAction(liveRunHost, LiveRun.LiveRunMode.Telegram, discoverySettings));
+        sc.AddSingleton<IScheduledAction>(
+            new ScheduledTelegramRunAction(liveRunHost, LiveRun.LiveRunMode.TelegramMaintain, discoverySettings));
 
         var provider = sc.BuildServiceProvider();
 
@@ -90,7 +119,9 @@ public sealed class ScheduledAutomationHost : IDisposable
         var runner = new ScheduledJobRunner(
             catalog.GetFactory(),
             provider,
-            pollInterval);
+            pollInterval,
+            gate,
+            capabilityGate);
 
         return new ScheduledAutomationHost(provider, runner, options, actions);
     }

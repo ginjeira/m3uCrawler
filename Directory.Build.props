@@ -18,8 +18,8 @@
   -->
 
   <PropertyGroup>
-    <M3uCrawlerVersion Condition="'$(M3uCrawlerVersion)' == ''">0.1.0-dev</M3uCrawlerVersion>
-    <M3uCrawlerAssemblyVersion Condition="'$(M3uCrawlerAssemblyVersion)' == ''">0.1.0.0</M3uCrawlerAssemblyVersion>
+    <M3uCrawlerVersion Condition="'$(M3uCrawlerVersion)' == ''">1.0.1</M3uCrawlerVersion>
+    <M3uCrawlerAssemblyVersion Condition="'$(M3uCrawlerAssemblyVersion)' == ''">1.0.0.0</M3uCrawlerAssemblyVersion>
   </PropertyGroup>
 
   <!--

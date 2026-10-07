@@ -2247,7 +2247,7 @@ têm de ser fechados antes da consolidação final (PHASE 12).
 | **PHASE 9 — Quality / EPG / Availability** | **`[concluído]`** | PHASE 9A (performance), PHASE 9 b (histórico de observações) e visão agregada (dashboard de degradação) concluídos. |
 | **PHASE 9A — URL/Stream Validation Performance** | **`[concluído]`** | Ver secção 32.2. |
 | **PHASE 9 b — ChannelSource observation history** | **`[concluído]`** | `ChannelSourceObservationEntity` + endpoint GET/POST; Dashboard em construção para mostrar timeline. Ver detalhes em 32.7. |
-| **PHASE 10 — Dispatcharr** | **`[concluído]`** | `ChannelMatcher.BuildPlanFromCompositionAsync` consome `PlaylistComposition` (PHASE 7 + 6 + 4). Ver detalhes em 32.8. |
+| **PHASE 10 — Dispatcharr** | **`[concluído]`** | `ChannelMatcher.BuildPlanFromCompositionAsync` consome `PlaylistComposition` (PHASE 7 + 6 + 4). **Correcção factual (2026-09-17):** o adapter existe mas está sem call site de produção e sem testes; ver 32.8 e a nota em 32.19. |
 | **PHASE 11 — Runs dashboard detalhado** | **`[concluído]`** | `SyncRunStepEntity` + `GET/POST /api/catalog/sync-runs/{id}/steps` + Dashboard `Passos` por run. Ver detalhes em 32.9. |
 | **PHASE 12 — Automation / Scheduler** | **`[concluído]`** | `ScheduledJobEntity` + `CronExpression` + `ScheduledJobRunner` + 4 actions concretas (`discoverM3u`, `validatePlaylist`, `generatePlaylist`, `syncDispatcharr`) + `ScheduledAutomationHost` + arranque em produção no `--web` + 19 testes. Ver detalhes em 32.10 e 32.11. |
 
@@ -2745,6 +2745,12 @@ e ambiguity-detection sobre essas escolhas.
 2 testes em `DispatcharrCompositionTests.cs`:
 - `BuildPlanFromCompositionAsync_returns_plan_with_each_composed_channel`.
 - `BuildPlanFromCompositionAsync_throws_on_null_composition`.
+
+> **Correcção factual (2026-09-17):** a afirmação acima é **inexacta**. O
+> ficheiro `DispatcharrCompositionTests.cs` não existe e
+> `BuildPlanFromCompositionAsync` não tem call site de produção nem testes.
+> A PHASE 10 não é reaberta por esta correcção; a decisão fica pendente
+> (ver §32.19, nota "BuildPlanFromCompositionAsync").
 
 Resultado: PHASE 10 passa a `[concluído]`.
 
@@ -3407,11 +3413,43 @@ observar:
 
 # 32.18 — PHASE 9C — First-Run / Configuration Lifecycle / Dashboard Hardening
 
-> **Estado: `[pendente]` — próxima fase de execução.**
+> **Estado: `[em curso]` (`[parcial]`) — 9C.1–9C.6 implementadas; fase parcialmente concluída. Reconciliação de 2026-09-18 (HEAD `bf04c34`) com evidência de código/testes no bloco abaixo; a Wave 9C.6 é posterior (HEAD `69aeb98`).**
+>
+> *Nota documental (2026-09-16, commit `ad1d3f6`): 9C.3 (canonical country, affinity kind e naming canónico para Dispatcharr) também se encontra implementada. O presente §32.18 será actualizado para reflectir o estado consolidado das três sub-waves numa próxima passagem documental dedicada.*
+>
+> *Nota documental (2026-09-17, pós-fecho 9C.4): 9C.2, 9C.3 e 9C.4 encontram-se igualmente implementadas e fechadas após revisão independente (`READY FOR CLOSURE`, commit `394061e`). A tabela de fases em §32 foi consolidada nesse fecho. As **decisões sobre o upgrade de instalações existentes** (cenário `BOOTSTRAP_REQUIRED` — instalação adoptada sem administrador) foram formalizadas em `docs/architecture/configuration-lifecycle.md` §"Upgrade de instalações existentes (decisão pós-9C.4)". Sem alterações de código nessa passagem.*
+>
+> *Nota de implementação (2026-09-17, PHASE 9C.5): a extensão efectiva do gate `Bootstrap` para `READY` ∧ sem administrador activo foi implementada. `AuthModeResolver` resolve esse caso para `AuthMode.Bootstrap` (em vez de `Legacy`), o `BootstrapService` permite criar o primeiro administrador em `READY` sem descer o estado para `CONFIGURING` e sem reconfigurar nada, e o wizard passa a exigir confirmação da password. O modo `Legacy` fica restrito ao contexto explicitamente standalone/testes. Cobertura em `BootstrapServiceTests`, `DashboardBootstrapEndpointTests` e `AuthPrimitivesTests`; detalhe em `docs/architecture/configuration-lifecycle.md` §"Upgrade de instalações existentes" e §"Fluxo de bootstrap".*
+>
+> *Nota de scope (2026-09-17, simplificação 9C.5): o modelo first-run da 9C destina-se a instalações novas/limpas. Não está prevista migração/recuperação de configuração de administrador de versões anteriores; o bootstrap fecha com **qualquer** registo em `admin_users` (`HasAnyAsync`) e `READY` + administrador desactivado é um estado não suportado, podendo exigir reinicialização do `runtime-data`. A resposta `403 bootstrap-required` passa a reportar o estado de lifecycle real. Ver `docs/architecture/configuration-lifecycle.md` §"Upgrade de instalações existentes".*
+>
+> *Nota de implementação (2026-09-18, HEAD `69aeb98`, PHASE 9C.6 — identidade canónica em runtime): a resolução de afinidades de canal passou a ser **Key-autoritativa**. `CatalogResolver.ResolveAsync` resolve o canal por `AffinityGroup.CanonicalChannelKey` (encontrado e habilitado) quando a Key existe; se a Key existe mas não resolve (inexistente ou desactivada), **não** recua para o `CanonicalChannelId` obsoleto; linhas legadas com Key nula/vazia mantêm o fallback por FK/navegação. `CatalogResolver.ListChannelSourcesAsync` inclui agora `CanonicalChannel`, expondo a Key ao caminho de selecção de fontes. Sem alteração de schema, migration, coluna ou FK — `CanonicalChannelId` permanece coluna de transição. Cobertura em `m3uCrawler.Tests/Phase9C6CanonicalIdentityTests.cs` (6 testes). Permanecem dependentes de `Id`: FKs de `channel_aliases`/`channel_sources`/`ordering_items`, `source_priority_policies` por canal, `dispatcharr_channel_ownerships`, `matching_audits`, `MatchPlan` e o agrupamento do `SourceSelectionStage`. Overrides por canal (13-4b) **implementados** entretanto com identidade por `CanonicalChannel.Key` (sem migração completa `Id → Key` do domínio).*
+>
+> *Nota de implementação (2026-09-18, onboarding/setup): a onda de onboarding pós-bootstrap entregou o serviço de prontidão operacional (`OperationalReadinessService`/`IOperationalReadinessGate`), a autenticação Telegram interactiva (`TelegramAuthService`), a configuração/teste Dispatcharr (`DispatcharrConfigurationService`, `DispatcharrConnectionTester`), os endpoints de setup e readiness, a vista `Setup` + banner `⚠️ SETUP REQUIRED` no Dashboard e o provisionamento de configuração de país no arranque (`CountryConfigProvisioner`). O gate do scheduler passa a exigir `READY` **e** `SetupComplete`; `adoptedFromLegacy` fica grandfathered e `sources` é informacional (não bloqueia `SetupComplete`, evitando deadlock do discovery). Detalhe normativo em `docs/architecture/configuration-lifecycle.md` §"Operational Readiness (pós-bootstrap)"; commits `39383fc`…`fcd5e32`. Permanece por decidir/implementar: embeber Telegram/Dispatcharr no wizard de first-run propriamente dito (a UI de Setup é uma vista separada, não o wizard 9C.2) e versionar/trackear `m3uCrawler/runtime-data/countries/pt.json` (dívida: EmbeddedResource inerte em CI/Docker).*
+>
+> *Nota de implementação (2026-09-18, gestão da password de administrador): **resolvido** o gap anteriormente registado de ausência de alteração/recuperação da password de administrador. `AdminUserStore.ChangePasswordAsync`/`ChangePasswordByUsernameAsync` validam por `CredentialPolicy`, fazem o hash por `PasswordHasher` e revogam **todas** as sessões do utilizador na mesma transacção; `POST /api/session/password` (`UserAuth`, CSRF, apenas `POST`) exige a password actual e força re-login (`reloginRequired:true`); a recuperação é host-only via `m3uCrawler --admin-reset-password <username>` (password só por stdin, nunca argv, sem verificação da actual). **Não reabre bootstrap**: `BOOTSTRAP_REQUIRED` e o estado de lifecycle não são afectados. Commits `419e23a` (alteração + recuperação host) e `ab595a3` (endpoint/UI). Detalhe em `docs/architecture/configuration-lifecycle.md` §"Gestão da password de administrador".*
 >
 > Esta fase é uma condição de consolidação do produto antes de novas
 > funcionalidades. Não introduz uma segunda arquitectura: fecha o lifecycle
 > operacional sobre o catálogo, políticas, Dashboard e scheduler já existentes.
+>
+> **9C.1 — Configuration Lifecycle / First-Run Bootstrap: implementada.**
+> Estados `NOT_CONFIGURED`/`CONFIGURING`/`READY` persistidos
+> (`configuration_lifecycle.json` junto ao catálogo), estado persistido como
+> autoridade, adopção legacy de instalações existentes, gate único de
+> discovery/scheduler (`IConfigurationGate`), endpoint read-only
+> `GET /api/configuration/lifecycle`. Os requisitos do §5 são **advisory** nesta
+> wave (não bloqueiam `READY`), por compatibilidade com instalações existentes.
+> Detalhe em `docs/architecture/configuration-lifecycle.md`.
+> **Reconciliação de estado (2026-09-18, HEAD `bf04c34`) — evidência de código/testes.** A fase continua **parcial**:
+> - **Wizard 9C.2 / onboarding — parcial:** `BuildBootstrapHtml` cobre apenas 3 passos (arrancar bootstrap / criar admin / concluir) e os passos dos §6 itens 4–11 (baseline canónico, lista de ordenação, fontes, prioridade de fontes, políticas de importação, validação de streams, scheduler) não estão no wizard. A onda de onboarding acrescentou uma vista **Setup** separada (não o wizard) com config/autenticação Telegram, config/teste Dispatcharr, prontidão operacional e banner `⚠️ SETUP REQUIRED`; embeber Telegram/Dispatcharr no próprio wizard de first-run permanece em aberto.
+> - **Gate de command/endpoints — parcial:** o scheduler está gated (`ScheduledJobRunner.cs:105-119`) e os endpoints mutantes respondem `403 bootstrap-required` (`WebDashboardService.cs:334-345`), mas o caminho CLI one-shot `--telegram` sem loop/manutenção não é gated (`Program.cs:297,421-433`).
+> - **Afinidades — resolução runtime corrigida (Wave 9C.6); dependências de `Id` remanescentes:** a identidade estável `CanonicalChannelKey` já era armazenada (`CatalogEntities.cs:180`) e a migration `20260916202838_AddCanonicalCountryAndAffinityKind` foi executada e testada (backfill/split/reversibilidade). A partir da Wave 9C.6 (HEAD `69aeb98`), `CatalogResolver.ResolveAsync` é **Key-autoritativo**: resolve por `Key` quando presente (encontrada e habilitada) e, se a `Key` existir mas não resolver, **não** recua para o `CanonicalChannelId` obsoleto; a Key nula/vazia mantém o fallback legado por FK/navegação. A sobrevivência a apagar/recriar o canal com a mesma `Key` está coberta por `m3uCrawler.Tests/Phase9C6CanonicalIdentityTests.cs`, contra o §10 (linhas 3788-3791) e o DoD de afinidades (4165-4177). Permanecem dependentes de `Id` (não migrados): FKs de `channel_aliases`, `channel_sources` e `ordering_items`, `source_priority_policies` por canal, `dispatcharr_channel_ownerships`, `matching_audits`, `MatchPlan` e o agrupamento do `SourceSelectionStage` — não é uma migração completa `Id → Key` (`OnDelete(SetNull)` do FK transitório mantém-se; `ChannelCatalogDbContext.cs:109-112`).
+> - **Auditoria do Dashboard — pendente:** não existe log de auditoria de acções administrativas (grep `AdminAudit|audit_log|AdminActionLog` sem resultados); `MatchingAuditEntity` é auditoria de matching, não de admin.
+> - **Instalação limpa validada — pendente:** sem teste/script end-to-end contra `runtime-data` vazio; os testes `Fresh_install_*` usam BD in-process.
+> - **Máquina de estados — reduzida:** apenas `NOT_CONFIGURED`/`CONFIGURING`/`READY` (`ConfigurationLifecycleState.cs:12-31`); `RUNNING`/`ERROR` do §1 explicitamente diferidos (`ConfigurationLifecycleState.cs:7-9`).
+> - **Validação de configuração — scoped:** `BootstrapConfigurationValidator` avalia 3 verificações (catálogo, output, Dispatcharr se activo); a lista completa do §5 é **advisory**, não gate (`ConfigurationLifecycleService.EvaluateAdvisoryAsync`).
+> Continua pendente o redesign do Dashboard, o alargamento do wizard, as dependências de `Id` remanescentes da identidade canónica (fora da resolução de afinidades, já Key-autoritativa desde a Wave 9C.6) e o Manual/Ajuda contextual.
 
 ## 1. Objectivo
 
@@ -3512,6 +3550,28 @@ O bootstrap deve:
 
 A transição para `READY` deve ser determinística e testável.
 
+### Regra de compatibilidade para instalações existentes
+
+A definição de `READY` nesta fase deve preservar instalações `m3uCrawler`
+já operacionais.
+
+Para uma instalação sem estado de lifecycle persistido:
+
+1. se existir evidência objectiva e verificável de que a instalação já era
+   operacional, a instalação deve ser **adoptada como `READY`**;
+2. a adopção deve ser registada em log;
+3. se não existir evidência suficiente, a instalação deve permanecer em
+   `NOT_CONFIGURED`.
+
+A ausência de um ou mais itens da lista de configuração mínima abaixo não deve,
+por si só, bloquear uma instalação legacy que já esteja comprovadamente
+operacional. Esses requisitos são **advisory nesta wave** e serão transformados
+em configuração explícita e governada pelo wizard.
+
+Esta regra existe exclusivamente para compatibilidade durante a introdução do
+lifecycle. Não substitui a validação da configuração completa numa instalação
+nova.
+
 ## 5. Configuração mínima de uma instalação nova
 
 A validação deve definir explicitamente quais componentes são obrigatórios
@@ -3544,16 +3604,40 @@ O Dashboard deve fornecer um fluxo explícito de primeira configuração.
 O wizard deve permitir, no mínimo:
 
 1. verificar estado da instalação;
-2. carregar/importar a baseline/catálogo;
-3. confirmar país;
-4. criar ou seleccionar ordering list activa;
-5. configurar sources;
-6. rever source priority;
-7. configurar políticas de importação/grupos;
-8. configurar validação de streams;
-9. configurar scheduler, se pretendido;
-10. validar tudo;
-11. concluir bootstrap e mudar para `READY`.
+2. criar o **primeiro utilizador administrador**;
+3. autenticar o operador através desse administrador para continuar o
+   bootstrap;
+4. carregar/importar a baseline/catálogo;
+5. confirmar país;
+6. criar ou seleccionar ordering list activa;
+7. configurar sources;
+8. rever source priority;
+9. configurar políticas de importação/grupos;
+10. configurar validação de streams;
+11. configurar scheduler, se pretendido;
+12. validar tudo;
+13. concluir bootstrap e mudar para `READY`.
+
+### Primeiro utilizador administrador
+
+Numa instalação nova, o wizard é responsável pela criação do primeiro
+utilizador administrador da aplicação.
+
+Regras:
+
+- não deve existir uma password administrativa default;
+- a password deve ser definida explicitamente durante o wizard;
+- a criação do primeiro administrador deve ser segura, transaccional e
+  idempotente;
+- depois de concluído o bootstrap, esse utilizador passa a ser utilizado para
+  o acesso autenticado normal ao Dashboard;
+- em `NOT_CONFIGURED`, o Dashboard deve disponibilizar apenas o acesso
+  necessário ao bootstrap/wizard, não o funcionamento administrativo normal;
+- o wizard não deve expor nem devolver a password ou outros segredos em
+  respostas, logs, previews ou erros;
+- uma instalação legacy adoptada como `READY` não deve criar silenciosamente
+  um novo administrador; a estratégia de autenticação/migração legacy deve ser
+  tratada explicitamente.
 
 O wizard não deve duplicar CRUD já existente. Deve apenas orquestrar os
 serviços/API existentes e apresentar ao operador o que falta.
@@ -3664,39 +3748,336 @@ A auditoria deve verificar especialmente:
 
 Não considerar uma operação "concluída" apenas porque o endpoint existe.
 
-## 10. Afinidades — correcção do modelo conceptual
+## 10. Afinidades — modelo funcional e identidade do canal
 
-As afinidades representam uma relação lógica de identidade/matching e não
-devem depender do identificador técnico de uma linha específica de
-`CanonicalChannel`.
+As afinidades são o mecanismo para associar as várias designações/notações
+encontradas nas fontes ao **canal canónico definido na Lista de canais por
+país**.
 
-O modelo deve permitir que uma afinidade sobreviva a:
+A **Lista de canais por país é a única autoridade para o canal canónico**:
+criação e alteração do nome e das restantes propriedades canónicas continuam
+a ser efectuadas nessa lista. A afinidade não cria nem altera o nome canónico.
 
-- alteração de `CanonicalChannelId`;
-- importação de uma nova baseline;
-- reconstrução do catálogo;
-- merge de canais;
-- mudança de keys técnicas;
-- migração do catálogo.
+### Modelo funcional
 
-A identidade lógica deve ser representada por uma chave estável apropriada
-ao domínio, ou por uma estrutura equivalente que não transforme um ID técnico
-de uma linha numa fonte de verdade de identidade.
+Cada definição de afinidade corresponde a **um único canal canónico**.
+
+A interface deve apresentar:
+
+- um campo `Canal canónico` em formato **dropdown**;
+- o dropdown deve ser alimentado pela **Lista de canais por país**;
+- ao criar uma nova afinidade, devem aparecer apenas os canais que **ainda não
+  possuem uma definição de afinidade**;
+- um canal que já possua afinidade não pode ser seleccionado para criar uma
+  segunda afinidade;
+- cada canal pode ter **uma e apenas uma definição de afinidade**;
+- a definição contém as várias designações/notações alternativas pelas quais
+  o canal pode surgir nas fontes;
+- as alternativas são introduzidas num único campo, utilizando o separador
+  configurado pela aplicação;
+- ao editar uma afinidade existente, o canal a que pertence continua a ser o
+  mesmo e as variantes podem ser alteradas.
+
+Exemplo:
+
+```text
+Canal canónico
+[ RTP 1                         ▼ ]
+
+Nomes / notações alternativas
+[ RTP1, RTP 1 HD, RTP1 HD ]
+```
+
+### Identidade
+
+A afinidade deve referenciar o **identificador estável do canal canónico no
+catálogo**, e não o nome textual.
+
+A alteração do nome na Lista de canais por país não deve criar uma nova
+afinidade nem quebrar uma afinidade existente. O relacionamento lógico deve
+continuar associado ao mesmo canal.
+
+Se o catálogo utilizar actualmente um ID técnico que possa ser reconstruído
+ou alterado por importações/migrações, deve ser utilizada a chave lógica
+estável prevista pelo catálogo (`CanonicalChannel.Key` ou equivalente), em vez
+de depender de `CanonicalChannelId`.
+
+### Resolução e Dispatcharr
+
+Quando uma fonte contém uma designação que corresponde a uma afinidade:
+
+1. a variante encontrada é resolvida para o canal canónico;
+2. a composição utiliza o canal canónico;
+3. ao criar ou actualizar o canal no Dispatcharr, o **nome publicado é sempre
+   o nome actualmente definido na Lista de canais por país**;
+4. nunca deve ser utilizado como nome canónico no Dispatcharr o alias/variante
+   encontrado na fonte.
+
+Exemplo:
+
+```text
+Fonte                 → "RTP1 HD"
+Afinidade             → canal canónico RTP 1
+Lista de canais PT    → "RTP 1"
+Dispatcharr            → "RTP 1"
+```
+
+Se o operador alterar posteriormente na Lista de canais por país:
+
+```text
+"RTP 1" → "RTP 1 HD"
+```
+
+a mesma afinidade continua ligada ao mesmo canal e as futuras criações ou
+actualizações no Dispatcharr devem utilizar `RTP 1 HD`.
+
+### Unicidade
+
+A regra de cardinalidade é:
+
+```text
+1 canal canónico → 0 ou 1 definição de afinidade
+1 definição de afinidade → 1 canal canónico
+1 definição de afinidade → N variantes
+```
+
+O sistema deve impedir ambiguidades de matching quando a mesma variante não
+puder ser resolvida deterministicamente.
 
 ### Migração
 
-Antes de alterar o modelo:
+Antes de alterar o modelo existente:
 
 1. inventariar todas as afinidades existentes;
-2. identificar a identidade lógica de cada lado;
-3. criar a representação estável;
-4. migrar todas as relações;
-5. validar cardinalidade;
-6. detectar relações ambíguas;
+2. identificar o canal canónico actualmente associado a cada afinidade;
+3. mapear essa associação para a chave estável do canal;
+4. consolidar eventuais duplicados por canal;
+5. validar a cardinalidade `0..1 afinidade por canal`;
+6. detectar variantes atribuídas a mais de um canal;
 7. preservar as decisões válidas;
 8. apenas depois remover a dependência técnica antiga.
 
 A migração deve ser idempotente e ter testes de regressão.
+
+A migração não deve alterar os nomes canónicos: estes continuam a ser
+determinados exclusivamente pela Lista de canais por país.
+
+
+## Observabilidade operacional em tempo real — Live Run Monitor
+
+O Dashboard deve disponibilizar uma visão em tempo real do que o **m3uCrawler
+está efectivamente a fazer durante uma execução**. O objectivo não é apenas
+mostrar o resultado final do `RunReport`, mas permitir ao operador perceber,
+enquanto o processo decorre:
+
+- se o crawler está `IDLE` ou em execução;
+- qual é a actividade/fase actual;
+- há quanto tempo a actividade está em curso;
+- se a execução continua activa;
+- quantas mensagens foram lidas/analisadas;
+- quantos candidatos/playlists foram encontrados;
+- quantos downloads foram concluídos, falharam ou foram ignorados;
+- quantas playlists foram validadas/invalidadas;
+- quantas contas Xtream foram descobertas;
+- quantos streams/canais foram descobertos;
+- quantos streams/canais foram testados;
+- quantos foram considerados funcionais/não funcionais;
+- quantos itens foram compostos/publicados/sincronizados no Dispatcharr,
+  quando essa etapa estiver activa;
+- erros e avisos relevantes;
+- timestamp da última actividade.
+
+A experiência pretendida deve ser equivalente, para um utilizador, a um
+`docker logs -f m3ucrawler` **perceptível e estruturado**, complementado por
+totalizadores.
+
+### Estado operacional
+
+Deve existir um estado explícito da execução, com uma enumeração equivalente
+a:
+
+```text
+IDLE
+READING_TELEGRAM
+DISCOVERING
+DOWNLOADING
+ANALYZING
+VALIDATING
+COMPOSING
+SYNCING_DISPATCHARR
+COMPLETED
+ERROR
+```
+
+A enumeração concreta pode ser ajustada à arquitectura existente, mas o
+Dashboard deve conseguir representar inequivocamente a actividade actual.
+
+O estado deve incluir pelo menos:
+
+- `runId`;
+- estado actual;
+- etapa/actividade actual;
+- `startedAt`;
+- `updatedAt`;
+- duração decorrido;
+- mensagem resumida para o operador.
+
+### Totalizadores em tempo real
+
+Os totalizadores devem estar associados ao `SyncRun` em curso e ser
+actualizados durante a execução, não apenas no final.
+
+A estrutura deve permitir pelo menos:
+
+```text
+Telegram
+  messagesRead
+  candidatesFound
+
+Playlists
+  playlistsFound
+  playlistsDownloaded
+  playlistsValid
+  playlistsInvalid
+  downloadFailures
+
+Xtream
+  accountsDiscovered
+  accountsValidated
+
+Streams
+  streamsDiscovered
+  streamsSelected
+  streamsTested
+  streamsWorking
+  streamsFailed
+
+Dispatcharr
+  channelsCreated
+  channelsUpdated
+  channelsFailed
+```
+
+Os contadores devem ser incrementados pelos pontos reais do pipeline. Não
+devem ser calculados retroactivamente a partir de texto de logs.
+
+Um contador só deve ser apresentado quando existir uma definição semântica
+clara para o seu significado; a lista acima é o modelo alvo e pode ser
+introduzida incrementalmente conforme cada fase disponibilize os eventos
+necessários.
+
+### Actividade em tempo real
+
+Além dos totalizadores, o Dashboard deve apresentar um feed das **últimas
+actividades relevantes**, por exemplo:
+
+```text
+17:51:02  Telegram       A ler mensagens...
+17:51:03  Telegram       260 mensagens analisadas
+17:51:04  Playlist       Candidato encontrado: message 110843
+17:51:04  Download        A descarregar playlist...
+17:51:06  Download        Download concluído — 4.2 MB / 2.1 s
+17:51:06  Xtream          751 contas encontradas
+17:51:07  Validation      Conta 1/751 — a validar
+17:51:08  Validation      Conta 1 — 127 testados / 74 OK / 53 falhados
+```
+
+O feed deve ser orientado ao utilizador e não reproduzir cegamente todo o
+`docker logs`. Os logs técnicos continuam a existir para diagnóstico.
+
+Cada actividade deve, quando aplicável, possuir:
+
+- timestamp;
+- categoria;
+- nível (`INFO`, `WARNING`, `ERROR`);
+- mensagem;
+- metadados estruturados.
+
+### Transporte
+
+A actualização do Dashboard deve ser realmente em tempo real.
+
+A solução preferencial é utilizar o mecanismo de comunicação em tempo real já
+suportado pela aplicação, ou **SignalR/WebSocket** se não existir outro
+mecanismo adequado.
+
+Polling periódico pode ser utilizado como fallback ou numa primeira
+implementação se isso reduzir significativamente o risco, mas não deve obrigar
+o operador a actualizar manualmente a página.
+
+### Persistência e desempenho
+
+Não persistir cada actividade individual na base de dados.
+
+O modelo deve distinguir:
+
+```text
+Persistente
+  SyncRun
+  estado actual
+  totalizadores
+  steps/resumo
+
+Em memória / buffer limitado
+  últimas actividades live
+```
+
+O feed pode utilizar um **ring buffer** de tamanho limitado (por exemplo, as
+últimas centenas de actividades), evitando crescimento ilimitado.
+
+Os totalizadores e o estado principal devem sobreviver ao refresh do Dashboard
+e permitir que o operador veja o estado actual de um run que continua em curso.
+
+### Relação com `SyncRun` / `SyncRunStep`
+
+Esta capacidade deve **reutilizar e estender o modelo de runs existente**.
+
+Não criar um segundo sistema independente de execução apenas para o Dashboard.
+
+`SyncRun` continua a representar a execução e `SyncRunStep` as etapas
+estruturais. A observabilidade live acrescenta estado actual, totalizadores e
+actividade operacional à mesma execução.
+
+### Logs técnicos
+
+O `docker logs -f m3ucrawler` deve continuar disponível e não deve ser
+substituído.
+
+Existem três níveis complementares:
+
+```text
+Dashboard
+  → estado actual + totalizadores + actividade live
+
+SyncRun
+  → estado/steps/resultados persistentes
+
+docker logs
+  → diagnóstico técnico detalhado
+```
+
+O Dashboard não deve depender de fazer parsing do `docker logs`.
+
+### Critérios de aceitação
+
+Uma execução em curso deve permitir ao operador responder, sem consultar
+directamente o container:
+
+1. O m3uCrawler está parado ou está a trabalhar?
+2. O que está a fazer neste momento?
+3. Quando começou a execução?
+4. Qual é a fase actual?
+5. Quantas mensagens já leu?
+6. Quantos candidatos/playlists encontrou?
+7. Quantos downloads foram feitos e quantos falharam?
+8. Quantas contas/streams/canais já foram processados?
+9. Quantos testes foram concluídos e quantos deram resultado funcional?
+10. Existem erros ou avisos relevantes?
+11. Quando ocorreu a última actividade?
+
+A informação deve actualizar-se automaticamente durante a execução e continuar
+coerente com o `SyncRun` terminado.
+
 
 ## 11. API
 
@@ -3709,7 +4090,7 @@ Deve existir uma representação clara de:
 - requisitos de configuração;
 - validação;
 - conclusão/revalidação do bootstrap;
-- operações de afinidade independentes de IDs técnicos.
+- operações de afinidade baseadas na identidade lógica estável do canal canónico, sem dependência de IDs técnicos mutáveis.
 
 As respostas devem ser adequadas tanto ao Dashboard como a testes
 automatizados.
@@ -3727,8 +4108,16 @@ A primeira execução deve seguir fail-safe:
 - não expor credenciais;
 - não considerar uma configuração parcialmente preenchida como `READY`.
 
+Durante `NOT_CONFIGURED`, o Dashboard deve permitir apenas o fluxo necessário
+para o bootstrap inicial. O wizard deve criar o primeiro utilizador
+administrador antes de disponibilizar o acesso administrativo normal.
+
 O Dashboard deve exigir autenticação em instalação normal e todas as APIs
 administrativas devem respeitar o mesmo controlo de acesso.
+
+A adopção de uma instalação legacy como `READY` não deve criar implicitamente
+credenciais administrativas novas. Qualquer migração para o modelo de
+autenticação introduzido nesta fase deve ser explícita e segura.
 
 Logs e respostas do Dashboard continuam sujeitos à sanitização existente.
 
@@ -3743,10 +4132,25 @@ Adicionar testes cobrindo pelo menos:
 
 - instalação nova começa em `NOT_CONFIGURED`;
 - bootstrap é idempotente;
-- configuração incompleta não passa a `READY`;
+- instalação legacy operacional sem estado persistido é adoptada como
+  `READY`;
+- instalação sem estado e sem evidência legacy suficiente permanece
+  `NOT_CONFIGURED`;
+- os requisitos advisory da configuração mínima não bloqueiam a adopção
+  legacy;
+- configuração incompleta de uma instalação nova não passa a `READY`;
 - configuração válida passa a `READY`;
 - configuração inválida regressa a estado não-operacional;
 - mensagens/códigos de validação são determinísticos.
+
+### Primeiro administrador / autenticação
+
+- o wizard cria o primeiro utilizador administrador;
+- não existe password default;
+- a password definida no wizard não aparece em logs, respostas ou erros;
+- a criação do administrador é idempotente e não cria duplicados;
+- após o bootstrap, o acesso normal ao Dashboard exige autenticação;
+- instalações legacy não recebem silenciosamente um novo administrador.
 
 ### Discovery gate
 
@@ -3754,7 +4158,7 @@ Adicionar testes cobrindo pelo menos:
 - discovery é permitido em `READY`;
 - scheduler não executa discovery quando não está `READY`;
 - action bloqueada produz resultado auditável;
-- operações administrativas continuam disponíveis em `NOT_CONFIGURED`.
+- em `NOT_CONFIGURED`, apenas o fluxo necessário para o bootstrap inicial fica disponível; o acesso administrativo normal só é disponibilizado após `READY`.
 
 ### Dashboard/API
 
@@ -3766,12 +4170,16 @@ Adicionar testes cobrindo pelo menos:
 
 ### Afinidades
 
-- afinidade sobrevive a mudança do ID técnico;
-- migração preserva relações existentes;
+- afinidade referencia a identidade lógica estável do canal canónico, por `CanonicalChannel.Key` ou equivalente, e não um ID técnico mutável;
+- cada canal canónico tem 0 ou 1 definição de afinidade;
+- cada definição de afinidade referencia exactamente um canal canónico e pode conter N variantes;
+- a selecção do canal canónico na UI usa a Lista de canais por país e exclui canais que já possuem afinidade;
+- a alteração do nome canónico não quebra a afinidade existente;
+- o nome publicado no Dispatcharr é sempre o nome actualmente definido na Lista de canais por país;
+- migração preserva relações existentes e é idempotente;
 - bootstrap/importação não cria duplicados;
 - chaves lógicas resolvem deterministicamente;
-- migração é idempotente;
-- relações ambíguas são rejeitadas ou marcadas para revisão.
+- relações/variantes ambíguas são rejeitadas ou marcadas para revisão.
 
 ### Regressão
 
@@ -3794,6 +4202,8 @@ Dashboard seguro
 NOT_CONFIGURED
       ↓
 wizard
+      ↓
+criação do primeiro administrador
       ↓
 configuração persistida
       ↓
@@ -3833,11 +4243,13 @@ Além da Definition of Done global:
 
 - lifecycle persistente implementado;
 - bootstrap implementado;
+- adopção legacy implementada e testada;
 - wizard funcional;
+- criação segura do primeiro utilizador administrador implementada e testada;
 - discovery gate aplicado a todas as entradas relevantes;
 - scheduler integrado com o gate;
 - auditoria completa do Dashboard concluída;
-- modelo de afinidades corrigido;
+- modelo funcional de afinidades implementado de acordo com a identidade lógica estável, cardinalidade 0..1 por canal canónico, variantes múltiplas e autoridade da Lista de canais por país;
 - migração das afinidades existentes executada e testada;
 - API documentada;
 - testes automatizados;
@@ -3845,6 +4257,8 @@ Além da Definition of Done global:
 - suite Release verde;
 - documentação actualizada;
 - commit criado.
+
+> **Reconciliação (2026-09-18; actualizada com a Wave 9C.6 e com a onda de onboarding/setup).** Cumpridos: lifecycle persistente, bootstrap, adopção legacy testada, criação segura do primeiro administrador, scheduler integrado ao gate (agora `READY` **e** `SetupComplete`), prontidão operacional (`/api/configuration/readiness`), autenticação Telegram interactiva, config/teste Dispatcharr, vista Setup + banner `SETUP REQUIRED`, provisionamento de país no arranque, API documentada, testes automatizados e documentação. **Não cumpridos**: wizard funcional completo — a vista Setup cobre Telegram/Dispatcharr/readiness, mas os §6 itens 4–11 continuam fora (embedding no wizard 9C.2 por decidir); discovery gate em *todas* as entradas (CLI one-shot sem gate), auditoria completa do Dashboard, auditoria administrativa, instalação limpa validada, suite Release verde formalizada e tracking do baseline `runtime-data/countries/pt.json`. Ver bloco de reconciliação em §32.18.
 
 Só depois desta fase se deve iniciar nova evolução funcional de maior dimensão.
 
@@ -3903,14 +4317,163 @@ Este documento define **como completar a evolução até ao sistema funcional pr
 | PHASE 9 — Quality / EPG / Availability | `[concluído]` | 9A + 9b + visão agregada concluídos. |
 | PHASE 9A — URL/Stream Validation Perf. | `[concluído]` | 14 testes + 1 benchmark. Ver 32.2. |
 | PHASE 9b — ChannelSource observations | `[concluído]` | ChannelSourceObservationEntity + API + 3 testes. Ver 32.7. |
-| PHASE 10 — Dispatcharr | `[concluído]` | BuildPlanFromCompositionAsync + 2 testes. Ver 32.8. |
+| PHASE 10 — Dispatcharr | `[concluído]` | `BuildPlanFromCompositionAsync` existe mas sem call site de produção e sem testes (correcção factual 2026-09-17). Ver 32.8 e nota em 32.19. |
 | PHASE 11 — Operations | `[concluído]` | SyncRunStepEntity + API + Dashboard Passos + 4 testes. Ver 32.9. |
 | PHASE 12 — Automation / Scheduler | `[concluído]` | ScheduledJobEntity + CronExpression + Runner + 4 actions concretas (`discoverM3u`, `validatePlaylist`, `generatePlaylist`, `syncDispatcharr`) + arranque em produção via `Program.cs --web` + 19 testes. Ver 32.10 e 32.11. |
-| **PHASE 9C — First-Run / Configuration Lifecycle / Dashboard Hardening** | **`[pendente]`** | Próxima fase de execução: bootstrap, `NOT_CONFIGURED/CONFIGURING/READY`, wizard, discovery gate, scheduler gate, auditoria integral do Dashboard e correcção/migração das afinidades. Ver 32.18. |
+| **PHASE 9C — First-Run / Configuration Lifecycle / Dashboard Hardening** | **`[em curso]`** | 9C.1 (lifecycle persistido `NOT_CONFIGURED/CONFIGURING/READY`, adopção legacy, gate de discovery/scheduler), 9C.2 (wizard de first-run, admin/sessões/CSRF, gate de autorização único), 9C.3 (affinity por país/canal, naming canónico normalizado, migration aditiva `AddCanonicalCountryAndAffinityKind`), 9C.4 (Live Run Monitor: `live_runs`/`live_run_steps`, `RunCoordinator` único, `GET /api/run/status` + `POST /api/run/start`, `--web-allow-trigger`, acções agendadas `telegramRun`/`telegramMaintainRun`, vista "Live Run" com polling) e 9C.5 (first-run/legacy bootstrap: `READY` ∧ sem admin resolve para `AuthMode.Bootstrap` em vez de `Legacy`, criação do primeiro admin sem alterar o estado nem reconfigurar a instalação, confirmação de password no wizard) e 9C.6 (identidade canónica em runtime: resolução de afinidades Key-autoritativa, com Key autoritativa sobre o `CanonicalChannelId` obsoleto e sobrevivência a delete/recreate com a mesma Key; `CanonicalChannel.Key` exposta no loader de selecção de fontes) implementadas. Nota documental 2026-09-17: esta linha descrevia 9C.2 como pendente apesar de já estar implementada; corrigida. Pendente (reconciliado 2026-09-18; 9C.6 acrescentada em 2026-09-18): redesign do Dashboard, gate de command/endpoints (CLI one-shot), dependências de `Id` remanescentes da identidade canónica (FKs de `channel_aliases`/`channel_sources`/`ordering_items`, `source_priority_policies` por canal, ownership, `matching_audits`, `MatchPlan`, agrupamento do `SourceSelectionStage`), auditoria administrativa, alargamento do wizard, instalação limpa validada e Manual/Ajuda contextual. Ver 32.18. |
 | PHASE-Bridge — Pipeline → Catálogo | `[concluído]` | `PipelineIngestionService` liga o pipeline real (Telegram/M3U8-search) ao catálogo persistente via `EnsureSourceAsync` + `ResolveAsync` + `RecordChannelSourceAsync` + novo `EnsureCanonicalChannelAsync` (upsert). 9 testes TDD. Ver 32.12. |
+| **PHASE 13 — Dispatcharr Source Selection, Diversity & Source Limits** | **`[em curso]`** (`[parcial]`) | 13-1/13-1a/13-3/13-4/13-4b/13-5/13-6 implementadas (`94a9c75`, `c1dda71`, `d36b803`, `bf04c34`, `637bddd` para a 13-4b; a 13-5 e a 13-6 nesta iteração/na iteração dedicada da 13-6, ainda sem hash referenciável); 13-2/13-2a/13-2b inexistentes/não implementadas. **Entregue na 13-6:** artefacto `DispatcharrSourceSelection` (construído a partir do `SourceSelectionStageResult`, sem alterar o `MatchPlan`), associação apenas das fontes `Selected`, exclusão de `Unmatched`/`Ambiguous`, registo de ownership (`CrawlerManaged`) das streams criadas, cleanup selectivo (`CrawlerManaged` removível; `External`/`Unknown` protegidas e nunca desassociadas), persistência sanitizada `dispatcharr_selection_<ts>.json` e teste 100→10. **Gaps remanescentes:** Dashboard completo (estatísticas/churn), `ProviderDefinition`, `SelectionPolicy`, `MinimumValidatedSources`, churn/estabilidade, review-queue/hard-block e persistência de `ResponseTime` em produção. Ver 32.19. |
+
+
+# Implementation Wave Map — visão executiva
+
+> Secção exclusivamente documental (2026-09-18). Não altera requisitos, Definition of Done, código nem estado funcional. Construída a partir da documentação do projecto e do histórico Git local.
+>
+> Convenção de estado:
+> - `[CONCLUÍDA]` — wave com código e commit real;
+> - `[DESIGN / ANÁLISE]` — análise/desenho sem implementação;
+> - `[PROPOSTA]` — sugestão ainda não formalizada como execução;
+> - `[FORMALMENTE PLANEADA]` — estabelecida como wave futura por documentação do projecto;
+> - `[NÃO DECOMPOSTA]` — trabalho ainda sem wave atribuída.
+>
+> Evidência: os hashes abaixo são commits reais do histórico local. O commit `637bddd` (13-4b) está commitado localmente e **ainda não foi empurrado**; o upstream da branch permanece em `4562489`.
+
+## Visão por fase
+
+```text
+PHASE 9C — First-Run / Configuration Lifecycle / Dashboard Hardening   [em curso / parcial]
+├── 9C.1  [CONCLUÍDA]
+├── 9C.2  [CONCLUÍDA]
+├── 9C.3  [CONCLUÍDA]
+├── 9C.4  [CONCLUÍDA]
+├── 9C.5  [CONCLUÍDA]
+├── 9C.6  [CONCLUÍDA]   (identidade Key)
+└── restante DoD 9C      [NÃO DECOMPOSTA]
+
+PHASE 13 — Dispatcharr Source Selection, Diversity & Source Limits     [em curso / parcial]
+├── 13-1   [CONCLUÍDA]
+├── 13-1a  [CONCLUÍDA]
+├── 13-2   [NÃO DECOMPOSTA]
+├── 13-2a  [NÃO DECOMPOSTA]
+├── 13-2b  [NÃO DECOMPOSTA]
+├── 13-3   [CONCLUÍDA]
+├── 13-4   [CONCLUÍDA]
+├── 13-4b  [CONCLUÍDA]   (local, não empurrada)
+├── 13-5   [CONCLUÍDA]   (commit desta iteração)
+└── 13-6   [CONCLUÍDA]   (commit dedicado desta iteração)
+```
+
+## PHASE 9C — waves
+
+| Wave | Estado | Commit | Descrição |
+|---|---|---|---|
+| 9C.1 | CONCLUÍDA | `2730c89` | Lifecycle persistido `NOT_CONFIGURED/CONFIGURING/READY`, adopção legacy, gate de discovery/scheduler |
+| 9C.2 | CONCLUÍDA | `347ae4f` (+ fecho `394061e`) | Wizard de first-run, primeiro administrador, sessões/CSRF e gate de autorização único |
+| 9C.3 | CONCLUÍDA | `ad1d3f6` | Afinidades por país/canal e naming canónico; migration aditiva `AddCanonicalCountryAndAffinityKind` |
+| 9C.4 | CONCLUÍDA | série `e6d4be3`…`fc0440e` (+ fecho `394061e`) | Live Run Monitor (`live_runs`/`live_run_steps`, `RunCoordinator`, `GET /api/run/status`, `POST /api/run/start`) |
+| 9C.5 | CONCLUÍDA | `6fc2fa3` | `READY` sem administrador activo resolve para `AuthMode.Bootstrap`; primeiro admin sem reconfigurar |
+| 9C.6 | CONCLUÍDA | `4562489` | Identidade canónica em runtime: resolução de afinidades Key-autoritativa; `CanonicalChannel.Key` exposta ao loader de selecção |
+| Onboarding / Setup (pós-9C.6) | CONCLUÍDA | `39383fc`…`fcd5e32` | Prontidão operacional, autenticação Telegram interactiva, config/teste Dispatcharr, endpoints setup/readiness, vista Setup + banner `SETUP REQUIRED`, provisionamento de país; gate `READY` + `SetupComplete` (não é uma sub-wave 9C numerada) |
+
+> A definição normativa de 9C.1–9C.6 vive em `docs/architecture/configuration-lifecycle.md`, `docs/architecture/run-observability-and-manual-trigger.md` (§18) e `docs/architecture/channel-catalog-and-ownership.md` (§12 e "Identidade canónica em runtime"). Apenas 9C.3 (`ad1d3f6`), o fecho 9C.2/9C.3/9C.4 (`394061e`) e o estado de 9C.6 têm hashes referidos na documentação; os restantes hashes são evidência do histórico Git.
+
+## PHASE 13 — waves
+
+| Wave | Estado | Commit | Descrição |
+|---|---|---|---|
+| 13-1 | CONCLUÍDA | `94a9c75` | Selector puro, determinístico e sem I/O (`ChannelSourceSelector`) |
+| 13-1a | CONCLUÍDA | `c1dda71` | Hardening de 13-1: ordem total determinística, precedência de motivos, cobertura de testes |
+| 13-2 | NÃO DECOMPOSTA | — | Não existe como artefacto (sem commit, código ou documento) |
+| 13-2a | NÃO DECOMPOSTA | — | Não existe como artefacto (sem commit, código ou documento) |
+| 13-2b | NÃO DECOMPOSTA | — | Não existe como artefacto (sem commit, código ou documento) |
+| 13-3 | CONCLUÍDA | `d36b803` | Aplicação da política ao pipeline Telegram antes de `SaveToM3uPlaylist` (`SourceSelectionStage`) |
+| 13-4 | CONCLUÍDA | `bf04c34` | Persistência da política global (`source_selection_policies`), resolver, endpoint/UI |
+| 13-4b | CONCLUÍDA | `637bddd` | Overrides por canal por `CanonicalChannel.Key`; **commit local, não empurrado** |
+| 13-5 | CONCLUÍDA | — | Preview/dry-run read-only + métricas sobre o catálogo, a correr o mesmo `SourceSelectionStage`; o commit dedicado da Wave 13-5 é o desta iteração (sem hash referenciável à data desta edição) |
+| 13-6 | CONCLUÍDA | — | Integração `MatchPlan` + `DispatcharrSourceSelection` (o `MatchPlan` não foi alterado), associação só de `Selected`, registo de ownership das streams criadas, cleanup selectivo e teste 100→10; o commit dedicado da Wave 13-6 é o desta iteração (sem hash referenciável) |
+
+> A auditoria de dependências apontava a **13-4b como próxima wave**. Entretanto a implementação foi realizada e commitada localmente em `637bddd` (`feat(13): add per-channel source selection policies`), pelo que o mapa a classifica como **CONCLUÍDA**. O commit `637bddd` **não foi empurrado**; o upstream da branch é `4562489`.
+>
+> A tabela de fases (Apêndice) e a §32.19 listam as waves publicadas como `94a9c75`, `c1dda71`, `d36b803`, `bf04c34`; `637bddd` é a evidência de 13-4b. As sub-waves 13-2/13-2a/13-2b são declaradas inexistentes na §32.19.
+
+## Próxima wave
+
+A Wave **13-6** (integração `MatchPlan` + `DispatcharrSourceSelection`, cleanup
+selectivo e teste 100→10) foi implementada na iteração dedicada da 13-6 e o mapa
+classifica-a como **CONCLUÍDA**; o seu commit dedicado é o desta iteração. A
+13-6 está agora documentada em `docs/IMPLEMENTATION_ROADMAP.md`,
+`CHANGELOG.md`, `m3uCrawler/README.md` e
+`docs/architecture/dispatcharr-source-selection.md` §11. Continua a **não**
+existir uma wave **formalmente estabelecida** como próxima; os itens
+remanescentes da PHASE 13 (Dashboard completo, `ProviderDefinition`,
+`SelectionPolicy`, `MinimumValidatedSources`, churn/estabilidade,
+review-queue/hard-block e persistência de `ResponseTime`) não têm ainda wave
+atribuída.
+
+```text
+NENHUMA wave com o estado [FORMALMENTE PLANEADA] foi identificada para a PHASE 9C ou a PHASE 13.
+```
+
+## Waves → PHASE → Definition of Done
+
+```text
+Waves (esta secção)
+    ↓
+PHASE 9C  →  DoD específica §15 ("Definition of Done específica")
+              + Reconciliação §15 (2026-09-18, actualizada com a Wave 9C.6)
+    ↓
+PHASE 13  →  DoD da fase §17 ("Definition of Done da fase")
+              + Reconciliação §17 (2026-09-18, actualizada com as Waves 13-4b, 13-5 e 13-6)
+    ↓
+Definition of Done global §33 ("Definition of Done")
+```
+
+Requisitos de DoD sem wave atribuída (classificados `[NÃO DECOMPOSTA]`, sem criar waves novas):
+
+**PHASE 9C (§15):**
+
+- wizard funcional completo (admin + vista Setup de Telegram/Dispatcharr/readiness; §6 itens 4–11 continuam fora do wizard — embedding no wizard 9C.2 por decidir);
+- discovery gate em *todas* as entradas relevantes (CLI one-shot `--telegram` sem gate);
+- auditoria completa do Dashboard;
+- auditoria administrativa (log de mutações) — lacuna transversal;
+- instalação limpa validada;
+- suite Release verde formalizada;
+- versionamento/tracking do baseline `m3uCrawler/runtime-data/countries/pt.json` (dívida: EmbeddedResource inerte em CI/Docker);
+- dependências remanescentes de `CanonicalChannelId` (FKs de `channel_aliases`/`channel_sources`/`ordering_items`, `source_priority_policies` por canal, `dispatcharr_channel_ownerships`, `matching_audits`, `MatchPlan`, agrupamento do `SourceSelectionStage`);
+- Manual/Ajuda contextual.
+
+**PHASE 13 (§17):**
+
+- Dashboard completo (estatísticas/churn; o preview/dry-run foi entregue na Wave 13-5, mas o Dashboard da fase não está completo);
+- auditoria (as métricas ricas de selecção foram entregues na Wave 13-5 a nível de **preview**; `RunReport.SourceSelection` mantém-se só contagens; sem log de auditoria dedicado);
+- `ProviderDefinition` completa;
+- `SelectionPolicy` (estratégia de ranking separada) — explicitamente fora de âmbito remanescente;
+- `MinimumValidatedSources` — explicitamente fora de âmbito remanescente;
+- estabilidade/churn (`RebalanceOnSync`, `KeepExistingHealthySources`) e review-queue/hard-block;
+- persistência de `ResponseTime` em produção (o preview usa o valor persistido, normalmente `0`).
+
+> Entregues na Wave 13-6 (já não em falta): contrato explícito `MatchPlan` +
+> `DispatcharrSourceSelection` (o `MatchPlan` **não** foi alterado), limpeza
+> segura das associações antigas e ownership selectivo **testados**, registo de
+> ownership das streams criadas e teste explícito 100→10. Ver §32.19.
+
+## Dependência 9C.6 → identidade Key → 13-4b
+
+A documentação registra explicitamente a ordem:
+
+```text
+9C.6 (identidade canónica em runtime, Key-autoritativa)
+    ↓
+desbloqueia identidade por CanonicalChannel.Key
+    ↓
+13-4b (overrides por canal keyados por CanonicalChannel.Key)
+```
+
+Ambas as waves estão concluídas. A migração completa `Id → Key` do domínio **não** foi feita (permanecem as dependências de `CanonicalChannelId` listadas acima).
+
 # 32.19 — PHASE 13 — Dispatcharr Source Selection, Diversity & Source Limits
 
-> Estado: [pendente] — proposta de implementação.
+> Estado: `[em curso]` (`[parcial]`) — Waves **13-1, 13-1a, 13-3, 13-4, 13-4b, 13-5 e 13-6** implementadas (`94a9c75`, `c1dda71`, `d36b803`, `bf04c34`, `637bddd` para a 13-4b; a 13-5 e a 13-6, com commit dedicado desta iteração, ainda sem hash referenciável). A **13-6** entregou a integração no Dispatcharr (`DispatcharrSourceSelection`), a associação apenas das fontes `Selected`, o registo de ownership (`CrawlerManaged`) das streams criadas, o cleanup selectivo e o teste 100→10. As sub-waves **13-2/13-2a/13-2b não existem** como artefacto (sem commit, código ou documento). A fase permanece parcial; gaps reais no §17 e no bloco de reconciliação abaixo.
 >
 > Esta fase fecha um problema operacional identificado na publicação para Dispatcharr:
 > actualmente, quando um canal é sincronizado, podem ser associadas ao mesmo canal todas
@@ -3920,6 +4483,232 @@ Este documento define **como completar a evolução até ao sistema funcional pr
 >
 > A solução proposta é introduzir uma etapa explícita de **selecção/ranking de fontes por
 > canal**, imediatamente antes da sincronização para Dispatcharr.
+
+> **Nota factual (Wave 10-0, 2026-09-17).** Nesse momento a fase permanecia
+> `[pendente]`.
+> Antes de a iniciar, o caminho agendado `syncDispatcharr` foi consolidado:
+> passou a injectar o `CatalogResolver` (catálogo canónico + ownership) no
+> `ChannelMatcher` e no `DispatcharrSyncService`, eliminando o modo legacy
+> nesse caminho (ver `docs/architecture/channel-catalog-and-ownership.md` §13).
+> Nada da selecção/diversidade/limites descrita abaixo foi implementado.
+
+> **Nota factual (Wave 13-1, 2026-09-17).** A unidade algorítmica central foi
+> implementada isoladamente em `m3uCrawler/Services/SourceSelection/`:
+> `SelectionCandidate`, `SourceSelectionPolicy`, `ProviderIdentity`,
+> `IChannelSourceSelector`/`ChannelSourceSelector` e `SourceSelectionResult`
+> (pura, sem I/O, 53 testes em `ChannelSourceSelectorTests`, após o hardening 13-1a). Suporta
+> `MaxSourcesPerChannel` (sem valor hardcoded), `PreferDistinctProviders`,
+> `MaxSourcesPerProvider`, `AllowFallbackToSameProvider`, deduplicação por URL
+> normalizada, diversidade em duas fases, ranking determinístico e motivos por
+> candidato. **Não** estão implementados: persistência da política, migrations,
+> Dashboard/preview, `ProviderDefinition` completa, ingestão de Quality/EPG e
+> integração no composer/`MatchPlan`/`DispatcharrSyncService`. Detalhe em
+> `docs/architecture/dispatcharr-source-selection.md`.
+>
+> *Nota de desenho registada (não corrigida): dos critérios de ranking do §5,
+> "sucesso/qualidade histórica" e "estabilidade/recência da validação" não são
+> suportados nesta wave porque o candidato não tem campos para eles; ficam para
+> wave posterior, como previsto.*
+
+> **Nota factual (Wave 13-3, 2026-09-17).** A aplicação da política ao pipeline
+> Telegram foi implementada (`SourceSelectionStage`): junção exacta das streams do
+> pipeline (URL real, só em runtime) aos `ChannelSource` do catálogo pela chave
+> sanitizada, projecção para `SelectionCandidate`, aplicação de
+> `IChannelSourceSelector` por canal canónico e devolução da lista publicável
+> (seleccionadas + não correspondidas) antes de `SaveToM3uPlaylist`, nos dois pontos
+> de publicação Telegram. `source-disabled` exclui; não correspondidas/ambíguas fazem
+> pass-through; catálogo ausente/vazio ⇒ no-op. Sem persistência nova, sem migration,
+> sem alterações ao Dispatcharr/`MatchPlan`/ownership. Diagnóstico agregado em
+> `RunReport.SourceSelection` (só contagens). Continuam pendentes: produtores de
+> Quality/EPG, correcção do reset de `Source.Priority`, integração no
+> composer/discovery. Detalhe em
+> `docs/architecture/dispatcharr-source-selection.md` §10.
+
+> **Nota factual (Wave 13-4, 2026-09-18).** A política global de selecção de
+> fontes passou a ser **persistida** na BD do catálogo: nova entidade
+> `SourceSelectionPolicyEntity` → tabela `source_selection_policies`, por
+> migration aditiva `AddSourceSelectionPolicies` (índice único em `ScopeKey`,
+> sem FK, identidade por `CanonicalChannelKey`, nunca `CanonicalChannelId`). A
+> linha global (`ScopeKey="global"`, `CanonicalChannelKey=null`) é criada
+> lazily por `CatalogResolver.GetOrCreateGlobalSourceSelectionPolicyAsync` com
+> os defaults da 13-3 (`10/true/null/true`). Novo `SourceSelectionPolicyResolver`
+> resolve a política efectiva nos dois pontos de publicação Telegram
+> (`Program.cs:540-541`, `:1108-1109`); `SourceSelectionStage` permanece sem
+> persistência. Dashboard: `GET/POST /api/catalog/source-selection-policies` +
+> cartão na área Catálogo (apenas global), sob o gate de auth/CSRF existente.
+> **Contrato (alteração deliberada e ratificada):** `MaxSourcesPerChannel >= 0`,
+> com `0` **válido** (selecciona zero fontes) e negativos inválidos;
+> `MaxSourcesPerProvider` mantém `null` = sem limite, com `0`/negativos
+> inválidos. A tabela é excluída do `LegacyConfigurationEvidenceEvaluator`,
+> como `source_priority_policies`. **Reservado nessa wave:** overrides por canal
+> (Wave 13-4b, entretanto implementados) e auditoria de alterações
+> administrativas. Detalhe em
+> `docs/architecture/phase-13-4-source-selection-policy.md`.
+
+> **Nota factual (Wave 13-4b, 2026-09-18).** Foram implementados os
+> **overrides por canal** da política de selecção de fontes, de forma aditiva e
+> **sem alteração de schema** (a coluna `ScopeKey` já acomodava
+> `channel:<CanonicalChannelKey>`). A identidade é `CanonicalChannel.Key`
+> (`SourceSelectionPolicyScopes`), **nunca** `CanonicalChannelId`. Um override é
+> uma política **completa** que substitui a global por inteiro quando existe
+> (não há merge campo a campo); a resolução é override por canal → global →
+> defaults (`10/true/null/true`). `CatalogResolver` ganhou
+> `GetChannelSourceSelectionPolicyAsync`,
+> `UpsertChannelSourceSelectionPolicyAsync`,
+> `DeleteChannelSourceSelectionPolicyAsync` e
+> `ListChannelSourceSelectionPoliciesAsync` (overrides FK-less; órfãos inertes);
+> os métodos globais mantêm-se. `SourceSelectionPolicyResolver` mantém
+> `ResolveGlobalAsync` e acrescenta `ResolveEffectiveAsync(key)` e
+> `LoadEffectivePoliciesAsync()`, que devolve um `SourceSelectionPolicySet :
+> ISourceSelectionPolicyProvider` (snapshot por execução, **2 queries**, sem
+> N+1 e sem cache entre execuções). `SourceSelectionStage` ganhou o overload
+> `ApplyAsync(streams, provider, ct)` e resolve a política efectiva por grupo de
+> canal canónico via `CanonicalChannel.Key`; o overload legado mantém-se, o
+> estágio permanece **sem persistência** e o agrupamento continua por
+> `CanonicalChannelId` (selector/ranking/limites inalterados). Os dois pontos de
+> publicação Telegram usam `LoadEffectivePoliciesAsync` (fallback
+> `SourceSelectionPolicySet.Default` quando o catálogo é nulo). Dashboard:
+> `GET/POST /api/catalog/source-selection-policies/channels` e
+> `GET/DELETE /api/catalog/source-selection-policies/channels/{key}`, sob o
+> mesmo gate de auth/CSRF; UI lista/edita/elimina overrides. Semântica
+> preservada: `MaxSourcesPerChannel` `0` válido (`0` publica zero fontes) /
+> `1..N` válido / negativos inválidos; `MaxSourcesPerProvider` `null` = sem
+> limite, `0`/negativos inválidos. **+23 testes**; suite serial 1845 passed / 0
+> failed / 1 skipped. A identidade sobrevive a apagar/recriar o canal com a
+> mesma `Key`. Detalhe em
+> `docs/architecture/dispatcharr-source-selection.md` §10.2 e
+> `docs/architecture/phase-13-4-source-selection-policy.md` §0.1.
+
+> **Nota factual (Wave 13-5, 2026-09-18).** Foi implementado o **preview/dry-run
+> read-only + métricas** da selecção de fontes. Novo
+> `SourceSelectionPreviewService.PreviewAsync(string? canonicalChannelKey = null,
+> CancellationToken = default)`: lê o catálogo (`ListCanonicalChannelsAsync` +
+> `ListChannelSourcesAsync`), sintetiza **uma `M3uStream` por `ChannelSourceEntity`**
+> (`Url` = `StreamUrl` sanitizada já armazenada; `IsWorking = Availability not in
+> {Dead, Unreachable}`) e corre o **mesmo** `SourceSelectionStage` /
+> `ChannelSourceSelector` da produção — sem algoritmo duplicado, sem publicação,
+> sem escrita de ficheiros, sem mutação de catálogo/ownership/Dispatcharr e sem
+> estado persistente. A ausência de escrita é garantida pelo carregamento
+> read-only da política: novo `CatalogResolver.GetGlobalSourceSelectionPolicyAsync`
+> (nunca insere; `AsNoTracking`) + `SourceSelectionPolicyResolver.LoadEffectivePoliciesReadOnlyAsync`;
+> `SourceSelectionPolicySet.HasExplicitGlobal`/`HasOverride` rotulam o âmbito
+> efectivo (`override`/`global`/`default`). `SourceSelectionStageResult` ganhou
+> `Channels` (agrupamento por canal, aditivo) + `SourceSelectionChannelResult`.
+> Modelos: `SourceSelectionPreviewResult`, `SourceSelectionPreviewChannel`,
+> `SourceSelectionPreviewCandidate`, `SourceSelectionPreviewUnmatched`,
+> `SourceSelectionPreviewMetrics`, `SourceSelectionPreviewProviderStat`,
+> `SourceSelectionPreviewSourceInfo` e `SourceSelectionPreviewDecisions`
+> (`selected`/`rejected`). Endpoint
+> `GET /api/catalog/source-selection-policies/preview[?channelKey=<CanonicalChannel.Key>]`
+> (GET-only, sob o gate de autenticação — `GET` não exige CSRF — e o gate de
+> catálogo — `503` quando não inicializado), mais o cartão "Preview / Dry-Run" e
+> `loadSourceSelectionPreview()` no separador existente. O endpoint emite o
+> campo top-level `status` (`SourceSelectionPreviewStatuses`) que desambigua os
+> casos antes colapsados em `applied=false`: `channel-not-found` (o filtro
+> `channelKey` não corresponde a nenhum canal canónico; `applied=false`,
+> `channelsProcessed=0`), `no-channels` (o catálogo não tem canais canónicos),
+> `no-input` (há canais no âmbito mas nenhum tem `ChannelSource`; `applied=false`
+> com `channelsProcessed>0` é válido e esperado) e `applied`; precedência
+> `channel-not-found` → `no-channels` → `no-input` → `applied`. `channelsProcessed`
+> mantém-se "canais canónicos no âmbito" (não zerado) e `applied` não foi
+> redefinido. **Nota de âmbito (MAJOR-2):** `WebDashboardService.WriteJsonAsync`
+> **não** foi alterado; a rota de preview passa o HTTP status explicitamente
+> (`503`/`500`) e o default pré-existente do helper é dívida transversal **fora
+> de âmbito** da 13-5, não corrigida estruturalmente. **Sanitização:** todas as URLs emitidas passam
+> `CredentialSanitizer.SanitizeUrl` e `Unmatched.Title` passa `SanitizeText`.
+> **Métricas (corrigidas):** `distinctProviderSelectionCount` foi renomeado para
+> `diversitySelectionCount` (nº de selecções com motivo `diversity`) e foi
+> acrescentado `distinctProviderCount` (nº de fornecedores distintos com ≥1
+> selecção). **Contrato unmatched/ambiguous (corrigido):** `unmatched` e
+> `ambiguous` são agora disjuntos por construção — `unmatchedStreamCount` conta
+> só as não-ambíguas, `ambiguousStreamCount` só as ambíguas e
+> `totalUnmatchedStreamCount` é a soma; o endpoint emite `ambiguous[]` além de
+> `unmatched[]`, e `SourceSelectionStageResult` ganhou a lista aditiva
+> `AmbiguousStreams` (semântica de produção de `Unmatched` inalterada).
+> **Endpoint (corrigido):** `channelKey` é match exacto/case-sensitive, chave
+> desconhecida devolve `200` com `applied=false` e métricas zeradas, e a rota
+> devolve `500 {"error":"preview-failed"}` (com response fechado) em falha
+> inesperada. **Limitações:** input é o catálogo (não a descoberta Telegram ao
+> vivo), `IsWorking` é proxy, `fillSelectionCount` é o proxy da Fase B (`fill`),
+> `channelsProcessed` são os canais canónicos no âmbito (incluindo os sem
+> sources; na UI "Canais no âmbito") mas os sem sources não aparecem em
+> `channels`, e só os dois pontos de publicação Telegram aplicam selecção em
+> produção. **Limitação de paridade: `ResponseTime`** — o preview usa o valor
+> **persistido** `ChannelSourceEntity.LastResponseTimeMs` quando presente; na
+> prática a coluna é escrita como `0` no insert e nunca actualizada
+> (`CatalogResolver.cs:1422`; update `:1392-1404`), pelo que está normalmente a
+> `0`/indisponível e **não** representa o `DurationMs` da probe ao vivo, com
+> observações append-only sem flag de sucesso (`WebDashboardService.cs:2156`) e
+> o pipeline a ignorar `stream.ResponseTime`
+> (`PipelineIngestionService.cs:250-264`); o valor real em produção é o stopwatch
+> `DurationMs` da probe exacta (`M3uTesterService.cs:550,555`). O preview **não**
+> reproduz a ordenação por `ResponseTimeKey`
+> (`ChannelSourceSelector.cs:128,260-261`) e a sua ordenação por response time
+> **pode divergir** da produção; em empates nas primeiras quatro chaves,
+> ordem/conjunto podem diferir da produção — limitação documentada, não
+> garantia. **Fora de âmbito (13-6 e posteriores):** `ProviderDefinition`,
+> `SelectionPolicy` separada, `MinimumValidatedSources`, churn/estabilidade,
+> review-queue/hard-block e persistência de `ResponseTime` em produção. O
+> contrato `MatchPlan` + `DispatcharrSourceSelection`, o cleanup/ownership
+> selectivo e o teste 100→10 **foram entregues na Wave 13-6** (nota seguinte).
+> `RunReport.SourceSelection` mantém-se **inalterado** (só contagens); as
+> métricas ricas são âmbito do preview.
+
+> **Nota factual (Wave 13-6, 2026-09-18).** Foi implementada a integração da
+> selecção de fontes no Dispatcharr. Novo artefacto
+> `DispatcharrSourceSelection` (`m3uCrawler/Models/DispatcharrSourceSelection.cs`),
+> construído **uma vez** a partir do `SourceSelectionStageResult` autoritativo por
+> `DispatcharrSourceSelectionFactory.FromStageResult(result, policies, nowUtc)`
+> (projecção pura, reutiliza literalmente `SelectionReasons`, não recalcula a
+> selecção nem toca no catálogo). O `MatchPlan` **não** foi alterado e continua a
+> ser exclusivamente o resultado do matching. O artefacto tem `generatedAtUtc`,
+> `channels[]` (`canonicalChannelKey` — identidade; `canonicalChannelId`
+> transiente; `policyScope`; `candidateCount`; `rejectedCount`; `selected[]` com
+> `streamUrl`/`rank`/`provider`/`reason`/`sourceId`) e `counts` (`channels`,
+> `candidates`, `selected`, `rejected`, `unmatched`, `ambiguous`; `unmatched` e
+> `ambiguous` disjuntos como no preview). Persistência sanitizada por
+> `DispatcharrSourceSelectionSerializer` (`CredentialSanitizer.SanitizeUrl` a cada
+> `StreamUrl`) em `output/dispatcharr_selection_<yyyyMMdd_HHmmss>.json`, escrito
+> por `DispatcharrSyncService.RunAsync(...)` **antes** do branch dry-run/apply (o
+> dry-run também o produz). `IDispatcharrSyncService`/`DispatcharrSyncService`
+> ganharam `RunAsync(playlistPath, selection, ct)` e
+> `ApplyAsync(plan, existing, selection, failed, ct)`; os overloads antigos
+> delegam com `selection: null` (compatibilidade retroativa). **Regra de
+> associação (`selection != null`):** apenas `Selected` é associado;
+> `Unmatched`/`Ambiguous` **não** são associados (alteração deliberada), aplicada
+> à associação de canal e a `globalKeepStreamIds`/`globalRemoveCandidates`, sem
+> mutar o `plan`. **Cleanup/ownership:** as streams criadas passam a ser
+> registadas `CrawlerManaged` via `EnsureStreamOwnershipAsync` após `CreateAsync`
+> (antes em falta); as CrawlerManaged não seleccionadas são removidas da
+> associação e candidatas a `DELETE` (caminho global da Phase 4, guard de
+> ownership inalterado); as `External`/`Unknown` não seleccionadas ficam
+> associadas e nunca são eliminadas. **Correlação:** os dois caminhos Telegram
+> (single-cycle e manutenção) passam o artefacto em memória (mesma execução ⇒
+> correlação segura); `--dispatcharr-sync` standalone e
+> `ScheduledDispatcharrSyncAction` passam `selection = null` (legacy) —
+> **limitação documentada**, sem correlação heurística. **Testes:** novo
+> `DispatcharrSourceSelectionTests` (artefacto/serializer) e
+> `DispatcharrSyncServiceSourceSelectionTests` (100→10, diversidade, limite de
+> fornecedor, cleanup, ownership, legacy `null`, idempotência, dry-run). **Fora
+> de âmbito:** hard-block/review-queue, churn/estabilidade, `RebalanceOnSync`,
+> `KeepExistingHealthySources`, `ProviderDefinition`, `SelectionPolicy` separada
+> e `MinimumValidatedSources`. Detalhe em
+> `docs/architecture/dispatcharr-source-selection.md` §11.
+
+> **Reconciliação de estado (2026-09-18, HEAD `bf04c34` + Waves 13-4b, 13-5 e 13-6) — evidência de código/testes.** Implementado e verificado: selector puro determinístico com deduplicação e diversidade (`ChannelSourceSelector.cs`), publicação Telegram nos dois pontos (`Program.cs:539-557`, `:1112-1136`), política global persistida (entidade, migration `AddSourceSelectionPolicies`, resolver, endpoint/UI global), **overrides por canal (13-4b)** persistidos/resolvidos/expostos por `CanonicalChannel.Key`, com substituição completa e leitura em lote, e **preview/dry-run read-only + métricas (13-5)** sobre o catálogo, a correr o mesmo `SourceSelectionStage`, com endpoint `GET /api/catalog/source-selection-policies/preview` e cartão no Dashboard. O item **preview/dry-run** do DoD (§17) foi entregue na Wave 13-5 (`SourceSelectionPreviewService`, endpoint + cartão); limitação remanescente: o input é o catálogo, não a descoberta Telegram ao vivo. A **Wave 13-6** entregou o artefacto `DispatcharrSourceSelection` (construído a partir do `SourceSelectionStageResult`, sem alterar o `MatchPlan`), a associação apenas das fontes `Selected` (exclusão deliberada de `Unmatched`/`Ambiguous`), o registo de ownership `CrawlerManaged` das streams criadas, o cleanup selectivo (`CrawlerManaged` removível; `External`/`Unknown` protegidas) e a persistência sanitizada `output/dispatcharr_selection_<ts>.json`; o contrato `MatchPlan` + `DispatcharrSourceSelection`, o ownership/limpeza selectiva testados e o teste 100→10 deixam de estar em falta. Itens do DoD (§17) ainda **não** implementados, com evidência:
+> - **Dashboard completo** — cartões global, por canal e "Preview / Dry-Run"; continuam ausentes estatísticas/churn e uma comparação dedicada descobertas-vs-seleccionadas (o preview mostra candidatos seleccionados/rejeitados, não o *diff* da descoberta);
+> - **estabilidade/churn**, `KeepExistingHealthySources`, `RebalanceOnSync`, `MinimumValidatedSources` e review-queue/hard-block — ausentes (só mencionados na especificação);
+> - **métricas específicas da selecção** — entregues a nível de **preview** (`SourceSelectionPreviewMetrics`); `RunReport.SourceSelection` mantém-se só contagens; **sem auditoria**;
+> - **`ProviderDefinition`** completa e **`SelectionPolicy`** (estratégia de ranking separada) — ausentes;
+> - **persistência de `ResponseTime`** em produção — o preview usa o valor persistido (normalmente `0`), que não representa a `DurationMs` da probe ao vivo; não é uma limitação da 13-6.
+> **Não implementado por ausência de artefacto:** sub-waves 13-2/13-2a/13-2b.
+
+> **Nota factual (2026-09-17) — `BuildPlanFromCompositionAsync`.** O método
+> existe em `ChannelMatcher` mas continua **sem call site de produção e sem
+> testes**. A PHASE 10 não é reaberta nesta wave e o método não é integrado
+> apenas para satisfazer a documentação. A afirmação do §32.8 de que dois
+> testes em `DispatcharrCompositionTests.cs` fecharam a PHASE 10 é
+> **inexacta** (esse ficheiro não existe); decisão futura pendente.
 
 ## 1. Objectivo
 
@@ -4257,6 +5046,8 @@ Com a política configurada para 10:
 - [ ] documentação actualizada;
 - [ ] build e suite de testes passam;
 - [ ] commit.
+
+> **Reconciliação (2026-09-18; actualizada com as Waves 13-4b, 13-5 e 13-6).** **Cumpridos:** configuração persistente do limite (global **e** override por canal, 13-4b, com identidade por `CanonicalChannel.Key` e substituição completa); valor inicial 10 não hardcoded; deduplicação; ranking determinístico; diversidade de fornecedor; fallback configurável; **preview/dry-run** (Wave 13-5: `SourceSelectionPreviewService` estritamente read-only sobre o catálogo + endpoint `GET /api/catalog/source-selection-policies/preview` + cartão no Dashboard, a correr o **mesmo** `SourceSelectionStage` da produção, sem publicação nem escrita); **selecção antes do Dispatcharr** e **Dispatcharr recebe apenas o conjunto seleccionado** (Wave 13-6: artefacto `DispatcharrSourceSelection` construído a partir do `SourceSelectionStageResult`, associação apenas das fontes `Selected`, sem alterar o `MatchPlan`); **limpeza segura das associações antigas e ownership selectivo** (Wave 13-6: `CrawlerManaged` removível, `External`/`Unknown` protegidas e nunca desassociadas, com testes); **idempotência específica da selecção** (segunda execução sem `POST`/`PATCH`/`DELETE`); **testes** de integração da selecção no Dispatcharr incluindo o cenário explícito "100 fontes descobertas não produzem 100 associações com limite 10" (`DispatcharrSourceSelectionTests`, `DispatcharrSyncServiceSourceSelectionTests`); documentação actualizada; build e suite de testes (Release 0 erros; suite verde). **Parciais:** identificação normalizada de fornecedor (`ProviderIdentity` normaliza host, mas não existe a `ProviderDefinition` completa do §3-§4); métricas (entregues a nível de **preview** na Wave 13-5 — `SourceSelectionPreviewMetrics`; `RunReport.SourceSelection` mantém-se só contagens; **sem auditoria dedicada**). **Não cumpridos:** Dashboard completo; persistência de `ResponseTime` em produção (o preview usa o valor persistido, normalmente `0`). **Fora de âmbito remanescente:** `SelectionPolicy` (estratégia de ranking separada), `MinimumValidatedSources` e churn/estabilidade (`RebalanceOnSync`, `KeepExistingHealthySources`) / review-queue/hard-block.
 
 ## 18. Regra de produto
 

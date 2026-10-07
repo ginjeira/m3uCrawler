@@ -143,7 +143,8 @@ public class WebDashboardServiceTests
             NewFunctionalCount = 10,
             ExistingRetestedCount = 20,
             ExistingStillWorkingCount = 15,
-            FinalPlaylistCount = 25
+            FinalPlaylistCount = 25,
+            StreamsSkippedAlreadyValidated = 3
         };
 
         var json = JsonSerializer.Serialize(entry, DashboardJsonOptions);
@@ -157,6 +158,7 @@ public class WebDashboardServiceTests
         Assert.Contains("\"existingRetestedCount\"", json);
         Assert.Contains("\"existingStillWorkingCount\"", json);
         Assert.Contains("\"finalPlaylistCount\"", json);
+        Assert.Contains("\"streamsSkippedAlreadyValidated\": 3", json);
         Assert.DoesNotContain("\"Timestamp\"", json);
         Assert.DoesNotContain("\"HistoryHours\"", json);
     }
@@ -192,7 +194,10 @@ public class WebDashboardServiceTests
             ChannelsRecognized = 5,
             StreamCount = 100,
             WorkingStreams = 80,
-            State = "ok"
+            State = "ok",
+            CandidateId = "c1",
+            MessageId = 42,
+            MessageDateUtc = new DateTime(2026, 10, 2, 12, 0, 0, DateTimeKind.Utc)
         };
 
         var json = JsonSerializer.Serialize(item, DashboardJsonOptions);
@@ -204,6 +209,9 @@ public class WebDashboardServiceTests
         Assert.Contains("\"streamCount\"", json);
         Assert.Contains("\"workingStreams\"", json);
         Assert.Contains("\"state\"", json);
+        Assert.Contains("\"candidateId\"", json);
+        Assert.Contains("\"messageId\"", json);
+        Assert.Contains("\"messageDateUtc\"", json);
         Assert.DoesNotContain("\"CountryDetected\"", json);
         Assert.DoesNotContain("\"WorkingStreams\"", json);
     }

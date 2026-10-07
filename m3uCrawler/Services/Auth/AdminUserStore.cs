@@ -1,0 +1,251 @@
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+using m3uCrawler.Services.Catalog;
+using Microsoft.EntityFrameworkCore;
+
+namespace m3uCrawler.Services.Auth;
+
+public enum CreateAdminResult
+{
+    Created = 0,
+    AlreadyExists = 1,
+}
+
+/// <summary>
+/// W10a — Resultado de uma alteração de password de administrador.
+/// </summary>
+public enum ChangePasswordResult
+{
+    Changed = 0,
+    UserNotFound = 1,
+    InvalidPassword = 2,
+}
+
+/// <summary>
+/// PHASE 9C.2 — Acesso a administradores no catálogo SQLite.
+///
+/// <para>
+/// A criação do <b>primeiro</b> administrador é transaccional e recusa-se a
+/// criar um segundo: verifica dentro da transacção que a tabela está vazia e
+/// a <c>UNIQUE(Username)</c> actua como salvaguarda adicional contra corridas.
+/// </para>
+/// </summary>
+public sealed class AdminUserStore
+{
+    private readonly IDbContextFactory<ChannelCatalogDbContext> _factory;
+
+    public AdminUserStore(IDbContextFactory<ChannelCatalogDbContext> factory)
+    {
+        _factory = factory ?? throw new ArgumentNullException(nameof(factory));
+    }
+
+    public async Task<bool> HasAnyAsync(CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.AdminUsers.AnyAsync(cancellationToken);
+    }
+
+    public async Task<bool> HasActiveAdminAsync(CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.AdminUsers.AnyAsync(u => u.IsEnabled, cancellationToken);
+    }
+
+    public async Task<AdminUserEntity?> FindByUsernameAsync(
+        string username,
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.AdminUsers
+            .FirstOrDefaultAsync(u => u.Username == username, cancellationToken);
+    }
+
+    /// <summary>
+    /// W6a — Nome de utilizador pelo <c>Id</c>, para atribuição de actor em
+    /// registos de auditoria. Devolve <c>null</c> se o utilizador não existir.
+    /// Nunca expõe hash nem password.
+    /// </summary>
+    public async Task<string?> GetUsernameAsync(
+        long adminUserId,
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.AdminUsers
+            .Where(u => u.Id == adminUserId)
+            .Select(u => u.Username)
+            .FirstOrDefaultAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Cria o primeiro administrador de forma transaccional. Se já existir
+    /// qualquer administrador, devolve <see cref="CreateAdminResult.AlreadyExists"/>
+    /// sem alterar nada (idempotente).
+    /// </summary>
+    public async Task<CreateAdminResult> CreateFirstAdminAsync(
+        string username,
+        string password,
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        await using var transaction = await context.Database.BeginTransactionAsync(cancellationToken);
+
+        if (await context.AdminUsers.AnyAsync(cancellationToken))
+        {
+            await transaction.RollbackAsync(cancellationToken);
+            return CreateAdminResult.AlreadyExists;
+        }
+
+        var now = DateTime.UtcNow;
+        context.AdminUsers.Add(new AdminUserEntity
+        {
+            Username = username,
+            PasswordHash = PasswordHasher.Hash(password),
+            IsEnabled = true,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+        });
+
+        try
+        {
+            await context.SaveChangesAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+            return CreateAdminResult.Created;
+        }
+        catch (DbUpdateException)
+        {
+            // Corrida com outro pedido: a unique de username (ou o duplicado)
+            // impediu a inserção. Nada foi criado.
+            await transaction.RollbackAsync(cancellationToken);
+            return CreateAdminResult.AlreadyExists;
+        }
+    }
+
+    /// <summary>
+    /// Verifica credenciais. Para utilizador inexistente ou inactivo executa
+    /// a derivação dummy (tempo uniforme, sem enumeração) e devolve <c>null</c>.
+    /// </summary>
+    public async Task<AdminUserEntity?> VerifyCredentialsAsync(
+        string username,
+        string password,
+        CancellationToken cancellationToken = default)
+    {
+        var user = await FindByUsernameAsync(username, cancellationToken);
+        if (user == null || !user.IsEnabled)
+        {
+            PasswordHasher.VerifyDummy(password);
+            return null;
+        }
+
+        if (!PasswordHasher.Verify(password, user.PasswordHash))
+        {
+            return null;
+        }
+
+        return user;
+    }
+
+    /// <summary>
+    /// W10b — Verifica a password de um administrador pelo <c>Id</c>. Mesma
+    /// uniformização temporal de <see cref="VerifyCredentialsAsync"/>: para
+    /// utilizador inexistente ou inactivo executa a derivação dummy e devolve
+    /// <c>false</c>, sem revelar a existência do utilizador. Usado para
+    /// reautenticar a sessão actual antes de uma alteração de password.
+    /// </summary>
+    public async Task<bool> VerifyCredentialsByIdAsync(
+        int userId,
+        string password,
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var user = await context.AdminUsers
+            .FirstOrDefaultAsync(u => u.Id == userId, cancellationToken);
+        if (user == null || !user.IsEnabled)
+        {
+            PasswordHasher.VerifyDummy(password);
+            return false;
+        }
+
+        return PasswordHasher.Verify(password, user.PasswordHash);
+    }
+
+    public async Task MarkLoginAsync(long adminUserId, DateTime atUtc, CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var user = await context.AdminUsers.FirstOrDefaultAsync(u => u.Id == adminUserId, cancellationToken);
+        if (user == null) return;
+        user.LastLoginAtUtc = atUtc;
+        user.UpdatedAtUtc = atUtc;
+        await context.SaveChangesAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// W10a — Altera a password de um administrador pelo <c>Id</c>. A nova
+    /// password é validada por <see cref="CredentialPolicy.ValidatePassword"/>
+    /// antes de qualquer acesso à BD; se for inválida devolve
+    /// <see cref="ChangePasswordResult.InvalidPassword"/> sem tocar no
+    /// repositório. A actualização do hash e a revogação de todas as sessões
+    /// do utilizador acontecem na mesma transacção (rollback em falha).
+    /// Nunca registar a password nem o hash.
+    /// </summary>
+    public Task<ChangePasswordResult> ChangePasswordAsync(
+        int userId,
+        string newPassword,
+        CancellationToken cancellationToken = default)
+        => ChangePasswordCoreAsync(
+            context => context.AdminUsers.FirstOrDefaultAsync(u => u.Id == userId, cancellationToken),
+            newPassword,
+            cancellationToken);
+
+    /// <summary>
+    /// W10a — Altera a password de um administrador pelo <c>Username</c>
+    /// (case-sensitive, como persistido). Mesma semântica transaccional de
+    /// <see cref="ChangePasswordAsync(int, string, CancellationToken)"/>.
+    /// </summary>
+    public Task<ChangePasswordResult> ChangePasswordByUsernameAsync(
+        string username,
+        string newPassword,
+        CancellationToken cancellationToken = default)
+        => ChangePasswordCoreAsync(
+            context => context.AdminUsers.FirstOrDefaultAsync(u => u.Username == username, cancellationToken),
+            newPassword,
+            cancellationToken);
+
+    private async Task<ChangePasswordResult> ChangePasswordCoreAsync(
+        Func<ChannelCatalogDbContext, Task<AdminUserEntity?>> findUser,
+        string newPassword,
+        CancellationToken cancellationToken)
+    {
+        // Política de password centralizada (não duplicar regras). Inválida
+        // nunca chega a tocar na BD.
+        if (CredentialPolicy.ValidatePassword(newPassword) != null)
+        {
+            return ChangePasswordResult.InvalidPassword;
+        }
+
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        await using var transaction = await context.Database.BeginTransactionAsync(cancellationToken);
+
+        var user = await findUser(context);
+        if (user == null)
+        {
+            await transaction.RollbackAsync(cancellationToken);
+            return ChangePasswordResult.UserNotFound;
+        }
+
+        var now = DateTime.UtcNow;
+        user.PasswordHash = PasswordHasher.Hash(newPassword);
+        user.UpdatedAtUtc = now;
+
+        // Revogação: todas as sessões do utilizador caem na mesma
+        // transacção que a mudança de password (defesa em profundidade —
+        // uma password alterada não deve manter sessões antigas vivas).
+        await context.AdminSessions
+            .Where(s => s.AdminUserId == user.Id)
+            .ExecuteDeleteAsync(cancellationToken);
+
+        await context.SaveChangesAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+        return ChangePasswordResult.Changed;
+    }
+}

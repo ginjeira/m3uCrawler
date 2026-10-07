@@ -1,0 +1,272 @@
+using m3uCrawler.Services.Catalog;
+
+namespace m3uCrawler.Services.SourceSelection;
+
+/// <summary>
+/// PHASE 13 (Wave 13-1) — Identidade normalizada de fornecedor usada
+/// apenas para diversidade/deduplicação de fornecedor na selecção de
+/// fontes. Não faz descoberta de fornecedor nem I/O: assume que o
+/// chamador já tem uma representação de fornecedor (host, conta,
+/// origem) e limita-se a normalizá-la.
+///
+/// <para>
+/// Todos os valores ausentes/desconhecidos colapsam numa <b>única</b>
+/// identidade <see cref="Unknown"/>. Isto é deliberado: uma fonte
+/// desconhecida não deve ganhar diversidade artificial por parecer
+/// diferente de outra fonte também desconhecida.
+/// </para>
+///
+/// <para>
+/// Este tipo é uma chave de comparação interna. Não deve ser
+/// apresentado ao operador como "fornecedor" sem enriquecimento
+/// posterior (essa é a <c>ProviderDefinition</c> prevista na fase,
+/// fora do âmbito desta wave).
+/// </para>
+/// </summary>
+public readonly record struct ProviderIdentity(string Key)
+{
+    public const string UnknownKey = "<unknown>";
+
+    /// <summary>Identidade única para fornecedor não determinável.</summary>
+    public static readonly ProviderIdentity Unknown = new(UnknownKey);
+
+    public bool IsUnknown => string.Equals(Key, UnknownKey, StringComparison.Ordinal);
+
+    /// <summary>
+    /// Normaliza uma representação textual de fornecedor. Tokens
+    /// vazios ou sentinelas conhecidos (<c>(unknown)</c>, <c>unknown</c>,
+    /// <c>&lt;unknown&gt;</c>) mapeiam para <see cref="Unknown"/>.
+    /// </summary>
+    public static ProviderIdentity Normalize(string? provider)
+    {
+        if (string.IsNullOrWhiteSpace(provider)) return Unknown;
+
+        var trimmed = provider.Trim();
+        if (trimmed.Equals("(unknown)", StringComparison.OrdinalIgnoreCase)
+            || trimmed.Equals("unknown", StringComparison.OrdinalIgnoreCase)
+            || trimmed.Equals(UnknownKey, StringComparison.OrdinalIgnoreCase))
+        {
+            return Unknown;
+        }
+
+        return new ProviderIdentity(trimmed.ToLowerInvariant());
+    }
+
+    public override string ToString() => Key;
+}
+
+/// <summary>
+/// PHASE 13 (Wave 13-1) — Candidato de <c>ChannelSource</c> à selecção
+/// de publicação. Transporta o mínimo de dados necessários para o
+/// ranking/diversidade, reutilizando os enums de domínio existentes
+/// (<see cref="StreamQuality"/>, <see cref="EpgState"/>,
+/// <see cref="AvailabilityState"/>) em vez de os duplicar.
+///
+/// <para>
+/// O candidato é deliberadamente <b>independente</b> de EF/DbContext,
+/// ficheiros, HTTP e Dispatcharr. O chamador projeta
+/// <c>ChannelSourceEntity</c> para este record. Campos que ainda não
+/// sejam realistas de popular (ex.: <see cref="Quality"/>/<see cref="Epg"/>
+/// são <c>Unknown</c> no catálogo actual) são suportados pelo contrato
+/// e tratados como "desconhecido" pelo ranking.
+/// </para>
+/// </summary>
+public sealed record SelectionCandidate(
+    string StreamUrl,
+    long SourceId,
+    int SourcePriority,
+    StreamQuality Quality,
+    EpgState Epg,
+    AvailabilityState Availability,
+    long LastResponseTimeMs,
+    string? ExternalStreamId,
+    ProviderIdentity Provider,
+    bool IsWorking = true,
+    string? StreamFingerprint = null,
+    DateTime? LastSuccessfulValidationUtc = null);
+
+/// <summary>
+/// PHASE W4a — Override explícito do canal (critério 1 de DL-101).
+///
+/// <para>
+/// Representa a escolha explícita, pelo operador, de uma origem concreta
+/// para o canal: a fonte com <see cref="SourceId"/> indicado (e, quando
+/// definido, o <see cref="ExternalStreamId"/> indicado) precede qualquer
+/// outra no ranking. Não é critério persistido: é um input do snapshot da
+/// execução (<c>09-SELECTION.md:13-21</c>).
+/// </para>
+///
+/// <para>
+/// Quando definido mas sem correspondência nos candidatos, o critério é um
+/// <b>no-op</b> documentado: o selector não reordena nem falha.
+/// </para>
+/// </summary>
+public sealed record ChannelSourceOverride(
+    long SourceId,
+    string? ExternalStreamId = null);
+
+/// <summary>
+/// PHASE W4a — Inputs activáveis do ranking DL-101 que não fazem parte do
+/// contrato de <see cref="SourceSelectionPolicy"/> (limites/diversidade).
+///
+/// <para>
+/// Os critérios fixos de DL-101 são sempre avaliados pela ordem fechada;
+/// este record apenas controla os pontos que a norma deixa à policy:
+/// <list type="bullet">
+///   <item><see cref="ChannelOverride"/> — critério 1 (override explícito);</item>
+///   <item><see cref="PreferredQualities"/> — critério 4 (media/qualidade);
+///         <c>null</c>/vazio usa a ordem natural (<c>FourK &gt; UHD &gt; FHD
+///         &gt; HD &gt; SD &gt; Unknown</c>);</item>
+///   <item><see cref="UseValidationFreshness"/> — critério 5 (frescura da
+///         última validação bem sucedida); desligado por omissão, pelo que
+///         é um <b>no-op</b> documentado quando a policy não o utiliza.</item>
+/// </list>
+/// </para>
+/// </summary>
+public sealed record SourceSelectionCriteria(
+    ChannelSourceOverride? ChannelOverride = null,
+    IReadOnlyList<StreamQuality>? PreferredQualities = null,
+    bool UseValidationFreshness = false);
+
+/// <summary>
+/// PHASE 13 (Wave 13-1) — Política de selecção de fontes por canal.
+/// Valores concretos (ex.: <c>MaxSourcesPerChannel = 10</c>) são
+/// fornecidos pelo chamador; o algoritmo não contém limites hardcoded.
+/// </summary>
+/// <param name="MaxSourcesPerChannel">
+/// Número máximo de fontes seleccionadas por canal. Nunca ultrapassado.
+/// <c>0</c> é válido e significa que nenhuma fonte é seleccionada
+/// ("não publicar"); valores negativos são inválidos.
+/// </param>
+/// <param name="PreferDistinctProviders">
+/// Quando <c>true</c>, a Fase A favorece um representante por fornecedor
+/// antes de preencher os lugares restantes.
+/// </param>
+/// <param name="MaxSourcesPerProvider">
+/// Limite opcional por fornecedor. <c>null</c> significa sem limite.
+/// Aplica-se em ambas as fases.
+/// </param>
+/// <param name="AllowFallbackToSameProvider">
+/// Quando <c>true</c>, a Fase B pode preencher lugares restantes com
+/// fontes adicionais de fornecedores já representados (respeitando
+/// <paramref name="MaxSourcesPerProvider"/>). Quando <c>false</c>, a
+/// Fase B só acrescenta fornecedores ainda não representados.
+/// </param>
+public sealed record SourceSelectionPolicy(
+    int MaxSourcesPerChannel,
+    bool PreferDistinctProviders,
+    int? MaxSourcesPerProvider = null,
+    bool AllowFallbackToSameProvider = true);
+
+/// <summary>Fonte seleccionada, com a ordem final e o motivo.</summary>
+public sealed record SelectedSource(SelectionCandidate Candidate, int Rank, string Reason);
+
+/// <summary>Fonte rejeitada, com o motivo da rejeição.</summary>
+public sealed record RejectedSource(SelectionCandidate Candidate, string Reason);
+
+/// <summary>
+/// PHASE 13 (Wave 13-5) — Resultado da selecção para um canal canónico
+/// individual, usado para preview/dry-run e métricas agregadas.
+///
+/// <para>
+/// Puramente aditivo: não altera a semântica nem a ordem de
+/// <see cref="SourceSelectionResult"/> /
+/// <see cref="SourceSelectionStageResult.Selected"/> /
+/// <see cref="SourceSelectionStageResult.Rejected"/>. É registado um
+/// resultado por grupo de canal canónico processado, incluindo grupos cujas
+/// fontes estão todas desactivadas (<see cref="Selected"/> vazio e
+/// <see cref="Rejected"/> com entradas <c>source-disabled</c>).
+/// </para>
+///
+/// <para>
+/// <b>Sensível:</b> <see cref="Selected"/> e <see cref="Rejected"/> contêm
+/// <see cref="SelectionCandidate.StreamUrl"/> com a URL real (credenciais
+/// incluídas) apenas em memória. Nunca devem ser serializados, persistidos
+/// ou logados; o preview projeta para tipos sanitizados.
+/// </para>
+/// </summary>
+public sealed record SourceSelectionChannelResult(
+    long CanonicalChannelId,
+    string? CanonicalChannelKey,
+    SourceSelectionPolicy Policy,
+    IReadOnlyList<SelectedSource> Selected,
+    IReadOnlyList<RejectedSource> Rejected)
+{
+    /// <summary>Total de candidatos considerados neste canal.</summary>
+    public int CandidateCount => Selected.Count + Rejected.Count;
+}
+
+/// <summary>
+/// Resultado determinístico da selecção. <see cref="Selected"/> está na
+/// ordem final (Rank = índice); <see cref="Rejected"/> cobre todos os
+/// restantes candidatos com motivo observável (preview/auditoria).
+/// </summary>
+public sealed record SourceSelectionResult(
+    IReadOnlyList<SelectedSource> Selected,
+    IReadOnlyList<RejectedSource> Rejected,
+    int TotalCandidates);
+
+/// <summary>
+/// Vocabulário estável dos motivos de selecção/rejeição.
+///
+/// <para>
+/// <b>Precedência dos motivos de rejeição</b> (avaliada por esta ordem):
+/// <list type="number">
+///   <item><c>duplicate-url</c> — a URL normalizada já foi considerada
+///         (antes de qualquer limite);</item>
+///   <item><c>invalid-url</c> / <c>not-working</c> / <c>unavailable</c> —
+///         inelegibilidade, independente dos limites;</item>
+///   <item><c>limit-reached</c> — <c>MaxSourcesPerChannel</c> atingido;
+///         tem precedência sobre os motivos de fornecedor;</item>
+///   <item><c>provider-limit</c> — <c>MaxSourcesPerProvider</c> atingido;</item>
+///   <item><c>fallback-disabled</c> — fornecedor já representado e
+///         <c>AllowFallbackToSameProvider=false</c>.</item>
+/// </list>
+/// Um candidato pode satisfazer mais de uma condição; o motivo emitido é o
+/// primeiro da precedência acima.
+/// </para>
+/// </summary>
+public static class SelectionReasons
+{
+    /// <summary>Selecionada na Fase A (diversidade por fornecedor).</summary>
+    public const string Diversity = "diversity";
+
+    /// <summary>Selecionada na Fase B (preenchimento de lugares restantes).</summary>
+    public const string Fill = "fill";
+
+    /// <summary>URL vazia, não absoluta ou não http/https.</summary>
+    public const string InvalidUrl = "invalid-url";
+
+    /// <summary>Candidato marcado como não funcional.</summary>
+    public const string NotWorking = "not-working";
+
+    /// <summary>Disponibilidade terminal (Dead/Unreachable).</summary>
+    public const string Unavailable = "unavailable";
+
+    /// <summary>URL equivalente (após normalização) a um candidato já considerado.</summary>
+    public const string DuplicateUrl = "duplicate-url";
+
+    /// <summary>
+    /// Limite do canal (<c>MaxSourcesPerChannel</c>) já atingido. Tem
+    /// precedência sobre <see cref="ProviderLimit"/> e
+    /// <see cref="FallbackDisabled"/>.
+    /// </summary>
+    public const string LimitReached = "limit-reached";
+
+    /// <summary>Limite por fornecedor (<c>MaxSourcesPerProvider</c>) atingido.</summary>
+    public const string ProviderLimit = "provider-limit";
+
+    /// <summary>Fornecedor já representado e o fallback está desactivado.</summary>
+    public const string FallbackDisabled = "fallback-disabled";
+
+    /// <summary>
+    /// <b>Reservado — nunca emitido.</b> A Fase B selecciona qualquer
+    /// candidato elegível não seleccionado enquanto houver vagas de canal e
+    /// de fornecedor e o fallback o permitir; logo, após a Fase B, todo o
+    /// candidato rejeitado cai necessariamente em <see cref="LimitReached"/>,
+    /// <see cref="ProviderLimit"/> ou <see cref="FallbackDisabled"/>.
+    /// Mantido apenas para estabilidade do vocabulário; consumidores
+    /// (preview/Dashboard/auditoria) não devem depender dele.
+    /// </summary>
+    public const string NotSelected = "not-selected";
+}

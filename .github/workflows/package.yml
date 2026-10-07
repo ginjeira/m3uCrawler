@@ -137,12 +137,23 @@ jobs:
             --self-contained false \
             --output ./publish
 
+      # O baseline canónico PT é incluído no artefacto de deploy para que o
+      # resolver o encontre em <app>/docs/catalog/ (o recurso embutido na
+      # assembly é a rede de segurança, mas o ficheiro versionado deve ser
+      # auditável no deployment).
+      - name: Stage canonical baseline
+        run: |
+          mkdir -p ./publish/docs/catalog
+          cp docs/catalog/m3ucrawler_pt_canonical_catalog.json ./publish/docs/catalog/
+
       - name: Verify published contents
         run: |
           test -f publish/m3uCrawler.dll
           test -f publish/m3uCrawler
+          test -f publish/docs/catalog/m3ucrawler_pt_canonical_catalog.json
           echo "Published files:"
           ls -la publish
+          ls -la publish/docs/catalog
 
       - name: Annotate artefact with build metadata
         shell: bash

@@ -6,6 +6,7 @@ using System.Threading.Tasks;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using m3uCrawler.Services.Matching;
 
 namespace m3uCrawler.Services.Catalog;
 
@@ -123,78 +124,125 @@ public sealed class ChannelCatalogBootstrapper
         // canónica portuguesa sem remover nada do seed legacy.
         await TryImportBaselineAsync(context, cancellationToken);
 
+        // Wave B — normalização de aliases legacy. As instalações
+        // pré-existentes podem ter aliases gravados em bruto (com
+        // tokens de país/qualidade, maiúsculas, diacríticos). Sem
+        // normalização esses aliases nunca são encontrados pelo
+        // matcher. A operação é idempotente e collision-safe.
+        await NormalizeExistingAliasesAsync(context, _logger, cancellationToken);
+
         lockStream?.Dispose();
         return context;
     }
 
     /// <summary>
-    /// Procura o ficheiro <c>docs/catalog/m3ucrawler_pt_canonical_catalog.json</c>
-    /// em três localizações canónicas:
-    /// <list type="number">
-    ///   <item>Directório de trabalho actual (override).</item>
-    ///   <item>Raiz do repo: <c>docs/catalog/m3ucrawler_pt_canonical_catalog.json</c>.</item>
-    ///   <item>Directório do executável + 5 níveis acima (caso esteja
-    ///         instalado a partir de um deploy empacotado).</item>
-    /// </list>
-    /// Se não encontrar, não falha — é um baseline opcional. Quando
-    /// encontra, importa-o idempotentemente via
-    /// <see cref="CatalogBaselineImporter"/>. O relatório da
-    /// importação fica registado em log.
+    /// Importa o baseline canónico a partir do ficheiro resolvido; se
+    /// não existir ficheiro, usa o recurso embutido na assembly. Esta
+    /// segunda via garante que uma instalação fresca (imagem sem
+    /// <c>docs/catalog/</c> no disco) continua a popular os canais PT
+    /// generalistas. A operação é idempotente e aditiva — não remove
+    /// nem duplica o que já existe.
     /// </summary>
     private async Task TryImportBaselineAsync(ChannelCatalogDbContext context, CancellationToken cancellationToken)
     {
         var baselinePath = ResolveBaselinePath();
+
         if (baselinePath is null)
         {
-            _logger.LogDebug("No baseline canonical catalog JSON found; skipping baseline import.");
-            return;
+            // Antes: LogDebug (invisível em produção). Agora LogWarning
+            // para o operador perceber que a baseline veio do recurso
+            // embutido e não do ficheiro empacotado — mas nunca falha,
+            // porque o recurso embutido está sempre disponível.
+            _logger.LogWarning(
+                "No baseline canonical catalog file found (checked M3U_BASELINE_PATH, " +
+                "CWD/docs/catalog and AppContext.BaseDirectory/docs/catalog); " +
+                "falling back to the embedded baseline resource.");
         }
 
         try
         {
-            _logger.LogInformation("Importing baseline canonical catalog from {Path}", baselinePath);
-            var baseline = await CatalogBaselineImporter.LoadFromFileAsync(baselinePath, cancellationToken);
+            var baseline = await LoadBaselineAsync(baselinePath, cancellationToken);
             var report = await CatalogBaselineImporter.ImportAsync(context, baseline, cancellationToken);
             _logger.LogInformation(
-                "Baseline import: catalogId={CatalogId} version={Version} channelsCreated={Created} " +
-                "channelsUpdated={Updated} aliasesAdded={AliasesAdded} aliasesSkipped={AliasesSkipped}",
+                "Baseline import: source={Source} catalogId={CatalogId} version={Version} " +
+                "channelsCreated={Created} channelsUpdated={Updated} aliasesAdded={AliasesAdded} " +
+                "aliasesSkipped={AliasesSkipped} externalIdentitiesAdded={ExternalIdentitiesAdded} " +
+                "externalIdentitiesSkipped={ExternalIdentitiesSkipped} externalIdentityConflicts={ExternalIdentityConflicts}",
+                baselinePath ?? ("embedded:" + CatalogBaselineImporter.EmbeddedBaselineResourceName),
                 report.CatalogId, report.Version, report.ChannelsCreated,
-                report.ChannelsUpdated, report.AliasesAdded, report.AliasesSkipped);
+                report.ChannelsUpdated, report.AliasesAdded, report.AliasesSkipped,
+                report.ExternalIdentitiesAdded, report.ExternalIdentitiesSkipped,
+                report.ExternalIdentityConflicts);
             foreach (var warning in report.Warnings)
             {
                 _logger.LogWarning("Baseline import warning: {Warning}", warning);
             }
         }
-        catch (FileNotFoundException)
-        {
-            // Já tratado acima; re-throw não esperado.
-        }
         catch (Exception ex)
         {
-            // Baseline é uma extensão opcional. Falha na importação
-            // não aborta o arranque (o seed programático continua a
-            // funcionar) mas é registada para diagnóstico.
+            // A baseline embutida deve estar sempre presente; uma falha
+            // aqui é anómala e fica visível, mas não aborta o arranque
+            // (o seed programático continua activo).
             _logger.LogWarning(ex,
-                "Failed to import baseline canonical catalog from {Path}. The programmed seed is still active.",
-                baselinePath);
+                "Failed to load/import the baseline canonical catalog (path={Path}). " +
+                "The programmed seed is still active.",
+                baselinePath ?? "<embedded>");
         }
     }
 
-    private string? ResolveBaselinePath()
-    {
-        // Ordem de resolução:
-        //   1. Override via variável de ambiente M3U_BASELINE_PATH.
-        //   2. CWD/docs/catalog/m3ucrawler_pt_canonical_catalog.json.
-        //   3. Repo root / docs/catalog/m3ucrawler_pt_canonical_catalog.json
-        //      (a partir do CWD ou do BaseDirectory).
-        var env = Environment.GetEnvironmentVariable("M3U_BASELINE_PATH");
-        if (!string.IsNullOrEmpty(env) && File.Exists(env)) return env;
+    /// <summary>
+    /// Decide a origem do baseline: ficheiro quando
+    /// <paramref name="resolvedPath"/> é não-nulo (precedência), caso
+    /// contrário o recurso embutido. Interno para permitir testes
+    /// determinísticos da precedência sem depender do filesystem do
+    /// repositório.
+    /// </summary>
+    internal static Task<CatalogBaseline> LoadBaselineAsync(string? resolvedPath, CancellationToken cancellationToken = default)
+        => resolvedPath is null
+            ? CatalogBaselineImporter.LoadEmbeddedAsync(cancellationToken)
+            : CatalogBaselineImporter.LoadFromFileAsync(resolvedPath, cancellationToken);
 
+    /// <summary>
+    /// Resolve o caminho do ficheiro baseline usando o ambiente real
+    /// (CWD, directório da assembly, env var).
+    /// </summary>
+    private string? ResolveBaselinePath()
+        => ResolveBaselinePathFor(
+            Directory.GetCurrentDirectory(),
+            AppContext.BaseDirectory,
+            Environment.GetEnvironmentVariable("M3U_BASELINE_PATH"));
+
+    /// <summary>
+    /// Resolve o caminho do ficheiro baseline com entradas
+    /// explícitas. Ordem de resolução (maior precedência primeiro):
+    /// <list type="number">
+    ///   <item>Override via variável de ambiente
+    ///         <c>M3U_BASELINE_PATH</c> (usado em produção no
+    ///         Dockerfile).</item>
+    ///   <item><c>&lt;CWD&gt;/docs/catalog/m3ucrawler_pt_canonical_catalog.json</c>.</item>
+    ///   <item><c>&lt;AppContext.BaseDirectory&gt;/docs/catalog/…</c>
+    ///         (ficheiro empacotado em <c>/app/docs/catalog</c>).</item>
+    ///   <item>Raiz do repo a partir do
+    ///         <c>BaseDirectory</c> (5 e 4 níveis acima), para
+    ///         desenvolvimento/testes.</item>
+    /// </list>
+    /// Devolve <c>null</c> quando nenhum existe; nesse caso o caller
+    /// usa o recurso embutido.
+    /// </summary>
+    internal static string? ResolveBaselinePathFor(
+        string currentDirectory,
+        string baseDirectory,
+        string? envPath)
+    {
+        if (!string.IsNullOrEmpty(envPath) && File.Exists(envPath)) return envPath;
+
+        var fileName = CatalogBaselineImporter.BaselineFileName;
         var candidates = new[]
         {
-            Path.Combine(Directory.GetCurrentDirectory(), "docs", "catalog", "m3ucrawler_pt_canonical_catalog.json"),
-            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", "docs", "catalog", "m3ucrawler_pt_canonical_catalog.json"),
-            Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "docs", "catalog", "m3ucrawler_pt_canonical_catalog.json"),
+            Path.Combine(currentDirectory, "docs", "catalog", fileName),
+            Path.Combine(baseDirectory, "docs", "catalog", fileName),
+            Path.Combine(baseDirectory, "..", "..", "..", "..", "..", "docs", "catalog", fileName),
+            Path.Combine(baseDirectory, "..", "..", "..", "..", "docs", "catalog", fileName),
         };
         foreach (var c in candidates)
         {
@@ -253,6 +301,17 @@ public sealed class ChannelCatalogBootstrapper
     /// Aplica o seed de forma idempotente. Em condições normais a
     /// migration inicial já popula o seed, mas este método
     /// suporta cenários em que o seed é reaplicado manualmente.
+    ///
+    /// <para>
+    /// Os aliases do seed são normalizados via
+    /// <see cref="ChannelNormalizer.Normalize"/> antes de serem
+    /// inseridos, para que uma instalação fresca fique imediatamente
+    /// matchable. A normalização pode colapsar vários aliases numa
+    /// única forma: esses duplicados são deduplicados; colisões com
+    /// aliases já pertencentes a outro canal são ignoradas
+    /// deterministicamente (o alias existente mantém o dono). As
+    /// <c>Key</c> dos canais não são alteradas.
+    /// </para>
     /// </summary>
     public static async Task SeedAsync(ChannelCatalogDbContext context, CancellationToken cancellationToken = default)
     {
@@ -279,25 +338,52 @@ public sealed class ChannelCatalogBootstrapper
             existingChannelKeys, System.StringComparer.Ordinal);
 
         var now = DateTime.UtcNow;
+
+        // Wave A — grupos canónicos configuráveis. Garantir os 9 grupos
+        // por omissão (idempotente, por Key) ANTES de qualquer canal, para
+        // que os canais possam ser criados já com GroupId. O mapeamento
+        // vive em CanonicalGroupDefaults (única fonte C#).
+        var groupIds = await EnsureCanonicalGroupsAsync(context, now, cancellationToken);
+
         foreach (var ch in CatalogSeed.Channels)
         {
+            // Forma única matchable, deduplicada por canal.
+            var channelAliases = new System.Collections.Generic.List<string>();
+            var seenForChannel = new System.Collections.Generic.HashSet<string>(
+                System.StringComparer.Ordinal);
+            foreach (var rawAlias in ch.Aliases)
+            {
+                var normalizedAlias = ChannelNormalizer.Normalize(rawAlias);
+                if (normalizedAlias.Length == 0) continue;
+                if (seenForChannel.Add(normalizedAlias)) channelAliases.Add(normalizedAlias);
+            }
+
             if (!existingChannelKeySet.Contains(ch.Key))
             {
+                // TODO/ADR (Wave W3s): canais do seed programático ficam com
+                // Country = null (o record CanonicalChannelSeed não tem
+                // país). Não se introduz migration para os preencher: a
+                // propriedade/ownership dos dados de país é um ADR em aberto
+                // (docs/Reestructure/24-DECISIONS.md, "country data
+                // ownership"). Country é apenas classificação, não
+                // identidade. Fixado por CountryAttributeConsistencyTests.
                 var entity = new CanonicalChannelEntity
                 {
                     Key = ch.Key,
                     DisplayName = ch.DisplayName,
                     EditorialCategory = ch.Category,
-                    EditorialGroup = ch.Group,
+                    GroupId = groupIds.TryGetValue(ch.GroupKey, out var groupId)
+                            ? groupId
+                            : null,
                     PublicationPolicy = ch.Policy,
                     IsEnabled = true,
                     CreatedAtUtc = now,
                     UpdatedAtUtc = now,
                 };
                 context.CanonicalChannels.Add(entity);
-                foreach (var alias in ch.Aliases)
+                foreach (var alias in channelAliases)
                 {
-                    if (existingAliasSet.Contains(alias)) continue;
+                    if (!existingAliasSet.Add(alias)) continue;
                     context.ChannelAliases.Add(new ChannelAliasEntity
                     {
                         NormalizedAlias = alias,
@@ -313,10 +399,10 @@ public sealed class ChannelCatalogBootstrapper
                 var existing = await context.CanonicalChannels
                     .Include(c => c.Aliases)
                     .FirstAsync(c => c.Key == ch.Key, cancellationToken);
-                foreach (var alias in ch.Aliases)
+                foreach (var alias in channelAliases)
                 {
                     if (existing.Aliases.Any(a => a.NormalizedAlias == alias)) continue;
-                    if (existingAliasSet.Contains(alias)) continue;
+                    if (!existingAliasSet.Add(alias)) continue;
                     existing.Aliases.Add(new ChannelAliasEntity
                     {
                         NormalizedAlias = alias,
@@ -341,5 +427,162 @@ public sealed class ChannelCatalogBootstrapper
         }
 
         await context.SaveChangesAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Garante que os 9 grupos canónicos por omissão existem
+    /// (idempotente, por <see cref="CanonicalGroupEntity.Key"/>) e
+    /// devolve o mapa <c>Key → Id</c>. É a única implementação C# de
+    /// garantia de grupos; o mapeamento em si vive em
+    /// <see cref="CanonicalGroupDefaults"/>.
+    /// </summary>
+    internal static async Task<System.Collections.Generic.Dictionary<string, long>> EnsureCanonicalGroupsAsync(
+        ChannelCatalogDbContext context,
+        DateTime now,
+        CancellationToken cancellationToken = default)
+    {
+        var existing = await context.CanonicalGroups
+            .AsNoTracking()
+            .Select(g => new { g.Id, g.Key })
+            .ToListAsync(cancellationToken);
+        var idsByKey = new System.Collections.Generic.Dictionary<string, long>(
+            System.StringComparer.Ordinal);
+        foreach (var g in existing)
+        {
+            idsByKey[g.Key] = g.Id;
+        }
+
+        var added = false;
+        foreach (var def in CanonicalGroupDefaults.All)
+        {
+            if (idsByKey.ContainsKey(def.Key)) continue;
+            context.CanonicalGroups.Add(new CanonicalGroupEntity
+            {
+                Key = def.Key,
+                DisplayName = def.DisplayName,
+                Order = def.Order,
+                IsEnabled = true,
+                IsDefault = def.IsDefault,
+                CreatedAtUtc = now,
+                UpdatedAtUtc = now,
+            });
+            added = true;
+        }
+
+        if (added)
+        {
+            await context.SaveChangesAsync(cancellationToken);
+            idsByKey.Clear();
+            var refreshed = await context.CanonicalGroups
+                .AsNoTracking()
+                .Select(g => new { g.Id, g.Key })
+                .ToListAsync(cancellationToken);
+            foreach (var g in refreshed)
+            {
+                idsByKey[g.Key] = g.Id;
+            }
+        }
+
+        return idsByKey;
+    }
+
+    /// <summary>
+    /// Wave B — normaliza in-place os <c>NormalizedAlias</c> de
+    /// instalações pré-existentes para a forma matchable do
+    /// <see cref="ChannelNormalizer.Normalize"/> (o que o matcher
+    /// consulta). Idempotente e collision-safe:
+    /// <list type="bullet">
+    ///   <item>valor normalizado vazio ou já igual → sem alteração;</item>
+    ///   <item>colisão com outro alias do MESMO canal → o alias
+    ///         duplicado é removido (merge);</item>
+    ///   <item>colisão com um alias de OUTRO canal → o alias existente
+    ///         mantém o dono e o alias legacy é deixado como está
+    ///         (skip determinístico; nunca lança).</item>
+    /// </list>
+    /// Devolve o número de aliases efectivamente alterados.
+    /// </summary>
+    internal static async Task<int> NormalizeExistingAliasesAsync(
+        ChannelCatalogDbContext context,
+        ILogger? logger,
+        CancellationToken cancellationToken = default)
+    {
+        var aliases = await context.ChannelAliases
+            .OrderBy(a => a.Id)
+            .ToListAsync(cancellationToken);
+
+        // value -> (aliasRowId, channelId) do dono actual. Mantido
+        // actualizado à medida que renomeamos/removemos.
+        var ownerByValue = new System.Collections.Generic.Dictionary<
+            string, (long AliasId, long ChannelId)>(System.StringComparer.Ordinal);
+        foreach (var alias in aliases)
+        {
+            ownerByValue[alias.NormalizedAlias] = (alias.Id, alias.CanonicalChannelId);
+        }
+
+        var changed = 0;
+        var merged = 0;
+        var skipped = 0;
+        var toRemove = new System.Collections.Generic.List<ChannelAliasEntity>();
+
+        foreach (var alias in aliases)
+        {
+            var current = alias.NormalizedAlias;
+            var target = ChannelNormalizer.Normalize(current);
+            if (target.Length == 0) continue;
+            if (string.Equals(target, current, StringComparison.Ordinal)) continue;
+
+            if (ownerByValue.TryGetValue(target, out var owner))
+            {
+                if (owner.ChannelId == alias.CanonicalChannelId)
+                {
+                    // Já existe a forma normalizada neste canal: o
+                    // alias legacy é redundante → merge/remove.
+                    toRemove.Add(alias);
+                    ownerByValue.Remove(current);
+                    merged++;
+                    changed++;
+                }
+                else
+                {
+                    // Colisão com outro canal: não roubar identidade.
+                    // Deixa o alias legacy como está (não-matchable,
+                    // mas sem corromper o dono existente).
+                    skipped++;
+                }
+                continue;
+            }
+
+            ownerByValue.Remove(current);
+            alias.NormalizedAlias = target;
+            ownerByValue[target] = (alias.Id, alias.CanonicalChannelId);
+            changed++;
+        }
+
+        if (toRemove.Count > 0)
+        {
+            context.ChannelAliases.RemoveRange(toRemove);
+        }
+
+        if (changed > 0 || skipped > 0)
+        {
+            await context.SaveChangesAsync(cancellationToken);
+        }
+
+        if (changed > 0)
+        {
+            logger?.LogWarning(
+                "Channel alias normalization: {Changed} legacy aliases normalised " +
+                "({Merged} merged, {Skipped} collision(s) skipped).",
+                changed, merged, skipped);
+        }
+        else if (skipped > 0)
+        {
+            logger?.LogWarning(
+                "Channel alias normalization: {Skipped} legacy alias collision(s) " +
+                "skipped; no alias changed.",
+                skipped);
+        }
+
+        return changed;
     }
 }

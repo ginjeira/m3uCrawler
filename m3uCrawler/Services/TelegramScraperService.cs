@@ -3,6 +3,9 @@ using System.Text;
 using System.Text.RegularExpressions;
 using m3uCrawler.Models;
 using m3uCrawler.Services.Catalog;
+using m3uCrawler.Services.LiveRun;
+using m3uCrawler.Services.Recognition;
+using m3uCrawler.Services.Telegram;
 using m3uCrawler.Services.Validation;
 using TL;
 
@@ -11,6 +14,19 @@ namespace m3uCrawler.Services
     public class TelegramScraperService
     {
         private readonly WTelegram.Client? _client;
+
+        // Wave W5 — Caminho de aplicação: o cliente WTelegram vivo é
+        // detido pelo TelegramAuthService (dashboard/scheduler) e lido a
+        // cada execução. Quando presente, este scraper NUNCA constrói um
+        // cliente próprio nem lê da consola.
+        private readonly ITelegramClientProvider? _clientProvider;
+
+        // Fallback legacy (CLI interactiva sem serviço de aplicação): o
+        // cliente é criado preguiçosamente a partir do wtelegram.config
+        // lido no momento (sem snapshot estático).
+        private readonly object _fallbackClientGate = new();
+        private WTelegram.Client? _fallbackClient;
+
         private readonly M3uCandidateDetector _detector = new();
 
         // EXPERIMENT-SERIAL-PER-XTREAM (2026-09-16): singleton do lock
@@ -25,6 +41,32 @@ namespace m3uCrawler.Services
         // comportamento dos testes que instanciam directamente.
         private m3uCrawler.Services.Validation.ITraceSink _trace = m3uCrawler.Services.Validation.NullTraceSink.Instance;
 
+        // D-M4-02 — resolvedor de policies (W5.1). Opcional; quando
+        // configurado, o scraper lê a policy efectiva do snapshot do Run
+        // (ILiveRunProgress.RunId) e propaga-a para a ingestão do
+        // catálogo. Sem resolver => sem policy (B1: nunca fallback para
+        // policy viva; sem fabrico).
+        private m3uCrawler.Services.Recognition.RecognitionPolicyResolver? _recognitionPolicyResolver;
+
+        // W2-FU-1 (2026-09-22) — resolvedor de catálogo opcional para
+        // alimentar o observer de falhas de aquisição. Quando configurado
+        // E o caller fornece um pipelineIngestor (caminho com ingestion),
+        // o scraper instala um CatalogAcquisitionFailureObserver com
+        // sourceId=null no tester — agrega em RunReport mas NÃO persiste
+        // em Source (a identidade operacional Source<->peer/chat ainda
+        // não está ligada; ver W2-FU-2 follow-up). Sem resolver, sem
+        // observer: o comportamento legacy é preservado (no-op, sem
+        // side-effects).
+        private m3uCrawler.Services.Catalog.CatalogResolver? _catalogResolver;
+
+        // Membros de afinidade Kind=Country (classificação de país), por
+        // código ISO. Injectados na construção do CountryChannelValidator
+        // deste scraper. Escopo de instância: não existe estado estático
+        // partilhado entre processos/serviços. Country affinity NÃO cria
+        // identidade de canal.
+        private IReadOnlyDictionary<string, IEnumerable<string>> _countryAffinityMembers =
+            new Dictionary<string, IEnumerable<string>>(StringComparer.OrdinalIgnoreCase);
+
         public RunReport? LastRunReport { get; private set; }
 
         // PHASE-OBSERVABILITY (2026-09-15): associa um sink de tracing
@@ -37,13 +79,76 @@ namespace m3uCrawler.Services
         }
 
         /// <summary>
-        /// Construtor padrão: lê <c>wtelegram.config</c> e instancia o
-        /// <see cref="WTelegram.Client"/> a partir dele. Requer credenciais reais
-        /// para descoberta em produção.
+        /// D-M4-02 — Injecta o resolvedor de policies de reconhecimento.
+        /// Quando configurado, o scraper resolve a policy efectiva a
+        /// partir do snapshot do Run (criado em <c>RunCoordinator</c>) e
+        /// propaga-a para <see cref="PipelineIngestionService.IngestAsync"/>.
+        /// <c>null</c> (default) preserva o comportamento anterior (sem
+        /// policy ⇒ mesma forma da wave W5.1 com policy nula).
+        /// </summary>
+        public void SetRecognitionPolicyResolver(
+            m3uCrawler.Services.Recognition.RecognitionPolicyResolver? resolver)
+        {
+            _recognitionPolicyResolver = resolver;
+        }
+
+        /// <summary>
+        /// W2-FU-1 (2026-09-22) — Injecta o resolvedor de catálogo
+        /// utilizado pelo observer de falhas de aquisição. Quando
+        /// configurado E o caller fornece um <c>pipelineIngestor</c> (caminho
+        /// com ingestion), <see cref="SearchAndTestM3UInTelegramAsync"/>
+        /// instala um <see cref="Validation.CatalogAcquisitionFailureObserver"/>
+        /// com <c>sourceId=null</c> no tester — agrega em
+        /// <see cref="RunReport"/> mas NÃO persiste em <c>Source</c>.
+        /// Passar <c>null</c> (default) preserva o comportamento legacy
+        /// (sem observer, sem side-effects).
+        /// </summary>
+        public void SetCatalogResolver(
+            m3uCrawler.Services.Catalog.CatalogResolver? resolver)
+        {
+            _catalogResolver = resolver;
+        }
+
+        /// <summary>
+        /// Define os membros de afinidade <c>Kind=Country</c> usados pelo
+        /// <see cref="CountryChannelValidator"/> criado em cada run. Chamado
+        /// pela composição (Program.cs) após o catálogo estar disponível.
+        /// Passar <c>null</c> repõe o estado vazio.
+        /// </summary>
+        public void SetCountryAffinityMembers(
+            IReadOnlyDictionary<string, IEnumerable<string>>? members)
+        {
+            _countryAffinityMembers = members
+                ?? new Dictionary<string, IEnumerable<string>>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// D-M4-02a — identidade operacional do Run para as ocorrências de
+        /// descoberta (W1). Usa exclusivamente
+        /// <see cref="ILiveRunProgress.RunId"/> (= <c>RunCoordinator.RunId</c>).
+        ///
+        /// <para>
+        /// Sem Run operacional devolve <c>null</c>: não fabrica identidade e
+        /// <b>nunca</b> usa <c>PipelineTrace.RunId</c> (diagnóstico) como
+        /// fallback. Nesse caso mantém-se o comportamento conservador de não
+        /// aplicar deduplicação baseada em Run (D-M4-01 B1).
+        /// </para>
+        /// </summary>
+        internal static string? ResolveOperationalRunId(ILiveRunProgress? liveRunProgress)
+        {
+            var runId = liveRunProgress?.RunId;
+            return string.IsNullOrWhiteSpace(runId) ? null : runId;
+        }
+
+        /// <summary>
+        /// Construtor padrão (legacy CLI interactiva): não cria cliente de
+        /// imediato. O cliente é criado preguiçosamente a partir do
+        /// <c>wtelegram.config</c> lido no momento do login, permitindo
+        /// que alterações ao ficheiro se apliquem sem reiniciar o
+        /// processo. Requer credenciais reais para produção.
         /// </summary>
         public TelegramScraperService()
         {
-            _client = new WTelegram.Client(Config);
         }
 
         /// <summary>
@@ -57,12 +162,51 @@ namespace m3uCrawler.Services
             _client = client;
         }
 
-        private static readonly Dictionary<string, string> _fileConfig = LoadConfigFile();
+        /// <summary>
+        /// Wave W5 — Caminho de aplicação: reutiliza o <c>WTelegram.Client</c>
+        /// vivo e autenticado detido pelo <see cref="ITelegramClientProvider"/>
+        /// (o <c>TelegramAuthService</c> do dashboard). Não constrói um
+        /// cliente de consola nem lê credenciais de <c>wtelegram.config</c>.
+        /// </summary>
+        public TelegramScraperService(ITelegramClientProvider clientProvider)
+        {
+            _clientProvider = clientProvider
+                ?? throw new ArgumentNullException(nameof(clientProvider));
+        }
+
+        /// <summary>
+        /// Wave W5 — Resolve o cliente a usar em cada operação Telegram.
+        /// No caminho de aplicação valida a autenticação e devolve o
+        /// cliente vivo do provider; no caminho legacy devolve o cliente
+        /// injectado ou cria (uma vez) o fallback a partir do ficheiro.
+        /// </summary>
+        internal WTelegram.Client RequireClient()
+        {
+            if (_clientProvider is not null)
+            {
+                if (!_clientProvider.IsAuthenticated)
+                    throw new TelegramNotAuthenticatedException();
+
+                return _clientProvider.LiveClient ?? throw new TelegramNotAuthenticatedException();
+            }
+
+            if (_client is not null)
+                return _client;
+
+            lock (_fallbackClientGate)
+            {
+                _fallbackClient ??= new WTelegram.Client(Config);
+                return _fallbackClient;
+            }
+        }
+
+        // Wave W5 — somente para testes: leitura de um ficheiro de
+        // configuração num directório explícito, sem snapshot estático.
+        internal static Dictionary<string, string> LoadConfigFileFrom(string directory)
+            => ParseConfigFile(Path.Combine(directory, "wtelegram.config"));
 
         private static Dictionary<string, string> LoadConfigFile()
         {
-            var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-
             // Procura o ficheiro junto ao executável e, em alternativa, na
             // pasta atual de trabalho (útil ao correr via "dotnet run").
             string[] candidatePaths =
@@ -72,7 +216,16 @@ namespace m3uCrawler.Services
             };
 
             string? path = candidatePaths.FirstOrDefault(File.Exists);
-            if (path == null) return dict;
+            return path == null
+                ? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                : ParseConfigFile(path);
+        }
+
+        private static Dictionary<string, string> ParseConfigFile(string path)
+        {
+            var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+            if (!File.Exists(path)) return dict;
 
             foreach (var line in File.ReadAllLines(path))
             {
@@ -90,10 +243,15 @@ namespace m3uCrawler.Services
             return dict;
         }
 
-        private static string? Config(string what)
+        private string? Config(string what)
         {
+            // Wave W5 — leitura sem snapshot estático: o ficheiro é
+            // relido a cada pedido, pelo que alterações a
+            // wtelegram.config se aplicam sem reiniciar o processo.
+            var fileConfig = LoadConfigFile();
+
             // "ask" no ficheiro significa pedir interativamente na consola
-            if (_fileConfig.TryGetValue(what, out var value))
+            if (fileConfig.TryGetValue(what, out var value))
             {
                 if (value.Equals("ask", StringComparison.OrdinalIgnoreCase))
                     return AskConsole($"{what}: ");
@@ -117,13 +275,26 @@ namespace m3uCrawler.Services
         // Chamado pelo Program.cs para autenticar antes de pesquisar
         public async Task LoginAsync()
         {
+            // Wave W5 — caminho de aplicação: a autenticação já foi
+            // conduzida pelo TelegramAuthService (dashboard). Não há
+            // login interactivo nem leitura da consola. Se o serviço
+            // ainda não estiver autenticado, falhar de forma explícita
+            // (o arranque trata esta excepção sem terminar o processo).
+            if (_clientProvider is not null)
+            {
+                if (_clientProvider.IsAuthenticated && _clientProvider.LiveClient is not null)
+                    return;
+                throw new TelegramNotAuthenticatedException();
+            }
+
+            var client = RequireClient();
             const int maxAttempts = 3;
 
             for (int attempt = 1; attempt <= maxAttempts; attempt++)
             {
                 try
                 {
-                    var me = await _client!.LoginUserIfNeeded();
+                    var me = await client.LoginUserIfNeeded();
                     Console.WriteLine($"Autenticado como: {(me?.username ?? me?.first_name ?? "(sem nome)")}");
                     return;
                 }
@@ -171,11 +342,26 @@ namespace m3uCrawler.Services
             RunReport? report = null,
             PipelineIngestionService? pipelineIngestor = null,
             string? pipelineSourceKey = null,
-            CancellationToken cancellationToken = default)
+            ILiveRunProgress? liveRunProgress = null,
+            CancellationToken cancellationToken = default,
+            int minHistoryHours = 0)
         {
             var rep = report ?? new RunReport();
             rep.StartedAt = DateTime.UtcNow;
             rep.Status = "running";
+
+            // PHASE 9C.4 — instrumentação da Live Run. Opcional por
+            // design: sem monitor (null) o comportamento é exactamente
+            // o actual. Os reportes são feitos nos mesmos pontos onde o
+            // RunReport autoritativo já é actualizado.
+            if (liveRunProgress is not null)
+            {
+                await liveRunProgress.EnterPhaseAsync(
+                    LiveRunPhase.ReadingTelegram,
+                    $"reading telegram messages (keyword='{keyword}', window {minHistoryHours}-{historyHours}h)",
+                    cancellationToken)
+                    .ConfigureAwait(false);
+            }
 
             // PHASE-OBSERVABILITY (2026-09-15): tracing por run. O trace e'
             // opcional (null -> NullTraceSink) para manter back-compat. Em
@@ -184,7 +370,7 @@ namespace m3uCrawler.Services
             var trace = _trace ?? m3uCrawler.Services.Validation.NullTraceSink.Instance;
             var runCtx = new m3uCrawler.Services.Validation.TraceContext { };
             trace.Information(m3uCrawler.Services.Validation.TraceCategory.RunStart, runCtx,
-                $"keyword='{keyword}' limit={limit} maxConcurrency={maxConcurrency} maxUrlsToTest={maxUrlsToTest} historyHours={historyHours} countryCode={countryCode}");
+                $"keyword='{keyword}' limit={limit} maxConcurrency={maxConcurrency} maxUrlsToTest={maxUrlsToTest} historyHours={historyHours} countryCode={countryCode} minHistoryHours={minHistoryHours}");
             trace.Information(m3uCrawler.Services.Validation.TraceCategory.RunParameters, runCtx,
                 $"source=Telegram countriesDir={countriesDir ?? "<default>"} pipelineIngestor={(pipelineIngestor != null ? "set" : "null")} pipelineSourceKey={pipelineSourceKey ?? "<null>"}");
 
@@ -218,7 +404,7 @@ namespace m3uCrawler.Services
 
             var countriesRoot = countriesDir
                 ?? Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries");
-            var validator = new CountryChannelValidator(countriesRoot);
+            var validator = new CountryChannelValidator(countriesRoot, _countryAffinityMembers);
             var parser = new M3uParserService();
             // 9A-PROD-WIRING: tester criado via factory. Quando existe
             // um stream_validation_policy.json no runtime-data, este
@@ -226,10 +412,42 @@ namespace m3uCrawler.Services
             // defaults.
             var validationState = TryLoadSharedValidationState()
                 ?? StreamValidationTesterFactory.CreateIsolatedState();
-            var tester = StreamValidationTesterFactory.CreateTester(validationState);
+            // W2-FU-1 (2026-09-22) — wire do observer de falhas de
+            // aquisição. sourceId é SEMPRE null neste wave: a identidade
+            // operacional Source<->peer/chat não está ainda ligada (ver
+            // W2-FU-2 follow-up). Só instalamos o observer no caminho
+            // COM ingestion (pipelineIngestor != null) E quando o
+            // caller injectou um catalog resolver. Caminho legacy sem
+            // catalog preserva o comportamento actual (no observer, sem
+            // side-effects).
+            m3uCrawler.Services.Validation.IAcquisitionFailureObserver? acquisitionFailureObserver = null;
+            if (pipelineIngestor != null && _catalogResolver != null)
+            {
+                // W2-FU-2A (2026-09-23): resolve existing Source.Id by sourceKey
+                // before acquisition. Read-only; if Source does not exist,
+                // existingSourceId = null and the observer falls back to the
+                // W2-FU-1 RunReport-only path (no Source created during failure).
+                var sourceKey = pipelineSourceKey ?? $"telegram-{Slugify(keyword)}";
+                var existingSourceId = await _catalogResolver.GetSourceIdByKeyAsync(
+                    sourceKey, cancellationToken);
+
+                acquisitionFailureObserver = new m3uCrawler.Services.Validation.CatalogAcquisitionFailureObserver(
+                    _catalogResolver, sourceId: existingSourceId, report: rep);
+            }
+            var tester = acquisitionFailureObserver is null
+                ? StreamValidationTesterFactory.CreateTester(validationState)
+                : StreamValidationTesterFactory.CreateTester(validationState, acquisitionFailureObserver);
+            // W-DEDUP (2026-10-01): registo de validação física por run. Criado aqui
+            // porque o AccountValidator é criado uma vez por run de descoberta Telegram.
+            // In-memory, não persistido, reset implícito a cada run (nova instância).
+            var validationKeyRegistry = new ValidationKeyRegistry();
             // PHASE 9A.2 (2026-09-16): o validador de accounts reusa o MESMO
             // state/cache/host-tracker que o tester.
-            var accountValidator = new AccountValidator(validationState, tester);
+            // PHASE W-DASHBOARD — liga o progresso do Live Run ao AccountValidator
+            // (constructor, porque o validator é criado uma vez por run de
+            // descoberta e não há mais nenhum call-site de produção).
+            var accountValidator = new AccountValidator(
+                validationState, tester, validationKeyRegistry, liveRunProgress);
             var maxConcurrentAccounts = validationState.Options.MaxConcurrentAccounts;
             // PHASE 9A.3 (2026-09-16): coordenador GLOBAL por run. A mesma
             // instancia e' partilhada por TODOS os candidate workers deste
@@ -286,6 +504,7 @@ namespace m3uCrawler.Services
                                     c, tester, parser, validator, countryCode, rep,
                                     maxUrlsToTest, accountValidator, accountGateCoordinator,
                                     candidateChannel.Writer, working, workingLock,
+                                    liveRunProgress,
                                     cancellationToken);
                             }
                             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -330,14 +549,46 @@ namespace m3uCrawler.Services
             // Producer: arranca a enumearacao Telegram com callback de emissao.
             int messagesAnalyzed = 0;
             Exception? enumEx = null;
+            // W1 — dedup por identidade funcional no mesmo Run: a mesma
+            // conta funcional não origina processamento equivalente
+            // duplicado. Candidatos sem identidade estável passam intactos.
+            // D-M4-02a — identidade operacional do Run (nunca o trace de
+            // diagnóstico). Sem Run operacional => null (sem dedup por Run).
+            var discoveryRunId = ResolveOperationalRunId(liveRunProgress);
+            var seenDiscoveryAccounts =
+                new System.Collections.Concurrent.ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
             try
             {
                 messagesAnalyzed = await SearchM3UInTelegramInternal(
                     keyword, limit, historyHours, rep,
+                    liveRunProgress: liveRunProgress,
+                    minHistoryHours: minHistoryHours,
                     onCandidateProduced: c =>
                     {
                         // PHASE-OBSERVABILITY: ChannelEnqueue event.
                         var enqueueTrace = _trace ?? m3uCrawler.Services.Validation.NullTraceSink.Instance;
+
+                        // W1 — duas ocorrências da mesma conta funcional no
+                        // mesmo Run são a mesma unidade: não enfileirar a
+                        // segunda (nunca dedup quando não há identidade).
+                        var candidateAccountKey = AccountIdentity.ComputeXtreamAccountKey(c.Url);
+                        if (candidateAccountKey != null
+                            && !string.IsNullOrEmpty(discoveryRunId)
+                            && !seenDiscoveryAccounts.TryAdd(candidateAccountKey, 0))
+                        {
+                            rep.RejectionReasons.Add(
+                                $"{Display(c)}: duplicate functional account in same run");
+                            enqueueTrace.Warning(
+                                m3uCrawler.Services.Validation.TraceCategory.CandidateRejected,
+                                new m3uCrawler.Services.Validation.TraceContext
+                                {
+                                    CandidateId = c.Id,
+                                    ChatTitle = c.Source,
+                                },
+                                "reason=duplicate-functional-account");
+                            return;
+                        }
+
                         enqueueTrace.Information(m3uCrawler.Services.Validation.TraceCategory.ChannelEnqueue, new m3uCrawler.Services.Validation.TraceContext
                         {
                             CandidateId = c.Id,
@@ -371,6 +622,10 @@ namespace m3uCrawler.Services
             rep.MessagesAnalyzed = messagesAnalyzed;
             // rep.CandidatesFound e' incrementado dentro de ProcessOneTelegramMessageAsync.
             LastRunReport = rep;
+
+            // PHASE 9C.4 — contadores de Telegram (mensagens/dialogos)
+            // disponiveis apenas agora, apos a enumeracao do producer.
+            liveRunProgress?.ReportCounts(rep);
 
             try
             {
@@ -406,8 +661,32 @@ namespace m3uCrawler.Services
                     ?? $"telegram-{Slugify(keyword)}";
                 try
                 {
+                    // W1 — a ocorrência de descoberta é atribuída ao Run
+                    // efectivo (RunId opaco), quando disponível.
+                    // D-M4-02a — identidade operacional
+                    // (ILiveRunProgress.RunId = RunCoordinator.RunId); sem Run
+                    // operacional => null. Nunca se usa PipelineTrace.RunId
+                    // como identidade de Run.
+                    var discoveryRunIdForIngestion = ResolveOperationalRunId(liveRunProgress);
+
+                    // D-M4-02 — propaga a policy efectiva do snapshot do
+                    // Run para a ingestion. Sem Run operacional (sem
+                    // snapshot a propagar) ⇒ policy = null: B1 (nunca
+                    // fallback para policy viva, nunca fabrico). Sem
+                    // resolver injectado ⇒ policy = null (sem mudança
+                    // face à wave W5.1).
+                    RecognitionPolicy? snapshotPolicy = null;
+                    if (_recognitionPolicyResolver is not null
+                        && !string.IsNullOrEmpty(discoveryRunIdForIngestion))
+                    {
+                        snapshotPolicy = await _recognitionPolicyResolver
+                            .GetSnapshotPolicyAsync(discoveryRunIdForIngestion, null, null, cancellationToken)
+                            .ConfigureAwait(false);
+                    }
+
                     var ingestionResult = await pipelineIngestor.IngestAsync(
-                        working, sourceKey, "Telegram", countryCode, cancellationToken);
+                        working, sourceKey, "Telegram", countryCode, cancellationToken,
+                        discoveryRunIdForIngestion, snapshotPolicy);
                     Console.WriteLine(
                         $"📥 Ingestão no catálogo: {ingestionResult.IngestedCount}/{ingestionResult.ReceivedCount} " +
                         $"streams → source='{sourceKey}', matched={ingestionResult.MatchedCount}, " +
@@ -421,6 +700,24 @@ namespace m3uCrawler.Services
                     Console.WriteLine($"⚠️ Ingestão no catálogo falhou (não fatal): {ex.Message}");
                 }
             }
+            else
+            {
+                // W-REVIEW-04 / D5-C — Modo LEGACY: pipeline Telegram sem
+                // ingestion. Quando nenhum PipelineIngestionService é fornecido,
+                // ChannelSource e ReviewItem NÃO são persistidos para este run.
+                // A playlist funcional continua a ser escrita. A mensagem é
+                // deliberadamente opaca (sem URL, credenciais, peer/message
+                // identifiers, source key ou RunId) para não introduzir
+                // superfície de leak.
+                trace.Warning(
+                    m3uCrawler.Services.Validation.TraceCategory.RunStart,
+                    runCtx,
+                    "telegram pipeline running without ingestion (pipelineIngestor=null); " +
+                    "ChannelSource/ReviewItem not persisted for this run");
+                Console.WriteLine(
+                    "⚠️ Pipeline Telegram em modo LEGACY (sem ingestion): " +
+                    "ChannelSource/ReviewItem não serão persistidos para este run.");
+            }
 
             // PHASE-OBSERVABILITY (2026-09-15): RunEnd event.
             var traceEnd = _trace ?? m3uCrawler.Services.Validation.NullTraceSink.Instance;
@@ -432,6 +729,21 @@ namespace m3uCrawler.Services
             if (_trace is m3uCrawler.Services.Validation.PipelineTrace realTrace)
             {
                 m3uCrawler.Services.Validation.RunReportTraceReconciler.RecordSnapshot(rep, realTrace);
+            }
+
+            // PHASE 9C.4 — snapshot final dos contadores reais.
+            if (liveRunProgress is not null)
+            {
+                liveRunProgress.ReportCounts(rep);
+                liveRunProgress.ReportMessage(
+                    $"pipeline completed: {rep.StreamsWorking} working / {rep.StreamsTested} tested streams");
+                // PHASE W-DASHBOARD — o sumário entra também no feed de
+                // actividades (além do LastMessage), incluindo as validações
+                // físicas evitadas pela dedup por run.
+                liveRunProgress.ReportActivity(
+                    LiveRunActivityCategory.System,
+                    LiveRunActivityLevel.Info,
+                    $"run completed: {rep.StreamsWorking} working / {rep.StreamsTested} tested / {rep.StreamsSkippedAlreadyValidated} reused-dedup");
             }
             return (working, rep);
         }
@@ -463,6 +775,7 @@ namespace m3uCrawler.Services
             System.Threading.Channels.ChannelWriter<CandidatePlaylist> writer,
             List<M3uStream> working,
             object workingLock,
+            ILiveRunProgress? liveRunProgress,
             CancellationToken cancellationToken)
         {
             // PIPELINE-INC-HARDENING (2026-09-14): cada instancia de ProcessCandidateAsync
@@ -490,6 +803,32 @@ namespace m3uCrawler.Services
             //     AccountGateCoordinator dentro de TestStreamsAsync).
             //   - ChannelWriter.TryWrite (NAO pede lock; e' lock-free).
             string? content = candidate.Content;
+            // PHASE 9C.4 — Downloading: só quando há download HTTP real
+            // (candidatos a partir de anexo já trazem conteúdo).
+            if (liveRunProgress is not null && content is null)
+            {
+                await liveRunProgress.EnterPhaseAsync(
+                    LiveRunPhase.Downloading,
+                    "downloading playlist content",
+                    cancellationToken).ConfigureAwait(false);
+                // PHASE W-DASHBOARD — activity de download com proveniência
+                // (candidateId + messageId de origem). A mensagem da fase fica
+                // genérica; a activity identifica o candidate.
+                var downloadMetadata = new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["candidateId"] = candidate.Id,
+                };
+                if (candidate.SourceMessageId.HasValue)
+                {
+                    downloadMetadata["messageId"] = candidate.SourceMessageId.Value
+                        .ToString(CultureInfo.InvariantCulture);
+                }
+                liveRunProgress.ReportActivity(
+                    LiveRunActivityCategory.Playlist,
+                    LiveRunActivityLevel.Info,
+                    $"downloading playlist content ({Display(candidate)})",
+                    downloadMetadata);
+            }
             // EXPERIMENT-SERIAL-PER-XTREAM (2026-09-16): se o candidate foi
             // promovido a partir de uma publicacao Xtream (DetectedFrom
             // == "xtream publication"), serializamos o download por
@@ -512,6 +851,27 @@ namespace m3uCrawler.Services
                 {
                     content = await DownloadPlaylistContentAsync(candidate.Url, tester);
                 }
+            }
+
+            if (liveRunProgress is not null)
+            {
+                liveRunProgress.ReportCounts(rep);
+                var playlistMetadata = new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["candidateId"] = candidate.Id,
+                };
+                if (candidate.SourceMessageId.HasValue)
+                {
+                    playlistMetadata["messageId"] = candidate.SourceMessageId.Value
+                        .ToString(CultureInfo.InvariantCulture);
+                }
+                liveRunProgress.ReportActivity(
+                    LiveRunActivityCategory.Playlist,
+                    content is null ? LiveRunActivityLevel.Warning : LiveRunActivityLevel.Info,
+                    content is null
+                        ? $"playlist download failed ({Display(candidate)})"
+                        : $"playlist content downloaded ({Display(candidate)})",
+                    playlistMetadata);
             }
 
             // URL sem extensao (.m3u/.m3u8): detetada por heuristica. So' tratada
@@ -557,7 +917,11 @@ namespace m3uCrawler.Services
                         xIdx++;
 
                         var playlistUrl = acc.M3uUrl ?? BuildXtreamPlaylistUrl(acc);
-                        var promoted = PromoteXtreamAccount(playlistUrl, candidate.Url ?? string.Empty);
+                        var promoted = PromoteXtreamAccount(
+                            playlistUrl,
+                            candidate.Url ?? string.Empty,
+                            candidate.SourceMessageId,
+                            candidate.SourceMessageDateUtc);
                         if (promoted != null)
                         {
                             resTrace.Information(m3uCrawler.Services.Validation.TraceCategory.CandidatePromoted, new m3uCrawler.Services.Validation.TraceContext
@@ -565,6 +929,20 @@ namespace m3uCrawler.Services
                                 CandidateId = candidate.Id,
                                 ParentCandidateId = promoted.Id,
                             }, $"promotedCandidateId={promoted.Id} m3uUrl={CredentialSanitizer.SanitizeUrl(playlistUrl ?? string.Empty)}");
+
+                            // PHASE W-DASHBOARD — fan-out Xtream visível no feed.
+                            if (liveRunProgress is not null)
+                            {
+                                liveRunProgress.ReportActivity(
+                                    LiveRunActivityCategory.Xtream,
+                                    LiveRunActivityLevel.Info,
+                                    $"xtream account promoted: candidate {promoted.Id} (parent {candidate.Id})",
+                                    new Dictionary<string, string>(StringComparer.Ordinal)
+                                    {
+                                        ["candidateId"] = promoted.Id,
+                                        ["parentCandidateId"] = candidate.Id,
+                                    });
+                            }
 
                             // Re-injecta no canal. ChannelWriter.TryWrite e' non-blocking.
                             if (!writer.TryWrite(promoted))
@@ -591,7 +969,49 @@ namespace m3uCrawler.Services
                 return;
             }
 
+            // Contrato W3 — parsing M3U consistente para TODOS os candidates
+            // (não apenas RequiresContentVerification): a primeira linha não
+            // vazia tem de ser #EXTM3U. Um resultado Failed não é contado como
+            // playlist descarregada/válida nem entrega streams; Partial entrega
+            // as entradas válidas e é contabilizado como Partial.
+            var parseResult = parser.ParseDetailed(content, cancellationToken);
+            if (parseResult.Status == M3uPlaylistStatus.Failed)
+            {
+                Interlocked.Increment(ref rep._PlaylistsInvalid);
+                var diagnostic = parseResult.Diagnostics.FirstOrDefault();
+                var reason = diagnostic is null
+                    ? "playlist M3U inválida"
+                    : $"playlist M3U inválida ({diagnostic.Kind} linha {diagnostic.LineNumber}): {diagnostic.Reason}";
+                AddRejection(rep, $"{Display(candidate)}: {reason}");
+                if (liveRunProgress is not null)
+                {
+                    liveRunProgress.ReportActivity(
+                        LiveRunActivityCategory.Playlist,
+                        LiveRunActivityLevel.Warning,
+                        $"{reason} ({Display(candidate)})",
+                        new Dictionary<string, string>(StringComparer.Ordinal)
+                        {
+                            ["candidateId"] = candidate.Id,
+                        });
+                }
+                return;
+            }
+
             Interlocked.Increment(ref rep._PlaylistsDownloaded);
+            if (parseResult.Status == M3uPlaylistStatus.Partial)
+            {
+                Interlocked.Increment(ref rep._PlaylistsPartial);
+            }
+
+            // PHASE 9C.4 — Analyzing: análise de conteúdo da playlist
+            // (deteccao de país + parsing M3U). VALIDATING cobre o gate
+            // per-stream abaixo.
+            if (liveRunProgress is not null)
+            {
+                await liveRunProgress.EnterPhaseAsync(
+                    LiveRunPhase.Analyzing, "analyzing playlist content", cancellationToken)
+                    .ConfigureAwait(false);
+            }
 
             var analysis = validator.AnalyzePlaylist(content, countryCode, 3);
             var discovered = new DiscoveredPlaylist
@@ -600,7 +1020,10 @@ namespace m3uCrawler.Services
                 Name = Display(candidate),
                 CountryDetected = analysis.IsTargetCountry ? countryCode : string.Empty,
                 ChannelsRecognized = analysis.RecognizedChannelCount,
-                State = analysis.IsTargetCountry ? "accepted" : "rejected"
+                State = analysis.IsTargetCountry ? "accepted" : "rejected",
+                CandidateId = candidate.Id,
+                MessageId = candidate.SourceMessageId,
+                MessageDateUtc = candidate.SourceMessageDateUtc,
             };
 
             if (!analysis.IsTargetCountry)
@@ -616,9 +1039,28 @@ namespace m3uCrawler.Services
             Interlocked.Increment(ref rep._CountryMatches);
             Interlocked.Add(ref rep._ChannelsRecognized, analysis.RecognizedChannelCount);
 
-            var streams = parser.Parse(content);
+            var streams = parseResult.Streams.ToList();
             discovered.StreamCount = streams.Count;
             Interlocked.Add(ref rep._StreamsExtracted, streams.Count);
+
+            // PHASE 9C.4 — Validating: gate per-canal/per-stream e teste
+            // dos streams alvo.
+            if (liveRunProgress is not null)
+            {
+                await liveRunProgress.EnterPhaseAsync(
+                    LiveRunPhase.Validating, "validating streams for country", cancellationToken)
+                    .ConfigureAwait(false);
+                // PHASE W-DASHBOARD — quantos streams entram no gate e para
+                // que país, com proveniência do candidate.
+                liveRunProgress.ReportActivity(
+                    LiveRunActivityCategory.Stream,
+                    LiveRunActivityLevel.Info,
+                    $"validating {streams.Count} streams for country '{countryCode}'",
+                    new Dictionary<string, string>(StringComparer.Ordinal)
+                    {
+                        ["candidateId"] = candidate.Id,
+                    });
+            }
 
             // Gate per-stream (pipeline per-canal/per-stream, desde 2026-08-30).
             // AnalyzePlaylist actua apenas como fast-reject acima; a aprovacao final
@@ -645,9 +1087,10 @@ namespace m3uCrawler.Services
                 accountValidator.ValidateAccountAsync,
                 accountGateCoordinator,
                 candidate.Url, countryStreams, maxUrlsToTest, cancellationToken);
-            Interlocked.Add(ref rep._StreamsTested, tested.Count);
-            Interlocked.Add(ref rep._StreamsWorking, tested.Count(s => s.IsWorking));
-            Interlocked.Add(ref rep._StreamsFailed, tested.Count(s => !s.IsWorking));
+            AccumulateValidationCounters(rep, tested);
+            // WorkingStreams inclui, por design, streams conhecidos-working
+            // reutilizados (LastTested == default): nao se perde nenhum canal
+            // ja' validado neste run.
             discovered.WorkingStreams = tested.Count(s => s.IsWorking);
 
             lock (workingLock)
@@ -657,6 +1100,29 @@ namespace m3uCrawler.Services
             // discovered precisa de ser adicionado ao RunReport sob lock
             // (lista partilhada).
             AddDiscovered(rep, discovered);
+
+            if (liveRunProgress is not null)
+            {
+                liveRunProgress.ReportCounts(rep);
+                liveRunProgress.ReportMessage(
+                    $"tested {rep.StreamsTested}/{rep.StreamsAfterCountryFilter} streams");
+                // PHASE W-DASHBOARD — sumário por playlist com a distinção
+                // física vs reutilizada. Usa a MESMA regra do
+                // AccumulateValidationCounters (LastTested == default =>
+                // reutilizado), extraída para helper testável.
+                var (physical, reused) = CountPhysicalAndReused(tested);
+                var validatedWorking = tested.Count(s => s.IsWorking);
+                liveRunProgress.ReportActivity(
+                    LiveRunActivityCategory.Stream,
+                    LiveRunActivityLevel.Info,
+                    $"validated {validatedWorking}/{tested.Count} streams (physical {physical}, reused {reused})",
+                    new Dictionary<string, string>(StringComparer.Ordinal)
+                    {
+                        ["candidateId"] = candidate.Id,
+                        ["physical"] = physical.ToString(CultureInfo.InvariantCulture),
+                        ["reused"] = reused.ToString(CultureInfo.InvariantCulture),
+                    });
+            }
         }
 
         // PIPELINE-INC-HARDENING: helpers thread-safe para escrita em
@@ -679,7 +1145,9 @@ namespace m3uCrawler.Services
 
         private async Task<int> SearchM3UInTelegramInternal(
             string keyword, int limit = 200, int historyHours = 24, RunReport? report = null,
-            Action<CandidatePlaylist>? onCandidateProduced = null)
+            Action<CandidatePlaylist>? onCandidateProduced = null,
+            ILiveRunProgress? liveRunProgress = null,
+            int minHistoryHours = 0)
         {
             var candidates = new List<CandidatePlaylist>();
             // Publicacoes descobertas em qualquer mensagem: referencias Telegram
@@ -689,11 +1157,15 @@ namespace m3uCrawler.Services
             var discoveredPublications = new List<TelegramPublicationRef>();
             int messagesAnalyzed = 0;
 
+            // Wave W5 — cliente vivo único: no caminho de aplicação é o
+            // cliente autenticado do dashboard/scheduler.
+            var client = RequireClient();
+
             // Idempotente: se já autenticado, não faz nada
-            var me = await _client!.LoginUserIfNeeded();
+            var me = await client.LoginUserIfNeeded();
             Console.WriteLine($"Autenticado como: {(me?.username ?? me?.first_name ?? "(sem nome)")}");
 
-            var dialogsBase = await _client.Messages_GetAllDialogs();
+            var dialogsBase = await client.Messages_GetAllDialogs();
 
             Dialog[] dialogList;
             Dictionary<long, ChatBase> chatsDict;
@@ -723,7 +1195,15 @@ namespace m3uCrawler.Services
             // por dialogo. Agora o cutoff e' calculado UMA unica vez antes de iterar.
             // Se um dialogo demora muito a processar, mensagens no limite da janela
             // continuam elegiveis.
-            var cycleCutoff = DateTime.UtcNow.AddHours(-historyHours);
+            var cycleStartUtc = DateTime.UtcNow;
+            var cycleCutoff = cycleStartUtc.AddHours(-historyHours);
+            // W-HISTWIN (2026-10-02): limite inferior da janela (idade mínima).
+            // Derivado do MESMO instante cycleStartUtc para preservar o
+            // invariante R1 (um único par de cutoffs por ciclo). null = sem
+            // limite inferior (minHistoryHours = 0, comportamento legacy).
+            DateTime? cycleMinCutoff = minHistoryHours > 0
+                ? cycleStartUtc.AddHours(-minHistoryHours)
+                : null;
             if (report != null) report.DialogsTotal = dialogList.Length;
 
             foreach (var dialog in dialogList)
@@ -780,10 +1260,10 @@ namespace m3uCrawler.Services
                         {
                             return resolvedPeer switch
                             {
-                                User user => await _client.Messages_GetHistory(
+                                User user => await client.Messages_GetHistory(
                                     user, offset_id: offsetId, offset_date: default,
                                     add_offset: 0, limit: 100, max_id: 0, min_id: 0),
-                                ChatBase chat => await _client.Messages_GetHistory(
+                                ChatBase chat => await client.Messages_GetHistory(
                                     chat, offset_id: offsetId, offset_date: default,
                                     add_offset: 0, limit: 100, max_id: 0, min_id: 0),
                                 _ => null
@@ -795,8 +1275,9 @@ namespace m3uCrawler.Services
                             messagesAnalyzed++;
                             await ProcessOneTelegramMessageAsync(
                                 msg, chatTitle, report, discoveredPublications, candidates,
-                                onCandidateProduced);
-                        });
+                                onCandidateProduced, liveRunProgress);
+                        },
+                        minCutoffDate: cycleMinCutoff);
                 }
                 catch (WTelegram.WTException ex) when (ex.Message.Contains("FLOOD_WAIT"))
                 {
@@ -840,7 +1321,9 @@ namespace m3uCrawler.Services
                     foreach (var acc in res.XtreamAccounts)
                     {
                         var playlistUrl = acc.M3uUrl ?? BuildXtreamPlaylistUrl(acc);
-                        var promoted = PromoteXtreamAccount(playlistUrl, res.ReferenceUrl);
+                        // W-HISTWIN-PROV: a mensagem de origem é a t.me/c referenciada (res.MessageId);
+                        // a data não está disponível na resolução — fica null.
+                        var promoted = PromoteXtreamAccount(playlistUrl, res.ReferenceUrl, res.MessageId);
                         if (promoted != null)
                         {
                             candidates.Add(promoted);
@@ -860,13 +1343,20 @@ namespace m3uCrawler.Services
         //   - resolvedPeer: ignorado (mantido por simetria da API anterior);
         //     a identificacao real do peer ja' foi feita no caller.
         //   - chatTitle: identificador legivel (usado apenas em logs).
-        //   - cutoffDate: cutoff temporal UNICO por ciclo (R1).
+        //   - cutoffDate: cutoff temporal UNICO por ciclo (R1). Limite
+        //     superior (Max) da janela; limites inclusivos.
         //   - pageFetcher: delegate que devolve a proxima pagina de
         //     mensagens para um dado offsetId. Pode lancar excepcoes
         //     (RpcError, IOException, FLOOD_WAIT, etc.).
         //   - onMessage: callback async invocado por cada mensagem que
         //     passou o filtro temporal. NAO e' invocado para mensagens
-        //     anteriores ao cutoff.
+        //     anteriores ao cutoff nem para mensagens mais recentes que
+        //     minCutoffDate.
+        //   - minCutoffDate: limite inferior (Min) opcional da janela,
+        //     tambem inclusivo. Mensagens mais recentes que este valor
+        //     sao saltadas SEM terminar a paginacao (a ordem e'
+        //     descendente; as mensagens dentro da faixa vem a seguir).
+        //     null = sem limite inferior (comportamento legacy).
         //
         // Comportamento:
         //   - Paginas sao obtidas em batches de 100.
@@ -884,7 +1374,8 @@ namespace m3uCrawler.Services
             string chatTitle,
             DateTime cutoffDate,
             Func<int, Task<Messages_MessagesBase?>> pageFetcher,
-            Func<Message, Task> onMessage)
+            Func<Message, Task> onMessage,
+            DateTime? minCutoffDate = null)
         {
             int offsetId = 0;
             bool reachedCutoff = false;
@@ -920,6 +1411,15 @@ namespace m3uCrawler.Services
                         break;
                     }
 
+                    // W-HISTWIN: limite inferior da janela. Mensagens mais recentes
+                    // que o mínimo são saltadas SEM terminar a paginação (a ordem é
+                    // descendente; as mensagens dentro da faixa vêm a seguir).
+                    // Limites inclusivos: m.date == minCutoffDate é aceite (idade == Min).
+                    if (minCutoffDate.HasValue && m.date > minCutoffDate.Value)
+                    {
+                        continue;
+                    }
+
                     await onMessage(m);
                 }
 
@@ -942,7 +1442,8 @@ namespace m3uCrawler.Services
             RunReport? report,
             List<TelegramPublicationRef> discoveredPublications,
             List<CandidatePlaylist> candidates,
-            Action<CandidatePlaylist>? onCandidateProduced)
+            Action<CandidatePlaylist>? onCandidateProduced,
+            ILiveRunProgress? liveRunProgress = null)
         {
             // Em TL atual a legenda de um media é o próprio texto da mensagem.
             string text = m.message ?? "";
@@ -1092,16 +1593,67 @@ namespace m3uCrawler.Services
                 report: report,
                 messageId: m.ID);
 
+            // PHASE 9C.4 — Discovering: reportado ANTES de enfileirar os
+            // candidatos, garantindo que a ordem monotónica do timeline
+            // (ReadingTelegram -> Discovering -> Downloading) se mantém
+            // mesmo com o producer/consumer concorrente.
+            if (liveRunProgress is not null && found.Count > 0)
+            {
+                await liveRunProgress.EnterPhaseAsync(
+                    LiveRunPhase.Discovering,
+                    $"detected {found.Count} candidate(s)",
+                    CancellationToken.None).ConfigureAwait(false);
+                liveRunProgress.ReportCounts(report!);
+                // PHASE W-DASHBOARD — a activity Discovering carrega a
+                // proveniência da mensagem de origem em metadata (a mensagem da
+                // fase fica curta; o messageId não entra no texto).
+                liveRunProgress.ReportActivity(
+                    LiveRunActivityCategory.Telegram,
+                    LiveRunActivityLevel.Info,
+                    $"detected {found.Count} candidate(s)",
+                    new Dictionary<string, string>(StringComparer.Ordinal)
+                    {
+                        ["messageId"] = m.ID.ToString(CultureInfo.InvariantCulture),
+                        ["messageDateUtc"] = m.date.ToString("o", CultureInfo.InvariantCulture),
+                        ["chat"] = chatTitle,
+                    });
+            }
+
             foreach (var candidate in found)
             {
-                candidate.Source = chatTitle;
+                ApplyTelegramMessageProvenance(candidate, chatTitle, m.ID, m.date);
                 candidates.Add(candidate);
                 // Candidados devem ser contados incrementalmente (consistente com
                 // a semantica anterior: rep.CandidatesFound = candidates.Count
                 // no fim do pipeline; agora definido no momento da producao).
                 if (report != null) report.CandidatesFound++;
                 onCandidateProduced?.Invoke(candidate);
+
+                // PHASE W-DASHBOARD — uma activity por candidate criado, com
+                // a proveniência já aplicada (candidateId/messageId/chat).
+                if (liveRunProgress is not null)
+                {
+                    var (message, metadata) = BuildCandidateCreatedActivity(candidate);
+                    liveRunProgress.ReportActivity(
+                        LiveRunActivityCategory.Telegram,
+                        LiveRunActivityLevel.Info,
+                        message,
+                        metadata);
+                }
             }
+        }
+
+        // ==== W-HISTWIN-PROV (2026-10-02): proveniência mensagem → candidate ====
+        // Isolado em helper interno estático para ser testado sem rede (mesmo
+        // padrão de EnumerateDialogHistoryAsync). Aplica a proveniência da
+        // mensagem Telegram de origem a um candidate: chat title (Source),
+        // id e data/hora UTC da mensagem.
+        internal static void ApplyTelegramMessageProvenance(
+            CandidatePlaylist candidate, string chatTitle, long messageId, DateTime messageDateUtc)
+        {
+            candidate.Source = chatTitle;
+            candidate.SourceMessageId = messageId;
+            candidate.SourceMessageDateUtc = messageDateUtc;
         }
 
         // ==== Registo de dialogo incompleto (R2) ====
@@ -1184,7 +1736,7 @@ namespace m3uCrawler.Services
                 {
                     var inputChannel = new InputChannel(channel.id, channel.access_hash);
                     var ids = new InputMessage[] { new InputMessageID { id = messageId } };
-                    var response = await _client.Channels_GetMessages(inputChannel, ids);
+                    var response = await RequireClient().Channels_GetMessages(inputChannel, ids);
                     if (response is Messages_ChannelMessages mcm && mcm.messages != null && mcm.messages.Length > 0)
                     {
                         var msg = mcm.messages[0] as Message;
@@ -1466,7 +2018,7 @@ namespace m3uCrawler.Services
                 // InputDocumentFileLocation que implementa
                 // InputFileLocationBase. Tambem ha overloads Document-typed
                 // mas nao suportam fileSize.
-                await _client!.DownloadFileAsync(
+                await RequireClient().DownloadFileAsync(
                     fileLocation: document.ToFileLocation(),
                     outputStream: ms,
                     dc_id: 0,
@@ -1656,6 +2208,82 @@ namespace m3uCrawler.Services
     int rejected = streams.Count - accepted.Count;
     return (accepted, rejected);
 }
+
+        /// <summary>
+        /// W-DEDUP (2026-10-01): acumula contadores de validacao fisica a
+        /// partir das streams construidas para um candidate.
+        ///
+        /// <para>
+        /// Invariante: <c>StreamsTested == StreamsWorking + StreamsFailed</c>
+        /// passa a cobrir apenas validacoes FISICAS. Streams reutilizadas
+        /// (<c>LastTested == default</c>, conhecidas-working de outra
+        /// AccountKey neste run) nao sao GET fisico e sao contadas em
+        /// <c>StreamsSkippedAlreadyValidated</c>. Escreve em <paramref name="rep"/>
+        /// de forma atomica (os candidate workers correm em paralelo).
+        /// </para>
+        /// </summary>
+        internal static void AccumulateValidationCounters(RunReport rep, IReadOnlyList<M3uStream> tested)
+        {
+            int physical = 0, working = 0, failed = 0;
+            foreach (var s in tested)
+            {
+                if (s.LastTested == default) continue;   // reutilizado: não é GET físico
+                physical++;
+                if (s.IsWorking) working++; else failed++;
+            }
+            Interlocked.Add(ref rep._StreamsTested, physical);
+            Interlocked.Add(ref rep._StreamsWorking, working);
+            Interlocked.Add(ref rep._StreamsFailed, failed);
+            Interlocked.Add(ref rep._StreamsSkippedAlreadyValidated, tested.Count - physical);
+        }
+
+        /// <summary>
+        /// PHASE W-DASHBOARD — separa validações FÍSICAS de REUTILIZADAS para
+        /// uma lista de streams testados. Regra idêntica à usada por
+        /// <see cref="AccumulateValidationCounters"/>: <c>LastTested == default</c>
+        /// significa que a stream foi reutilizada (conhecida Working neste run)
+        /// e não gerou GET físico. Helper puro, testável sem HTTP.
+        /// </summary>
+        internal static (int Physical, int Reused) CountPhysicalAndReused(
+            IReadOnlyList<M3uStream> tested)
+        {
+            int physical = 0, reused = 0;
+            foreach (var s in tested)
+            {
+                if (s.LastTested == default) reused++;
+                else physical++;
+            }
+            return (physical, reused);
+        }
+
+        /// <summary>
+        /// PHASE W-DASHBOARD — mensagem + metadata de proveniência para a
+        /// activity emitida quando um candidate é criado a partir de uma
+        /// mensagem Telegram enumerada. Puro, testável sem rede. Não inclui
+        /// credenciais: <c>chat</c> é o título do chat (Source) e
+        /// <c>messageId</c> só entra quando existe.
+        /// </summary>
+        internal static (string Message, IReadOnlyDictionary<string, string> Metadata) BuildCandidateCreatedActivity(
+            CandidatePlaylist candidate)
+        {
+            var metadata = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["candidateId"] = candidate.Id,
+            };
+            if (candidate.SourceMessageId.HasValue)
+            {
+                metadata["messageId"] = candidate.SourceMessageId.Value
+                    .ToString(CultureInfo.InvariantCulture);
+            }
+            if (!string.IsNullOrEmpty(candidate.Source))
+            {
+                metadata["chat"] = candidate.Source;
+            }
+
+            var message =
+                $"candidate {candidate.Id} created (kind={candidate.Kind}, from={candidate.DetectedFrom})";
+            return (message, metadata);
+        }
 
         // Filtra streams existentes re-testados para retencao na playlist.
         //
@@ -1852,8 +2480,14 @@ namespace m3uCrawler.Services
         /// entrar no pipeline Xtream/M3U existente. O Source e' o URL publico da
         /// publicacao (sem credenciais) para que DiscoveredPlaylists/RunReport nao
         /// exponham segredos.
+        /// A proveniência da mensagem de origem (id/data) é herdada dos parâmetros opcionais;
+        /// o Source mantém o URL público da publicação (sem credenciais).
         /// </summary>
-        internal static CandidatePlaylist? PromoteXtreamAccount(string? playlistUrl, string publicationUrl)
+        internal static CandidatePlaylist? PromoteXtreamAccount(
+            string? playlistUrl,
+            string publicationUrl,
+            long? sourceMessageId = null,
+            DateTime? sourceMessageDateUtc = null)
         {
             if (string.IsNullOrWhiteSpace(playlistUrl)) return null;
             return new CandidatePlaylist
@@ -1862,7 +2496,9 @@ namespace m3uCrawler.Services
                 Url = playlistUrl,
                 Source = $"xtream publication: {publicationUrl}",
                 DetectedFrom = "xtream publication",
-                RequiresContentVerification = true
+                RequiresContentVerification = true,
+                SourceMessageId = sourceMessageId,
+                SourceMessageDateUtc = sourceMessageDateUtc
             };
         }
 

@@ -38,6 +38,14 @@ docker exec m3ucrawler ls /opt/playlists/playlist.m3u
 docker inspect --format '{{index .Config.Cmd}}' m3ucrawler | tr ',' '\n'
 ```
 
+> **Isolar faixas temporais do histórico (testes de janelas):** usar `--min-history-hours N --history-hours M` (ex.: `384→720`) selecciona apenas mensagens com idade entre N e M horas, sem reprocessar o histórico recente. `--min-history-hours 0` é o comportamento por omissão. Detalhe em `m3uCrawler/README.md` § "Janela de histórico da pesquisa Telegram (Min/Max)".
+
+> **Instalação nova:** `wtelegram.config`/`session.dat` podem ainda não
+> existir. Nesse caso o processo **não reinicia em loop** — o dashboard fica
+> acessível e a autenticação Telegram é feita em `Setup → Telegram`. Após
+> autenticar, as execuções (agendadas ou manuais) funcionam no mesmo
+> processo, sem restart. O ciclo automático permanece bloqueado até lá.
+
 ---
 
 ## 2. Logs
@@ -94,9 +102,10 @@ Iniciando m3uCrawler...
 ... (espera de --loop-hours 24)
 ```
 
-Para forçar um ciclo fora do horário (sem reiniciar o container):
+Para disparar um ciclo fora do horário (sem reiniciar o container) tem de existir `--web-allow-trigger` no `command` do compose:
 
-- A abordagem correcta é reiniciar o container. O `entrypoint` é o início de cada ciclo, não há forma de "disparar" um ciclo individual sem reiniciar.
+- **Dashboard → "Run now"** (`POST /api/run/start`, botão de execução manual): dispara imediatamente um ciclo de descoberta no mesmo processo. Devolve `409` quando já há um run em curso.
+- **Dashboard → Scheduled Jobs** (quando existe job `telegramMaintainRun`/`telegramRun` em `scheduled_jobs`): o runner corre o job no próximo slot cron. Ver `m3uCrawler/README.md` § "Scheduler / Scheduled Jobs".
 - Em caso de necessidade operacional, parar e subir:
   ```bash
   docker compose restart m3ucrawler
@@ -113,9 +122,9 @@ Todos os artefactos ficam em `/opt/m3ucrawler/runtime-data/output/` (no host) �
 |---|---|
 | `output/telegram_run_report.json` | `RunReport` da última execução (camelCase). É o diagnóstico principal. |
 | `output/telegram_maintain_report.json` | Detalhe adicional do ciclo de manutenção. |
-| `output/playlist.m3u` | Playlist consolidada após merge (modo manutenção). Persiste entre ciclos. |
-| `output/playlist_temp.m3u` | Streams funcionais do ciclo actual (modo manutenção). |
-| `output/telegram_playlist_<timestamp>.m3u` | Saída de uma pesquisa `--telegram` ad-hoc. |
+| `output/playlist.m3u` | Playlist canónica final (nome fixo). É o output do `RunPublicationService` em todos os caminhos de publicação Telegram e o input do sync Dispatcharr; também é escrita pelas acções agendadas de output (`discoverM3u`, `validatePlaylist`, `generatePlaylist`). Persiste entre ciclos e nunca é apagada por ausência de novos candidatos. |
+| `output/playlist_temp.m3u` | Intermédio canónico normalizado/deduplicado, escrito pelo `RunPublicationService` **antes** da selecção. É produzido em todos os caminhos de publicação Telegram (ciclo único, manutenção e scheduler); não é renomeado. Pode incluir streams que a selecção rejeita no `playlist.m3u`. |
+| `output/telegram_playlist_<timestamp>.m3u` | Artefacto histórico/técnico de um ciclo Telegram (ciclo único e `telegramRun` agendado), escrito a partir do resultado final. O Dispatcharr **nunca** o consome (consome `playlist.m3u`). No modo manutenção (nome final igual ao canónico) não é escrito. A pesquisa M3U legacy escreve `playlist_<timestamp>.m3u`. |
 | `output/telegram_report_<timestamp>.json` | Relatório JSON de uma pesquisa `--telegram` ad-hoc. |
 | `output/import_history.json` | Histórico persistente. |
 
@@ -134,8 +143,9 @@ Campos principais a verificar:
 - `countryMatches` — quantas playlists passaram a validação por país.
 - `playlistsRejected` — quantas foram rejeitadas.
 - `streamsTested`, `streamsWorking`, `streamsFailed` — health do teste de streams.
+- `streamsSkippedAlreadyValidated` — GETs físicos evitados pela deduplicação W-DEDUP (`sfp1` já `Working` neste run).
 - `rejectionReasons` — lista de motivos de rejeição (sanitizados).
-- `discoveredPlaylists` — resumo por playlist (sanitizado).
+- `discoveredPlaylists` — resumo por playlist (sanitizado); cada entrada inclui a proveniência `candidateId`/`messageId`/`messageDateUtc` da mensagem de origem.
 
 ### Endpoint dashboard
 
@@ -147,6 +157,16 @@ Campos principais a verificar:
 | `GET /api/playlist` | Playlist funcional | **Não** (preserva credenciais por design) |
 | `GET /api/playlist_temp` | Playlist temp funcional | **Não** |
 | `GET /api/playlist/preview` | Pré-visualização | **Sim** (`SanitizeM3uContent`) |
+
+### Configuração e diagnóstico pelo dashboard
+
+**Janela Min/Max, keyword e MaxStreams** configuram-se na vista **Descoberta**, card "Configuração de descoberta" (sem editar `app_settings.json` à mão):
+
+1. Abrir a vista Descoberta; o formulário carrega os valores persistidos via `GET /api/discovery/settings`.
+2. Preencher `Pesquisa` (keyword), `Min (h)`, `Max (h)` e `Máx streams` e premir **Guardar** (`POST /api/discovery/settings`). A linha sob o formulário mostra a janela inclusiva resultante (ex.: "425h ≤ idade da mensagem ≤ 450h").
+3. Limites: Min ≥ 0; Max 1–1440h; Min ≤ Max; MaxStreams ≥ 1. Erros de validação (HTTP 400) aparecem inline e o formulário recarrega os valores efectivamente persistidos. `Min 0` = sem limite inferior (comportamento legacy). Os valores são usados pela CLI, scheduler e runs manuais (`POST /api/run/start` mantém o contrato antigo, tecto próprio 720h).
+
+**Live Run como diagnóstico.** O feed de actividades mostra o contexto por evento — `category` (badge) e `metadata` em `key=value`. Sequência típica a seguir: leitura do Telegram (`keyword` + janela) → mensagem analisada (`messageId`/`chat`) → candidate criado (`candidateId`) → promoção Xtream (`parentCandidateId`) → download (`candidateId` + motivo em caso de falha) → validação por playlist (`physical N / reused M`) → conclusão/dispatcharr. Para W-DEDUP, cada ronda de conta gera `account validation: N physical, M reused, K failed` (conta mascarada) e o contador `StreamsSkippedAlreadyValidated` aparece no Live Run, no card/badge do Overview ("N reutilizados (W-DEDUP)") e na tabela de Execuções.
 
 ---
 
@@ -238,6 +258,8 @@ docker compose logs --tail=500 m3ucrawler | grep -iE 'tester|test.*stream|ms$|ti
 # 4. Se o problema for persistente (>2 ciclos consecutivos), investigar manualmente um stream:
 docker exec -it m3ucrawler sh -c 'cat /opt/playlists/playlist_temp.m3u | head -5'
 # Pegar num URL e testar fora do container com curl.
+# Nota: playlist_temp.m3u é o intermédio normalizado/deduplicado (escrito pelo RunPublicationService
+# antes da selecção). O timestamped telegram_playlist_<timestamp>.m3u é histórico/técnico.
 ```
 
 **Acção correctiva**: aumentar `PlaylistManagerService` não é trivial (é código). Para reduzir falsos negativos temporariamente, considerar reduzir `--max-streams` ou desactivar `--fast` no `docker-compose.yml`.

@@ -1,3 +1,4 @@
+using m3uCrawler.Build;
 using m3uCrawler.Models;
 using m3uCrawler.Services.Catalog;
 using m3uCrawler.Services.Dispatcharr;
@@ -18,10 +19,33 @@ namespace m3uCrawler.Services.Sync
     public interface IDispatcharrSyncService
     {
         Task<DispatcharrSyncResult> RunAsync(string playlistPath, CancellationToken ct = default);
+
+        // PHASE 13 (Wave 13-6 part 2) — overload que transporta o artefacto de
+        // selecção de fontes para o apply. `selection: null` mantém o
+        // comportamento legado.
+        Task<DispatcharrSyncResult> RunAsync(string playlistPath, DispatcharrSourceSelection? selection, CancellationToken ct = default);
     }
 
     public sealed class DispatcharrSyncService : IDispatcharrSyncService
     {
+        /// <summary>
+        /// PHASE W6b-2 — Acumulador em memória das contagens observadas
+        /// durante a fase de apply. Não é persistido directamente: serve
+        /// de evidência para os <c>SyncRunStep</c> e para o resultado
+        /// final (<c>ok</c>/<c>partial</c>/<c>error</c>).
+        /// </summary>
+        internal sealed class DispatcharrApplyRecorder
+        {
+            public int AttemptedChannels { get; set; }
+            public int ChannelsCreated { get; set; }
+            public int StreamsCreated { get; set; }
+            public int StreamAssociations { get; set; }
+            public int StreamsRemoved { get; set; }
+            public int StreamsProtected { get; set; }
+            public int ChannelsFailed { get; set; }
+            public List<string> Errors { get; } = new();
+        }
+
         private readonly DispatcharrConfig _config;
         private readonly IChannelMatcher _matcher;
         private readonly IStreamOrderingPolicy _ordering;
@@ -89,80 +113,266 @@ namespace m3uCrawler.Services.Sync
             }
         }
 
-        public async Task<DispatcharrSyncResult> RunAsync(string playlistPath, CancellationToken ct = default)
+        public Task<DispatcharrSyncResult> RunAsync(string playlistPath, CancellationToken ct = default)
+            => RunAsync(playlistPath, selection: null, ct);
+
+        public async Task<DispatcharrSyncResult> RunAsync(string playlistPath, DispatcharrSourceSelection? selection, CancellationToken ct = default)
         {
             if (!_config.Enabled)
                 return new DispatcharrSyncResult { DryRun = true };
 
+            // PHASE 13 (Wave 13-6 audit F1) — um artefacto não-aplicado NUNCA
+            // pode ser interpretado como "seleccionar zero". Trata-se como
+            // ausência de selecção (comportamento legacy).
+            if (selection is { Applied: false }) selection = null;
+
             Directory.CreateDirectory(_outputDir);
 
             var startedAt = DateTime.UtcNow;
-            Console.WriteLine("🛰️  A iniciar sincronização com Dispatcharr...");
+            var runId = await StartSyncRunAsync(startedAt);
+            var recorder = new DispatcharrApplyRecorder();
 
-            var discovered = await PlaylistReader.ReadAsync(playlistPath, ct: ct);
-            Console.WriteLine($"📥 Streams extraídos da playlist: {discovered.Count}");
-
-            var existing = await FetchStateAsync(ct);
-            if (existing.Version != null)
-                Console.WriteLine($"🧾 Dispatcharr versão detetada: {existing.Version}");
-
-            var options = new MatchingOptions
+            try
             {
-                MatchThreshold = _config.MatchThreshold,
-                Aliases = AliasMapFor(_aliases),
-            };
+                Console.WriteLine("🛰️  A iniciar sincronização com Dispatcharr...");
 
-            var plan = _matcher.BuildPlan(
-                discovered,
-                existing,
-                options,
-                _ordering,
-                playlistPath,
-                _config.BaseUrl,
-                _config.DryRun);
+                var readStartedAt = DateTime.UtcNow;
+                var discovered = await PlaylistReader.ReadAsync(playlistPath, ct: ct);
+                Console.WriteLine($"📥 Streams extraídos da playlist: {discovered.Count}");
 
-            var planPath = Path.Combine(_outputDir, $"dispatcharr_plan_{startedAt:yyyyMMdd_HHmmss}.json");
-            await MatchPlanSerializer.WriteAsync(plan, planPath, ct);
+                var existing = await FetchStateAsync(ct);
+                if (existing.Version != null)
+                    Console.WriteLine($"🧾 Dispatcharr versão detetada: {existing.Version}");
 
-            var failed = new List<FailedReportEntry>();
-            var reportBuilder = new ReportBuilder(plan, existing.Version, playlistPath, startedAt);
-            var preReport = reportBuilder.Build();
+                var options = new MatchingOptions
+                {
+                    MatchThreshold = _config.MatchThreshold,
+                    Aliases = AliasMapFor(_aliases),
+                };
 
-            if (_config.DryRun)
-            {
-                Console.WriteLine("🟡 Dry-run activo: a aplicar seria um no-op. Plano + relatório gerados sem chamadas HTTP de escrita.");
+                var plan = _matcher.BuildPlan(
+                    discovered,
+                    existing,
+                    options,
+                    _ordering,
+                    playlistPath,
+                    _config.BaseUrl,
+                    _config.DryRun);
+
+                await RecordSyncRunStepSafeAsync(
+                    runId, "read-plan", readStartedAt, DateTime.UtcNow,
+                    itemsProcessed: discovered.Count,
+                    itemsSucceeded: plan.Channels.Count,
+                    itemsFailed: 0,
+                    result: "ok");
+
+                var planPath = Path.Combine(_outputDir, $"dispatcharr_plan_{startedAt:yyyyMMdd_HHmmss}.json");
+                await MatchPlanSerializer.WriteAsync(plan, planPath, ct);
+
+                // PHASE 13 (Wave 13-6 part 2) — artefacto da selecção de fontes,
+                // escrito ANTES do branch dry-run/apply para que o dry-run também
+                // o produza. Mesmo `startedAt` do plano. O serializer sanitiza as
+                // URLs (nunca credenciais em disco).
+                if (selection != null)
+                {
+                    var selectionPath = Path.Combine(_outputDir, $"dispatcharr_selection_{startedAt:yyyyMMdd_HHmmss}.json");
+                    await DispatcharrSourceSelectionSerializer.WriteAsync(selection, selectionPath, ct);
+                }
+
+                // PHASE W6b-2 — passo de selecção: distingue explicitamente
+                // "applied" de "skipped" (legacy / artefacto ausente).
+                var selectionStartedAt = DateTime.UtcNow;
+                await RecordSyncRunStepSafeAsync(
+                    runId, "selection", selectionStartedAt, DateTime.UtcNow,
+                    itemsProcessed: selection == null ? 0 : selection.Channels.Count,
+                    itemsSucceeded: selection == null ? 0 : selection.Counts.Selected,
+                    itemsFailed: 0,
+                    result: selection == null ? "skipped" : "applied");
+
+                var failed = new List<FailedReportEntry>();
+                var reportBuilder = new ReportBuilder(plan, existing.Version, playlistPath, startedAt);
+                var preReport = reportBuilder.Build();
+
+                if (_config.DryRun)
+                {
+                    Console.WriteLine("🟡 Dry-run activo: a aplicar seria um no-op. Plano + relatório gerados sem chamadas HTTP de escrita.");
+                    var dryRunStartedAt = DateTime.UtcNow;
+                    await RecordSyncRunStepSafeAsync(
+                        runId, "dry-run", dryRunStartedAt, DateTime.UtcNow,
+                        itemsProcessed: plan.Channels.Count,
+                        itemsSucceeded: 0,
+                        itemsFailed: 0,
+                        result: "dry-run");
+                }
+                else
+                {
+                    var applyStartedAt = DateTime.UtcNow;
+                    await ApplyAsync(plan, existing, selection, failed, ct, recorder);
+                    var applyFinishedAt = DateTime.UtcNow;
+
+                    var succeededChannels = Math.Max(0, recorder.AttemptedChannels - recorder.ChannelsFailed);
+                    await RecordSyncRunStepSafeAsync(
+                        runId, "apply", applyStartedAt, applyFinishedAt,
+                        itemsProcessed: recorder.AttemptedChannels,
+                        itemsSucceeded: succeededChannels,
+                        itemsFailed: recorder.ChannelsFailed,
+                        result: recorder.ChannelsFailed == 0 ? "ok" : "partial");
+
+                    var created = recorder.ChannelsCreated + recorder.StreamsCreated;
+                    await RecordSyncRunStepSafeAsync(
+                        runId, "apply-create", applyStartedAt, applyFinishedAt,
+                        itemsProcessed: created, itemsSucceeded: created, itemsFailed: 0, result: "ok");
+                    await RecordSyncRunStepSafeAsync(
+                        runId, "apply-associate", applyStartedAt, applyFinishedAt,
+                        itemsProcessed: recorder.StreamAssociations,
+                        itemsSucceeded: recorder.StreamAssociations, itemsFailed: 0, result: "ok");
+                    await RecordSyncRunStepSafeAsync(
+                        runId, "apply-remove", applyStartedAt, applyFinishedAt,
+                        itemsProcessed: recorder.StreamsRemoved,
+                        itemsSucceeded: recorder.StreamsRemoved, itemsFailed: 0, result: "ok");
+                    await RecordSyncRunStepSafeAsync(
+                        runId, "apply-protected", applyStartedAt, applyFinishedAt,
+                        itemsProcessed: recorder.StreamsProtected,
+                        itemsSucceeded: recorder.StreamsProtected, itemsFailed: 0, result: "ok");
+                    if (recorder.ChannelsFailed > 0)
+                    {
+                        await RecordSyncRunStepSafeAsync(
+                            runId, "apply-errors", applyStartedAt, applyFinishedAt,
+                            itemsProcessed: recorder.ChannelsFailed,
+                            itemsSucceeded: 0,
+                            itemsFailed: recorder.ChannelsFailed,
+                            result: "error");
+                    }
+                }
+
+                preReport.Counts.Failed = failed.Count;
+                var finishedAt = DateTime.UtcNow;
+                var finalReport = reportBuilder.Finish(finishedAt, preReport, failed);
+                var reportPath = Path.Combine(_outputDir, $"dispatcharr_report_{startedAt:yyyyMMdd_HHmmss}.json");
+                await MatchPlanSerializer.WriteReportAsync(finalReport, reportPath, ct);
+
+                var finalResult = ResolveRunResult(recorder, failed.Count);
+                await FinishSyncRunSafeAsync(runId, finishedAt, finalResult, recorder);
+
+                Console.WriteLine();
+                Console.WriteLine("✅ Sincronização concluída.");
+                Console.WriteLine($"   • Matched:         {finalReport.Counts.Matched}");
+                Console.WriteLine($"   • New channels:    {finalReport.Counts.NewChannels}");
+                Console.WriteLine($"   • New streams:     {finalReport.Counts.NewStreams}");
+                Console.WriteLine($"   • Removed streams: {finalReport.Counts.RemovedStreams}");
+                Console.WriteLine($"   • Skipped:         {finalReport.Counts.Skipped}");
+                Console.WriteLine($"   • Ambiguous:       {finalReport.Counts.Ambiguous}");
+                Console.WriteLine($"   • Unchanged:       {finalReport.Counts.Unchanged}");
+                Console.WriteLine($"   • Failed:          {finalReport.Counts.Failed}");
+                Console.WriteLine($"   • Plano:           {planPath}");
+                Console.WriteLine($"   • Relatório:       {reportPath}");
+
+                return new DispatcharrSyncResult
+                {
+                    Plan = plan,
+                    Report = finalReport,
+                    PlanPath = planPath,
+                    ReportPath = reportPath,
+                    DryRun = _config.DryRun,
+                };
             }
-            else
+            catch (Exception ex)
             {
-                await ApplyAsync(plan, existing, failed, ct);
+                // Um run que falha termina como Failed — nunca como sucesso.
+                // Apenas o tipo da excepção é persistido (nunca a mensagem,
+                // que pode conter segredos).
+                await FinishSyncRunSafeAsync(
+                    runId, DateTime.UtcNow, $"error: {ex.GetType().Name}", recorder);
+                throw;
             }
+        }
 
-            preReport.Counts.Failed = failed.Count;
-            var finalReport = reportBuilder.Finish(DateTime.UtcNow, preReport, failed);
-            var reportPath = Path.Combine(_outputDir, $"dispatcharr_report_{startedAt:yyyyMMdd_HHmmss}.json");
-            await MatchPlanSerializer.WriteReportAsync(finalReport, reportPath, ct);
-
-            Console.WriteLine();
-            Console.WriteLine("✅ Sincronização concluída.");
-            Console.WriteLine($"   • Matched:         {finalReport.Counts.Matched}");
-            Console.WriteLine($"   • New channels:    {finalReport.Counts.NewChannels}");
-            Console.WriteLine($"   • New streams:     {finalReport.Counts.NewStreams}");
-            Console.WriteLine($"   • Removed streams: {finalReport.Counts.RemovedStreams}");
-            Console.WriteLine($"   • Skipped:         {finalReport.Counts.Skipped}");
-            Console.WriteLine($"   • Ambiguous:       {finalReport.Counts.Ambiguous}");
-            Console.WriteLine($"   • Unchanged:       {finalReport.Counts.Unchanged}");
-            Console.WriteLine($"   • Failed:          {finalReport.Counts.Failed}");
-            Console.WriteLine($"   • Plano:           {planPath}");
-            Console.WriteLine($"   • Relatório:       {reportPath}");
-
-            return new DispatcharrSyncResult
+        /// <summary>
+        /// PHASE W6b-2 — Cria a row de <see cref="SyncRunEntity"/> no início
+        /// da execução (<c>running</c>). Best-effort: uma falha de
+        /// observabilidade nunca aborta a sincronização. Devolve
+        /// <c>null</c> sem catálogo ou se a criação falhar.
+        /// </summary>
+        private async Task<long?> StartSyncRunAsync(DateTime startedAtUtc)
+        {
+            if (_catalog == null) return null;
+            try
             {
-                Plan = plan,
-                Report = finalReport,
-                PlanPath = planPath,
-                ReportPath = reportPath,
-                DryRun = _config.DryRun,
-            };
+                return await _catalog.RecordSyncRunAsync(new SyncRunEntity
+                {
+                    StartedAtUtc = startedAtUtc,
+                    FinishedAtUtc = startedAtUtc,
+                    AppVersion = BuildInfo.Current.Commit,
+                    Result = "running",
+                });
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"⚠️ Não foi possível registar a SyncRun: {ex.GetType().Name}");
+                return null;
+            }
+        }
+
+        /// <summary>PHASE W6b-2 — Fecho best-effort de um SyncRun.</summary>
+        private async Task FinishSyncRunSafeAsync(
+            long? runId, DateTime finishedAtUtc, string result, DispatcharrApplyRecorder recorder)
+        {
+            if (_catalog == null || runId is null) return;
+            try
+            {
+                await _catalog.FinishSyncRunAsync(
+                    runId.Value,
+                    finishedAtUtc,
+                    result,
+                    countCreatedCrawlerManaged: recorder.ChannelsCreated + recorder.StreamsCreated,
+                    countProtectedExternalStreams: recorder.StreamsProtected,
+                    countRemovedCrawlerManagedStreams: recorder.StreamsRemoved);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"⚠️ Não foi possível fechar a SyncRun {runId}: {ex.GetType().Name}");
+            }
+        }
+
+        /// <summary>PHASE W6b-2 — Registo best-effort de um passo do run.</summary>
+        private async Task RecordSyncRunStepSafeAsync(
+            long? runId, string step,
+            DateTime startedAtUtc, DateTime finishedAtUtc,
+            int itemsProcessed, int itemsSucceeded, int itemsFailed, string result)
+        {
+            if (_catalog == null || runId is null) return;
+            try
+            {
+                await _catalog.RecordSyncRunStepAsync(
+                    runId.Value, step, startedAtUtc, finishedAtUtc,
+                    itemsProcessed, itemsSucceeded, itemsFailed, result);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"⚠️ Não foi possível registar o passo '{step}' da SyncRun: {ex.GetType().Name}");
+            }
+        }
+
+        /// <summary>
+        /// PHASE W6b-2 — Semântica do resultado do run:
+        /// <list type="bullet">
+        ///   <item><c>dry-run</c> — plano/relatório gerados sem escrita;</item>
+        ///   <item><c>ok</c> — sem falhas de aplicação;</item>
+        ///   <item><c>partial</c> — algumas unidades aplicadas e outras
+        ///         falhadas (<c>12-DISPATCHARR.md</c> §5);</item>
+        ///   <item><c>error</c> — todas as unidades tentadas falharam, ou
+        ///         falhas sem qualquer aplicação com sucesso.</item>
+        /// </list>
+        /// </summary>
+        private string ResolveRunResult(DispatcharrApplyRecorder recorder, int failedEntries)
+        {
+            if (_config.DryRun) return "dry-run";
+            var totalFailures = Math.Max(recorder.ChannelsFailed, failedEntries);
+            if (totalFailures == 0) return "ok";
+            if (recorder.AttemptedChannels > 0 && recorder.ChannelsFailed < recorder.AttemptedChannels)
+                return "partial";
+            if (recorder.AttemptedChannels > 0) return "error";
+            return "partial";
         }
 
         private async Task<DispatcharrState> FetchStateAsync(CancellationToken ct)
@@ -174,8 +384,22 @@ namespace m3uCrawler.Services.Sync
             return new DispatcharrState(channels, streams, groups, version);
         }
 
-        internal async Task ApplyAsync(MatchPlan plan, DispatcharrState existing, List<FailedReportEntry> failed, CancellationToken ct)
+        internal Task ApplyAsync(MatchPlan plan, DispatcharrState existing, List<FailedReportEntry> failed, CancellationToken ct)
+            => ApplyAsync(plan, existing, selection: null, failed, ct);
+
+        // PHASE 13 (Wave 13-6 part 2) — overload selection-aware. Com
+        // `selection == null` o comportamento é idêntico ao legado (a
+        // sobrecarga de 4 argumentos mantém-se para os testes).
+        //
+        // PHASE W6b-2 — `recorder` (opcional, último para preservar as
+        // chamadas posicionais existentes) acumula evidência para os
+        // SyncRunStep; não altera a semântica de apply.
+        internal async Task ApplyAsync(MatchPlan plan, DispatcharrState existing, DispatcharrSourceSelection? selection, List<FailedReportEntry> failed, CancellationToken ct, DispatcharrApplyRecorder? recorder = null)
         {
+            // PHASE 13 (Wave 13-6 audit F1) — defesa redundante: um artefacto
+            // não-aplicado nunca filtra.
+            if (selection is { Applied: false }) selection = null;
+
             var ambiguousGroupNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var g in existing.Groups)
             {
@@ -192,6 +416,21 @@ namespace m3uCrawler.Services.Sync
             {
                 if (ambiguousGroupNames.Contains(g.Name)) continue;
                 groupByName[g.Name] = g.Id;
+            }
+
+            // Ownership de canais existentes: só CrawlerManaged pode ser
+            // renomeado. Sem catalog (legacy) não há ownership, logo
+            // não há rename (nunca se promove External/Unknown).
+            IReadOnlyDictionary<long, ChannelOwnership> channelOwnershipById =
+                new Dictionary<long, ChannelOwnership>();
+            if (_catalog != null)
+            {
+                var existingChannelIds = plan.Channels
+                    .Where(c => c.ExistingChannelId.HasValue)
+                    .Select(c => c.ExistingChannelId!.Value)
+                    .Distinct()
+                    .ToList();
+                channelOwnershipById = await _catalog.GetChannelOwnershipMapAsync(existingChannelIds, ct);
             }
 
             // Cross-channel stream ownership:
@@ -213,19 +452,71 @@ namespace m3uCrawler.Services.Sync
             var globalKeepStreamIds = new HashSet<long>();
             var globalRemoveCandidates = new HashSet<long>();
 
+            // PHASE 13 (Wave 13-6 part 2) — filtragem por selecção de fontes.
+            // O `plan` NUNCA é mutado: para cada canal calcula-se a lista
+            // efectiva (streams seleccionadas + streams protegidas
+            // External/Unknown) e os ids CrawlerManaged a remover.
+            Dictionary<string, HashSet<string>>? selectedByKey = null;
+            IReadOnlyDictionary<long, StreamOwnership>? excludedOwnershipMap = null;
+            if (selection != null)
+            {
+                selectedByKey = BuildSelectedByKey(selection);
+                excludedOwnershipMap = await LoadExcludedStreamOwnershipAsync(plan, selectedByKey, ct);
+            }
+
             foreach (var channel in plan.Channels)
             {
                 if (channel.Outcome == SyncOutcome.Ambiguous || channel.Outcome == SyncOutcome.Skipped)
                     continue;
 
-                var ctx = await BeginChannelApplyAsync(channel, existing, groupByName, ct);
+                var effectiveStreams = channel.Streams;
+                IReadOnlyList<long> droppedCrawlerManagedIds = Array.Empty<long>();
+                if (selection != null)
+                {
+                    effectiveStreams = ComputeEffectiveStreams(
+                        channel, selectedByKey!, excludedOwnershipMap, out var dropped);
+                    droppedCrawlerManagedIds = dropped;
+                }
+
+                var ctx = await BeginChannelApplyAsync(
+                    channel, existing, groupByName, ct, channelOwnershipById,
+                    effectiveStreams: selection == null ? null : effectiveStreams,
+                    selectionFiltered: selection != null,
+                    failed: failed,
+                    recorder: recorder);
+
+                // PHASE W6b-2 — evidência por canal para os SyncRunStep.
+                if (recorder != null)
+                {
+                    recorder.AttemptedChannels++;
+                    if (ctx.PatchFailed)
+                    {
+                        recorder.ChannelsFailed++;
+                        recorder.Errors.Add(
+                            $"{ctx.PatchException?.GetType().Name}: " +
+                            CredentialSanitizer.SanitizeText(ctx.PatchException?.Message ?? string.Empty));
+                    }
+                }
 
                 // Record stream IDs the matcher intended to keep on this channel BEFORE
                 // any DELETE happens. NewStreamIds (Phase 2) are physical creations that
                 // must survive. AllStreamIds (Phase 3 body) is the deduplicated union of
                 // kept-existing + new ids that this channel will reference.
-                foreach (var id in ctx.NewStreamIds.Values) globalKeepStreamIds.Add(id);
-                foreach (var id in ctx.AllStreamIds) globalKeepStreamIds.Add(id);
+                //
+                // PHASE 13 (Wave 13-6 audit 3-F2) — streams criadas em Phase 2 que
+                // ficaram órfãs (canal novo não criado) são compensadas em
+                // BeginChannelApplyAsync: NÃO entram no keep, entram nos remove
+                // candidates para serem limpas pela Phase 4.
+                foreach (var id in ctx.NewStreamIds.Values)
+                {
+                    if (!ctx.OrphanedStreamIds.Contains(id))
+                        globalKeepStreamIds.Add(id);
+                }
+                foreach (var id in ctx.AllStreamIds)
+                {
+                    if (!ctx.OrphanedStreamIds.Contains(id))
+                        globalKeepStreamIds.Add(id);
+                }
 
                 // Record this channel's Removed candidates. We deduplicate globally and
                 // exclude them from the actual DELETE set if:
@@ -234,11 +525,15 @@ namespace m3uCrawler.Services.Sync
                 //       confirm the channel state — preserving the stream is safer).
                 if (!ctx.PatchFailed)
                 {
-                    foreach (var s in channel.Streams)
+                    foreach (var s in effectiveStreams)
                     {
                         if (s.Outcome == SyncOutcome.Removed && s.ExistingStreamId.HasValue)
                             globalRemoveCandidates.Add(s.ExistingStreamId!.Value);
                     }
+                    // Streams CrawlerManaged removidas pela selecção: o PATCH já
+                    // as desassociou; o DELETE global (Phase 4) remove-as.
+                    foreach (var id in droppedCrawlerManagedIds)
+                        globalRemoveCandidates.Add(id);
                 }
                 else
                 {
@@ -249,6 +544,14 @@ namespace m3uCrawler.Services.Sync
                         ExistingChannelId = channel.ExistingChannelId,
                     });
                     Console.WriteLine($"❌ Falha ao aplicar canal '{channel.CanonicalName}': {ctx.PatchException?.Message}");
+
+                    // PHASE 13 (Wave 13-6 audit 3-F2) — o canal novo falhou
+                    // depois de a Phase 2 ter criado streams. Essas streams
+                    // ficaram órfãs; a compensação registou ownership
+                    // CrawlerManaged e marcou-as para remoção. Só removemos
+                    // streams que criámos nós (nunca External/Unknown).
+                    foreach (var id in ctx.OrphanedStreamIds)
+                        globalRemoveCandidates.Add(id);
                 }
             }
 
@@ -292,17 +595,205 @@ namespace m3uCrawler.Services.Sync
                     // conta como failed (não é erro de aplicação,
                     // é defesa intencional).
                     Console.WriteLine($"🛡️ Ownership guard: stream {streamId} ({ownership}) mantida apesar de plano a marcar como Removed.");
+                    if (recorder != null) recorder.StreamsProtected++;
                     continue;
                 }
                 try
                 {
                     await _streams.DeleteAsync(streamId, ct);
+                    if (recorder != null) recorder.StreamsRemoved++;
                 }
                 catch (DispatcharrException dex)
                 {
+                    recorder?.Errors.Add(
+                        $"delete {streamId}: {CredentialSanitizer.SanitizeText(dex.Message)}");
                     Console.WriteLine($"⚠️ Falha a remover stream {streamId}: {dex.Message}");
                 }
             }
+        }
+
+        /// <summary>
+        /// W-V3 (Wave V3) — identidade interna estável de um stream para efeitos
+        /// de matching de selecção. Usa o fingerprint canónico <c>sfp1</c>
+        /// (<see cref="StreamFingerprint.TryComputeFingerprint"/>), que é a
+        /// identidade lógica de stream definida pela arquitectura. Se a URL não
+        /// for fingerprintável (não http/https), recorre à URL RAW original.
+        ///
+        /// <para>
+        /// NUNCA usa <see cref="CredentialSanitizer.SanitizeUrl"/>: a
+        /// representação sanitizada é apenas de apresentação e colide entre
+        /// contas distintas que sirvam o mesmo stream id.
+        /// </para>
+        /// </summary>
+        private static string StreamIdentityKey(string streamUrl)
+        {
+            var fingerprint = StreamFingerprint.TryComputeFingerprint(streamUrl);
+            if (!string.IsNullOrEmpty(fingerprint))
+            {
+                return StreamFingerprint.Version + "|" + fingerprint;
+            }
+
+            // URL não fingerprintável (ex.: esquema não-http). Mantém a URL RAW
+            // como identidade — nunca a forma sanitizada.
+            return "raw|" + streamUrl;
+        }
+
+        /// <summary>
+        /// PHASE 13 (Wave 13-6 part 2) — indexa as identidades estáveis dos
+        /// streams seleccionados por <see cref="ChannelDecision.CanonicalChannelKey"/>
+        /// (Ordinal). A identidade é o fingerprint <c>sfp1</c>
+        /// (<see cref="StreamIdentityKey"/>), NÃO uma URL sanitizada. Entradas
+        /// com key vazia são ignoradas.
+        /// </summary>
+        private static Dictionary<string, HashSet<string>> BuildSelectedByKey(DispatcharrSourceSelection selection)
+        {
+            var result = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+            foreach (var channel in selection.Channels)
+            {
+                if (string.IsNullOrEmpty(channel.CanonicalChannelKey)) continue;
+                var set = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var selected in channel.Selected)
+                    set.Add(StreamIdentityKey(selected.StreamUrl));
+                result[channel.CanonicalChannelKey] = set;
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// PHASE 13 (Wave 13-6 part 2) — carrega, numa única query, o
+        /// ownership de todas as streams existentes que a selecção exclui.
+        /// Sem catálogo devolve <c>null</c> (default legacy CrawlerManaged).
+        /// </summary>
+        private async Task<IReadOnlyDictionary<long, StreamOwnership>?> LoadExcludedStreamOwnershipAsync(
+            MatchPlan plan,
+            IReadOnlyDictionary<string, HashSet<string>> selectedByKey,
+            CancellationToken ct)
+        {
+            if (_catalog == null) return null;
+
+            var ids = new HashSet<long>();
+            foreach (var channel in plan.Channels)
+            {
+                if (channel.Outcome == SyncOutcome.Ambiguous || channel.Outcome == SyncOutcome.Skipped)
+                    continue;
+                var selectedSet = ResolveSelectedSet(selectedByKey, channel.CanonicalChannelKey);
+                if (selectedSet == null)
+                {
+                    // PHASE 13 (Wave 13-6 audit F2) — canal NÃO AVALIADO: sem
+                    // entrada no artefacto. Conservador: não recolhemos os seus
+                    // ids como excluídos (logo, sem unlink/DELETE).
+                    continue;
+                }
+                foreach (var s in channel.Streams)
+                {
+                    if (s.ExistingStreamId.HasValue
+                        && !selectedSet.Contains(StreamIdentityKey(s.StreamUrl)))
+                    {
+                        ids.Add(s.ExistingStreamId.Value);
+                    }
+                }
+            }
+
+            if (ids.Count == 0) return new Dictionary<long, StreamOwnership>();
+            return await _catalog.GetStreamOwnershipMapAsync(ids.ToList(), ct);
+        }
+
+        /// <summary>
+        /// PHASE 13 (Wave 13-6 part 2) — calcula a lista efectiva de streams de
+        /// um canal sob selecção:
+        /// <list type="bullet">
+        ///   <item>seleccionada → mantém;</item>
+        ///   <item>excluída com <c>ExistingStreamId</c> CrawlerManaged (ou sem
+        ///         catálogo) → descarta e marca para remoção;</item>
+        ///   <item>excluída com <c>ExistingStreamId</c> External/Unknown →
+        ///         mantém (protegida, nunca se desassocia stream de outro
+        ///         owner);</item>
+        ///   <item>excluída sem <c>ExistingStreamId</c> → descarta (nunca se
+        ///         faz POST de uma fonte não seleccionada).</item>
+        /// </list>
+        /// </summary>
+        private static List<StreamMatchDecision> ComputeEffectiveStreams(
+            ChannelDecision channel,
+            IReadOnlyDictionary<string, HashSet<string>> selectedByKey,
+            IReadOnlyDictionary<long, StreamOwnership>? excludedOwnershipMap,
+            out List<long> droppedCrawlerManagedIds)
+        {
+            var selectedSet = ResolveSelectedSet(selectedByKey, channel.CanonicalChannelKey);
+
+            // PHASE 13 (Wave 13-6 audit F2) — canal NÃO AVALIADO (key nula/vazia
+            // ou key não presente no artefacto). Conservador: mantém todas as
+            // streams existentes, independentemente do ownership; nunca faz POST
+            // de streams novas; não produz remove candidates. Um artefacto não
+            // implica "seleccionar zero".
+            if (selectedSet == null)
+            {
+                Console.WriteLine(
+                    $"🧩 Selecção: canal '{channel.CanonicalChannelKey}' não avaliado (sem entrada no artefacto); mantém streams existentes sem POST/DELETE.");
+                droppedCrawlerManagedIds = new List<long>();
+                return channel.Streams.Where(s => s.ExistingStreamId.HasValue).ToList();
+            }
+
+            var kept = new List<StreamMatchDecision>(channel.Streams.Count);
+            var dropped = new List<long>();
+
+            foreach (var s in channel.Streams)
+            {
+                if (selectedSet.Contains(StreamIdentityKey(s.StreamUrl)))
+                {
+                    kept.Add(s);
+                    continue;
+                }
+
+                if (!s.ExistingStreamId.HasValue)
+                {
+                    // Seria um POST (Phase 2). Nunca publicar uma fonte não
+                    // seleccionada.
+                    continue;
+                }
+
+                var streamId = s.ExistingStreamId.Value;
+                var ownership = excludedOwnershipMap == null
+                    ? StreamOwnership.CrawlerManaged
+                    : (excludedOwnershipMap.TryGetValue(streamId, out var own)
+                        ? own
+                        : StreamOwnership.Unknown);
+
+                if (ownership == StreamOwnership.CrawlerManaged)
+                {
+                    dropped.Add(streamId);
+                }
+                else
+                {
+                    // Protegida: nunca desassociar uma stream de outro owner.
+                    kept.Add(s);
+                }
+            }
+
+            droppedCrawlerManagedIds = dropped;
+            return kept;
+        }
+
+        /// <summary>
+        /// PHASE 13 (Wave 13-6 audit F2) — resolve a entrada de selecção de um
+        /// canal num tri-state:
+        /// <list type="bullet">
+        ///   <item><c>null</c> — NÃO AVALIADO: key nula/vazia, ou key não
+        ///         presente no artefacto. O apply é conservador;</item>
+        ///   <item>conjunto (possivelmente vazio) — AVALIADO: key presente no
+        ///         artefacto, mesmo com <c>Selected = []</c>. Aplica selecção
+        ///         estrita.</item>
+        /// </list>
+        /// </summary>
+        private static HashSet<string>? ResolveSelectedSet(
+            IReadOnlyDictionary<string, HashSet<string>> selectedByKey,
+            string? canonicalChannelKey)
+        {
+            if (!string.IsNullOrEmpty(canonicalChannelKey)
+                && selectedByKey.TryGetValue(canonicalChannelKey, out var set))
+            {
+                return set;
+            }
+            return null;
         }
 
         internal sealed class ChannelApplyContext
@@ -310,16 +801,32 @@ namespace m3uCrawler.Services.Sync
             public Dictionary<string, long> GroupByName { get; init; } = new();
             public Dictionary<string, long> NewStreamIds { get; } = new(StringComparer.OrdinalIgnoreCase);
             public IReadOnlyList<long> AllStreamIds { get; set; } = Array.Empty<long>();
+            public long? CreatedChannelId { get; set; }
             public bool PatchFailed { get; set; }
             public Exception? PatchException { get; set; }
+
+            /// <summary>
+            /// PHASE 13 (Wave 13-6 audit 3-F2) — streams físicas criadas nesta
+            /// run (Phase 2) que ficaram sem canal associado porque a criação
+            /// do canal novo falhou. São compensadas: ownership CrawlerManaged
+            /// registado e ids marcados para remoção na Phase 4.
+            /// </summary>
+            public List<long> OrphanedStreamIds { get; } = new();
         }
 
         internal async Task<ChannelApplyContext> BeginChannelApplyAsync(
             ChannelDecision channel,
             DispatcharrState existing,
             Dictionary<string, long> groupByName,
-            CancellationToken ct)
+            CancellationToken ct,
+            IReadOnlyDictionary<long, ChannelOwnership>? channelOwnershipById = null,
+            IReadOnlyList<StreamMatchDecision>? effectiveStreams = null,
+            bool selectionFiltered = false,
+            List<FailedReportEntry>? failed = null,
+            DispatcharrApplyRecorder? recorder = null)
         {
+            channelOwnershipById ??= new Dictionary<long, ChannelOwnership>();
+            var streams = effectiveStreams ?? channel.Streams;
             var ctx = new ChannelApplyContext { GroupByName = groupByName };
 
             // Phase 1: resolve group (no HTTP yet).
@@ -345,7 +852,7 @@ namespace m3uCrawler.Services.Sync
                     groupId = resolved;
             }
 
-            var orderedWorking = channel.Streams
+            var orderedWorking = streams
                 .Where(s => s.Outcome != SyncOutcome.Skipped
                          && s.Outcome != SyncOutcome.Removed
                          && s.IsWorking)
@@ -365,12 +872,22 @@ namespace m3uCrawler.Services.Sync
                         IsCustom = true,
                     }, ct);
                     ctx.NewStreamIds[s.StreamUrl] = newId;
+                    if (recorder != null) recorder.StreamsCreated++;
                 }
                 catch (DispatcharrException ex)
                 {
                     ctx.PatchFailed = true;
                     ctx.PatchException = ex;
-                    Console.WriteLine($"❌ Falha ao criar stream '{s.StreamUrl}': {ex.Message}");
+                    // PHASE 13 (Wave 13-6 audit 6-F3) — nunca logar a URL crua
+                    // (pode conter credenciais Xtream).
+                    Console.WriteLine($"❌ Falha ao criar stream '{CredentialSanitizer.SanitizeUrl(s.StreamUrl)}': {ex.Message}");
+                    // PHASE 13 (Wave 13-6 audit 3-F2) — a Phase 2 pode ter
+                    // criado streams antes desta falha. Sem compensação, essas
+                    // streams ficariam sem ownership e excluídas de
+                    // globalKeepStreamIds/globalRemoveCandidates. Compensar
+                    // ANTES do early-return, com o mesmo mecanismo do fim
+                    // normal da Phase 3.
+                    await CompensateOrphanedStreamsAsync(ctx, channel, failed, ct);
                     return ctx;
                 }
             }
@@ -392,29 +909,91 @@ namespace m3uCrawler.Services.Sync
             {
                 if (channel.Outcome == SyncOutcome.NewChannel)
                 {
-                    await _channels.CreateAsync(new NewChannelRequest
+                    // PHASE 13 (Wave 13-6 part 2) — com selecção activa, um canal
+                    // novo sem streams efectivas nunca é criado (idempotência).
+                    if (selectionFiltered && ctx.AllStreamIds.Count == 0)
+                    {
+                        return ctx;
+                    }
+
+                    var createdId = await _channels.CreateAsync(new NewChannelRequest
                     {
                         Name = channel.CanonicalName,
                         ChannelGroupId = groupId,
                         Streams = ctx.AllStreamIds.ToList(),
                     }, ct);
-                }
-                else if (channel.ExistingChannelId.HasValue && ctx.AllStreamIds.Count > 0)
-                {
-                    var currentIds = await _channels.ListStreamIdsAsync(channel.ExistingChannelId.Value, ct);
-                    if (!currentIds.SequenceEqual(ctx.AllStreamIds))
+                    ctx.CreatedChannelId = createdId;
+                    if (recorder != null)
                     {
-                        await _channels.UpdateStreamsAsync(channel.ExistingChannelId.Value, ctx.AllStreamIds.ToList(), ct);
+                        recorder.ChannelsCreated++;
+                        recorder.StreamAssociations += ctx.AllStreamIds.Count;
+                    }
+
+                    // Regista ownership CrawlerManaged para o canal
+                    // criado. Sem isto, o rename em runs futuros não é
+                    // possível (External/Unknown nunca é promovido).
+                    if (_catalog != null)
+                    {
+                        await _catalog.EnsureChannelOwnershipAsync(
+                            createdId,
+                            "created-by-crawler",
+                            channel.CanonicalChannelId,
+                            ct,
+                            ChannelOwnership.CrawlerManaged);
                     }
                 }
-                else if (channel.ExistingChannelId.HasValue && channel.StreamsEmptied)
+                else
                 {
-                    // Scenario B: channel should be left with streams=[] on Dispatcharr.
-                    // PATCH unconditionally — even if currentIds is already empty, the explicit
-                    // PATCH documents the operator intent in the plan and is idempotent.
-                    await _channels.UpdateStreamsAsync(channel.ExistingChannelId.Value, Array.Empty<long>(), ct);
+                    // Rename canónico, independente do update de streams:
+                    // apenas canais CrawlerManaged com nome resolvido pelo
+                    // catálogo. External/Unknown nunca são renomeados
+                    // (respeita read-only e a regra de ownership).
+                    if (channel.ExistingChannelId.HasValue
+                        && !string.IsNullOrWhiteSpace(channel.CanonicalChannelKey)
+                        && channelOwnershipById.TryGetValue(channel.ExistingChannelId.Value, out var ownership)
+                        && ownership == ChannelOwnership.CrawlerManaged
+                        && !string.IsNullOrWhiteSpace(channel.CanonicalName))
+                    {
+                        var currentChannel = existing.Channels
+                            .FirstOrDefault(c => c.Id == channel.ExistingChannelId.Value);
+                        if (currentChannel != null
+                            && !string.Equals(currentChannel.Name, channel.CanonicalName, StringComparison.Ordinal))
+                        {
+                            await _channels.UpdateNameAsync(channel.ExistingChannelId.Value, channel.CanonicalName, ct);
+                        }
+                    }
+
+                    if (channel.ExistingChannelId.HasValue && ctx.AllStreamIds.Count > 0)
+                    {
+                        var currentIds = await _channels.ListStreamIdsAsync(channel.ExistingChannelId.Value, ct);
+                        if (!currentIds.SequenceEqual(ctx.AllStreamIds))
+                        {
+                            await _channels.UpdateStreamsAsync(channel.ExistingChannelId.Value, ctx.AllStreamIds.ToList(), ct);
+                            if (recorder != null) recorder.StreamAssociations += ctx.AllStreamIds.Count;
+                        }
+                    }
+                    else if (channel.ExistingChannelId.HasValue && selectionFiltered)
+                    {
+                        // PHASE 13 (Wave 13-6 part 2) — canal existente sem streams
+                        // efectivas: PATCH streams=[] APENAS se tiver streams
+                        // actualmente (idempotência). Sob selecção a emptiness
+                        // deriva da lista efectiva, não de StreamsEmptied.
+                        var currentIds = await _channels.ListStreamIdsAsync(channel.ExistingChannelId.Value, ct);
+                        if (currentIds.Count > 0)
+                        {
+                            await _channels.UpdateStreamsAsync(channel.ExistingChannelId.Value, Array.Empty<long>(), ct);
+                        }
+                    }
+                    else if (channel.ExistingChannelId.HasValue && channel.StreamsEmptied)
+                    {
+                        // Scenario B (legacy, selection == null): channel should be left
+                        // with streams=[] on Dispatcharr. PATCH unconditionally — even if
+                        // currentIds is already empty, the explicit PATCH documents the
+                        // operator intent in the plan and is idempotent.
+                        await _channels.UpdateStreamsAsync(channel.ExistingChannelId.Value, Array.Empty<long>(), ct);
+                    }
+                    // else (scenario C): no PATCH, channel left untouched.
                 }
-                // else (scenario C): no PATCH, channel left untouched.
             }
             catch (Exception ex)
             {
@@ -422,7 +1001,119 @@ namespace m3uCrawler.Services.Sync
                 ctx.PatchException = ex;
             }
 
+            // PHASE 13 (Wave 13-6 part 2) — registar ownership CrawlerManaged
+            // das streams criadas em Phase 2, agora que o canal alvo é conhecido
+            // (canal criado ou canal existente). Reutiliza o método existente
+            // EnsureStreamOwnershipAsync; só actua com catálogo.
+            //
+            // PHASE 13 (Wave 13-6 audit 3-F1) — cada escrita de ownership tem o
+            // seu próprio try/catch: uma falha de escrita NUNCA aborta a run
+            // (report é escrito na mesma); é registada em FailedChannels.
+            //
+            // PHASE 13 (Wave 13-6 audit 3-F2) — quando o canal novo não chegou
+            // a ser criado (ou a Phase 2 falhou a meio), as streams já criadas
+            // ficam órfãs. Compensação mínima: registar ownership CrawlerManaged
+            // (provamos que fomos nós que as criámos) e marcá-las para remoção
+            // na Phase 4. Nunca promovemos External/Unknown.
+            if (ctx.NewStreamIds.Count > 0)
+            {
+                var targetChannelId = channel.Outcome == SyncOutcome.NewChannel
+                    ? ctx.CreatedChannelId
+                    : channel.ExistingChannelId;
+                if (targetChannelId.HasValue)
+                {
+                    if (_catalog != null)
+                    {
+                        foreach (var newId in ctx.NewStreamIds.Values)
+                        {
+                            try
+                            {
+                                await _catalog.EnsureStreamOwnershipAsync(
+                                    newId,
+                                    targetChannelId.Value,
+                                    StreamOwnership.CrawlerManaged,
+                                    null,
+                                    ct);
+                            }
+                            catch (Exception ex)
+                            {
+                                RecordOwnershipFailure(failed, channel, newId, ex);
+                            }
+                        }
+                    }
+                }
+                else if (ctx.PatchFailed && channel.Outcome == SyncOutcome.NewChannel)
+                {
+                    await CompensateOrphanedStreamsAsync(ctx, channel, failed, ct);
+                }
+            }
+
             return ctx;
+        }
+
+        /// <summary>
+        /// PHASE 13 (Wave 13-6 audit 3-F2) — compensa streams criadas em
+        /// Phase 2 que ficaram sem canal associado (canal novo nunca criado,
+        /// ou Phase 2 interrompida a meio por falha de criação). Regista
+        /// ownership CrawlerManaged com canal desconhecido (0) e marca cada
+        /// id em <see cref="ChannelApplyContext.OrphanedStreamIds"/> para que
+        /// <see cref="ApplyAsync"/> as exclua de globalKeepStreamIds e as
+        /// adicione aos remove candidates da Phase 4.
+        ///
+        /// Reutilizado pelo fim normal de <see cref="BeginChannelApplyAsync"/>
+        /// e por qualquer early-return que ocorra depois de já existir pelo
+        /// menos uma stream criada. Uma falha de escrita de ownership é
+        /// reportada (3-F1) e nunca aborta a run.
+        /// </summary>
+        private async Task CompensateOrphanedStreamsAsync(
+            ChannelApplyContext ctx,
+            ChannelDecision channel,
+            List<FailedReportEntry>? failed,
+            CancellationToken ct)
+        {
+            foreach (var newId in ctx.NewStreamIds.Values)
+            {
+                if (!ctx.OrphanedStreamIds.Contains(newId))
+                    ctx.OrphanedStreamIds.Add(newId);
+                if (_catalog == null) continue;
+                try
+                {
+                    // 0 = canal de Dispatcharr ainda não existe /
+                    // desconhecido. A row de ownership serve para
+                    // provar CrawlerManaged e permitir o DELETE de
+                    // compensação na Phase 4.
+                    await _catalog.EnsureStreamOwnershipAsync(
+                        newId,
+                        0,
+                        StreamOwnership.CrawlerManaged,
+                        null,
+                        ct);
+                }
+                catch (Exception ex)
+                {
+                    RecordOwnershipFailure(failed, channel, newId, ex);
+                }
+            }
+        }
+
+        /// <summary>
+        /// PHASE 13 (Wave 13-6 audit 3-F1) — regista uma falha de escrita de
+        /// ownership no relatório e no log, sem interromper a run.
+        /// </summary>
+        private static void RecordOwnershipFailure(
+            List<FailedReportEntry>? failed,
+            ChannelDecision channel,
+            long streamId,
+            Exception ex)
+        {
+            failed?.Add(new FailedReportEntry
+            {
+                Identity = channel.Identity,
+                Reason = $"ownership: {ex.GetType().Name}: {ex.Message} (stream {streamId})",
+                ExistingChannelId = channel.ExistingChannelId,
+            });
+            Console.WriteLine(
+                $"❌ Falha ao registar ownership da stream {streamId} (canal '{channel.CanonicalName}'): {ex.Message}");
         }
 
         internal async Task CompleteChannelApplyAsync(

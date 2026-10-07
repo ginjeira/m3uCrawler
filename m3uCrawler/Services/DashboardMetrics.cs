@@ -84,6 +84,7 @@ namespace m3uCrawler.Services
                 streamsTested = r.StreamsTested,
                 streamsWorking = r.StreamsWorking,
                 streamsFailed = r.StreamsFailed,
+                streamsSkippedAlreadyValidated = r.StreamsSkippedAlreadyValidated,
                 successRatePercent = rate,
                 testsBalanced = r.StreamsWorking + r.StreamsFailed == r.StreamsTested,
             };
@@ -119,6 +120,12 @@ namespace m3uCrawler.Services
                     // Occurrences is preserved separately so the UI can surface the dup.
                     var list = g.Select(x => x.Item).ToList();
                     var first = list[0];
+                    // PHASE W-DASHBOARD — proveniência da mensagem de origem.
+                    // O grupo é (source,name); o representante é o primeiro
+                    // item da lista na ordem em que chegou (input order), e
+                    // cada campo escolhe o primeiro valor não-nulo desse
+                    // representante/lista. Determinista: mesmo input => mesmo
+                    // resultado (a ordenação final do output não afecta isto).
                     return new DiscoveredPlaylistSummary
                     {
                         Source = (first.Source ?? string.Empty).Trim(),
@@ -130,6 +137,9 @@ namespace m3uCrawler.Services
                         WorkingStreams = list.Max(p => p.WorkingStreams),
                         State = list.Any(p => string.Equals(p.State, "accepted", StringComparison.OrdinalIgnoreCase)) ? "accepted" : "rejected",
                         Occurrences = list.Count,
+                        CandidateId = list.Select(p => p.CandidateId).FirstOrDefault(v => v is not null),
+                        MessageId = list.Select(p => p.MessageId).FirstOrDefault(v => v.HasValue),
+                        MessageDateUtc = list.Select(p => p.MessageDateUtc).FirstOrDefault(v => v.HasValue),
                     };
                 })
                 .OrderByDescending(s => s.WorkingStreams)
@@ -282,6 +292,13 @@ namespace m3uCrawler.Services
         public int WorkingStreams { get; set; }
         public string State { get; set; } = string.Empty;
         public int Occurrences { get; set; }
+
+        // PHASE W-DASHBOARD — proveniência da mensagem Telegram de origem do
+        // representante do grupo (source,name). Propaga os campos homónimos
+        // de DiscoveredPlaylist; null quando nenhuma entrada do grupo os tem.
+        public string? CandidateId { get; set; }
+        public long? MessageId { get; set; }
+        public DateTime? MessageDateUtc { get; set; }
     }
 }
 

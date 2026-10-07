@@ -26,5 +26,12 @@ namespace m3uCrawler.Models
         public int StreamsTested { get; set; }
         public int StreamsWorking { get; set; }
         public int StreamsFailed { get; set; }
+
+        /// <summary>
+        /// W-DEDUP / PHASE W-DASHBOARD — validações físicas evitadas por
+        /// reutilização de conhecimento Working dentro do mesmo run.
+        /// Aditivo (default 0); não altera a tabela/entidades SQLite.
+        /// </summary>
+        public int StreamsSkippedAlreadyValidated { get; set; }
     }
 }

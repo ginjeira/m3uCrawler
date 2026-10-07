@@ -737,8 +737,12 @@ namespace m3uCrawler.Services
         private static bool LooksLikeValidHost(string host)
         {
             if (string.IsNullOrWhiteSpace(host)) return false;
-            // IPv4: 4 grupos de 1-3 digitos separados por '.'.
-            if (System.Net.IPAddress.TryParse(host, out _)) return true;
+            // W2 — IP literal passa pela MESMA política SSRF (sem política
+            // paralela): loopback/private/link-local/metadata são recusados.
+            if (System.Net.IPAddress.TryParse(host, out _))
+            {
+                return Validation.SsrfGuard.IsAllowedLiteralHost(host);
+            }
             // Hostname: alfanumerico + '-', deve conter pelo menos um '.'.
             if (!host.Contains('.')) return false;
             // Cada label entre pontos deve ter pelo menos 1 char alfanumerico.

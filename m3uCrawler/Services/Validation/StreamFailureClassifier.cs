@@ -16,6 +16,11 @@ public enum StreamFailureKind
     HttpStatus4xx = 9,
     HttpStatus5xx = 10,
     HttpStatus429 = 11,
+
+    /// <summary>
+    /// W2 — bloqueio da política SSRF (fail-closed). Nunca retryable.
+    /// </summary>
+    Security = 12,
     Unknown = 99,
 }
 
@@ -32,6 +37,15 @@ public sealed record StreamTestOutcome(
     int Attempts,
     bool WasShortCircuited)
 {
+    /// <summary>W-DEDUP (2026-10-01): true quando o resultado foi reutilizado a
+    /// partir de conhecimento Working já existente neste run (mesmo sfp1, outra
+    /// AccountKey). NÃO representa um GET físico desta conta.</summary>
+    public bool ReusedKnownWorking { get; init; }
+
+    // Nota: records incluem propriedades init-only na igualdade/ToString
+    // geradas; a posição do parâmetro posicional mantém-se para não quebrar
+    // os pontos de construção existentes.
+
     public static StreamTestOutcome Empty(string url) =>
         new(url, false, null, StreamFailureKind.Unknown, 0, false, 0, false);
 }
@@ -47,6 +61,16 @@ public static class StreamFailureClassifier
         if (ex is OperationCanceledException || ex is TaskCanceledException || ex is TimeoutException)
         {
             return StreamFailureKind.Timeout;
+        }
+
+        // W2 — um bloqueio SSRF pode chegar embrulhado em HttpRequestException.
+        // É terminal (não retryable) e nunca deve ser classificado como Network.
+        for (var e = ex; e != null; e = e.InnerException)
+        {
+            if (e is SsrfBlockedException)
+            {
+                return StreamFailureKind.Security;
+            }
         }
 
         if (ex is System.Net.Sockets.SocketException se)
@@ -105,6 +129,7 @@ public static class StreamFailureClassifier
         return kind is StreamFailureKind.Timeout
             or StreamFailureKind.Network
             or StreamFailureKind.ConnectionRefused
+            or StreamFailureKind.DnsFailure
             or StreamFailureKind.HttpStatus429
             or StreamFailureKind.HttpStatus5xx;
     }

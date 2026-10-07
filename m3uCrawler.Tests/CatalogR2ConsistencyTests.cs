@@ -137,8 +137,10 @@ public class CatalogR2ConsistencyTests : IAsyncLifetime
     {
         var resolver = await NewResolverAsync();
 
-        // "RTP1" não tem espaço; após normalização fica "rtp1".
-        var resolved = await resolver.ResolveAsync("rtp1");
+        // A forma matchable de "RTP1" é "rtp 1" (o matcher normaliza
+        // o título antes de consultar o catálogo).
+        var resolved = await resolver.ResolveAsync(
+            m3uCrawler.Services.Matching.ChannelNormalizer.Normalize("RTP1"));
         Assert.NotNull(resolved);
         Assert.NotNull(resolved.CanonicalChannelId);
         var ch = (await resolver.ListCanonicalChannelsAsync())
@@ -163,9 +165,11 @@ public class CatalogR2ConsistencyTests : IAsyncLifetime
     public async Task CNN_Portugal_alias_resolves_to_the_unique_CNN_channel()
     {
         var resolver = await NewResolverAsync();
-        // CNN/Portugal (com espaço) bate no alias.
-        var resolved = await resolver.ResolveAsync("cnn portugal");
+        // "CNN Portugal" normaliza para "cnn" (token de país removido).
+        var resolved = await resolver.ResolveAsync(
+            m3uCrawler.Services.Matching.ChannelNormalizer.Normalize("CNN Portugal"));
         Assert.NotNull(resolved);
+        Assert.NotNull(resolved.CanonicalChannelId);
         var ch = (await resolver.ListCanonicalChannelsAsync())
             .First(c => c.Id == resolved.CanonicalChannelId!.Value);
 
@@ -216,12 +220,14 @@ public class CatalogR2ConsistencyTests : IAsyncLifetime
             foreach (var alias in ch.Aliases)
             {
                 if (string.IsNullOrWhiteSpace(alias)) continue;
-                var normalized = alias.Trim().ToLowerInvariant();
+                // A forma que o matcher consulta é a normalizada.
+                var normalized = m3uCrawler.Services.Matching.ChannelNormalizer.Normalize(alias);
+                if (normalized.Length == 0) continue;
                 aliasCount++;
 
                 // Para cada alias do JSON, deve existir pelo menos um
                 // canal canónico que o resolva. Não basta estar
-                // "no JSON" — tem de chegar à BD.
+                // "no JSON" — tem de chegar à BD na forma matchable.
                 var resolved = await resolver.ResolveAsync(normalized);
                 if (resolved != null && resolved.CanonicalChannelId.HasValue)
                 {
@@ -236,11 +242,11 @@ public class CatalogR2ConsistencyTests : IAsyncLifetime
     }
 
     // ════════════════════════════════════════════════════════════════
-    // F. Unknown verdadeiro continua a gerar CreateEligible
+    // F. Unknown verdadeiro NÃO cria identidade canónica (Wave B)
     // ════════════════════════════════════════════════════════════════
 
     [Fact]
-    public async Task Unknown_PT_stream_still_results_in_CreateEligible()
+    public async Task Unknown_PT_stream_is_not_created_and_is_reviewed()
     {
         var repoRoot = Path.GetFullPath(Path.Combine(
             Directory.GetCurrentDirectory(),
@@ -253,9 +259,10 @@ public class CatalogR2ConsistencyTests : IAsyncLifetime
 
         // Slug único para evitar colisões entre runs.
         var slug = $"desconhecido-{Guid.NewGuid():N}".Substring(0, 24);
+        var title = $"PT CANAL {slug.ToUpperInvariant()}";
         var stream = new m3uCrawler.Models.M3uStream
         {
-            Title = $"PT CANAL {slug.ToUpperInvariant()}",
+            Title = title,
             Url = $"http://x.example/{slug}.ts",
             Group = "Portugal",
         };
@@ -263,8 +270,18 @@ public class CatalogR2ConsistencyTests : IAsyncLifetime
         var result = await ingestor.IngestAsync(
             new[] { stream }, $"r2-{Guid.NewGuid():N}", "Telegram", "pt");
 
-        Assert.Equal(1, result.IngestedCount);
-        Assert.Equal(1, result.AutoCreatedCount);
+        Assert.Equal(0, result.IngestedCount);
+        Assert.Equal(0, result.AutoCreatedCount);
+
+        var channels = await resolver.ListCanonicalChannelsAsync();
+        Assert.DoesNotContain(channels, c => c.Key.Contains(slug) || c.DisplayName == title);
+
+        var normalized = m3uCrawler.Services.Matching.ChannelNormalizer.Normalize(title);
+        var reviews = (await resolver.ListAllReviewItemsAsync())
+            .Where(r => r.NormalizedIdentity == normalized)
+            .ToList();
+        Assert.Single(reviews);
+        Assert.Equal(ReviewItemState.Open, reviews[0].State);
     }
 
     // ════════════════════════════════════════════════════════════════

@@ -1,6 +1,7 @@
 using HtmlAgilityPack;
 using System.Text.RegularExpressions;
 using m3uCrawler.Models;
+using m3uCrawler.Services.Validation;
 
 namespace m3uCrawler.Services
 {
@@ -13,10 +14,15 @@ namespace m3uCrawler.Services
 
         public M3uCrawlerService()
         {
-            _httpClient = new HttpClient();
-            _httpClient.Timeout = TimeSpan.FromSeconds(30);
-            _httpClient.DefaultRequestHeaders.Add("User-Agent", 
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36");
+            // W2 (2026-09-19): este serviço faz aquisição externa de domínios
+            // arbitrários (scan/pesquisa), portanto usa o handler endurecido
+            // (SSRF + anti-rebinding + redirects manuais desactivados no
+            // handler). Não é o client partilhado do M3uTesterService (este
+            // serviço tem timeout próprio e não é cacheado).
+            var (client, _) = HttpClientFactory.CreateConfiguredClient(
+                StreamValidationOptions.DefaultConnectionTimeoutSeconds,
+                overallTimeoutSeconds: 30);
+            _httpClient = client;
             _httpClient.DefaultRequestHeaders.Add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8");
             _httpClient.DefaultRequestHeaders.Add("Accept-Language", "pt-BR,pt;q=0.9,en;q=0.8");
             

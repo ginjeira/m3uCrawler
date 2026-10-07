@@ -30,6 +30,31 @@ permanece apenas como **compatibilidade de categoria editorial**
   alias, categoria editorial, política de publicação, ownership,
   fingerprint de revisão e contadores de SyncRun.
 
+### Invariante de identidade (Wave B)
+
+`CanonicalChannel (Key)` + `ChannelAlias` é a **única** fonte de
+identidade de canal. Consequências normativas:
+
+- A ingestão (`PipelineIngestionService`) **não cria** canais
+  canónicos a partir de títulos desconhecidos. Se
+  `CatalogResolver.ResolveAsync` (IdentityRule → Affinity(Channel) →
+  ChannelAlias) não devolver um canal canónico real, o stream não é
+  ligado ao catálogo: não há `CanonicalChannel` inventado nem
+  `ChannelSource` sob identidade fabricada. O desconhecido fica
+  visível como `MatchingAudit` (sem canal) e como `ReviewItem`
+  idempotente.
+- Todos os aliases persistidos estão na **forma matchable** produzida
+  por `ChannelNormalizer.Normalize` (o que o matcher consulta). Os
+  caminhos de escrita normalizam: `AddAliasAsync`,
+  `RemoveAliasAsync`, `CreateCanonicalChannelAsync`,
+  `EnsureCanonicalChannelAsync`, o seed e os membros de afinidade
+  `Kind = Channel` (membros `Kind = Country` são apenas trim'd).
+- O arranque normaliza in-place aliases legacy de instalações
+  pré-existentes, de forma idempotente e collision-safe: um alias que
+  colida com a forma normalizada de outro canal é deixado intacto
+  (skip determinístico), nunca roubando identidade nem lançando.
+- As `Key` dos canais canónicos não mudam.
+
 ## 2. Modelo de dados
 
 ### `CanonicalChannel`
@@ -38,18 +63,49 @@ permanece apenas como **compatibilidade de categoria editorial**
 Id              long  PK
 Key             text  UK (ex.: "benfica-tv")
 DisplayName     text
+Country         text  NULL (ex.: "pt"; NULL = global/agnóstico)
 EditorialCategory    int (Live/Entretenimento/Desporto/Infantil/Documentarios)
-EditorialGroup  int (PortugalLive/PortugalFilmes24_7/...)
+GroupId         long  FK → CanonicalGroup (grupo de publicação do canal)
 PublicationPolicy    int (CreateEligible/MergeOnly/ReviewOnly/Excluded)
 IsEnabled       bool
 CreatedAtUtc    datetime
 UpdatedAtUtc    datetime
 ```
 
-`Key` é o identificador estável; `DisplayName` é o nome editorial;
-`EditorialCategory` é a categoria; `EditorialGroup` é o grupo final
-de publicação; `PublicationPolicy` é a autorização; `IsEnabled`
+`Key` é o identificador estável; `DisplayName` é o nome editorial
+(mutável, sem impacto na `Key` nem nas afinidades); `Country` é o
+país do catálogo canónico (opcional, não faz parte da identidade);
+`EditorialCategory` é a categoria; `GroupId` é o **grupo de publicação
+do canal** (FK → `CanonicalGroup`; a identidade do grupo é a `Key`,
+nunca o `DisplayName`); `PublicationPolicy` é a autorização; `IsEnabled`
 desactiva temporariamente sem apagar.
+
+O grupo de publicação é uma propriedade do **canal canónico**, não da
+source. A playlist M3U (`group-title`) e o agrupamento no Dispatcharr
+usam o `DisplayName` do grupo do canal, **independentemente do
+`group-title` da source**; este último é apenas sugestão
+(`GET /api/catalog/group-suggestion`, pré-selecção). O enum legado
+`CanonicalEditorialGroup`, a coluna `canonical_channels.EditorialGroup`
+e a tabela `group_mappings` foram removidos (Waves D1/D2, 2026-10-07).
+
+### `CanonicalGroup`
+
+```
+Id              long  PK
+Key             text  UK (ex.: "pt-desporto")  ← identidade estável
+DisplayName     text   (apresentação: group-title / Dispatcharr)
+Country         text  NULL
+Order           int
+IsEnabled       bool
+IsDefault       bool
+CreatedAtUtc    datetime
+UpdatedAtUtc    datetime
+```
+
+A identidade do grupo é a `Key`; o `DisplayName` é mutável. Um
+`CanonicalGroup` é referenciado por `CanonicalChannel.GroupId` e
+**não pode ser eliminado** enquanto estiver em uso por canais
+(`DELETE /api/catalog/canonical-groups/{id}` devolve **400**).
 
 ### `ChannelAlias`
 
@@ -161,9 +217,10 @@ de alias entre canais (um alias não pode aparecer em dois canais).
 
 ### Channels curados
 
-`benfica-tv` (Desporto, CreateEligible) com aliases: `btv`,
-`btv hevc pt`, `benficatv`, `benfica tv`, `pt benfica tv`,
-`pt  benfica tv`.
+`benfica-tv` (Desporto, CreateEligible). O alias persistido é a
+forma normalizada: `btv`, `benficatv`, `benfica tv` (as variantes
+`btv hevc pt`, `pt benfica tv`, `pt  benfica tv` colapsam para
+`btv`/`benfica tv` e são deduplicadas).
 
 `sport-tv-1` a `sport-tv-7`, `sport-tv-news` (todos CreateEligible,
 Desporto). Canais PT curados (RTP 1/2/3, RTP Notícias, SIC,
@@ -251,6 +308,14 @@ todas as streams são tratadas como `CrawlerManaged` (fallback).
 Isto preserva o comportamento histórico para testes e para
 cenários onde o catalog ainda não foi activado.
 
+> **Wave 10-0 (2026-09-17)** — este fallback deixou de ser alcançável
+> nos **entry points de produção**. O caminho agendado
+> (`ScheduledDispatcharrSyncAction`) passou a construir o mesmo pipeline
+> canónico do caminho principal (`Program.cs`), injectando o
+> `CatalogResolver` no `ChannelMatcher` e no `DispatcharrSyncService`.
+> O modo legacy fica restrito à construção explícita sem catalog
+> (testes/caracterização). Ver §13.
+
 ### Regras invariantes
 
 - Streams com `Ownership = External` ou `Unknown` (ou sem
@@ -274,13 +339,14 @@ StreamOwnership = External, Unknown, ou sem registo (com catalog)
 
 ## 7. Política para BTV e Benfica TV
 
-A entrada `BTV HEVC PT` (alias do canal `benfica-tv`) é resolvida
-para `benfica-tv` na BD:
+A entrada `BTV HEVC PT` (título que normaliza para `btv`, alias do
+canal `benfica-tv`) é resolvida para `benfica-tv` na BD:
 
 1. `ContentClassifier.Classify("BTV HEVC PT", ...)` devolve
    `Kind = Channel` (legado: alias match em `ChannelCategoryLookup`).
-2. `CatalogResolver.ResolveAsync("btv hevc pt")` devolve
-   `Canonical benfica-tv, Policy = CreateEligible, Kind = Canonical`.
+2. `CatalogResolver.ResolveAsync("btv")` (forma normalizada)
+   devolve `Canonical benfica-tv, Policy = CreateEligible,
+   Kind = Canonical`.
 3. Bucket tier = `Curated`; bucket identity = `benfica-tv`
    (canonical).
 4. Se já existir um canal `Benfica TV` no Dispatcharr:
@@ -297,8 +363,8 @@ distinto de Sport TV 1..7:
 
 1. `ContentClassifier.Classify("PT: SPORT TV NBA", ...)` →
    `Kind = Channel`.
-2. `CatalogResolver.ResolveAsync("pt sport tv nba")` → encontra
-   `ChannelAlias.NormalizedAlias = "pt sport tv nba"` →
+2. `CatalogResolver.ResolveAsync("sport tv nba")` → encontra
+   `ChannelAlias.NormalizedAlias = "sport tv nba"` →
    `Kind = Canonical, Key = "sport-tv-nba",
    PublicationPolicy = CreateEligible`.
 3. O bucket resolve para `(Curated, "sport-tv-nba")`.
@@ -319,9 +385,13 @@ Aliases canónicos suportados (na forma produzida por
 | Raw                      | Normalizado               |
 |--------------------------|---------------------------|
 | `SPORT TV NBA`           | `sport tv nba`            |
-| `PT: SPORT TV NBA`       | `pt sport tv nba`         |
-| `PT SPORT TV NBA`        | `pt sport tv nba`         |
-| `SPORT TV NBA HEVC PT`   | `sport tv nba hevc pt`    |
+| `PT: SPORT TV NBA`       | `sport tv nba`            |
+| `PT SPORT TV NBA`        | `sport tv nba`            |
+| `SPORT TV NBA HEVC PT`   | `sport tv nba`            |
+
+Os tokens de país (`PT`) e de qualidade (`HEVC`) são removidos pelo
+`ChannelNormalizer`, pelo que todas as variantes colapsam para o
+**único** alias persistido `sport tv nba`.
 
 (Não há mais `IdentityRule ReviewOnly` para NBA — a entrada foi
 removida quando o canal subiu para `Canonical CreateEligible`.)
@@ -389,3 +459,166 @@ SQLite in-memory (testes), o lock é ignorado.
 A BD SQLite usa WAL mode por defeito (EF Core SQLite default).
 Leituras concorrentes são seguras; escritas concorrentes são
 serializadas via `BEGIN IMMEDIATE`.
+
+## 12. Afinidades (PHASE 9C.3)
+
+### `AffinityGroup`
+
+```
+Id                  long  PK
+Name                text  UK
+Kind                int   (Channel=0 | Country=1)
+CanonicalChannelKey text  NULL (UK lógica para Channel)
+CountryCode         text  NULL
+CanonicalChannelId  long? FK → CanonicalChannel (transitório)
+CreatedAtUtc        datetime
+UpdatedAtUtc        datetime
+```
+
+### `AffinityMember`
+
+```
+Id                long  PK
+NormalizedMember  text
+Kind              int   (espelha o Kind do grupo)
+AffinityGroupId   long  FK → AffinityGroup (cascade)
+CreatedAtUtc      datetime
+```
+
+- **`Kind = Channel`**: `CanonicalChannelKey` obrigatório; a identidade é a
+  `Key` (nunca o `Id`). Cardinalidade **0..1 afinidade Channel por canal**.
+  `ResolveAsync` só considera membros Channel (`IdentityRule > Affinity >
+  ChannelAlias`).
+- **`Kind = Country`**: `CountryCode` obrigatório; `CanonicalChannelKey` nulo.
+  Membros injetados no `CountryChannelValidator` (country-level targeting).
+  Não resolvem canal.
+- **Unicidade de `NormalizedMember`**: índice único **filtrado**
+  (`WHERE Kind = 0`), pelo que uma variante não resolve para dois canais, mas
+  pode coexistir numa Channel affinity e numa Country affinity.
+- **Delimiter global** (`runtime-data/app_settings.json`,
+  `affinityVariantDelimiter`, default `,`): convenção de input; as variantes
+  persistem uma por registo. Alterar o delimiter não exige migration.
+- **Naming Dispatcharr**: canais criados pelo crawler usam o `DisplayName`
+  actual (`CanonicalChannelKey` presente no `ChannelDecision`); são registados
+  como `ChannelOwnership.CrawlerManaged` e só esses são renomeados. `External`/
+  `Unknown` nunca são renomeados.
+
+### Migração `AddCanonicalCountryAndAffinityKind`
+
+Aditiva e transaccional (toda a migration corre numa transação; uma falha
+reverte schema, dados e proveniência).
+
+**Up:**
+
+0. **Guard FK** (antes de qualquer mutação): deteta
+   `CanonicalChannelId` a apontar para um `CanonicalChannel` inexistente e
+   aborta com erro explícito.
+1. cria e popula a tabela de proveniência **`affinity_migration_backup`**
+   (`OriginalGroupId`, `OriginalCountryCode`, `GeneratedCountryGroupId`) antes
+   de alterar grupos mixed;
+2. classifica grupos (`Channel` se têm canal, `Country` caso contrário);
+3. backfill de `CanonicalChannelId → CanonicalChannel.Key` por JOIN (nunca por
+   nome); espelha o `Kind` nos membros;
+4. **split** de grupos mixed numa contrapartida Country (nome determinístico
+   `"<nome> #split-<id>"`, usado só para correlação interna do Up) e registo do
+   ID gerado na proveniência; guard de correlação completa;
+5. copia membros para a contrapartida; o grupo original fica Channel puro;
+   órfãos (sem canal e sem país) ficam `Country` com `CountryCode` nulo e são
+   preservados.
+
+`affinity_migration_backup` **não é mapeada no EF** (não entra no modelo nem no
+snapshot) e é mantida após a migration para permitir rollback; a sua remoção
+será feita numa migration dedicada posterior.
+
+**Down** (sem heurísticas de nome, sem `MIN(Id)`, sem deduplicação arbitrária):
+
+1. remove membros e grupos criados pelo Up, identificados exclusivamente por
+   `affinity_migration_backup.GeneratedCountryGroupId`;
+2. restaura `OriginalCountryCode` nos `OriginalGroupId`;
+3. valida o estado remanescente contra a unicidade global do modelo anterior:
+   se existirem `NormalizedMember` duplicados, **aborta** (transação revertida,
+   sem apagar nada) com mensagem explícita;
+4. só se válido: remove a proveniência, remove as colunas novas e recria o
+   índice único global.
+
+### Identidade canónica em runtime (Wave 9C.6)
+
+`CanonicalChannel.Key` é a **identidade de runtime** para a resolução de
+afinidades de canal. `CatalogResolver.ResolveAsync` passou a ser
+**Key-autoritativo**:
+
+- quando `AffinityGroup.CanonicalChannelKey` está presente, o canal canónico é
+  resolvido por `Key` (encontrado **e** `IsEnabled`);
+- se a `Key` está presente mas não resolve (inexistente ou desactivada),
+  **não** cai para o `CanonicalChannelId`/navegação obsoletos — prossegue para
+  o passo seguinte da cadeia (`ChannelAlias`);
+- linhas legadas com `Key` nula/vazia mantêm o fallback existente por
+  `CanonicalChannelId`/navegação `CanonicalChannel`.
+
+Consequência: uma afinidade **sobrevive** a apagar e recriar o canal canónico
+com a **mesma** `Key` — o `Id` técnico muda, a `Key` mantém-se, e a resolução
+devolve o canal recriado (novo `Id`).
+
+`CatalogResolver.ListChannelSourcesAsync` passou a incluir
+`CanonicalChannel` (`.Include(cs => cs.CanonicalChannel)`), pelo que a `Key`
+está disponível no caminho de selecção de fontes sem queries adicionais.
+
+Não há alteração de schema, migration, coluna ou FK: `CanonicalChannelId`
+mantém-se como **coluna de transição**.
+
+**Continua dependente de `Id`** (não migrado nesta wave):
+
+- FK `channel_aliases.CanonicalChannelId`;
+- FK `channel_sources.CanonicalChannelId`;
+- FK `ordering_items.CanonicalChannelId`;
+- `source_priority_policies` com scope por canal (`CanonicalChannelId`);
+- `dispatcharr_channel_ownerships.CanonicalChannelId`;
+- `matching_audits.CanonicalChannelId`;
+- `MatchPlan` (`CanonicalChannelId` por decisão);
+- agrupamento por canal do `SourceSelectionStage` (ainda por
+  `CanonicalChannelId`).
+
+Esta wave **não** é uma migração completa `Id → Key`. O ponto que resta para a
+futura Wave 13-4b é passar a pesquisa de política por canal do
+`SourceSelectionStage` a usar `CanonicalChannelKey` (resolver + contrato do
+estágio); os overrides por canal **não** foram implementados.
+
+## 13. Caminho agendado e contrato da playlist (Wave 10-0)
+
+### Sincronização agendada com o pipeline canónico
+
+A acção `syncDispatcharr` (`ScheduledDispatcharrSyncAction`) construía o
+`ChannelMatcher` sem `CatalogResolver` (`new ChannelMatcher(aliases)`),
+o que activava o modo legacy e desligava o ownership registry na fase de
+apply. A Wave 10-0 corrige o wiring:
+
+- o `CatalogResolver` é injectado por DI (`ScheduledAutomationHost.Build`
+  regista-o como singleton) e passado a `ChannelMatcher(aliases, null, catalog)`;
+- o mesmo `CatalogResolver` é passado a `DispatcharrSyncService`;
+- o `DispatcharrSyncService` continua a aplicar a salvaguarda redundante
+  de ownership antes de qualquer `DELETE`.
+
+A partir daqui, **todos os entry points de produção** (pipeline Telegram em
+`Program.cs`, scheduler `syncDispatcharr`) respeitam as mesmas regras:
+`CrawlerManaged` pode ser actualizado/removido conforme o plano;
+`External`, `Unknown` e streams sem registo (com catalog) nunca geram
+`Removed`, `DELETE` nem rename. Sem catalog, a construção entra no modo
+legacy descrito em §6 — comportamento preservado apenas para testes.
+
+### Contrato da playlist funcional
+
+Existe **um único** artefacto funcional: `output/playlist.m3u`
+(`ScheduledDispatcharrSyncAction.FunctionalPlaylistFileName`). Não é criada
+uma segunda playlist para o sync. Este ficheiro é escrito pelas várias
+fases do crawler — `ScheduledM3uDiscoveryAction`, `ScheduledValidationAction`,
+`ScheduledPlaylistGenerationAction` (composição a partir de uma
+`OrderingList`) e o pipeline Telegram — e é consumido por:
+
+- `syncDispatcharr` (input do matching/apply);
+- `GET /api/playlist` no Dashboard;
+- `LegacyConfigurationEvidenceEvaluator` (evidência de adopção legacy).
+
+A origem efectiva é, portanto, o **último produtor** que correu. Isto é o
+comportamento histórico e não é alterado nesta wave; o que fica explícito é
+que o sync usa exactamente `output/playlist.m3u` e que não existe uma
+segunda fonte. A futura selecção de fontes (PHASE 13) parte deste contrato.

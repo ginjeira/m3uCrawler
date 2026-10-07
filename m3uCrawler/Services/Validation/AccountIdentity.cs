@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace m3uCrawler.Services.Validation;
 
@@ -110,6 +111,160 @@ public static class AccountIdentity
         var stripped = ComputeSafeUrl(url);
         return Compute(stripped, username);
     }
+
+    // Xtream server URL shape: /live/USER/PASS/id.ts (also movie/series).
+    // Reuses the shape already recognised by M3uCandidateDetector.
+    private static readonly Regex _xtreamUserPathRegex = new(
+        @"/(?:live|movie|series)/(?<user>[^/]+)/",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static string? ExtractXtreamUsernameFromPath(Uri uri)
+    {
+        var match = _xtreamUserPathRegex.Match(uri.AbsolutePath);
+        if (!match.Success) return null;
+        var raw = match.Groups["user"].Value;
+        try { return Uri.UnescapeDataString(raw); }
+        catch { return raw; }
+    }
+
+    /// <summary>
+    /// W1 (2026-09-19) — identidade externa funcional estável de uma conta
+    /// Xtream, quando o provider a disponibiliza.
+    ///
+    /// <para>
+    /// A identidade funcional Xtream é <c>(endpoint normalizado, username)</c>:
+    /// o <c>username</c> é a identidade emitida pelo provider e o endpoint
+    /// (scheme + authority) distingue contas em infra-estruturas diferentes.
+    /// A <b>password nunca participa</b>. O path/query da API (get.php,
+    /// type, output) é routing, não identidade, pelo que não é usado —
+    /// assim variações de formato de playlist não criam outra conta
+    /// (T4). O resultado é codificado como um token determinístico
+    /// (SHA-256 truncado, 16 hex) para não persistir credenciais nem
+    /// usernames em claro.
+    /// </para>
+    ///
+    /// <para>
+    /// Reutiliza o algoritmo de fingerprint existente
+    /// (<see cref="Compute"/>) aplicando a normalização normativa
+    /// (NFKC + trim) aos componentes antes do hash. Não introduz um
+    /// algoritmo de identidade novo.
+    /// </para>
+    /// </summary>
+    public static bool TryComputeXtreamExternalIdentity(string? url, out string? externalIdentity)
+    {
+        externalIdentity = null;
+        if (string.IsNullOrWhiteSpace(url)) return false;
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri)) return false;
+        if (!string.Equals(uri.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        // Username pode vir da query (get.php?username=...) ou do path
+        // de servidor (/live/USER/PASS/...). Em ambos os casos a password
+        // é ignorada.
+        var username = ExtractUsername(url) ?? ExtractXtreamUsernameFromPath(uri);
+        if (string.IsNullOrEmpty(username)) return false;
+
+        // Endpoint/base resource normalizado: scheme + authority
+        // (host[:port]). Não é usado o path/query porque não fazem
+        // parte da identidade funcional da conta.
+        var endpoint = uri.Scheme.ToLowerInvariant() + "://" + uri.Authority.ToLowerInvariant();
+        var normalizedEndpoint = AccountKey.NormalizeExternalIdentity(endpoint);
+        var normalizedUsername = AccountKey.NormalizeExternalIdentity(username);
+        if (normalizedEndpoint.Length == 0 || normalizedUsername.Length == 0) return false;
+
+        externalIdentity = Compute(normalizedEndpoint, normalizedUsername);
+        return true;
+    }
+
+    /// <summary>
+    /// W1 — AccountKey de uma conta Xtream: namespace do provider
+    /// (<c>"xtream"</c>) + identidade externa funcional. Devolve
+    /// <c>null</c> quando a evidência não permite derivar uma identidade
+    /// estável (nunca inventa identidade).
+    /// </summary>
+    public static string? ComputeXtreamAccountKey(string? url)
+    {
+        if (!TryComputeXtreamExternalIdentity(url, out var externalIdentity)) return null;
+        return AccountKey.Compose(ProviderNamespaces.Xtream, externalIdentity);
+    }
+}
+
+/// <summary>
+/// W1 (2026-09-19) — composição canónica de <c>AccountKey</c>.
+///
+/// <para>
+/// Regra normativa (<c>docs/Reestructure/03-DISCOVERY.md §3</c>,
+/// <c>32-DOMAIN-SCHEMA.md</c>): <c>AccountKey = Provider namespace +
+/// external functional identity</c>. A identidade funcional é distinta
+/// de identificadores técnicos (<c>ProviderAccountId</c>).
+/// </para>
+///
+/// <para>
+/// <b>Normalização não-colapsante.</b> A única normalização permitida
+/// é NFKC + trim. Não há casefold, colapso de espaços, remoção de
+/// pontuação nem qualquer transformação que possa fundir contas
+/// funcionalmente distintas.
+/// </para>
+/// </summary>
+public static class AccountKey
+{
+    public const char Separator = '|';
+
+    /// <summary>
+    /// Normalização não-colapsante: NFKC + trim. Valores nulos ou vazios
+    /// devolvem string vazia (ausência de identidade, não identidade vazia).
+    /// </summary>
+    public static string NormalizeExternalIdentity(string? value)
+    {
+        if (string.IsNullOrEmpty(value)) return string.Empty;
+        return value.Normalize(NormalizationForm.FormKC).Trim();
+    }
+
+    /// <summary>
+    /// Compõe a identidade funcional canónica. Devolve <c>null</c> se o
+    /// namespace ou a identidade externa normalizada forem vazios — a
+    /// ausência de evidência estável não produz identidade.
+    /// </summary>
+    public static string? Compose(string? providerNamespace, string? externalFunctionalIdentity)
+    {
+        var ns = NormalizeExternalIdentity(providerNamespace);
+        var identity = NormalizeExternalIdentity(externalFunctionalIdentity);
+        if (ns.Length == 0 || identity.Length == 0) return null;
+        return ns + Separator + identity;
+    }
+}
+
+/// <summary>
+/// W1 — namespaces de provider usados na composição de <c>AccountKey</c>.
+/// O namespace é a <c>Key</c> da entidade <c>Provider</c>; nomes físicos
+/// podem evoluir, mas o namespace faz parte de identidade persistida.
+/// </summary>
+public static class ProviderNamespaces
+{
+    public const string Xtream = "xtream";
+    public const string Telegram = "telegram";
+    public const string M3u = "m3u";
+    public const string Http = "http";
+    public const string File = "file";
+    public const string Manual = "manual";
+
+    /// <summary>
+    /// Mapeia o nome do tipo de source do pipeline para o namespace do
+    /// provider do mecanismo de discovery.
+    /// </summary>
+    public static string FromSourceKindName(string? sourceKindName) =>
+        (sourceKindName?.Trim().ToLowerInvariant()) switch
+        {
+            "xtream" => Xtream,
+            "telegram" => Telegram,
+            "http" => Http,
+            "file" => File,
+            "manual" => Manual,
+            _ => M3u,
+        };
 }
 
 /// <summary>
@@ -154,6 +309,15 @@ public sealed record AccountStreamWork(
 
 /// <summary>
 /// Resultado da validacao de uma account/playlist.
+///
+/// <para>
+/// <b>Contadores (W-DEDUP, 2026-10-01).</b>
+/// <see cref="Tested"/> conta apenas GETs físicos desta account.
+/// <see cref="Working"/> conta o conhecimento working desta account
+/// (físico + reutilizado). <see cref="Reused"/> conta GETs físicos
+/// evitados por <c>sfp1</c> já conhecido Working neste run. Invariante:
+/// <c>Tested + Reused + (short-circuits de early-exit) == Outcomes.Count</c>.
+/// </para>
 /// </summary>
 public sealed record AccountValidationResult(
     AccountValidationWork Work,
@@ -161,4 +325,5 @@ public sealed record AccountValidationResult(
     int Working,
     int Failed,
     int ShortCircuited,
-    int Tested);
+    int Tested,
+    int Reused = 0);

@@ -13,6 +13,16 @@ namespace m3uCrawler.Models
         [JsonPropertyName("group")]
         public string Group { get; set; } = string.Empty;
 
+        /// <summary>
+        /// Valor original do atributo <c>tvg-id</c> do EXTINF (ou do
+        /// <c>#EXT-X-STREAM-INF</c>), preservado verbatim. É evidência
+        /// de identidade externa (ADR-0002 §5) e <b>nunca</b> cria por
+        /// si só um <c>CanonicalChannel</c> (DL-002). Vazio quando a
+        /// source não fornece tvg-id.
+        /// </summary>
+        [JsonPropertyName("tvgId")]
+        public string OriginalTvgId { get; set; } = string.Empty;
+
         [JsonPropertyName("logo")]
         public string Logo { get; set; } = string.Empty;
 

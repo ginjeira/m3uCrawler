@@ -11,11 +11,11 @@ Crawler em C# (.NET 9) para descobrir, validar e testar playlists M3U/M3U8 em fo
 - Validação por país baseada nos títulos dos canais extraídos dos `#EXTINF`, com threshold de 3 canais distintos e famílias canónicas (variantes como `RTP1` e `RTP 1` contam como uma única família).
 - Modo manutenção (`--telegram-maintain`) que preserva os streams existentes quando não há novas descobertas.
 - Relatório detalhado em `output/telegram_run_report.json`.
-- Dashboard web com gestão de listas de canais por país e diagnóstico da última execução.
+- Dashboard web com gestão de listas de canais por país, configuração de descoberta (keyword, janela Min/Max e `MaxStreams`) e diagnóstico da última execução (Live Run com contexto por evento).
 
 ## Estado actual
 
-- Build em Release: 0 warnings, 0 errors.
+- Build em Release: 0 errors (warnings baseline pré-existentes; não introduzir novas).
 - Suíte de testes (linha de comando abaixo) — referência operacional sempre actualizada, não uma propriedade arquitectural permanente.
 - Deployment em produção via **Docker Compose** com imagem `ghcr.io/ginjeira/m3ucrawler`. Ver `DEPLOYMENT.md`.
 

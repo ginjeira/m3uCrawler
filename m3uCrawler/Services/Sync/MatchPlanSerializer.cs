@@ -43,7 +43,8 @@ namespace m3uCrawler.Services.Sync
         public static string SerializeReport(SyncReport report)
         {
             if (report == null) throw new ArgumentNullException(nameof(report));
-            return JsonSerializer.Serialize(report, Options);
+            var sanitized = SanitizeForSerialization(report);
+            return JsonSerializer.Serialize(sanitized, Options);
         }
 
         public static async Task WriteReportAsync(SyncReport report, string path, CancellationToken ct = default)
@@ -54,33 +55,6 @@ namespace m3uCrawler.Services.Sync
 
         private static MatchPlan SanitizeForSerialization(MatchPlan plan)
         {
-            var channels = plan.Channels.Select(c => new ChannelDecision
-            {
-                Identity = c.Identity,
-                CanonicalName = c.CanonicalName,
-                Outcome = c.Outcome,
-                ExistingChannelId = c.ExistingChannelId,
-                ProposedChannelNumber = c.ProposedChannelNumber,
-                ChannelGroupName = c.ChannelGroupName,
-                MatchReason = c.MatchReason,
-                MatchScore = c.MatchScore,
-                AmbiguousCandidates = c.AmbiguousCandidates,
-                StreamsEmptied = c.StreamsEmptied,
-                OutputGroup = c.OutputGroup,
-                Streams = c.Streams.Select(s => new StreamMatchDecision
-                {
-                    Provider = s.Provider,
-                    StreamUrl = CredentialSanitizer.SanitizeUrl(s.StreamUrl),
-                    StreamName = s.StreamName,
-                    Outcome = s.Outcome,
-                    ExistingStreamId = s.ExistingStreamId,
-                    ProposedOrder = s.ProposedOrder,
-                    OrderReason = s.OrderReason,
-                    IsWorking = s.IsWorking,
-                    GroupName = s.GroupName,
-                }).ToList(),
-            }).ToList();
-
             return new MatchPlan
             {
                 GeneratedAtUtc = plan.GeneratedAtUtc,
@@ -89,10 +63,82 @@ namespace m3uCrawler.Services.Sync
                 DryRun = plan.DryRun,
                 MatchThreshold = plan.MatchThreshold,
                 Counts = plan.Counts,
-                Channels = channels,
+                Channels = plan.Channels.Select(SanitizeChannel).ToList(),
                 AmbiguousGroups = plan.AmbiguousGroups,
                 ClassifiedExclusions = plan.ClassifiedExclusions,
                 UnknownReviewRequired = plan.UnknownReviewRequired,
+            };
+        }
+
+        /// <summary>
+        /// Produz uma cópia sanitizada do <see cref="SyncReport"/> antes da
+        /// serialização, reutilizando exactamente a mesma projecção dos canais
+        /// e streams do plano. É o único ponto de escrita de
+        /// <c>dispatcharr_report_*.json</c>; garante que credenciais Xtream
+        /// embutidas no path (ex.: <c>/live/user/pass/id</c>) nunca são
+        /// persistidas. As contagens, estados, IDs e mensagens não sensíveis
+        /// são preservados.
+        /// </summary>
+        private static SyncReport SanitizeForSerialization(SyncReport report)
+        {
+            var failedChannels = report.FailedChannels
+                .Select(f => new FailedReportEntry
+                {
+                    Identity = f.Identity,
+                    Reason = CredentialSanitizer.SanitizeText(f.Reason),
+                    ExistingChannelId = f.ExistingChannelId,
+                })
+                .ToList();
+
+            return new SyncReport
+            {
+                StartedAtUtc = report.StartedAtUtc,
+                FinishedAtUtc = report.FinishedAtUtc,
+                DryRun = report.DryRun,
+                DispatcharrVersion = report.DispatcharrVersion,
+                SourcePlaylistPath = report.SourcePlaylistPath,
+                Counts = report.Counts,
+                Channels = report.Channels.Select(SanitizeChannel).ToList(),
+                AmbiguousDecisions = report.AmbiguousDecisions,
+                AmbiguousGroups = report.AmbiguousGroups,
+                FailedChannels = failedChannels,
+            };
+        }
+
+        private static ChannelDecision SanitizeChannel(ChannelDecision c)
+        {
+            return new ChannelDecision
+            {
+                Identity = c.Identity,
+                CanonicalName = c.CanonicalName,
+                CanonicalChannelKey = c.CanonicalChannelKey,
+                CanonicalChannelId = c.CanonicalChannelId,
+                Outcome = c.Outcome,
+                ExistingChannelId = c.ExistingChannelId,
+                ProposedChannelNumber = c.ProposedChannelNumber,
+                ChannelGroupName = c.ChannelGroupName,
+                MatchReason = c.MatchReason,
+                MatchScore = c.MatchScore,
+                Streams = c.Streams.Select(SanitizeStream).ToList(),
+                AmbiguousCandidates = c.AmbiguousCandidates,
+                StreamsEmptied = c.StreamsEmptied,
+                OutputGroup = c.OutputGroup,
+            };
+        }
+
+        private static StreamMatchDecision SanitizeStream(StreamMatchDecision s)
+        {
+            return new StreamMatchDecision
+            {
+                Provider = s.Provider,
+                StreamUrl = CredentialSanitizer.SanitizeUrl(s.StreamUrl),
+                StreamName = s.StreamName,
+                Outcome = s.Outcome,
+                ExistingStreamId = s.ExistingStreamId,
+                ProposedOrder = s.ProposedOrder,
+                OrderReason = s.OrderReason,
+                IsWorking = s.IsWorking,
+                GroupName = s.GroupName,
             };
         }
     }

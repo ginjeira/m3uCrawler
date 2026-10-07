@@ -32,4 +32,11 @@ public enum ChannelAdministrationError
     ChannelNotFound = 3,
     AlreadyExists = 4,
     HasOwnership = 5,
+
+    /// <summary>
+    /// W6b-1 — re-aprovação/exclusão de uma Review com uma mudança
+    /// declarada diferente da que já ficou resolvida. Uma decisão
+    /// resolvida não é reaberta nem alterada silenciosamente.
+    /// </summary>
+    ReviewConflict = 6,
 }

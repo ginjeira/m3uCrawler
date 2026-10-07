@@ -67,6 +67,14 @@ WORKDIR /data
 
 COPY --from=build /app/publish /app
 
+# Baseline canónico PT: fica também no filesystem da imagem (além do
+# recurso embutido na assembly) para que o resolver o encontre via
+# M3U_BASELINE_PATH / AppContext.BaseDirectory. O recurso embutido é a
+# rede de segurança; este COPY garante que o ficheiro versionado é
+# auditável no runtime.
+COPY --from=build /src/docs/catalog /app/docs/catalog
+ENV M3U_BASELINE_PATH=/app/docs/catalog/m3ucrawler_pt_canonical_catalog.json
+
 # The application is executed from /app but reads/writes runtime data from /data
 # (output, session files, and optional wtelegram.config).
 ENTRYPOINT ["dotnet", "/app/m3uCrawler.dll"]

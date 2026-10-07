@@ -82,22 +82,16 @@ public class PlaylistRetentionRegressionTests
     }
 
     [Fact]
-    public void Existing_stream_with_DnsFailure_is_NOT_classified_as_retryable_by_current_policy()
+    public void Existing_stream_with_DnsFailure_is_classified_as_retryable_and_preserved()
     {
-        // DOCUMENTAÇÃO: DnsFailure NÃO está actualmente em
-        // StreamFailureClassifier.IsRetryable. Um stream existente
-        // com falha DNS é portanto tratado como terminal.
-        //
-        // Isto pode ser revisto numa tarefa futura que actualize
-        // IsRetryable para incluir DnsFailure (DNS transientes são
-        // tipicamente retryable). Por agora, a política é:
-        //   Retryable = { Timeout, Network, ConnectionRefused,
-        //                 HttpStatus429, HttpStatus5xx }.
+        // W2 (2026-09-19): 19-FAILURE-MODEL §6 determina que DNS é retryable.
+        // StreamFailureClassifier.IsRetryable passou a incluir DnsFailure.
+        // Um stream existente com falha DNS é preservado (não removido).
         var ret = TelegramScraperService.FilterRetainedStreams(
             new[] { Item("http://a/1", isWorking: false, StreamFailureKind.DnsFailure) });
-        Assert.Empty(ret.Preserved);
-        Assert.Equal(1, ret.RemovedTerminal);
-        Assert.Equal(1, ret.RemovedByKind["DnsFailure"]);
+        Assert.Single(ret.Preserved);
+        Assert.Equal("http://a/1", ret.Preserved[0].Url);
+        Assert.Equal(0, ret.RemovedTerminal);
     }
 
     [Fact]

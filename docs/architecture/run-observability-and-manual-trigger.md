@@ -498,6 +498,13 @@ Estimativas:
 
 ### 5.6 Compatibilidade com `RunReport` e `telegram_run_report.json`
 
+> **Nota (2026-10-02).** O congelamento de schema descrito nesta
+> secção aplica-se à wave 9C.4. Waves posteriores voltaram a
+> adicionar campos **aditivos** ao `RunReport` (contador
+> `StreamsSkippedAlreadyValidated`; proveniência em
+> `DiscoveredPlaylists[]`) sem quebrar consumidores existentes —
+> ver §18.9 e `docs/Reestructure/08-VALIDATION.md §6`.
+
 `RunReport` continua imutável quanto ao schema. Adições
 opcionais (mantidas como nullable para retro-compatibilidade):
 
@@ -1467,3 +1474,143 @@ principal com:
 Não tocar: tudo o que está na §14 do plano principal +
 `CronExpression.cs` (já cobre o formato necessário) +
 `ScheduledJobRunner.cs` (mecanismo já existe, basta ligar).
+
+---
+
+## 18. Estado implementado (PHASE 9C.4)
+
+> Esta secção é **normativa sobre o que existe**, não sobre o que foi
+> desenhado. O plano acima (§1–§17) é o documento de desenho; onde as
+> duas versões divergem, esta secção descreve o comportamento actual e
+> identifica o desvio explicitamente.
+
+### 18.1 Modelo persistente
+
+- `live_runs` + `live_run_steps` (`LiveRunEntity` / `LiveRunStepEntity`),
+  migration aditiva `AddLiveRuns`. `CountsJson` é a representação
+  persistente tipada (`LiveRunCounts`); nenhuma contagem é derivada de
+  logs.
+- `LiveRun` cobre apenas a execução Telegram. `SyncRun`/`SyncRunStep`
+  continuam uma família separada e **não** foram alterados.
+- Estados de fase implementados (`LiveRunPhase`): `Idle`,
+  `ReadingTelegram`, `Discovering`, `Downloading`, `Analyzing`,
+  `Validating`, `Composing`, `SyncingDispatcharr`, `Completed`,
+  `Error`.
+- `LiveRunTerminalStatus`: `Unknown`, `Completed`, `Failed`.
+  `TerminalStatus.Failed` e `LiveRunPhase.Error` são deliberadamente
+  conceitos distintos.
+- Run interrompido por restart: `FinishedAtUtc == null` **e**
+  `TerminalStatus == Unknown` ⇒ recuperado como `Failed` por
+  `RunCoordinator.RecoverInterruptedRunsAsync()`. **O método é
+  invocado no startup de produção**, em ambos os caminhos onde o
+  `RunCoordinator` é configurado (`--web --telegram` e `--telegram`
+  standalone), imediatamente antes do primeiro `StartAsync`. Não existe
+  estado `Unknown` operacional adicional. A chamada é best-effort:
+  uma falha no recovery não bloqueia o arranque.
+
+### 18.2 Execução única
+
+- Um único `RunCoordinator` (`LiveRunHost.Coordinator`) serve CLI,
+  scheduler e API manual. O lock é um flag atómico
+  (`Interlocked.CompareExchange`); um segundo pedido recebe
+  `RunAlreadyInProgressException`.
+- `StartAsync` (bloqueante) é usado pela CLI e pelo scheduler;
+  `KickStartAsync` (não bloqueante, com o mesmo lock) é usado por
+  `POST /api/run/start`. Ambos invocam **a mesma** pipeline Telegram
+  (`SearchAndTestM3UInTelegramAsync` / `RunTelegramMaintenanceCycle`) —
+  não existe segundo pipeline.
+- `Source` identifica a origem (`cli`, `manual`, `scheduler`) e `Mode`
+  identifica `telegram` / `telegram-maintain`.
+
+### 18.3 API e autenticação
+
+- `GET /api/run/status` — snapshot operacional sanitizado.
+  Responde `503 pipeline-not-configured` quando a pipeline Telegram não
+  está configurada neste processo (`--web` sem `--telegram`).
+  O payload inclui `isRunning`, `status`, `runId`, `mode`, `source`,
+  `phase`, `phases`, `phaseStartedAtUtc`, `durationMs`, `counts`,
+  `recentActivities`, `recentRuns` e `webAllowTrigger`.
+- `POST /api/run/start` — arranque assíncrono. Contrato:
+  `202` aceite, `409 already-running`, `503 web-allow-trigger-disabled`,
+  `503 pipeline-not-configured`, `400 invalid payload`,
+  `401`/`403` conforme o gate 9C.2.
+- **Não foi criada autenticação própria.** Reutiliza-se o gate 9C.2
+  (`UserAuth`: sessão + CSRF; `--web-token`: credencial de máquina;
+  Bootstrap bloqueado; Legacy preservado).
+- `--web-allow-trigger` é opt-in (default `false`). Quando ausente,
+  `POST /api/run/start` devolve `503 web-allow-trigger-disabled`.
+
+### 18.4 Actividades
+
+- `LiveRunActivityFeed` é um **ring buffer em memória** (capacidade
+  200, thread-safe, `LiveRunActivity` com mensagem/metadata já
+  sanitizados por `LiveRunSanitizer`). **Não é persistido** em SQLite
+  nem em disco: o feed existe apenas enquanto o processo vive e só
+  acompanha o run corrente/último run in-process. Esta é a decisão
+  implementada na subwave 3 e substitui qualquer formulação anterior
+  do plano que sugerisse persistência de actividades.
+
+### 18.5 Scheduler (Scheduled Start Time)
+
+- A integração é feita **no scheduler existente**
+  (`ScheduledJobRunner` + `ScheduledAutomationHost`), através de duas
+  acções com nomes estáveis:
+  `telegramRun` (`Mode=telegram`) e `telegramMaintainRun`
+  (`Mode=telegram-maintain`). A corrida scheduler/manual e
+  scheduler/scheduler é resolvida pelo lock único do coordinator.
+- **Não existe `StartAtUtc`** nem scheduler paralelo. A UI calcula a
+  `CronExpression`; o agendamento reutiliza `CronExpression` e a
+  tabela `scheduled_jobs` existentes.
+- **Cron inválido é rejeitado de forma segura**: o job não executa, é
+  neutralizado (`NextRunAtUtc = null`, `LastResult = invalid-cron:…`)
+  e o tick continua a processar os restantes jobs.
+
+### 18.6 Dashboard
+
+- Nova vista `view-liverun` ("Live Run"), com estado, runId, fase,
+  duração, última actualização, mensagem, contadores, últimas
+  actividades, últimas execuções (24 h), estado do trigger, botão
+  **Run now** e a lista dos jobs agendados Telegram.
+- Actualização automática por **polling leve de 3 s** (apenas com a
+  vista activa e sem pedidos sobrepostos), via `GET /api/run/status`.
+  **Não há SSE/WebSocket, tail de logs nem parsing de `docker logs`.**
+- O `fetch` de mesma origem recebe automaticamente o `X-CSRF-Token`
+  injectado na página autenticada (helper 9C.2).
+
+### 18.7 Desvios face ao desenho original
+
+| Desenho (§1–§17) | Implementado (9C.4) |
+|---|---|
+| `RunProgressSnapshot` / `RunProgressSink` | `LiveRunSnapshot` / `ILiveRunProgress` + `NullLiveRunProgress` |
+| Tab "Runs" no Overview + bloco Overview | Vista dedicada `view-liverun` |
+| `startAtUtc` + `EffectiveCronExpression` | apenas `CronExpression` (a UI calcula a expressão) |
+| Acção `runTelegramCycle` | `telegramRun` + `telegramMaintainRun` |
+| Actividades possivelmente persistidas | ring buffer em memória, não persistido |
+| `RunId` em `RunReport` (§12.1) | **não implementado**: em 9C.4 o `RunReport` permaneceu inalterado (55 propriedades congeladas por teste); waves posteriores adicionaram campos aditivos (sem `RunId`) — ver §18.9 |
+| Sweeper de teste sobre `%TEMP%` global | Sweeper scoped a `%TEMP%\m3uCrawler.Tests.tmp\` (correcção pós-revisão F-001) |
+
+### 18.8 Não implementado (mantido fora de âmbito)
+
+- Cancelamento de run em curso (§12.3).
+- ETA / estimativa de duração (§12.4).
+- `StartAtUtc` / hora fixa da primeira execução (§16).
+- Qualquer forma de `live-log tail`.
+
+### 18.9 Actualizações pós-9C.4 (2026-10)
+
+Adições posteriores a 9C.4 na cadeia de observabilidade. Descritas aqui sem novos contratos; o registo canónico de execução é `docs/PROJECT_STATUS.md`.
+
+- **Proveniência mensagem → candidate → playlist.** `CandidatePlaylist` passou a transportar `SourceMessageId`/`SourceMessageDateUtc` e `DiscoveredPlaylist` (em `telegram_run_report.json`) passou a expor `CandidateId`/`MessageId`/`MessageDateUtc` (camelCase) via `GET /api/discovered-playlists`. A cadeia resultante é `run → mensagem (messageId, messageDateUtc, chat em source) → candidateId → estado/workingStreams da playlist`.
+- **`runId` CLI vs `LiveRun`.** Em modo CLI **não** existe `runId` operacional de coordenador: apenas o `runId` de diagnóstico do `PipelineTrace` (processo-scoped, só activo com `M3UCRAWLER_TRACE`). O `runId` operacional (`LiveRun`, criado pelo `RunCoordinator`) só existe em runs via dashboard/scheduler. Os dois **não** são a mesma identidade (ver `docs/Reestructure/13-RUNS.md §1` e DL-124 em `docs/Reestructure/31-DECISION-LOCK.md`).
+- **Contador `StreamsSkippedAlreadyValidated`.** W-DEDUP (2026-10-01) deduplica o GET físico por run (`ValidationKey = sfp1`); `RunReport.StreamsTested` conta apenas validações físicas e os GETs evitados vão para `StreamsSkippedAlreadyValidated`, espelhado em `LiveRunCounts.StreamsSkippedAlreadyValidated` e exposto por `DashboardMetrics.SummarizeRun`. Detalhe normativo em `docs/Reestructure/08-VALIDATION.md §6`.
+- **Janela de histórico Min/Max.** W-HISTWIN introduziu `DiscoverySettings.MinHistoryHours` (default `0`) a par de `HistoryHours` (máximo), com `GET/POST /api/discovery/settings` a devolver/aceitar `minHistoryHours`. O trigger `POST /api/run/start` mantém o contrato antigo (sem `minHistoryHours`; tecto próprio `720h`). A UI HTML do dashboard expõe estes parâmetros desde a W-DASHBOARD (ver §18.10); o Schedule Min/Max continua para wave futura.
+
+### 18.10 W-DASHBOARD — configuração de descoberta e Live View com contexto (2026-10-02)
+
+Extensão da cadeia de observabilidade implementada no working tree (não commitada). **Sem novos contratos de observabilidade** nem novo endpoint; o registo canónico de execução e os números da suite são `docs/PROJECT_STATUS.md`. Contratos HTTP actualizados em `docs/Reestructure/22-API-CONTRACTS.md` §13/§18.
+
+- **Configuração de descoberta.** A vista Descoberta passa a expor um card (`keyword`, `MinHistoryHours`, `HistoryHours`/Max, `MaxStreams`) que lê/grava pela SSOT `app_settings.json#discovery` via os endpoints existentes `GET/POST /api/discovery/settings`. A janela inclusiva é explicada no cliente a partir dos valores; erros 400 são inline e o formulário recarrega os valores persistidos. `POST /api/run/start` mantém o contrato antigo. Deliberadamente não expostos: credenciais, flags de deployment/restart, modos legacy, constantes técnicas e `dispatcharrTest` (ver `m3uCrawler/README.md` § "Configuração no Dashboard: o que está exposto e o que não").
+- **Activities com contexto.** O payload de activities (`GET /api/run/status`) passa a incluir `metadata` (dict opcional de contexto por evento) e as activities de fase incluem `runId`; o `category` é renderizado como badge e o metadata como `key=value` na vista Live Run. Contexto por fase: leitura Telegram (`keyword` + janela), mensagem analisada (`messageId`/`messageDateUtc`/`chat`), candidate criado (`candidateId`/`kind`/`from`), promoção Xtream (`candidateId`/`parentCandidateId`), download/parse (`candidateId` + motivo), validação por país e por playlist (**physical N / reused M**) e Dispatcharr (contadores do sync; tipo de erro).
+- **W-DEDUP visível.** O `AccountValidator` emite uma activity por ronda de conta (`account validation: N physical, M reused, K failed`, conta mascarada) sem alterar a lógica de decisão. O contador `StreamsSkippedAlreadyValidated` passa a surgir no Live Run, no Overview (card + badge) e no histórico de Execuções (`ImportHistoryEntry.StreamsSkippedAlreadyValidated`; entradas antigas mostram `—`) — substitui o cálculo `t−(w+f)` do Overview, que nunca disparava.
+- **Proveniência nas tabelas.** A tabela de Descoberta dá colunas MessageId / Data mensagem (UTC) / Candidato; `GET /api/discovery/summary` propaga o primeiro candidato/`messageId` não-nulo do grupo deduplicado (`DiscoveredPlaylistSummary`). `GET /api/discovered-playlists` mantém a proveniência por item (§18.9).
+- **Limitações.** Não há evento por stream individual (ring buffer de 200); `requestId` só existe no caminho de download; o `PipelineTrace` (`M3UCRAWLER_TRACE`) continua consola-only e separado do Live Run; em modo CLI não há `runId` operacional.

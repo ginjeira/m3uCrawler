@@ -1,9 +1,17 @@
 using m3uCrawler.Build;
 using m3uCrawler.Services;
+using m3uCrawler.Services.Audit;
+using m3uCrawler.Services.Auth;
 using m3uCrawler.Services.Automation;
 using m3uCrawler.Services.Catalog;
+using m3uCrawler.Services.Configuration;
+using m3uCrawler.Services.Dispatcharr;
+using m3uCrawler.Services.LiveRun;
 using m3uCrawler.Services.Matching;
 using m3uCrawler.Services.SourceOrdering;
+using m3uCrawler.Services.SourceSelection;
+using m3uCrawler.Services.Sync;
+using m3uCrawler.Services.Telegram;
 using m3uCrawler.Services.Validation;
 using m3uCrawler.Models;
 using System.Text;
@@ -21,6 +29,15 @@ namespace m3uCrawler
                 return;
             }
 
+            // W10a — Recuperação de password do administrador (host-only).
+            // Tratado antes do banner/dashboard/telegram para que este caminho
+            // imprima apenas mensagens funcionais e saia de seguida.
+            if (args.Contains("--admin-reset-password"))
+            {
+                Environment.ExitCode = await RunAdminResetPasswordAsync(args);
+                return;
+            }
+
             Console.WriteLine("=== m3uCrawler - Pesquisador de Streams M3U8 ===");
             Console.WriteLine(BuildInfo.Current.ToCliLine());
             Console.WriteLine();
@@ -33,6 +50,13 @@ namespace m3uCrawler
             }
             Console.WriteLine($"🇵🇹 País em validação: {countryCode}");
 
+            // Wave C — Store único de settings operacionais, partilhado por
+            // CLI, dashboard e scheduler. Fonte de verdade em
+            // runtime-data/app_settings.json (secção "discovery").
+            var appSettingsRuntimeDataDir = Path.Combine(Directory.GetCurrentDirectory(), "runtime-data");
+            var appSettingsStore = new AppSettingsStore(appSettingsRuntimeDataDir);
+            var discoverySettingsProvider = new DiscoverySettingsProvider(appSettingsStore);
+
             // Dashboard web: parsing e arranque no top-level para que --web
             // funcione standalone (sem --telegram). A pipeline Telegram
             // continua condicionada a args.Contains("--telegram") mais abaixo.
@@ -44,9 +68,29 @@ namespace m3uCrawler
                 webPort = parsedWebPort;
             }
             string? webToken = webEnabled ? GetOptionValue(args, "--web-token") : null;
+            // PHASE 9C.4 — opt-in para o botão "Run now" no dashboard.
+            // Default: false. Sem esta flag, POST /api/run/start devolve
+            // 503 web-allow-trigger-disabled (regra congelada).
+            bool webAllowTrigger = webEnabled && args.Contains("--web-allow-trigger");
+
+            // Lifecycle do processo residente: token partilhado entre
+            // Dashboard, Scheduler e mecanismo de shutdown (Ctrl+C / SIGTERM).
+            var processCts = new System.Threading.CancellationTokenSource();
+
             Task? webTask = null;
             CatalogResolver? webCatalogResolver = null;
             ScheduledAutomationHost? automationHost = null;
+            // PHASE 9C.4 — Host que detém o RunCoordinator único. Construído
+            // quando o catálogo está disponível (i.e. --web foi passado
+            // e o InitializeCatalogAsync foi bem-sucedido). O executor da
+            // pipeline Telegram é registado dentro do bloco --telegram.
+            LiveRunHost? liveRunHost = null;
+            // Wave W5 — Serviço de autenticação Telegram de aplicação
+            // (dashboard/scheduler). É construído no bloco --web e
+            // reutilizado pelo bloco --telegram para que o cliente WTelegram
+            // vivo e autenticado seja partilhado, em vez de a pipeline
+            // construir um segundo cliente com login de consola.
+            TelegramAuthService? applicationTelegramAuth = null;
             if (webEnabled)
             {
                 var dashboardOutputDir = GetOptionValue(args, "--output-dir") ?? "output";
@@ -58,17 +102,161 @@ namespace m3uCrawler
                         ResolveCatalogDbPath(args), CancellationToken.None);
                     WebDashboardService.SetCatalogResolver(webCatalogResolver);
 
+                    // DL-130 (Phase 5) — Cursores de publicação do catálogo.
+                    // Construído a partir da mesma factory que o resolver
+                    // (partilham o mesmo SQLite file). Se a construção
+                    // falhar (improvável: factory já existe), o endpoint
+                    // responde 503, mesmo padrão de _liveRunHost.
+                    WebDashboardService.SetPublicationStatusService(
+                        new PublicationStatusService(webCatalogResolver.GetFactory()));
+
+                    // PHASE 9C.1 — Lifecycle de configuração. O dashboard
+                    // fica sempre acessível; o estado é reportado em
+                    // /api/configuration/lifecycle e o gate bloqueia
+                    // discovery/scheduler automáticos em NOT_CONFIGURED.
+                    var lifecycle = BuildConfigurationLifecycle(
+                        ResolveCatalogDbPath(args),
+                        dashboardOutputDir,
+                        webCatalogResolver);
+                    WebDashboardService.SetConfigurationLifecycle(lifecycle);
+                    try
+                    {
+                        LogLifecycleState(await lifecycle.EnsureInitializedAsync(CancellationToken.None));
+                    }
+                    catch (Exception lifecycleEx)
+                    {
+                        Console.WriteLine($"⚠️ Não foi possível inicializar o estado de configuração: {lifecycleEx.Message}");
+                    }
+
                     // PHASE 12 — Construir e arrancar o scheduler. As actions
                     // concretas ficam registadas para o formulário do Dashboard
                     // e o runner entra em loop respeitando shutdown via Ctrl+C
                     // (CancellationToken propagado pelo _cts interno).
                     var dispatcharrConfig = DispatcharrConfigLoader.Load();
+
+                    // PHASE 9C.2 — Autenticação/bootstrap. Numa instalação
+                    // nova o wizard cria o primeiro administrador e só depois
+                    // o lifecycle passa a READY. Numa instalação legacy
+                    // adoptada READY sem administrador (PHASE 9C.5,
+                    // BOOTSTRAP_REQUIRED), o wizard fica activo apenas para
+                    // criar o primeiro administrador, sem reconfigurar nem
+                    // alterar o estado; após a criação passa a UserAuth.
+                    var adminUsers = new AdminUserStore(webCatalogResolver.GetFactory());
+                    var sessions = new SessionStore(webCatalogResolver.GetFactory());
+                    var authService = new AuthService(adminUsers, sessions);
+                    var bootstrapValidator = new BootstrapConfigurationValidator(
+                        webCatalogResolver.GetFactory(), dashboardOutputDir, dispatcharrConfig);
+                    var bootstrapService = new BootstrapService(
+                        lifecycle, adminUsers, bootstrapValidator);
+                    WebDashboardService.SetAuth(authService, bootstrapService);
+
+                    // W6a — Auditoria administrativa persistida no mesmo catálogo
+                    // SQLite. Best-effort; nunca bloqueia a mutação.
+                    WebDashboardService.SetAuditService(
+                        new AuditService(webCatalogResolver.GetFactory()));
+
+                    // Wave 4 (PHASE 9C) — Prontidão operacional. O gate do
+                    // scheduler exige, além do lifecycle READY, que os
+                    // componentes obrigatórios estejam funcionais (admin,
+                    // Telegram, Dispatcharr quando activado, catálogo,
+                    // output). Sources NÃO bloqueia o SetupComplete — de
+                    // outra forma o discovery nunca arrancaria. Instalações
+                    // adoptadas como legacy ficam grandfathered (ver
+                    // OperationalReadinessService).
+                    var wtelegramStore = new WtelegramConfigStore();
+                    // W6c — o resultado do último teste Dispatcharr é persistido
+                    // no settings store único (runtime-data/app_settings.json) e
+                    // consumido pela prontidão operacional.
+                    var dispatcharrTestStore = new DispatcharrConnectionTestStore(appSettingsStore);
+                    var telegramAuth = new TelegramAuthService(wtelegramStore);
+                    // Wave W5 — expor o serviço ao bloco --telegram (abaixo)
+                    // para partilha do cliente autenticado.
+                    applicationTelegramAuth = telegramAuth;
+                    var dispatcharrService = new DispatcharrConfigurationService(wtelegramStore);
+
+                    // Wave 5 (PHASE 9C) — Hidratação da sessão Telegram em
+                    // background: um session.dat persistido válido deve marcar
+                    // o processo como autenticado logo após restart, sem
+                    // bloquear o arranque do dashboard nem exigir rede. Falha
+                    // e timeout são não-fatais (a prontidão fica false).
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            var status = await telegramAuth
+                                .GetStatusAsync(CancellationToken.None)
+                                .WaitAsync(TimeSpan.FromSeconds(10));
+                            Console.WriteLine(
+                                $"🔐 Telegram auth: state={status.State} configured={status.Configured}");
+                        }
+                        catch (Exception hydrateEx)
+                        {
+                            Console.WriteLine(
+                                $"⚠️ Hidratação da sessão Telegram falhou: {hydrateEx.GetType().Name}");
+                        }
+                    });
+                    var operationalReadiness = new OperationalReadinessService(
+                        lifecycle,
+                        adminUsers.HasActiveAdminAsync,
+                        () => telegramAuth.IsAuthenticated,
+                        dispatcharrService.Get,
+                        ct => HasCanonicalChannelsAsync(webCatalogResolver, ct),
+                        ct => Task.FromResult(CountryConfigProvisioner.IsCountryDataAvailable(
+                            Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries"),
+                            countryCode)),
+                        () => IsOutputWritable(dashboardOutputDir),
+                        ct => CountChannelSourcesAsync(webCatalogResolver, ct),
+                        dispatcharrTestStore.Load);
+
+                    // Wave 5 (PHASE 9C) — Expor os serviços de setup/config
+                    // à API do dashboard (Telegram config/login, Dispatcharr
+                    // config/teste, prontidão). Sem estes serviços os
+                    // endpoints respondem 503 <serviço>-unavailable.
+                    WebDashboardService.SetSetupServices(
+                        telegramAuth,
+                        dispatcharrService,
+                        new DispatcharrConnectionTester(),
+                        operationalReadiness,
+                        dispatcharrTestStore);
+
+                    try
+                    {
+                        var readinessSnapshot = await operationalReadiness.EvaluateAsync(CancellationToken.None);
+                        if (!readinessSnapshot.SetupComplete)
+                        {
+                            var missing = readinessSnapshot.MissingRequired.Count == 0
+                                ? "(sem componentes obrigatórios em falta)"
+                                : string.Join(", ", readinessSnapshot.MissingRequired);
+                            Console.WriteLine($"⚠️ setup operacional incompleto: {missing}");
+                        }
+                    }
+                    catch (Exception readinessEx)
+                    {
+                        Console.WriteLine(
+                            $"⚠️ Não foi possível avaliar a prontidão operacional: {readinessEx.Message}");
+                    }
+
+                    // PHASE 9C.4 — Host do Live Run (RunCoordinator único).
+                    // É construído aqui (antes de automationHost.Start) e
+                    // partilhado entre o dashboard e o bloco --telegram
+                    // abaixo. Sem este host, o dashboard responde
+                    // pipeline-not-configured (GET) e 503 (POST).
+                    liveRunHost = new LiveRunHost(webCatalogResolver.GetFactory());
+                    WebDashboardService.SetLiveRunHost(liveRunHost);
+                    WebDashboardService.SetWebAllowTrigger(webAllowTrigger);
+
                     automationHost = ScheduledAutomationHost.Build(
                         webCatalogResolver,
                         dashboardOutputDir,
-                        dispatcharrConfig);
+                        dispatcharrConfig,
+                        gate: new ConfigurationGate(lifecycle),
+                        liveRunHost: liveRunHost,
+                        dispatcharrConfigLoader: DispatcharrConfigLoader.Load,
+                        discoverySettings: discoverySettingsProvider,
+                        capabilityGate: new ActionCapabilityGate(operationalReadiness));
                     WebDashboardService.SetScheduledActions(automationHost.RegisteredActions);
                     automationHost.Start();
+                    Console.WriteLine("📅 Scheduler iniciado (polling de scheduled jobs).");
                     Console.WriteLine(
                         $"🕒 ScheduledJobRunner activo ({automationHost.RegisteredActions.Count} actions registadas).");
                 }
@@ -77,7 +265,7 @@ namespace m3uCrawler
                     Console.WriteLine($"⚠️ Catálogo não disponível para o dashboard: {ex.Message}");
                 }
 
-                webTask = WebDashboardService.RunDashboardAsync(dashboardOutputDir, webPort, dashboardHistoryService, webToken, CancellationToken.None);
+                webTask = WebDashboardService.RunDashboardAsync(dashboardOutputDir, webPort, dashboardHistoryService, webToken, processCts.Token);
                 _ = webTask.ContinueWith(t =>
                 {
                     if (t.IsFaulted && t.Exception != null)
@@ -87,27 +275,99 @@ namespace m3uCrawler
                 }, TaskContinuationOptions.OnlyOnFaulted);
             }
 
-            // PHASE 12 — Shutdown limpo: Ctrl+C pára o runner antes da app sair.
-            if (automationHost is not null)
+            // Lifecycle — Shutdown coerente: Ctrl+C e SIGTERM sinalizam o
+            // token do processo, depois fazem drain do Scheduler (com
+            // limite documentado para actions que não respeitam
+            // cancellation), e por fim param o listener do Dashboard. Esta
+            // ordem evita tarefas órfãs e garante que GetContextAsync()
+            // não fica bloqueado indefinidamente.
+            //
+            // Limite de drain do Scheduler: se uma action pendurar e não
+            // respeitar cancellation, o shutdown termina por timeout e é
+            // registado explicitamente como terminado por força — nunca
+            // mascarado como shutdown normal silencioso.
+            const int SchedulerDrainTimeoutSeconds = 10;
+            int shutdownInvocationCount = 0;
+
+            void CoherentShutdown(string reason)
             {
-                ConsoleCancelEventHandler cancelHandler = (_, e) =>
+                int invocation = System.Threading.Interlocked.Increment(ref shutdownInvocationCount);
+                if (invocation > 1)
                 {
-                    e.Cancel = true;
+                    return; // Shutdown já em curso; sinal único.
+                }
+
+                Console.WriteLine($"🛑 Shutdown solicitado ({reason}).");
+
+                // 1-2) Sinalizar o token global e impedir novos trabalhos.
+                processCts.Cancel();
+                Console.WriteLine("🛑 Token de processo cancelado; novas execuções bloqueadas.");
+
+                // 3-4) Pedir ao Scheduler para parar; drain cooperativo das
+                //       actions em curso (recebem o token do runner).
+                if (automationHost is not null)
+                {
+                    Console.WriteLine("🛑 Scheduler stopping...");
                     try
                     {
-                        automationHost.StopAsync().GetAwaiter().GetResult();
+                        var stopTask = automationHost.StopAsync();
+                        if (!stopTask.Wait(SchedulerDrainTimeoutSeconds * 1000))
+                        {
+                            Console.WriteLine(
+                                "🛑 ⚠️ Scheduler não terminou dentro do limite de drain " +
+                                $"({SchedulerDrainTimeoutSeconds}s). Shutdown continua por força — " +
+                                "o Main não aguarda mais pelo runner.");
+                        }
+                        else
+                        {
+                            Console.WriteLine("🛑 Scheduler stopping... parado.");
+                        }
                     }
                     catch (Exception ex)
                     {
                         Console.WriteLine($"⚠️ Erro ao parar ScheduledJobRunner: {ex.Message}");
                     }
-                };
-                Console.CancelKeyPress += cancelHandler;
+                }
+
+                // 5) Parar o HttpListener — desbloqueia GetContextAsync()
+                //    pendente e permite que o webTask devolva.
+                try
+                {
+                    WebDashboardService.StopDashboard();
+                    Console.WriteLine("🛑 Dashboard stopping... listener parado.");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"⚠️ Erro ao parar listener do dashboard: {ex.Message}");
+                }
+
+                Console.WriteLine("🛑 Shutdown: cleanup orquestrado concluído; Main vai terminar.");
             }
+
+            // Ctrl+C: sinaliza ao mecanismo de lifecycle — o shutdown
+            // ordenado corre no callback sincronamente, mantendo o processo
+            // vivo até cleanup estar concluído.
+            ConsoleCancelEventHandler cancelHandler = (_, e) =>
+            {
+                e.Cancel = true;
+                CoherentShutdown("Ctrl+C");
+            };
+            Console.CancelKeyPress += cancelHandler;
+
+            // SIGTERM (docker stop, kill -TERM, systemd): ProcessExit corre
+            // sincronamente e dá a oportunidade de cleanup ordenado.
+            AppDomain.CurrentDomain.ProcessExit += (s, e) => CoherentShutdown("SIGTERM/ProcessExit");
 
             if (args.Contains("--telegram"))
             {
-                var scraper = new TelegramScraperService();
+                // Wave W5 — Caminho de aplicação (dashboard/scheduler):
+                // a pipeline reutiliza o cliente WTelegram autenticado do
+                // TelegramAuthService. Sem serviço de aplicação (CLI
+                // interactiva), mantém-se o fallback legacy que constrói
+                // um cliente a partir de wtelegram.config.
+                var scraper = applicationTelegramAuth is not null
+                    ? new TelegramScraperService(applicationTelegramAuth)
+                    : new TelegramScraperService();
                 // PHASE-OBSERVABILITY (2026-09-15): activar tracing automaticamente
                 // quando a env var M3UCRAWLER_TRACE esta' definida. Em modo
                 // observabilidade (--telegram + M3UCRAWLER_TRACE=1), o pipeline
@@ -123,73 +383,115 @@ namespace m3uCrawler
                     scraper.SetTrace(pipelineTrace);
                     Console.WriteLine($"[OBSERVABILITY] PipelineTrace active runId={pipelineTrace.RunId} minimumLevel=Debug");
                 }
-                await scraper.LoginAsync();
+                // Wave W5 — Arranque seguro numa instalação nova: o
+                // Telegram pode ainda não estar configurado/autenticado.
+                // A autenticação é uma operação de aplicação (dashboard),
+                // pelo que o arranque não pode terminar por causa dela.
+                // Se não estiver pronta, registamos um aviso não sensível,
+                // não corremos o ciclo CLI e mantemos o dashboard vivo
+                // para o Setup. O scheduler continua a respeitar o gate
+                // por capacidade (W2) até estar autenticado.
+                bool telegramReady = await TryAuthenticateTelegramForStartupAsync(
+                    scraper, applicationTelegramAuth);
 
                 var catalogDbPath = ResolveCatalogDbPath(args);
+                IReadOnlyDictionary<string, IEnumerable<string>> countryAffinityMembers =
+                    new Dictionary<string, IEnumerable<string>>(StringComparer.OrdinalIgnoreCase);
                 CatalogResolver? catalogForAffinity = null;
                 try
                 {
                     catalogForAffinity = await InitializeCatalogAsync(catalogDbPath, CancellationToken.None);
-                    await InjectAffinityMembersToValidatorAsync(catalogForAffinity);
+                    countryAffinityMembers = await LoadCountryAffinityMembersAsync(catalogForAffinity);
+                    scraper.SetCountryAffinityMembers(countryAffinityMembers);
+                    // W2-FU-1 (2026-09-22) — wire do resolver para o
+                    // observer de falhas de aquisição. Sem catalog
+                    // disponível, o scraper fica sem observer (no-op,
+                    // preserva o comportamento legacy). Reutiliza a
+                    // mesma instância de catalogForAffinity (já criada
+                    // para afinidades) para evitar inicialização dupla.
+                    scraper.SetCatalogResolver(catalogForAffinity);
                 }
                 catch (Exception ex)
                 {
                     Console.WriteLine($"⚠️ Catálogo não disponível para injeção de afinidades: {ex.Message}");
                 }
 
-                // Get search term from arguments or prompt user
-                string term = "";
-                
-                // Find the index of --telegram and get the next argument as search term
+                // === Wave C — Discovery settings (fonte de verdade única) ===
+                // Os parâmetros de discovery vivem em runtime-data/app_settings.json
+                // (secção "discovery"). Um override explícito de CLI é persistido,
+                // para que a próxima execução (CLI, dashboard ou scheduler) leia o
+                // mesmo valor. Sem override, lê-se o valor persistido (default PT).
+                // Termo explícito: argumentos após --telegram até à próxima opção.
+                string? cliTerm = null;
                 int telegramIndex = Array.IndexOf(args, "--telegram");
                 if (telegramIndex >= 0 && telegramIndex < args.Length - 1)
                 {
-                    // Get arguments after --telegram until the next option
                     var remainingArgs = new List<string>();
                     for (int i = telegramIndex + 1; i < args.Length; i++)
                     {
                         if (args[i].StartsWith("--")) break;
                         remainingArgs.Add(args[i]);
                     }
-                    
+
                     if (remainingArgs.Any())
                     {
-                        term = string.Join(" ", remainingArgs);
+                        cliTerm = string.Join(" ", remainingArgs).Trim();
                     }
                 }
-                
-                // If no term provided via arguments, prompt the user
-                if (string.IsNullOrWhiteSpace(term))
-                {
-                    Console.Write("Termo a procurar no Telegram: ");
-                    term = Console.ReadLine() ?? "";
-                }
 
-                if (string.IsNullOrWhiteSpace(term))
-                {
-                    Console.WriteLine("Termo de pesquisa não pode estar vazio!");
-                    return;
-                }
-
-                int telegramMaxStreams = 500;
+                int? cliMaxStreams = null;
                 var telegramMaxArg = GetOptionValue(args, "--max-streams");
                 if (int.TryParse(telegramMaxArg, out int telegramParsedMax) && telegramParsedMax > 0)
                 {
-                    telegramMaxStreams = Math.Min(telegramParsedMax, 5000);
+                    cliMaxStreams = Math.Min(telegramParsedMax, DiscoverySettings.OverrideMaxStreamsCeiling);
                 }
 
-                // Janela de pesquisa Telegram: 24h por defeito.
-                // 24h cobre ciclos diários sem aumentar desnecessariamente
-                // o volume (mensagens analisadas, downloads HTTP, validação).
-                // Confirmado em produção: resultados relevantes continuam
-                // a aparecer dentro de 24h (ex: 2026-09-11 — m3u@…-HITS_DI_…html).
-                int telegramHistoryHours = 24;
+                int? cliHistoryHours = null;
                 var historyArg = GetOptionValue(args, "--history-hours");
-                if (int.TryParse(historyArg, out int parsedHistoryHours) && parsedHistoryHours > 0)
+                if (int.TryParse(historyArg, out int parsedHistoryHours)
+                    && parsedHistoryHours >= DiscoverySettings.MinValidHistoryHours)
                 {
-                    telegramHistoryHours = Math.Min(parsedHistoryHours, 24 * 30);
+                    cliHistoryHours = Math.Min(parsedHistoryHours, DiscoverySettings.MaxValidHistoryHours);
                 }
-                Console.WriteLine($"🕒 Janela de pesquisa Telegram: últimas {telegramHistoryHours}h");
+
+                int? cliMinHistoryHours = null;
+                var minHistoryArg = GetOptionValue(args, "--min-history-hours");
+                if (int.TryParse(minHistoryArg, out int parsedMinHistoryHours)
+                    && parsedMinHistoryHours >= 0)
+                {
+                    cliMinHistoryHours = Math.Min(parsedMinHistoryHours, DiscoverySettings.MaxValidHistoryHours);
+                }
+
+                // CLI alimenta a mesma configuração: só persiste o que foi
+                // explicitamente indicado; os restantes campos mantêm-se.
+                if (!string.IsNullOrWhiteSpace(cliTerm) || cliMaxStreams.HasValue || cliHistoryHours.HasValue || cliMinHistoryHours.HasValue)
+                {
+                    var persistedForWrite = appSettingsStore.Load();
+                    if (!string.IsNullOrWhiteSpace(cliTerm)) persistedForWrite.Discovery.Keyword = cliTerm!;
+                    if (cliHistoryHours.HasValue) persistedForWrite.Discovery.HistoryHours = cliHistoryHours.Value;
+                    if (cliMinHistoryHours.HasValue) persistedForWrite.Discovery.MinHistoryHours = cliMinHistoryHours.Value;
+                    if (cliMaxStreams.HasValue) persistedForWrite.Discovery.MaxStreams = cliMaxStreams.Value;
+                    appSettingsStore.Save(persistedForWrite);
+                }
+
+                // Sem override explícito, o valor vem do store persistido
+                // (nunca de um snapshot em memória capturado no arranque).
+                var resolvedDiscovery = discoverySettingsProvider.Load();
+                string term = resolvedDiscovery.Keyword;
+                int telegramMaxStreams = resolvedDiscovery.MaxStreams;
+                int telegramHistoryHours = resolvedDiscovery.HistoryHours;
+                int telegramMinHistoryHours = resolvedDiscovery.MinHistoryHours;
+                Console.WriteLine($"🔎 Termo de pesquisa Telegram: {term}");
+                if (telegramMinHistoryHours > 0)
+                {
+                    Console.WriteLine($"🕒 Janela de pesquisa Telegram: mensagens com idade entre {telegramMinHistoryHours}h e {telegramHistoryHours}h");
+                }
+                else
+                {
+                    Console.WriteLine($"🕒 Janela de pesquisa Telegram: últimas {telegramHistoryHours}h");
+                }
+                Console.WriteLine($"🎯 Limite de streams Telegram: {telegramMaxStreams}");
+
 
                 bool maintenanceMode = args.Contains("--telegram-maintain");
 
@@ -204,7 +506,9 @@ namespace m3uCrawler
                 var outputDir = GetOptionValue(args, "--output-dir") ?? "output";
                 telegramPlaylistManager.CreateOutputDirectory(outputDir);
                 var importHistoryService = new ImportHistoryService(outputDir);
-                var countryChannelValidator = new CountryChannelValidator(Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries"));
+                var countryChannelValidator = new CountryChannelValidator(
+                    Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries"),
+                    countryAffinityMembers);
                 Console.WriteLine($"📂 Pasta de saída das playlists: {Path.GetFullPath(outputDir)}");
 
                 // PHASE-Bridge — Inicializar o ingestor de catálogo para o pipeline
@@ -213,6 +517,7 @@ namespace m3uCrawler
                 // M3U continua a ser produzida.
                 PipelineIngestionService? pipelineIngestor = null;
                 CatalogResolver? catalogForIngestion = null;
+                m3uCrawler.Services.Recognition.RecognitionPolicyResolver? recognitionPolicyResolver = null;
                 try
                 {
                     catalogForIngestion = await InitializeCatalogAsync(catalogDbPath, CancellationToken.None);
@@ -222,6 +527,13 @@ namespace m3uCrawler
                     // (linha 186), partilhando configuração com o scraper.
                     pipelineIngestor = new PipelineIngestionService(
                         catalogForIngestion, countryChannelValidator);
+                    // D-M4-02 — resolver de policies partilhado por
+                    // scraper (propagação) e RunCoordinator (criação do
+                    // snapshot). Sem catálogo disponível ⇒ null ⇒ o
+                    // wiring continua a funcionar sem snapshot machinery.
+                    recognitionPolicyResolver = new m3uCrawler.Services.Recognition.RecognitionPolicyResolver(
+                        catalogForIngestion);
+                    scraper.SetRecognitionPolicyResolver(recognitionPolicyResolver);
                     Console.WriteLine("📦 Ingestor de catálogo inicializado.");
                 }
                 catch (Exception ex)
@@ -229,98 +541,322 @@ namespace m3uCrawler
                     Console.WriteLine($"⚠️ Ingestor de catálogo não disponível: {ex.Message}");
                 }
 
-                do
+                // PHASE 9C.1 — Gate de configuração para discovery automático.
+                // Manutenção (--telegram-maintain) e loop (--loop-hours) são
+                // caminhos automáticos: em NOT_CONFIGURED/CONFIGURING ficam
+                // bloqueados. Uma invocação manual de um único ciclo
+                // (--telegram sem loop nem manutenção) é operador-iniciada e
+                // não é afectada nesta wave.
+                //
+                // Wave 4 (PHASE 9C) — O caminho CLI manual/automático mantém
+                // deliberadamente apenas o gate de lifecycle (sem readiness
+                // operacional): continua a ser o operador a decidir quando
+                // correr.
+                //
+                // Wave W2 — O scheduler/dashboard usa o gate global de
+                // bootstrap (lifecycle) mais um gate POR CAPACIDADE
+                // (ActionCapabilityGate): acções não-Telegram não ficam
+                // bloqueadas só porque o Telegram não está autenticado.
+                bool automaticDiscovery = maintenanceMode || loopHours > 0;
+                var configurationLifecycle = BuildConfigurationLifecycle(
+                    catalogDbPath, outputDir, catalogForIngestion);
+                if (automaticDiscovery)
                 {
-                    if (maintenanceMode)
+                    try
                     {
-                        await RunTelegramMaintenanceCycle(
-                            scraper,
-                            telegramPlaylistManager,
-                            importHistoryService,
-                            term,
-                            outputDir,
-                            telegramMaxStreams,
-                            domainFilter,
-                            telegramHistoryHours,
-                            args,
-                            pipelineIngestor,
-                            countryCode,
-                            Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries"));
+                        LogLifecycleState(await configurationLifecycle.EnsureInitializedAsync(CancellationToken.None));
+                    }
+                    catch (Exception lifecycleEx)
+                    {
+                        Console.WriteLine($"⚠️ Não foi possível inicializar o estado de configuração: {lifecycleEx.Message}");
+                    }
+                }
+                var configurationGate = new ConfigurationGate(configurationLifecycle);
+
+                // PHASE 9C.4 — Live Run Monitor. O RunCoordinator é o
+                // único ponto de orquestração da execução Telegram: CLI,
+                // scheduler e dashboard convergem aqui. O coordinator é
+                // obtido de duas formas:
+                //  1. Via LiveRunHost, quando --web está activo (o host
+                //     foi construído no top-level e é partilhado com o
+                //     dashboard — um único coordinator para tudo).
+                //  2. Via construção local, apenas quando --telegram corre
+                //     sem --web (degradação graciosa, comportamento
+                //     preservado).
+                RunCoordinator? liveRunCoordinator = null;
+                Exception? liveRunException = null;
+                var countriesDirectory = Path.Combine(
+                    Directory.GetCurrentDirectory(), "runtime-data", "countries");
+
+                // Wave W2 — Serviço de publicação único: country gate →
+                // selecção de fontes (política persistida) → publicação
+                // atómica → run report → histórico → Dispatcharr. É a única
+                // implementação da cauda do pipeline Telegram; CLI,
+                // manutenção, dashboard e scheduler convergem aqui.
+                var dispatcharrSyncCoordinator = new DispatcharrSyncCoordinator(
+                    DispatcharrConfigLoader.Load);
+                var publicationService = new RunPublicationService(
+                    outputDir,
+                    telegramPlaylistManager,
+                    importHistoryService,
+                    countryChannelValidator,
+                    catalogForIngestion,
+                    dispatcharrSyncCoordinator);
+
+                // W6 — Expor a sincronização Dispatcharr ao Dashboard. É o
+                // MESMO coordenador que serve o RunPublicationService, para
+                // não existir um segundo caminho/source-of-truth. O gate
+                // dedicado serializa os pedidos HTTP /dry-run e /sync
+                // (segunda tentativa concorrente → 409). Additivo: o
+                // comportamento do RunPublicationService e do scheduler
+                // permanece inalterado. Em --web standalone (sem --telegram)
+                // não há coordenador e os endpoints respondem 503
+                // dispatcharr-unavailable — o que é o esperado.
+                if (webEnabled)
+                {
+                    WebDashboardService.SetDispatcharrSync(
+                        dispatcharrSyncCoordinator,
+                        new DispatcharrConcurrencyGate());
+                }
+
+                // Wave W2 — Executor único da Live Run Telegram. Faz a
+                // discovery e delega a cauda no publicationService. É o
+                // mesmo executor usado pelo dashboard e pelo scheduler (via
+                // RunCoordinator) e pela CLI quando --web está activo.
+                var telegramLiveRunExecutor = new TelegramLiveRunExecutor(
+                    discover: async (effectiveDiscovery, progress, ct) =>
+                    {
+                        var (streams, report) = await scraper.SearchAndTestM3UInTelegramAsync(
+                            effectiveDiscovery.Keyword,
+                            limit: 200,
+                            maxConcurrency: 5,
+                            maxUrlsToTest: effectiveDiscovery.MaxStreams,
+                            historyHours: effectiveDiscovery.HistoryHours,
+                            minHistoryHours: effectiveDiscovery.MinHistoryHours,
+                            countryCode: countryCode,
+                            countriesDir: countriesDirectory,
+                            pipelineIngestor: pipelineIngestor,
+                            pipelineSourceKey: $"telegram-{Slugify(effectiveDiscovery.Keyword)}",
+                            liveRunProgress: progress,
+                            cancellationToken: ct);
+                        return new TelegramDiscoveryResult(streams, report);
+                    },
+                    maintain: (effectiveDiscovery, progress, ct) => RunTelegramMaintenanceCycle(
+                        scraper,
+                        telegramPlaylistManager,
+                        importHistoryService,
+                        publicationService,
+                        effectiveDiscovery.Keyword,
+                        outputDir,
+                        effectiveDiscovery.MaxStreams,
+                        domainFilter,
+                        effectiveDiscovery.HistoryHours,
+                        effectiveDiscovery.MinHistoryHours,
+                        args,
+                        pipelineIngestor,
+                        countryCode,
+                        countriesDirectory,
+                        progress,
+                        ct),
+                    publication: publicationService,
+                    discoverySettings: discoverySettingsProvider,
+                    countryCode: countryCode,
+                    domainFilter: domainFilter);
+
+                if (catalogForIngestion is not null)
+                {
+                    Func<LiveRunRequest, IRunPipeline> liveRunPipelineFactory = _ =>
+                        new TelegramRunPipeline(async (request, progress, ct) =>
+                        {
+                            liveRunException = null;
+                            try
+                            {
+                                await telegramLiveRunExecutor
+                                    .ExecuteAsync(request, progress, ct);
+                            }
+                            catch (Exception ex)
+                            {
+                                // Preserva a semântica CLI anterior: a
+                                // excepção é re-lançada depois de o
+                                // coordinator fechar o run (Failed) e
+                                // libertar o lock.
+                                liveRunException = ex;
+                                throw;
+                            }
+                        });
+
+                    if (liveRunHost is not null)
+                    {
+                        liveRunCoordinator = liveRunHost.ConfigureExecutor(liveRunPipelineFactory);
+                        // D-M4-02 — host devolve a instância única do
+                        // coordinator; injectamos o resolver de policies
+                        // para que o caminho dashboard herde o snapshot
+                        // machinery sem alterar a superfície do host.
+                        liveRunCoordinator.SetRecognitionPolicyResolver(
+                            recognitionPolicyResolver);
+                        Console.WriteLine("🔁 RunCoordinator partilhado com o dashboard (LiveRunHost).");
                     }
                     else
                     {
-                        var (workingStreams, runReport) = await scraper.SearchAndTestM3UInTelegramAsync(
-                            term,
-                            limit: 200,
-                            maxConcurrency: 5,
-                            maxUrlsToTest: telegramMaxStreams,
-                            historyHours: telegramHistoryHours,
-                            countryCode: countryCode,
-                            countriesDir: Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries"),
-                            pipelineIngestor: pipelineIngestor,
-                            pipelineSourceKey: $"telegram-{Slugify(term)}");
+                        liveRunCoordinator = new RunCoordinator(
+                            catalogForIngestion.GetFactory(), liveRunPipelineFactory,
+                            recognitionPolicyResolver: recognitionPolicyResolver);
+                    }
 
-                        if (!string.IsNullOrWhiteSpace(domainFilter))
+                    // PHASE 9C.4 — Recuperar runs interrompidos por crash
+                    // anterior: marca-os como Failed antes de iniciar
+                    // qualquer nova execução. Idempotente.
+                    try
+                    {
+                        var recovered = await liveRunCoordinator
+                            .RecoverInterruptedRunsAsync(CancellationToken.None);
+                        if (recovered > 0)
                         {
-                            int beforeFilter = workingStreams.Count;
-                            workingStreams = workingStreams
-                                .Where(s => UrlMatchesDomain(s.Url, domainFilter))
-                                .ToList();
-                            Console.WriteLine($"🌐 Após filtro de domínio: {workingStreams.Count}/{beforeFilter} streams");
+                            Console.WriteLine(
+                                $"🩹 RecoverInterruptedRunsAsync: {recovered} run(s) marcado(s) como Failed.");
                         }
+                    }
+                    catch (Exception recoveryEx)
+                    {
+                        // Não bloquear o startup por causa de falha de
+                        // recovery: o coordinator continua utilizável.
+                        Console.WriteLine(
+                            $"⚠️ Falha em RecoverInterruptedRunsAsync: {recoveryEx.GetType().Name}: {recoveryEx.Message}");
+                    }
+                }
 
-                        Console.WriteLine($"\n✅ Streams funcionais encontradas no Telegram: {workingStreams.Count}");
+                if (!telegramReady)
+                {
+                    // Wave W5 — O executor já foi registado acima (quando o
+                    // catálogo está disponível), pelo que uma autenticação
+                    // concluída no dashboard habilita execuções
+                    // agendadas/manuais no MESMO processo, sem reiniciar.
+                    // Aqui apenas não corremos o ciclo CLI imediato.
+                    if (webEnabled && webTask is not null)
+                    {
+                        await AwaitResidentDashboardAsync(webTask, automationHost,
+                            $"🌐 Dashboard activo em http://+:{webPort}/ (Telegram pendente de Setup). " +
+                            "CTRL+C para encerrar.");
+                    }
 
-                        foreach (var stream in workingStreams)
+                    return;
+                }
+
+                do
+                {
+                    if (automaticDiscovery && !await configurationGate.IsReadyAsync())
+                    {
+                        Console.WriteLine(
+                            $"⛔ automatic discovery blocked: not configured (state={configurationGate.State.ToWireName()})");
+                        if (loopHours <= 0)
                         {
-                            Console.WriteLine($"  • {stream.Title} ({stream.ResponseTime}ms) :: {CredentialSanitizer.SanitizeUrl(stream.Url)}");
+                            if (webEnabled && webTask is not null)
+                            {
+                                await AwaitResidentDashboardAsync(webTask, automationHost,
+                                    "⛔ Discovery automática bloqueada (lifecycle não READY). " +
+                                    $"Processo residente activo: Dashboard+Scheduler em http://+:{webPort}/. CTRL+C para encerrar.");
+                            }
+                            return;
                         }
+                        Console.WriteLine();
+                        Console.WriteLine($"⏳ Próxima execução em {loopHours} hora(s)...");
+                        await Task.Delay(TimeSpan.FromHours(loopHours));
+                        continue;
+                    }
 
-                        var countryMatches = countryChannelValidator.ValidateStreams(workingStreams, countryCode);
-                        Console.WriteLine($"📡 Validação por canais {countryCode.ToUpperInvariant()}: {countryMatches.Count} stream(s) correspondentes.");
-                        foreach (var match in countryMatches.Take(10))
+                    // Wave C — Recarregar a configuração de discovery a cada
+                    // iteração: uma edição no dashboard aplica-se ao ciclo
+                    // seguinte sem reiniciar o processo.
+                    var cycleDiscovery = discoverySettingsProvider.Load();
+
+                    if (maintenanceMode)
+                    {
+                        if (liveRunCoordinator is not null)
                         {
-                            Console.WriteLine($"  • {countryCode.ToUpperInvariant()} match: {match.Stream.Title} -> {string.Join(", ", match.MatchedAliases)}");
+                            liveRunException = null;
+                            await liveRunCoordinator.StartAsync(new LiveRunRequest
+                            {
+                                Mode = LiveRunMode.TelegramMaintain,
+                                Source = LiveRunSource.Cli,
+                                Keyword = cycleDiscovery.Keyword,
+                                HistoryHours = cycleDiscovery.HistoryHours,
+                                MaxStreams = cycleDiscovery.MaxStreams,
+                            }, CancellationToken.None);
+
+                            if (liveRunException is not null)
+                            {
+                                System.Runtime.ExceptionServices.ExceptionDispatchInfo
+                                    .Capture(liveRunException).Throw();
+                            }
                         }
-
-                        var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-                        var playlistPath = Path.Combine(outputDir, $"telegram_playlist_{timestamp}.m3u");
-                        var reportPath = Path.Combine(outputDir, $"telegram_report_{timestamp}.json");
-
-                        await telegramPlaylistManager.SaveToM3uPlaylist(workingStreams, playlistPath);
-                        await telegramPlaylistManager.SaveToJsonReport(workingStreams, reportPath);
-                        await SaveRunReportAsync(outputDir, runReport);
-
-                        Console.WriteLine($"\n✨ Arquivos gerados:");
-                        Console.WriteLine($"   • Playlist: {playlistPath}");
-                        Console.WriteLine($"   • Relatório: {reportPath}");
-                        Console.WriteLine($"   • Relatório de execução: {Path.Combine(outputDir, "telegram_run_report.json")}");
-
-                        if (workingStreams.Count == 0)
+                        else
                         {
-                            Console.WriteLine("❌ Nenhum stream funcional encontrado no Telegram.");
+                            await RunTelegramMaintenanceCycle(
+                                scraper,
+                                telegramPlaylistManager,
+                                importHistoryService,
+                                publicationService,
+                                cycleDiscovery.Keyword,
+                                outputDir,
+                                cycleDiscovery.MaxStreams,
+                                domainFilter,
+                                cycleDiscovery.HistoryHours,
+                                cycleDiscovery.MinHistoryHours,
+                                args,
+                                pipelineIngestor,
+                                countryCode,
+                                countriesDirectory);
                         }
-
-                        await TrySyncToDispatcharrAsync(playlistPath, outputDir, args);
-
-                        await importHistoryService.RecordImportAsync(new ImportHistoryEntry
+                    }
+                    else
+                    {
+                        if (liveRunCoordinator is not null)
                         {
-                            Timestamp = DateTime.UtcNow,
-                            Mode = "TelegramSearch",
-                            SearchTerm = term,
-                            HistoryHours = telegramHistoryHours,
-                            MaxStreams = telegramMaxStreams,
-                            NewFunctionalCount = workingStreams.Count,
-                            MessagesAnalyzed = runReport.MessagesAnalyzed,
-                            CandidatesFound = runReport.CandidatesFound,
-                            PlaylistsDownloaded = runReport.PlaylistsDownloaded,
-                            CountryMatches = runReport.CountryMatches,
-                            PlaylistsRejected = runReport.PlaylistsRejected,
-                            StreamsExtracted = runReport.StreamsExtracted,
-                            StreamsTested = runReport.StreamsTested,
-                            StreamsWorking = runReport.StreamsWorking,
-                            StreamsFailed = runReport.StreamsFailed
-                        });
+                            liveRunException = null;
+                            await liveRunCoordinator.StartAsync(new LiveRunRequest
+                            {
+                                Mode = LiveRunMode.Telegram,
+                                Source = LiveRunSource.Cli,
+                                Keyword = cycleDiscovery.Keyword,
+                                HistoryHours = cycleDiscovery.HistoryHours,
+                                MaxStreams = cycleDiscovery.MaxStreams,
+                            }, CancellationToken.None);
+
+                            if (liveRunException is not null)
+                            {
+                                System.Runtime.ExceptionServices.ExceptionDispatchInfo
+                                    .Capture(liveRunException).Throw();
+                            }
+                        }
+                        else
+                        {
+                            // Sem coordinator (catálogo indisponível): a CLI
+                            // executa a discovery e publica pelo MESMO serviço
+                            // partilhado usado pelo dashboard e scheduler.
+                            var (directStreams, directReport) = await scraper.SearchAndTestM3UInTelegramAsync(
+                                cycleDiscovery.Keyword,
+                                limit: 200,
+                                maxConcurrency: 5,
+                                maxUrlsToTest: cycleDiscovery.MaxStreams,
+                                historyHours: cycleDiscovery.HistoryHours,
+                                minHistoryHours: cycleDiscovery.MinHistoryHours,
+                                countryCode: countryCode,
+                                countriesDir: countriesDirectory,
+                                pipelineIngestor: pipelineIngestor,
+                                pipelineSourceKey: $"telegram-{Slugify(cycleDiscovery.Keyword)}");
+
+                            await publicationService.PublishAsync(new RunPublicationRequest
+                            {
+                                Streams = directStreams,
+                                Report = directReport,
+                                Keyword = cycleDiscovery.Keyword,
+                                HistoryHours = cycleDiscovery.HistoryHours,
+                                MaxStreams = cycleDiscovery.MaxStreams,
+                                DomainFilter = domainFilter,
+                                CountryCode = countryCode,
+                                HistoryMode = "TelegramSearch",
+                            }, null, CancellationToken.None);
+                        }
                     }
 
                     if (loopHours > 0)
@@ -331,6 +867,18 @@ namespace m3uCrawler
                     }
                 }
                 while (loopHours > 0);
+
+                // Lifecycle residente — O ciclo Telegram one-shot terminou
+                // (loopHours == 0). COM --web, o processo permanece vivo:
+                // Dashboard + Scheduler + LiveRunHost continuam disponíveis
+                // para execuções agendadas/manuais. SEM --web, termina
+                // imediatamente (comportamento CLI one-shot preservado).
+                if (webEnabled && webTask is not null)
+                {
+                    await AwaitResidentDashboardAsync(webTask, automationHost,
+                        $"🌐 Ciclo Telegram concluído. Processo residente activo: " +
+                        $"Dashboard+Scheduler em http://+:{webPort}/. CTRL+C para encerrar.");
+                }
 
                 return;
             }
@@ -372,7 +920,29 @@ namespace m3uCrawler
                     return;
                 }
 
-                await TrySyncToDispatcharrAsync(playlistPath, outputDir, args);
+                // Legacy standalone path: sem stage de selecção nesta execução,
+                // portanto selection fica null (sem correlação heurística).
+                var standaloneConfig = DispatcharrConfigLoader.Load();
+                CatalogResolver? standaloneCatalog = null;
+                if (standaloneConfig.Enabled)
+                {
+                    try
+                    {
+                        standaloneCatalog = await InitializeCatalogAsync(
+                            ResolveCatalogDbPath(args), CancellationToken.None);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine(
+                            $"❌ Catálogo indisponível. Sincronização abortada antes de qualquer " +
+                            $"escrita HTTP. Erro: {ex.GetType().Name}");
+                        return;
+                    }
+                }
+                var standaloneSync = new DispatcharrSyncCoordinator(() => standaloneConfig);
+                await standaloneSync.RunAsync(
+                    playlistPath, outputDir, standaloneCatalog, selection: null,
+                    liveRunProgress: null, CancellationToken.None);
                 return;
             }
 
@@ -466,10 +1036,8 @@ namespace m3uCrawler
             // modo M3U8-search legacy (prompts interactivos).
             if (webEnabled && webTask is not null)
             {
-                Console.WriteLine("🌐 Modo dashboard standalone activo. Aguardando pedidos em http://+:" + webPort + "/");
-                try { await webTask; }
-                catch (Exception ex) { Console.WriteLine($"❌ Dashboard task falhou: {ex.GetBaseException().Message}"); }
-                automationHost?.Dispose();
+                await AwaitResidentDashboardAsync(webTask, automationHost,
+                    $"🌐 Modo dashboard standalone activo. Aguardando pedidos em http://+:{webPort}/. CTRL+C para encerrar.");
                 return;
             }
 
@@ -489,7 +1057,7 @@ namespace m3uCrawler
                 
                 // Filter out known options from args to get search term
                 var searchArgs = new List<string>();
-                var skipWithValue = new HashSet<string> { "--max-streams", "--domain", "--web-port", "--web-token", "--bot-token", "--loop-hours", "--history-hours", "--max-results", "--user", "--pass" };
+                var skipWithValue = new HashSet<string> { "--max-streams", "--domain", "--web-port", "--web-token", "--bot-token", "--loop-hours", "--history-hours", "--min-history-hours", "--max-results", "--user", "--pass" };
                 for (int i = 0; i < args.Length; i++)
                 {
                     if (skipWithValue.Contains(args[i]))
@@ -641,16 +1209,19 @@ namespace m3uCrawler
             Console.WriteLine("  --web             Ativa uma interface web para ver histórico e playlist");
             Console.WriteLine("  --web-port N      Porta do servidor web (padrão: 5000)");
             Console.WriteLine("  --web-token TOKEN Bearer token para autorização no dashboard (protege timing-attack via FixedTimeEquals)");
+            Console.WriteLine("  --web-allow-trigger   Permite POST /api/run/start a partir do dashboard (opt-in; default: 503)");
             Console.WriteLine("  --bot             Modo bot Telegram (legacy M3U8-search)");
             Console.WriteLine("  --bot-token TOKEN Token do bot Telegram (também via M3U_BOT_TOKEN); obrigatorio com --bot");
             Console.WriteLine("  --scan-domain D   Faz scan direto ao domínio para procurar playlists (sem Telegram)");
             Console.WriteLine("  --telegram-maintain Mantém output/playlist.m3u com base no Telegram e remove links mortos");
-            Console.WriteLine("  --history-hours N Janela (em horas) para pesquisar mensagens no Telegram (padrão: 24)");
+            Console.WriteLine("  --history-hours N Limite superior (em horas) da janela de pesquisa Telegram (padrão: 24; máximo: 1440)");
+            Console.WriteLine("  --min-history-hours N Limite inferior (em horas) da idade das mensagens (padrão: 0 = legacy)");
             Console.WriteLine("  --loop-hours N    Repete execução a cada N horas (ex: 24)");
             Console.WriteLine("  --fast            Modo alta performance (20 conexões paralelas)");
             Console.WriteLine("  --high-performance Mesmo que --fast");
             Console.WriteLine("  --dispatcharr-sync  Sincroniza uma playlist M3U já existente com Dispatcharr (sem Telegram)");
             Console.WriteLine("  --playlist PATH    Caminho da playlist a sincronizar (default: <output-dir>/playlist.m3u)");
+            Console.WriteLine("  --admin-reset-password USERNAME  Recupera a password do administrador (host-only; password lida do stdin, nunca de argv)");
             Console.WriteLine("  --help, -h        Mostra esta ajuda");
             Console.WriteLine("  --version, -V     Mostra versão (SemVer + commit SHA + build number + data) e sai");
             Console.WriteLine();
@@ -680,6 +1251,222 @@ namespace m3uCrawler
             return null;
         }
 
+        /// <summary>
+        /// Lifecycle residente — mantém o processo vivo enquanto o
+        /// Dashboard/Scheduler estiverem activos. Junta-se ao webTask
+        /// (que termina quando o token de processo for cancelado ou o
+        /// listener for parado) e depois liberta o Scheduler. É o padrão
+        /// único usado nos QUATRO caminhos residentes:
+        ///   - <c>--telegram --web</c> com Telegram pendente de Setup;
+        ///   - <c>--telegram --web --telegram-maintain</c> com lifecycle
+        ///     não READY (discovery automática bloqueada, loopHours==0);
+        ///   - <c>--telegram --web</c> após o ciclo one-shot (loopHours==0);
+        ///   - <c>--web</c> standalone.
+        /// </summary>
+        internal static async Task AwaitResidentDashboardAsync(
+            Task? webTask,
+            ScheduledAutomationHost? automationHost,
+            string modeMessage)
+        {
+            Console.WriteLine(modeMessage);
+            if (webTask is null)
+            {
+                return;
+            }
+
+            try
+            {
+                await webTask;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"❌ Dashboard task falhou: {ex.GetBaseException().Message}");
+            }
+
+            automationHost?.Dispose();
+        }
+
+        /// <summary>
+        /// Wave W5 — Prepara o Telegram no arranque sem terminar o processo.
+        ///
+        /// <para>
+        /// No caminho de aplicação (<paramref name="applicationAuth"/> não
+        /// nulo) consulta o <see cref="TelegramAuthService"/>; uma
+        /// instalação nova sem <c>wtelegram.config</c>/<c>session.dat</c>
+        /// resolve rapidamente para <c>false</c> sem rede nem consola. No
+        /// caminho legacy (CLI interactiva) autentica o cliente de consola.
+        /// </para>
+        ///
+        /// <para>
+        /// Qualquer falha é convertida num aviso não sensível e em
+        /// <c>false</c>: o chamador mantém o dashboard vivo para o Setup.
+        /// </para>
+        /// </summary>
+        internal static async Task<bool> TryAuthenticateTelegramForStartupAsync(
+            TelegramScraperService scraper,
+            TelegramAuthService? applicationAuth,
+            TimeSpan? timeout = null)
+        {
+            try
+            {
+                if (applicationAuth is not null)
+                {
+                    var status = await applicationAuth
+                        .GetStatusAsync(CancellationToken.None)
+                        .WaitAsync(timeout ?? TimeSpan.FromSeconds(20));
+
+                    if (status.State == TelegramAuthState.Authenticated)
+                    {
+                        Console.WriteLine(
+                            $"🔐 Telegram autenticado: {status.UserName ?? "(conta)"}");
+                        return true;
+                    }
+
+                    Console.WriteLine(
+                        "⚠️ Telegram ainda não autenticado " +
+                        $"(estado={status.State}). Conclua o Setup no dashboard; " +
+                        "o ciclo Telegram automático fica bloqueado até lá.");
+                    return false;
+                }
+
+                await scraper.LoginAsync();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                // Nunca expor segredos: apenas o tipo da excepção.
+                Console.WriteLine(
+                    "⚠️ Telegram indisponível no arranque " +
+                    $"({ex.GetType().Name}). O dashboard permanece disponível " +
+                    "para Setup; o ciclo Telegram automático fica bloqueado.");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// W10a — Recuperação de password do administrador via host (CLI).
+        ///
+        /// <para>
+        /// A password NUNCA é um argumento de linha de comandos (ficaria no
+        /// histórico do shell e na lista de processos). Só o username é lido de
+        /// <c>argv</c>; a nova password e a confirmação são lidas do stdin.
+        /// </para>
+        /// <para>
+        /// Leitura: se <see cref="Console.IsInputRedirected"/> for verdadeiro
+        /// (input canalizado/automação) usa-se <c>Console.ReadLine()</c>; caso
+        /// contrário usa-se <c>Console.ReadKey(intercept:true)</c> com eco
+        /// mascarado (<c>*</c>), para a password não aparecer no terminal.
+        /// Nota/limitação: em alguns contentores sem TTY reconhecido pelo .NET,
+        /// <c>IsInputRedirected</c> é <c>true</c> mesmo com <c>docker run -it</c>,
+        /// caindo-se no caminho <c>ReadLine</c> onde o eco canónico do terminal
+        /// mostra os caracteres; a máscara não é garantida nesse cenário.
+        /// </para>
+        /// </summary>
+        static async Task<int> RunAdminResetPasswordAsync(string[] args)
+        {
+            var username = GetOptionValue(args, "--admin-reset-password");
+            if (string.IsNullOrWhiteSpace(username))
+            {
+                Console.Error.WriteLine("Uso: m3uCrawler --admin-reset-password <username>");
+                return 1;
+            }
+
+            CatalogResolver catalog;
+            try
+            {
+                catalog = await InitializeCatalogAsync(
+                    ResolveCatalogDbPath(args), CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                // Mensagem de erro sem qualquer valor de password/hash.
+                Console.Error.WriteLine($"❌ Catálogo não disponível: {ex.Message}");
+                return 1;
+            }
+
+            var users = new AdminUserStore(catalog.GetFactory());
+            var service = new AdminPasswordResetService(users);
+
+            var promptIndex = 0;
+            Func<string> passwordReader = () =>
+            {
+                Console.Write(promptIndex++ == 0
+                    ? "Nova password: "
+                    : "Confirmar nova password: ");
+
+                if (Console.IsInputRedirected)
+                {
+                    return Console.ReadLine() ?? string.Empty;
+                }
+
+                var masked = ReadMaskedPassword();
+                Console.WriteLine();
+                return masked;
+            };
+
+            AdminPasswordResetOutcome outcome;
+            try
+            {
+                outcome = await service.ResetAsync(username, passwordReader, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                // Nunca imprimir valores da password; apenas tipo/mensagem.
+                Console.Error.WriteLine($"❌ Falha ao alterar a password: {ex.GetType().Name}");
+                return 1;
+            }
+
+            switch (outcome)
+            {
+                case AdminPasswordResetOutcome.Changed:
+                    Console.WriteLine("password alterada");
+                    return 0;
+                case AdminPasswordResetOutcome.UserNotFound:
+                    Console.WriteLine("utilizador não encontrado");
+                    return 2;
+                case AdminPasswordResetOutcome.InvalidPassword:
+                    Console.WriteLine("password inválida");
+                    return 3;
+                default:
+                    Console.WriteLine("passwords não coincidem");
+                    return 4;
+            }
+        }
+
+        /// <summary>
+        /// Lê uma linha sem eco, escrevendo <c>*</c> por cada carácter. Suporta
+        /// backspace. Usado apenas em terminais interactivos (quando
+        /// <see cref="Console.IsInputRedirected"/> é falso).
+        /// </summary>
+        static string ReadMaskedPassword()
+        {
+            var buffer = new StringBuilder();
+            while (true)
+            {
+                var key = Console.ReadKey(intercept: true);
+                if (key.Key == ConsoleKey.Enter)
+                {
+                    return buffer.ToString();
+                }
+
+                if (key.Key == ConsoleKey.Backspace)
+                {
+                    if (buffer.Length > 0)
+                    {
+                        buffer.Length--;
+                        Console.Write("\b \b");
+                    }
+                    continue;
+                }
+
+                if (key.KeyChar != '\0')
+                {
+                    buffer.Append(key.KeyChar);
+                    Console.Write('*');
+                }
+            }
+        }
+
         static bool UrlMatchesDomain(string url, string domainFilter)
         {
             if (!Uri.TryCreate(url, UriKind.Absolute, out var uri)) return false;
@@ -706,25 +1493,24 @@ namespace m3uCrawler
             TelegramScraperService scraper,
             PlaylistManagerService playlistManager,
             ImportHistoryService importHistory,
+            IRunPublicationService publication,
             string term,
             string outputDir,
             int telegramMaxStreams,
             string? domainFilter,
             int telegramHistoryHours,
+            int telegramMinHistoryHours,
             string[] args,
             PipelineIngestionService? pipelineIngestor,
             string countryCode = "pt",
-            string? countriesDir = null)
+            string? countriesDir = null,
+            ILiveRunProgress? liveRunProgress = null,
+            CancellationToken cancellationToken = default)
         {
-            var tempPath = Path.Combine(outputDir, "playlist_temp.m3u");
             var mainPath = Path.Combine(outputDir, "playlist.m3u");
-            var reportPath = Path.Combine(outputDir, "telegram_maintain_report.json");
 
             Console.WriteLine();
             Console.WriteLine("🧹 Início do ciclo de manutenção Telegram...");
-
-            // Limpa sempre a playlist temporária no início do ciclo.
-            await File.WriteAllTextAsync(tempPath, "#EXTM3U" + Environment.NewLine, Encoding.UTF8);
 
             var (freshStreams, runReport) = await scraper.SearchAndTestM3UInTelegramAsync(
                 term,
@@ -732,11 +1518,16 @@ namespace m3uCrawler
                 maxConcurrency: 5,
                 maxUrlsToTest: telegramMaxStreams,
                 historyHours: telegramHistoryHours,
+                minHistoryHours: telegramMinHistoryHours,
                 countryCode: countryCode,
                 countriesDir: countriesDir,
                 report: new RunReport(),
                 pipelineIngestor: pipelineIngestor,
-                pipelineSourceKey: $"telegram-{Slugify(term)}");
+                pipelineSourceKey: $"telegram-{Slugify(term)}",
+                liveRunProgress: liveRunProgress,
+                cancellationToken: cancellationToken);
+
+            liveRunProgress?.ReportCounts(runReport);
 
             if (!string.IsNullOrWhiteSpace(domainFilter))
             {
@@ -746,10 +1537,6 @@ namespace m3uCrawler
                     .ToList();
                 Console.WriteLine($"🌐 Após filtro de domínio: {freshStreams.Count}/{beforeFilter} streams");
             }
-
-            await playlistManager.SaveToM3uPlaylist(freshStreams, tempPath);
-            Console.WriteLine($"🔔 Novos canais funcionais em playlist_temp.m3u: {freshStreams.Count}");
-            Console.WriteLine($"   • Escrito: {tempPath}");
 
             var existingMain = await playlistManager.LoadFromM3uPlaylist(mainPath);
             Console.WriteLine($"📄 playlist.m3u atual: {existingMain.Count} stream(s) a retestar");
@@ -824,51 +1611,71 @@ namespace m3uCrawler
             }
 
             // Se não houve novas descobertas, NÃO se apagam os streams existentes.
+            // PHASE 9C.4 — COMPOSING: composição da playlist alvo
+            // (merge dos streams retestados com as novas descobertas).
+            if (liveRunProgress is not null)
+            {
+                await liveRunProgress.EnterPhaseAsync(
+                    LiveRunPhase.Composing, "composing target playlist", cancellationToken)
+                    .ConfigureAwait(false);
+            }
             var finalStreams = TelegramScraperService.MergeStreams(stillWorkingMain, freshStreams);
 
-            await playlistManager.SaveToM3uPlaylist(finalStreams, mainPath);
-            await playlistManager.SaveToJsonReport(finalStreams, reportPath);
-            await SaveRunReportAsync(outputDir, runReport);
+            // Wave W2 — A selecção de fontes, a publicação atómica, o run
+            // report, o histórico e o sync Dispatcharr passam pelo serviço
+            // de publicação único. Zero duplicação entre manutenção e ciclo
+            // único: ambos produzem o mesmo contrato.
+            var published = await publication.PublishAsync(
+                new RunPublicationRequest
+                {
+                    Streams = finalStreams,
+                    Report = runReport,
+                    Keyword = term,
+                    HistoryHours = telegramHistoryHours,
+                    MaxStreams = telegramMaxStreams,
+                    CountryCode = countryCode,
+                    HistoryMode = "TelegramMaintenance",
+                    PlaylistFileName = "playlist.m3u",
+                    JsonReportFileName = "telegram_maintain_report.json",
+                    RunCountryGate = false,
+                    Verbose = false,
+                    NewFunctionalCountOverride = freshStreams.Count(s => s.IsWorking),
+                    ExistingRetestedCount = existingMain.Count,
+                    ExistingStillWorkingCount = stillWorkingMain.Count,
+                    TrackFinalPlaylistCount = true,
+                },
+                liveRunProgress,
+                cancellationToken).ConfigureAwait(false);
 
-            await TrySyncToDispatcharrAsync(mainPath, outputDir, args);
-
-            var historyEntry = new ImportHistoryEntry
+            liveRunProgress?.ReportCounts(counts =>
             {
-                Timestamp = DateTime.UtcNow,
-                Mode = "TelegramMaintenance",
-                SearchTerm = term,
-                HistoryHours = telegramHistoryHours,
-                MaxStreams = telegramMaxStreams,
-                NewFunctionalCount = freshStreams.Count(s => s.IsWorking),
-                ExistingRetestedCount = existingMain.Count,
-                ExistingStillWorkingCount = stillWorkingMain.Count,
-                FinalPlaylistCount = finalStreams.Count,
-                MessagesAnalyzed = runReport.MessagesAnalyzed,
-                CandidatesFound = runReport.CandidatesFound,
-                PlaylistsDownloaded = runReport.PlaylistsDownloaded,
-                CountryMatches = runReport.CountryMatches,
-                PlaylistsRejected = runReport.PlaylistsRejected,
-                StreamsExtracted = runReport.StreamsExtracted,
-                StreamsTested = runReport.StreamsTested,
-                StreamsWorking = runReport.StreamsWorking,
-                StreamsFailed = runReport.StreamsFailed
-            };
-            await importHistory.RecordImportAsync(historyEntry);
+                counts.TargetPlaylistEntries = published.Published.Count;
+                counts.ExistingPlaylistRetested = existingMain.Count;
+            });
 
             Console.WriteLine("✅ Ciclo concluído.");
             Console.WriteLine($"   • Mantidas de playlist.m3u: {stillWorkingMain.Count}");
-            Console.WriteLine($"   • Novas funcionais de playlist_temp.m3u: {freshStreams.Count(s => s.IsWorking)}");
-            Console.WriteLine($"   • Total final em playlist.m3u: {finalStreams.Count}");
-            Console.WriteLine($"   • playlist_temp.m3u: {tempPath}");
+            Console.WriteLine($"   • Novas funcionais descobertas: {freshStreams.Count(s => s.IsWorking)}");
+            Console.WriteLine($"   • Total final em playlist.m3u: {published.Published.Count}");
+            Console.WriteLine($"   • playlist_temp.m3u: {published.IntermediatePlaylistPath}");
             Console.WriteLine($"   • playlist.m3u: {mainPath}");
             Console.WriteLine($"   • Relatório de execução: {Path.Combine(outputDir, "telegram_run_report.json")}");
         }
 
-        static async Task InjectAffinityMembersToValidatorAsync(CatalogResolver catalog)
+        /// <summary>
+        /// Carrega os membros de afinidade <c>Kind=Country</c> do catálogo
+        /// como um mapa país→aliases. São injectados na construção de cada
+        /// <see cref="CountryChannelValidator"/>; não existe estado estático
+        /// partilhado. Estes membros são classificadores de país e não criam
+        /// identidade de canal.
+        /// </summary>
+        static async Task<IReadOnlyDictionary<string, IEnumerable<string>>> LoadCountryAffinityMembersAsync(CatalogResolver catalog)
         {
+            var result = new Dictionary<string, IEnumerable<string>>(StringComparer.OrdinalIgnoreCase);
             var groups = await catalog.ListAffinityGroupsAsync();
             var byCountry = groups
-                .Where(g => !string.IsNullOrWhiteSpace(g.CountryCode))
+                .Where(g => g.Kind == AffinityKind.Country
+                    && !string.IsNullOrWhiteSpace(g.CountryCode))
                 .GroupBy(g => g.CountryCode!.ToLowerInvariant());
             foreach (var group in byCountry)
             {
@@ -879,28 +1686,12 @@ namespace m3uCrawler
                     .ToList();
                 if (members.Count > 0)
                 {
-                    CountryChannelValidator.SetAffinityMembersStatic(group.Key, members);
+                    result[group.Key] = members;
                     Console.WriteLine($"  [{group.Key}] {members.Count} membro(s) de afinidade injetados");
                 }
             }
-        }
 
-        static async Task SaveRunReportAsync(string outputDir, RunReport report)
-        {
-            try
-            {
-                var path = Path.Combine(outputDir, "telegram_run_report.json");
-                var json = System.Text.Json.JsonSerializer.Serialize(report, new System.Text.Json.JsonSerializerOptions
-                {
-                    WriteIndented = true,
-                    PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase
-                });
-                await File.WriteAllTextAsync(path, json, Encoding.UTF8);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"⚠️ Não foi possível guardar o relatório de execução: {ex.Message}");
-            }
+            return result;
         }
 
         /// <summary>
@@ -939,50 +1730,96 @@ namespace m3uCrawler
             string dbPath, CancellationToken ct)
         {
             Console.WriteLine($"📦 Inicializando catálogo persistente: {dbPath}");
+
+            // Provisiona a baseline de países antes de qualquer
+            // CountryChannelValidator/CountryChannelListService ser
+            // construído (vale para --web e --telegram).
+            CountryConfigProvisioner.EnsureProvisioned(
+                Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries"));
+
             var bootstrapper = new ChannelCatalogBootstrapper(dbPath);
             await using var context = await bootstrapper.InitializeAsync(ct);
             await context.DisposeAsync();
             var factory = new RuntimeChannelCatalogDbContextFactory(dbPath);
-            return new CatalogResolver(factory, dbPath);
+            // W5.4 — lifecycle de Review auditado na camada de serviço.
+            return new CatalogResolver(factory, dbPath, new AuditService(factory));
         }
 
-        static async Task TrySyncToDispatcharrAsync(
-            string playlistPath, string outputDir, string[] args)
+        /// <summary>
+        /// PHASE 9C.1 — Constrói o serviço de lifecycle de configuração.
+        /// O estado é persistido ao lado do <c>channel-catalog.db</c>
+        /// (mesmo volume persistente). Não faz I/O; o bootstrap é
+        /// explícito via <c>EnsureInitializedAsync</c>.
+        /// </summary>
+        static ConfigurationLifecycleService BuildConfigurationLifecycle(
+            string catalogDbPath, string outputDir, CatalogResolver? catalog)
         {
-            var cfg = DispatcharrConfigLoader.Load();
-            if (!cfg.Enabled) return;
+            var store = ConfigurationLifecycleStore.ForCatalogDatabase(catalogDbPath);
+            return new ConfigurationLifecycleService(store, catalog?.GetFactory(), outputDir);
+        }
 
-            CatalogResolver catalog;
+        /// <summary>
+        /// Wave 4 (PHASE 9C) — Probe de prontidão: o catálogo canónico tem
+        /// pelo menos um canal. Fail-safe (nunca lança).
+        /// </summary>
+        static async Task<bool> HasCanonicalChannelsAsync(CatalogResolver catalog, CancellationToken ct)
+        {
+            var stats = await catalog.GetStatsAsync(ct);
+            return stats.CanonicalChannels >= 1;
+        }
+
+        /// <summary>
+        /// Wave 4 (PHASE 9C) — Probe de prontidão: número de
+        /// <c>channel_sources</c> realmente ingeridas. Fail-safe (devolve 0
+        /// em erro). Não é requisito de SetupComplete.
+        /// </summary>
+        static async Task<int> CountChannelSourcesAsync(CatalogResolver catalog, CancellationToken ct)
+        {
+            var stats = await catalog.GetStatsAsync(ct);
+            return stats.ChannelSources;
+        }
+
+        /// <summary>
+        /// Wave 4 (PHASE 9C) — Probe de output: a pasta existe e é
+        /// gravável. Cria a pasta se necessário; nunca lança.
+        /// </summary>
+        static bool IsOutputWritable(string outputDir)
+        {
+            if (string.IsNullOrWhiteSpace(outputDir))
+            {
+                return false;
+            }
+
             try
             {
-                catalog = await InitializeCatalogAsync(
-                    ResolveCatalogDbPath(args), CancellationToken.None);
+                Directory.CreateDirectory(outputDir);
+                var probe = Path.Combine(outputDir, $".m3ucrawler-readiness-probe-{Guid.NewGuid():N}");
+                File.WriteAllText(probe, "ok");
+                File.Delete(probe);
+                return true;
             }
-            catch (Exception ex)
+            catch (Exception ex) when (
+                ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// PHASE 9C.1 — Log não sensível do estado de configuração
+        /// (nome do estado e, quando aplicável, a marca de adopção legacy).
+        /// </summary>
+        static void LogLifecycleState(ConfigurationLifecycleSnapshot snapshot)
+        {
+            if (snapshot.AdoptedFromLegacy)
             {
                 Console.WriteLine(
-                    $"❌ Catálogo falhou a inicializar em '{ResolveCatalogDbPath(args)}'. " +
-                    $"Sincronização Dispatcharr abortada antes de qualquer escrita HTTP. " +
-                    $"Erro: {ex.Message}");
-                throw;
+                    $"🧭 Configuration lifecycle: {snapshot.State.ToWireName()} (legacy adoption: {snapshot.LastReason})");
             }
-
-            try
+            else
             {
-                var aliases = AliasResolver.FromFile(cfg.AliasFile);
-                var ordering = new StreamOrderingPolicy(cfg.ProviderPriority);
-                var matcher = new ChannelMatcher(aliases, null, catalog);
-                var sync = new m3uCrawler.Services.Sync.DispatcharrSyncService(
-                    cfg, outputDir,
-                    aliases: aliases,
-                    ordering: ordering,
-                    matcher: matcher,
-                    catalog: catalog);
-                await sync.RunAsync(playlistPath);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"⚠️ Falha na sincronização Dispatcharr: {ex.Message}");
+                Console.WriteLine(
+                    $"🧭 Configuration lifecycle: {snapshot.State.ToWireName()}");
             }
         }
     }

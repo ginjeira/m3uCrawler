@@ -72,25 +72,25 @@ public class CatalogBaselineImporterTests : IDisposable
     }
 
     [Fact]
-    public void ResolveEditorialGroup_maps_known_groups()
+    public void ResolveGroupKey_maps_known_groups()
     {
-        Assert.Equal(CanonicalEditorialGroup.PortugalLive, CatalogBaselineImporter.ResolveEditorialGroup("pt-generalistas"));
-        Assert.Equal(CanonicalEditorialGroup.PortugalDesporto, CatalogBaselineImporter.ResolveEditorialGroup("pt-desporto"));
-        Assert.Equal(CanonicalEditorialGroup.PortugalInfantil, CatalogBaselineImporter.ResolveEditorialGroup("pt-infantil"));
-        Assert.Equal(CanonicalEditorialGroup.PortugalDocumentarios, CatalogBaselineImporter.ResolveEditorialGroup("pt-documentarios"));
-        Assert.Equal(CanonicalEditorialGroup.PortugalFilmes24_7, CatalogBaselineImporter.ResolveEditorialGroup("pt-filmes-series"));
-        Assert.Equal(CanonicalEditorialGroup.PortugalEntretenimento, CatalogBaselineImporter.ResolveEditorialGroup("pt-entretenimento"));
-        Assert.Equal(CanonicalEditorialGroup.Foreign, CatalogBaselineImporter.ResolveEditorialGroup("international-news"));
-        Assert.Equal(CanonicalEditorialGroup.PortugalPPV, CatalogBaselineImporter.ResolveEditorialGroup("adultos"));
-        Assert.Equal(CanonicalEditorialGroup.PortugalFilmes24_7, CatalogBaselineImporter.ResolveEditorialGroup("vod-filmes"));
+        Assert.Equal(CanonicalGroupKeys.PortugalGeneralistas, CatalogBaselineImporter.ResolveGroupKey("pt-generalistas"));
+        Assert.Equal(CanonicalGroupKeys.PortugalDesporto, CatalogBaselineImporter.ResolveGroupKey("pt-desporto"));
+        Assert.Equal(CanonicalGroupKeys.PortugalInfantil, CatalogBaselineImporter.ResolveGroupKey("pt-infantil"));
+        Assert.Equal(CanonicalGroupKeys.PortugalDocumentarios, CatalogBaselineImporter.ResolveGroupKey("pt-documentarios"));
+        Assert.Equal(CanonicalGroupKeys.PortugalFilmesSeries, CatalogBaselineImporter.ResolveGroupKey("pt-filmes-series"));
+        Assert.Equal(CanonicalGroupKeys.PortugalEntretenimento, CatalogBaselineImporter.ResolveGroupKey("pt-entretenimento"));
+        Assert.Equal(CanonicalGroupKeys.International, CatalogBaselineImporter.ResolveGroupKey("international-news"));
+        Assert.Equal(CanonicalGroupKeys.PortugalPPV, CatalogBaselineImporter.ResolveGroupKey("adultos"));
+        Assert.Equal(CanonicalGroupKeys.PortugalFilmesSeries, CatalogBaselineImporter.ResolveGroupKey("vod-filmes"));
     }
 
     [Fact]
-    public void ResolveEditorialGroup_unknown_defaults_to_Other()
+    public void ResolveGroupKey_unknown_defaults_to_Other()
     {
-        Assert.Equal(CanonicalEditorialGroup.Other, CatalogBaselineImporter.ResolveEditorialGroup(null));
-        Assert.Equal(CanonicalEditorialGroup.Other, CatalogBaselineImporter.ResolveEditorialGroup(""));
-        Assert.Equal(CanonicalEditorialGroup.Other, CatalogBaselineImporter.ResolveEditorialGroup("xyz"));
+        Assert.Equal(CanonicalGroupKeys.Other, CatalogBaselineImporter.ResolveGroupKey(null));
+        Assert.Equal(CanonicalGroupKeys.Other, CatalogBaselineImporter.ResolveGroupKey(""));
+        Assert.Equal(CanonicalGroupKeys.Other, CatalogBaselineImporter.ResolveGroupKey("xyz"));
     }
 
     [Fact]
@@ -269,7 +269,7 @@ public class CatalogBaselineImporterTests : IDisposable
             Key = "pre-existing",
             DisplayName = "Pre Existing",
             EditorialCategory = EditorialCategory.Live,
-            EditorialGroup = CanonicalEditorialGroup.PortugalLive,
+            GroupId = null,
             PublicationPolicy = PublicationPolicy.CreateEligible,
             IsEnabled = true,
             CreatedAtUtc = DateTime.UtcNow,

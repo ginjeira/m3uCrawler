@@ -1,0 +1,310 @@
+# Plano de recuperação e evolução do Dashboard/pipeline — auditoria runtime 2026-10-04
+
+> **Documento de planeamento (docs-only).** Registra a auditoria runtime de 2026-10-04 e o plano de
+> waves de recuperação `W1–W7`. Subordinado à BÍBLIA (`docs/Reestructure/00-BIBLE.md:30-41`, `:105-128`);
+> não redefine conceitos normativos nem implementa nada.
+>
+> **Estado:** `W1`–`W6` **CONCLUÍDAS** (2026-10-04); `W7` **PARCIAL / NÃO CONCLUÍDA** (código + harness + runtime local da imagem W6 validados; deployment no servidor, Run Telegram real e Dry/Sync reais **não validados** — ver §W7). Este documento mantém o plano original; o progresso é registado em `docs/PROJECT_STATUS.md`.
+>
+> **Cross-reference:** estado corrente e prioridades em `docs/PROJECT_STATUS.md` (secção
+> "Waves 2026-10 — recuperação pós-auditoria runtime") e `ROADMAP.md` (§ "Em curso"). Índice de waves
+> em `docs/project/waves/README.md`.
+
+**Legenda de classificação (usada em todo o documento):**
+
+- **CONFIRMADO** — observado em runtime real (Playwright/API/BD) e/ou confirmado no código.
+- **DECISÃO** — arquitectura/comportamento já decidido pelo proprietário; não é hipótese.
+- **PENDENTE** — trabalho a executar numa wave futura; não implementado.
+
+## 1. Contexto da auditoria
+
+| Item | Valor |
+|---|---|
+| Data | 2026-10-04 |
+| HEAD | `cf0e3141f447f2b26dc6cc06c31fc53a4d111a3f` |
+| Runtime auditado | `m3ucrawler-first-test` em `192.168.68.142:5000` |
+| Imagem | `ghcr.io/ginjeira/m3ucrawler@sha256:09204621cde12af7148eabcdffb28a49fdf724988d348cc08aa3048d97ac519c` (build de `cf0e314`) |
+| Método | Playwright sobre bytes servidos (browser real) + API autenticada + leitura de BD/ficheiros/logs + código + histórico Git/legacy |
+
+A auditoria foi **runtime-first** (não apenas leitura estática). O backend/API foi validado com
+evidência HTTP + BD; a UI foi validada com um browser real.
+
+## 2. CONFIRMADO — problemas encontrados
+
+### 2.1 Regressão transversal de escopo JavaScript (IIFE) → UI parcialmente morta
+
+**CONFIRMADO (runtime + código + git).** O *script* principal do Dashboard é envolvido em
+`(function(){ … })();` (introduzido no commit `2311540` *"feat: redesign m3uCrawler dashboard"*,
+2026-08-30). As funções ficam **locais** ao IIFE; apenas **38** foram re-exportadas para `window`.
+Os *handlers* **inline** do HTML (`onclick='fn()'`, `onchange='fn()'`) resolvem os nomes no **escopo
+global** → qualquer função não exportada lança `ReferenceError` e o clique **não faz nada**.
+
+Evidência runtime (Playwright sobre os bytes servidos, `cf0e314`):
+
+- `typeof window.showCreateChannelForm === "undefined"`; clicar em **"+ Novo Canal"** →
+  `pageerror: showCreateChannelForm is not defined`; o formulário permanece `hidden`.
+- Clicar no nome de um canal → `pageerror: selectChannel is not defined`.
+- `<th>Display Name</th>` não tem handler nenhum (não há ordenação implementada).
+- `submitCreateScheduledJob`, `submitCreateOrderingList`, `submitCreateChannel` → **`undefined`**.
+- **~46** nomes de handler inline não têm export para `window` (22 observados mortos em runtime);
+  contrasta com os que **funcionam** por terem sido re-exportados (`approveReview`,
+  `submitAddAffinityGroup`, `loadCatalogReviews`, `startLiveRun`, `loadLiveRun`, …).
+
+Sintomas explicados: criação/edição/eliminação de canal canónico, criação de scheduler, criação de
+ordering list, e várias outras acções do Dashboard estão mortas por `ReferenceError`.
+
+> Nota: o **backend/API funciona** — a criação de canal (201), o scheduler CRUD (200) e o ordering
+> CRUD (201) responderam correctamente quando exercidos via API. A regressão é da **UI**.
+
+### 2.2 Problemas independentes confirmados
+
+| # | Problema | Classificação |
+|---|---|---|
+| P1 | **`WriteJsonAsync` mascara o status HTTP**: repõe sempre o status (default `200`), pelo que vários caminhos de erro devolvem `HTTP 200` com corpo `{"error":…}`. O JavaScript (`if (r.ok)`) interpreta como sucesso → falha silenciosa (ex.: canal sem `displayName`, enum inválido, ordering duplicado/sem campos). | CONFIRMADO (runtime + código) |
+| P2 | **Rotas inexistentes podem ficar penduradas**: `PUT`/`DELETE` não correspondidos mantêm o socket aberto (HTTP 000, sem `404/405`); `GET` desconhecido devolve o HTML do Dashboard com `200` (fallback SPA). | CONFIRMADO (runtime) |
+| P3 | **Ordering não tem `PUT`**: não existe edição de metadados; o endpoint devolve *hang* em vez de `404/405`. | CONFIRMADO (runtime + código) |
+| P4 | **Reviews não desaparecem**: `GET /api/catalog/reviews` devolve **todos** os itens, incluindo os `Resolved` (runtime: 513 itens, 60 `Resolved`); a UI só esconde botões, não remove linhas. | CONFIRMADO (runtime) |
+| P5 | **`approveReview` com UX incompleta**: usa `prompt()` em cadeia (acção, key, nome); não há *dropdown* de canais; `create-channel` só recolhe *key*+*name* (sem Display Name/país/categoria/grupo). | CONFIRMADO (runtime) |
+| P6 | **Add Alias não alimenta Affinity**: `ApplyAddAliasAsync` só escreve `channel_aliases`; `affinity_groups`/`affinity_members` ficam inalterados (testado num canal de teste). Alias e Affinity são dois mecanismos paralelos sem ligação. | CONFIRMADO (runtime + BD) |
+| P7 | **Dispatcharr sem UI funcional**: existem `POST /api/dispatcharr/dry-run` e `/sync`, mas nenhum botão no Dashboard (só um *badge* de estado). | CONFIRMADO (runtime) |
+| P8 | **Separador Canais/Países sem CRUD de país**: edita listas de canais/aliases por país (`runtime-data/countries/*.json`) e valida a playlist; **não** cria nem elimina países. O botão "Re-validar" (`loadCountryValidation`) está morto (§2.1). | CONFIRMADO (runtime + código) |
+| P9 | **Playlist canónica não é produzida pelo ciclo normal**: o ciclo `--telegram` produz `telegram_playlist_<timestamp>.m3u`; `playlist.m3u`/`playlist_temp.m3u` só são produzidos por `--telegram-maintain`. No runtime auditado esses ficheiros **não existem** → `/api/playlist` e `/api/playlist_temp` devolvem `404` e o separador Playlist mostra "não disponível". | CONFIRMADO (runtime + código) |
+| P10 | **Dispatcharr consome o artefacto timestamped** em vez do produto canónico decidido. | CONFIRMADO (runtime: `sourcePlaylistPath=…/telegram_playlist_20261003_200433.m3u`, `dryRun=false`) |
+| P11 | **Mutações do Scheduler não geram `audit_records`** (falta auditabilidade). | CONFIRMADO (BD) |
+| P12 | **Regressão não coberta por testes**: não existe teste que garanta que cada handler inline existe no escopo esperado. | CONFIRMADO (código) |
+
+## 3. DECISÃO — arquitectura alvo das playlists
+
+**DECISÃO.** Não remover `playlist.m3u` nem `playlist_temp.m3u`. A arquitectura alvo é:
+
+```
+RUN
+  ↓
+descoberta
+  ↓
+streams/candidates
+  ↓
+normalização
+  ↓
+deduplicação
+  ↓
+playlist_temp.m3u
+  ↓
+filtros / validação / matching / rejeições / publicação
+  ↓
+playlist.m3u
+  ↓
+Dispatcharr
+```
+
+Definições:
+
+- **`playlist_temp.m3u`** = conjunto **intermédio** com os streams/canais **normalizados e
+  deduplicados** antes dos filtros finais.
+- **`playlist.m3u`** = playlist **final publicada**, destinada ao consumo do **Dispatcharr**.
+- **`telegram_playlist_<timestamp>.m3u`** = artefacto **histórico/técnico** de uma execução, se
+  continuar a ser útil; **NÃO** deve ser o produto canónico do pipeline nem substituir
+  `playlist.m3u`.
+
+## 4. PENDENTE — plano de waves
+
+A ordem abaixo é **normativa** para a execução. Cada wave tem âmbito isolado, testes, evidência,
+actualização de documentação quando necessário, e **commit próprio**; não mistura alterações de
+waves seguintes.
+
+### W1 — Dashboard JS / IIFE / handlers
+
+**Objectivo:** restaurar as funcionalidades actualmente mortas devido ao problema de escopo/IIFE (§2.1).
+
+**Inclui:**
+- handlers usados pelo HTML inline;
+- criação/edição/eliminação de canonical channels;
+- scheduler;
+- ordering;
+- source groups;
+- country validation;
+- outras acções demonstradas como `ReferenceError`.
+
+**Critério:** todos os handlers referenciados pelo HTML devem existir no escopo esperado, **ou** a
+implementação deve ser convertida para *event listeners* sem dependência de globals. Adicionar
+**regressão** que impeça voltar a introduzir handlers HTML que não estejam disponíveis.
+
+**NÃO resolver nesta wave** os restantes problemas funcionais descobertos (§2.2, §3).
+
+**Estado:** **CONCLUÍDA** (2026-10-04). Abordagem **A** — re-exportação explícita para `window` (coerente com os exports já existentes) dos **48** handlers que faltavam; sem refactor do Dashboard e sem alterar endpoints/contratos. Regressão `DashboardInlineHandlerScopeTests` (cobre a classe: percorre todos os handlers inline do HTML renderizado e exige `window.<fn>` para cada função chamada). Validado em browser real sem `ReferenceError`. Ver `docs/PROJECT_STATUS.md` e `CHANGELOG.md`.
+
+### W2 — Pipeline de playlists / Dispatcharr
+
+**Objectivo:** restabelecer um pipeline funcional de dados novos para o Dispatcharr.
+
+**Implementar e validar a arquitectura**:
+`RUN → normalização/deduplicação → playlist_temp.m3u → filtros/validação/matching/rejeição/publicação → playlist.m3u → Dispatcharr`.
+
+**Requisitos:**
+- `playlist_temp.m3u` deve representar o estado intermédio definido em §3;
+- `playlist.m3u` deve representar o resultado final;
+- o Dispatcharr deve consumir `playlist.m3u`;
+- não depender de `telegram_playlist_<timestamp>.m3u` como produto principal;
+- preservar, se tecnicamente útil, os artefactos timestamped como histórico;
+- validar a cadeia com uma execução real controlada;
+- validar que existem dados novos em `playlist.m3u`;
+- validar que o Dispatcharr recebe esses dados.
+
+**Prioridade:** esta wave é **prioritária** e deve ser executada antes das waves funcionais
+restantes, porque deixar a playlist para o fim significa continuar sem alimentação normal do
+Dispatcharr.
+
+**NÃO misturar nesta wave:** scheduler; ordering; canonical CRUD; reviews; affinity; countries;
+redesign geral do Dashboard.
+
+**Estado:** **CONCLUÍDA** (2026-10-04). Implementação mínima no serviço único de publicação
+(`RunPublicationService.PublishAsync`): deduplicação por URL (OrdinalIgnoreCase, mantendo a
+primeira ocorrência) → escrita atómica do intermédio `playlist_temp.m3u` **antes** de qualquer
+filtro/validação/matching → selecção inalterada → escrita atómica do canónico final
+`playlist.m3u` → o Dispatcharr passa a receber **`playlist.m3u`** (nunca o timestamped). O
+`telegram_playlist_<timestamp>.m3u` continua a ser escrito no caminho normal como
+histórico/técnico; no ciclo de manutenção (`PlaylistFileName="playlist.m3u"`, coincidente com o
+canónico) deixa de haver escrita duplicada e o `RunPublicationService` passa a ser o **único**
+dono de `playlist_temp.m3u` (removida a truncagem/escrita manual em `Program.cs`). Testes em
+`WaveW2CanonicalPipelineTests` (dedup no intermédio; final = saída da selecção; separação
+temp/final; Dispatcharr consome `playlist.m3u` via dry-run com transporte falso; timestamped
+histórico + manutenção só canónico). Não foi feita execução real controlada contra Dispatcharr
+(sem rede) — a cadeia foi validada por integração determinística. Ver `docs/PROJECT_STATUS.md` e
+`CHANGELOG.md`.
+
+### W3 — HTTP/API transversal
+
+**Objectivo:** corrigir problemas transversais identificados em §2.2 P1–P2.
+
+- `WriteJsonAsync` não deve mascarar o status HTTP;
+- erros devem chegar ao browser como `4xx/5xx` adequados;
+- rotas inexistentes devem responder `404/405` e **nunca** ficar penduradas;
+- completar/validar contratos HTTP necessários;
+- adicionar testes de regressão.
+
+**Estado:** **CONCLUÍDA** (2026-10-04). Correçcão **transversal** em `WebDashboardService`, sem patches endpoint a endpoint e sem alterar a arquitectura `HttpListener`:
+(1) `WriteJsonAsync`/`WriteTextAsync` passam a **preservar** o status já fixado pelo chamador (parâmetro `HttpStatusCode?`; só sobrescreve quando explícito) — elimina o mascaramento 4xx→200;
+(2) `HandleRequestAsync` corre agora dentro de `try/catch/finally` com rastreio de respostas escritas (`ConditionalWeakTable`), garantindo que **nenhum** pedido fica pendurado: rota não-root não correspondida → `404` JSON (nunca o HTML do Dashboard), ramos que fixam um status de erro (ex.: 405) sem corpo devolvem esse status, e excepções não tratadas → `500` (log mínimo: método/path/tipo);
+(3) a página do Dashboard só é servida na raiz.
+Regressão em `WaveW3HttpSemanticsTests` (404 para GET/POST/PUT/DELETE em rota inexistente; 405 em método não suportado; 404 non-root; `/` continua HTML; API válida continua JSON; 201/400/404/409 preservados; `PUT` de Ordering → 404/405 sem hang).
+
+### W4 — Scheduler + Ordering + Canonical Channels
+
+**Objectivo:** validar e tornar funcionais end-to-end.
+
+- **Scheduler:** criar; editar; activar/desactivar; eliminar; persistência; execução; apresentação
+  dos jobs; ajuda de Cron; auditabilidade (ver §2.2 P11).
+- **Ordering:** criar; editar; eliminar; adicionar/remover items; preview; persistência (ver §2.2 P3).
+- **Canonical Channels:** criar; editar; eliminar; todos os campos relevantes; Display Name;
+  validações; UI completa.
+
+**Critério:** não considerar suficiente o facto de a API funcionar; cada funcionalidade deve ser
+**testada através do Dashboard**.
+
+**Estado:** **CONCLUÍDA** (2026-10-04).
+- **Scheduler:** adicionada edição pela UI (botão **Editar** por linha; prefill do formulário com o `Name` **bloqueado**, reutilizando o upsert-por-Name já existente; botão **Limpar / Novo**; reset/reload/feedback mantidos) e **auditabilidade** nas rotas de criar/upsert, enable/disable e eliminar (`catalog.scheduled-job.*`).
+- **Ordering:** novo `PUT /api/catalog/ordering-lists/{id}` + `CatalogResolver.UpdateOrderingListAsync` (edita `Name`/`Country`/`Description`/`IsEnabled`; `Key` imutável; validação; 400/404; audit `catalog.ordering-list.update`) e formulário de edição na UI; corrigido o silêncio de erros em `toggleOrderingItem`/`removeOrderingItem`.
+- **Canonical Channels:** o formulário de criação passa a servir também de **edição** (`editChannelInline` abre o formulário com `Key` bloqueado), expondo **todos** os campos suportados — DisplayName, Country, **EditorialCategory**, **EditorialGroup**, PublicationPolicy, IsEnabled (aliases só na criação) — que antes só existiam em `prompt()` parcial.
+- Handlers novos exportados para `window` (regressão W1 mantida). Testes: `WaveW4OrderingHttpTests`, `WaveW4ChannelAdminHttpTests`, `WaveW4UiHtmlTests` + extensões a `ScheduledJobsEndpointTests`/`WaveW3HttpSemanticsTests`. Ver `CHANGELOG.md`.
+
+### W5 — Reviews + Alias → Affinity
+
+**Reviews:**
+- canais aprovados/revistos devem **desaparecer** da lista de reviews pendentes (§2.2 P4);
+- Approve deve apresentar opções **estruturadas** (§2.2 P5);
+- Create Channel deve apresentar **formulário completo**;
+- Add Alias deve apresentar os canonical channels existentes para **selecção**;
+- não obrigar o utilizador a escrever manualmente uma canonical key.
+
+**Alias → Affinity** (§2.2 P6). Ao adicionar um alias a um canonical channel:
+- se já existir a Affinity correspondente, adicionar o membro de forma **idempotente**;
+- se não existir, criar **exactamente uma** Affinity;
+- adicionar o canonical/alias member correspondente;
+- **nunca** criar Affinities duplicadas;
+- reflectir a alteração no separador **Afinidades**.
+
+**Estado:** **CONCLUÍDA** (2026-10-04).
+- **Lista activa:** `GET /api/catalog/reviews` e `GET /api/reviews` excluem por omissão `Resolved`/`Ignored` (histórico via `?state=`; legacy aceita `?includeResolved=true`); a UI deixa de mostrar itens terminais.
+- **Aprovação estruturada:** removida a cadeia de `prompt()`; painel `#reviewApproveModal` com **Add Alias / Create Channel / Excluir**; Add Alias com `<select>` de canais canónicos (`GET /api/catalog/channels`); formulário completo de canal reutilizado da W4 (modo review) com **Display Name** e **IsEnabled**.
+- **Add Alias → Affinity:** `CatalogResolver.EnsureChannelAffinityMemberCoreAsync` (mesmo contexto/transacção do chamador) invocado em `ApplyAddAliasAsync` e `ApplyCreateChannelAsync`: reutiliza a affinity de canal existente ou cria **exactamente uma**; acrescenta o membro de forma idempotente.
+- `ReviewChannelSpec.IsEnabled` propagado até `ApplyCreateChannelAsync`. Testes: `WaveW5AliasAffinityTests`, `WaveW5ReviewListAndCreateTests`, `WaveW5UiHtmlTests`. Ver `CHANGELOG.md`.
+
+### W6 — Dispatcharr UI + Countries + restantes funcionalidades
+
+**Dispatcharr** (§2.2 P7):
+- disponibilizar **Dry Run**;
+- disponibilizar **Sync** real;
+- apresentar resultado;
+- apresentar erros;
+- respeitar a autenticação/configuração existente.
+
+**Countries** (§2.2 P8): decidir e documentar se o separador deve ser
+**(a)** CRUD completo de países, **ou** **(b)** apenas ferramenta de validação/configuração.
+Se for mantido como entidade funcional, implementar CRUD completo.
+
+**Corrigir também:** Revalidar; restantes botões mortos; funcionalidades sem implementação
+correspondente.
+
+**Estado:** **CONCLUÍDA** (2026-10-04).
+- **Dispatcharr UI:** botões **Dry Run** e **Sync Dispatcharr**, com confirmação forte antes do Sync (real/destrutivo), estado *busy*/anti-duplo-clique, resultado (mode/status/counts/planPath/reportPath) e erros reais; envia `{ playlistPath: "playlist.m3u" }` (canónico da W2). **Wiring de produção:** `Program.cs` regista o coordenador no Dashboard (`SetDispatcharrSync`, o MESMO do `RunPublicationService`); em `--web` standalone sem `--telegram` não há coordenador → 503 esperado.
+- **Countries (Opção B):** países são **configuração/aliases em JSON** (`runtime-data/countries/*.json`), sem entidade de domínio → mantido como ferramenta de configuração/validação; `Re-validar` já funcional (W1); corrigida a preservação do `displayName`; adicionados "Novo país" e "Eliminar" (`CountryChannelListService.DeleteCountry` + `DELETE /api/country`, 200/404).
+- **Rota morta corrigida:** `POST /api/catalog/pending-country-approvals/{id}/approve|reject` (parsing por segmentos; 400/404/405).
+- Restantes controlos auditados: funcionais; endpoints sem UI ficam documentados (não são "botões mortos"). Testes: `WaveW6*`. Ver `CHANGELOG.md`.
+
+### W7 — Auditoria final end-to-end
+
+**Objectivo:** executar auditoria completa do Dashboard e pipeline contra **runtime real controlado**.
+
+**Validar:** todas as funcionalidades visíveis; todas as rotas; todos os handlers; estados de erro;
+persistência; scheduler; ordering; canonical channels; reviews; aliases; affinities; countries;
+playlists; Dispatcharr; output inventory; observabilidade; documentação.
+
+**Estado:** **PARCIAL / NÃO CONCLUÍDA** (2026-10-04).
+
+- **VALIDADO:**
+  - suite completa (`2933 passed / 0 failed / 1 skipped`) e build Release (**0 errors / 54 warnings**);
+  - **runtime local isolado da imagem W6** (`m3ucrawler:first-real-test-9a6815c`): container residente; `/api/version` = `9a6815cb1780b5a47622253b742079625b57bfe9`; `/` → bootstrap (302→200); bootstrap + login + clientes autenticados; `GET /api/catalog/channels` / `/api/scheduled-actions` / `/api/countries` → 200; criar canal `TEST-E2E-W7` → 201 e eliminar → 200; rota inexistente → 404; `POST /api/dispatcharr/dry-run` → 503 `dispatcharr-unavailable` (esperado em `--web` sem `--telegram`). Nada no servidor foi tocado.
+- **NÃO VALIDADO (blockers):**
+  - **deployment** da imagem W6 no servidor — o utilizador SSH `kilo-m3ucrawler` não tem acesso ao Docker daemon e não há credenciais GHCR para publicar;
+  - **Run Telegram real** → `playlist_temp.m3u` / `playlist.m3u` → Dispatcharr (exige o runtime do servidor com credenciais reais);
+  - **Scheduler real** (job disparado) e **Ordering/Reviews/Alias→Affinity** no runtime real (cobertura apenas por testes/harness);
+  - **Dispatcharr Sync real** — **não autorizado** nesta wave.
+- **Observação do runtime em produção de teste (imagem `cf0e314`, pré-W1..W6):** residente há ~1d21h, mas **sem `playlist.m3u`/`playlist_temp.m3u`** e com **run #18 parado** (`TerminalStatus=0`/"Unknown", em *validating streams* desde `2026-10-04T11:54Z`) — comportamento **pré-W2**, não uma regressão das waves.
+- **Para concluir W7:** deploy controlado da imagem W6 no servidor (com rollback registado), Run controlada + Dry Run; Sync real **apenas com autorização explícita**.
+
+## 5. Ordem e prioridade
+
+1. **W1** e **W2** são as prioridades imediatas.
+2. **W2 é deliberadamente antecipada** (executada antes das restantes waves funcionais) para não
+   deixar o Dispatcharr sem dados novos enquanto as waves de UI decorrem.
+3. **W3–W7** seguem-se pela ordem indicada.
+
+## 6. Critérios gerais
+
+Cada wave deve:
+- ter âmbito isolado;
+- ter testes;
+- ter evidência;
+- actualizar documentação quando necessário;
+- produzir **commit próprio**;
+- não misturar alterações de waves seguintes.
+
+## 7. Rastreabilidade (problema → wave)
+
+| Problema (§2) | Wave |
+|---|---|
+| Regressão IIFE / handlers mortos (2.1) | **W1** |
+| Playlist canónica + Dispatcharr (P9, P10) | **W2** |
+| Masking de status / rotas penduradas (P1, P2) | **W3** |
+| Scheduler, Ordering, Canonical (P3, P11) | **W4** |
+| Reviews, Alias→Affinity (P4, P5, P6) | **W5** |
+| Dispatcharr UI, Countries, botões mortos (P7, P8) | **W6** |
+| Verificação global (todos) | **W7** |
+| Regressão de cobertura de handlers (P12) | **W1** |
+
+## 8. Não-objectivos
+
+Este plano **não** implementa nada; é documentação. Não altera código, APIs, UI, playlists,
+Dispatcharr nem configuração de deployment. Não reescreve documentação histórica para fazer parecer
+que algo já foi implementado. Os problemas em §2 são **CONFIRMADO** (observados), a arquitectura em
+§3 é **DECISÃO**, e §4 é **PENDENTE**.

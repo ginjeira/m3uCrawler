@@ -1,0 +1,375 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using m3uCrawler.Models;
+using m3uCrawler.Services.Catalog;
+using m3uCrawler.Services.Matching;
+
+namespace m3uCrawler.Services.SourceSelection;
+
+/// <summary>
+/// Defaults da política de selecção para a Wave 13-3 (sem persistência).
+/// O valor <c>10</c> é apenas o default de configuração — o algoritmo
+/// (<see cref="ChannelSourceSelector"/>) não tem limites hardcoded.
+/// </summary>
+public static class SourceSelectionDefaults
+{
+    public static SourceSelectionPolicy DefaultPolicy { get; } = new(
+        MaxSourcesPerChannel: 10,
+        PreferDistinctProviders: true,
+        MaxSourcesPerProvider: null,
+        AllowFallbackToSameProvider: true);
+}
+
+/// <summary>
+/// PHASE 13 (Wave 13-3) — Contrato do estágio que aplica a selecção de
+/// fontes do catálogo às streams do pipeline Telegram, antes da
+/// publicação em <c>output/playlist.m3u</c>.
+/// </summary>
+public interface ISourceSelectionStage
+{
+    Task<SourceSelectionStageResult> ApplyAsync(
+        IReadOnlyList<M3uStream> streams,
+        SourceSelectionPolicy policy,
+        CancellationToken cancellationToken = default);
+}
+
+/// <summary>
+/// PHASE 13 (Wave 13-3 / 13-4b) — Junta as streams do pipeline (URL real, em
+/// memória) aos <c>ChannelSource</c> do catálogo (URL sanitizada) e
+/// aplica <see cref="IChannelSourceSelector"/> por canal canónico.
+///
+/// <para>
+/// <b>Read-only e sem persistência.</b> Só lê o catálogo. Não insere/
+/// actualiza/apaga nada e nunca persiste a URL real. Não escreve ficheiros;
+/// a publicação é responsabilidade do caller
+/// (<c>PlaylistManagerService.SaveToM3uPlaylist</c>).
+/// </para>
+///
+/// <para>
+/// Recebe um <see cref="ISourceSelectionPolicyProvider"/> (tipicamente um
+/// <see cref="SourceSelectionPolicySet"/>) e resolve a política efectiva por
+/// canal canónico antes de invocar o selector. O overload que recebe uma
+/// única <see cref="SourceSelectionPolicy"/> continua suportado e delega no
+/// overload de provider através de <see cref="SourceSelectionPolicySet.Constant"/>.
+/// </para>
+///
+/// <para>
+/// <b>Resolução de identidade (W4.1 / V2).</b> A junção usa exclusivamente o
+/// <b>fingerprint canónico</b> do URL de runtime
+/// (<see cref="StreamFingerprint.TryComputeFingerprint"/>, versão
+/// <see cref="StreamFingerprint.Version"/>, actualmente <c>sfp1</c>) contra o
+/// fingerprint/versão persistidos em <c>ChannelSource</c>. A URL sanitizada é
+/// apenas apresentação/persistência e nunca é chave de junção; rows legacy sem
+/// fingerprint persistido não são correspondidas (sem fallback). Sem matching
+/// aproximado, por título ou por host.
+/// </para>
+///
+/// <para>
+/// <b>Segurança / resiliência:</b> se o catálogo não estiver disponível,
+/// estiver vazio, ou a leitura falhar, o estágio é um no-op e todas as
+/// streams passam inalteradas. Streams sem correspondência inequívoca
+/// (0 ou >1 canais canónicos) fazem pass-through e não contam para os
+/// limites.
+/// </para>
+/// </summary>
+public sealed class SourceSelectionStage : ISourceSelectionStage
+{
+    /// <summary>Motivo (stage-level) para uma stream cujo ChannelSource está desactivado.</summary>
+    public const string SourceDisabledReason = "source-disabled";
+
+    /// <summary>Motivo (stage-level) para URL mapeada a mais de um canal canónico.</summary>
+    public const string AmbiguousMappingReason = "ambiguous-mapping";
+
+    private readonly CatalogResolver? _catalog;
+    private readonly IChannelSourceSelector _selector;
+
+    public SourceSelectionStage(CatalogResolver? catalog, IChannelSourceSelector? selector = null)
+    {
+        _catalog = catalog;
+        _selector = selector ?? new ChannelSourceSelector();
+    }
+
+    /// <summary>
+    /// Overload legado: aplica uma política única a todos os canais.
+    /// Delega no overload que recebe um provider, sem duplicar o algoritmo.
+    /// </summary>
+    public Task<SourceSelectionStageResult> ApplyAsync(
+        IReadOnlyList<M3uStream> streams,
+        SourceSelectionPolicy policy,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(policy);
+        return ApplyAsync(streams, SourceSelectionPolicySet.Constant(policy), cancellationToken);
+    }
+
+    /// <summary>
+    /// Aplica a selecção resolvendo a política efectiva por canal canónico
+    /// através de <paramref name="policies"/>.
+    /// </summary>
+    public async Task<SourceSelectionStageResult> ApplyAsync(
+        IReadOnlyList<M3uStream> streams,
+        ISourceSelectionPolicyProvider policies,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(streams);
+        ArgumentNullException.ThrowIfNull(policies);
+
+        if (_catalog is null || streams.Count == 0)
+        {
+            return SourceSelectionStageResult.NoOp(streams);
+        }
+
+        IReadOnlyList<ChannelSourceEntity> channelSources;
+        IReadOnlyList<SourceEntity> sources;
+        try
+        {
+            channelSources = await _catalog.ListChannelSourcesAsync(cancellationToken: cancellationToken);
+            sources = await _catalog.ListSourcesAsync(cancellationToken);
+        }
+        catch (Exception)
+        {
+            // Leitura do catálogo é best-effort: uma falha não pode quebrar a pipeline.
+            return SourceSelectionStageResult.NoOp(streams);
+        }
+
+        if (channelSources.Count == 0)
+        {
+            return SourceSelectionStageResult.NoOp(streams);
+        }
+
+        var priorityBySource = new Dictionary<long, int>();
+        foreach (var source in sources)
+        {
+            priorityBySource[source.Id] = source.Priority;
+        }
+
+        // W4.1 / V2 — índice por fingerprint (versão + hash). A identidade de
+        // persistência consolida por fingerprint e essa é a única chave de
+        // junção. A URL sanitizada é apenas apresentação e nunca é usada como
+        // identidade (rows sem fingerprint persistido não são correspondidas).
+        var byFingerprint = new Dictionary<(string Version, string Fingerprint), List<ChannelSourceEntity>>();
+        foreach (var channelSource in channelSources)
+        {
+            if (!string.IsNullOrEmpty(channelSource.Fingerprint)
+                && !string.IsNullOrEmpty(channelSource.FingerprintVersion))
+            {
+                var fpKey = (channelSource.FingerprintVersion, channelSource.Fingerprint);
+                if (!byFingerprint.TryGetValue(fpKey, out var fpList))
+                {
+                    fpList = new List<ChannelSourceEntity>();
+                    byFingerprint[fpKey] = fpList;
+                }
+                fpList.Add(channelSource);
+            }
+        }
+
+        var matched = new List<MatchedEntry>();
+        var unmatched = new List<M3uStream>();
+        // Wave 13-5: subconjunto ambíguo de unmatched, apenas para preview.
+        // Referências exactas — não altera Unmatched nem a ordem de publicação.
+        var ambiguousStreams = new List<M3uStream>();
+        var ambiguousCount = 0;
+
+        foreach (var stream in streams)
+        {
+            var hits = ResolveHits(stream.Url, byFingerprint);
+            if (hits is null || hits.Count == 0)
+            {
+                unmatched.Add(stream);
+                continue;
+            }
+
+            if (hits.Select(h => h.CanonicalChannelId).Distinct().Count() > 1)
+            {
+                ambiguousCount++;
+                unmatched.Add(stream);
+                ambiguousStreams.Add(stream);
+                continue;
+            }
+
+            var channelSource = hits.OrderBy(h => h.Id).First();
+            var priority = priorityBySource.TryGetValue(channelSource.SourceId, out var p) ? p : 0;
+            matched.Add(new MatchedEntry(stream, channelSource, priority));
+        }
+
+        var selected = new List<SelectedSource>();
+        var rejected = new List<RejectedSource>();
+        var published = new List<M3uStream>();
+        var matchedChannelCount = 0;
+        // Wave 13-5: agrupamento por canal apenas para diagnóstico/preview.
+        // Puramente aditivo — a ordem e o conteúdo de selected/rejected/
+        // published mantêm-se exactamente como antes.
+        var channelResults = new List<SourceSelectionChannelResult>();
+
+        foreach (var group in matched
+                     .GroupBy(m => m.ChannelSource.CanonicalChannelId)
+                     .OrderBy(g => g.Key))
+        {
+            matchedChannelCount++;
+
+            // Agrupamento continua por CanonicalChannelId; a Key serve apenas
+            // para resolver o override de política (ListChannelSourcesAsync
+            // já faz Include de CanonicalChannel).
+            var canonicalKey = group
+                .Select(e => e.ChannelSource.CanonicalChannel?.Key)
+                .FirstOrDefault(k => !string.IsNullOrEmpty(k));
+            var groupPolicy = policies.Resolve(canonicalKey);
+
+            var groupSelected = new List<SelectedSource>();
+            var groupRejected = new List<RejectedSource>();
+
+            var enabled = new List<MatchedEntry>();
+            foreach (var entry in group)
+            {
+                if (!entry.ChannelSource.IsEnabled)
+                {
+                    // Excluída da publicação e não entra no selector (Wave 13-3).
+                    var disabled = new RejectedSource(entry.Candidate, SourceDisabledReason);
+                    rejected.Add(disabled);
+                    groupRejected.Add(disabled);
+                    continue;
+                }
+                enabled.Add(entry);
+            }
+
+            if (enabled.Count > 0)
+            {
+                var candidates = enabled.Select(e => e.Candidate).ToList();
+                var byCandidate = new Dictionary<SelectionCandidate, MatchedEntry>(ReferenceEqualityComparer.Instance);
+                foreach (var entry in enabled)
+                {
+                    byCandidate[entry.Candidate] = entry;
+                }
+
+                var result = _selector.Select(candidates, groupPolicy);
+
+                foreach (var sel in result.Selected)
+                {
+                    selected.Add(sel);
+                    groupSelected.Add(sel);
+                    published.Add(byCandidate[sel.Candidate].Stream);
+                }
+                foreach (var rej in result.Rejected)
+                {
+                    rejected.Add(rej);
+                    groupRejected.Add(rej);
+                }
+            }
+
+            channelResults.Add(new SourceSelectionChannelResult(
+                CanonicalChannelId: group.Key,
+                CanonicalChannelKey: canonicalKey,
+                Policy: groupPolicy,
+                Selected: groupSelected,
+                Rejected: groupRejected));
+        }
+
+        // Streams sem correspondência inequívoca: pass-through na ordem de entrada.
+        foreach (var stream in unmatched)
+        {
+            published.Add(stream);
+        }
+
+        return new SourceSelectionStageResult(
+            Published: published,
+            Selected: selected,
+            Rejected: rejected,
+            Unmatched: unmatched,
+            MatchedChannelCount: matchedChannelCount,
+            AmbiguousCount: ambiguousCount,
+            Applied: true)
+        {
+            Channels = channelResults,
+            AmbiguousStreams = ambiguousStreams,
+        };
+    }
+
+    /// <summary>
+    /// Deriva a identidade de fornecedor da URL real: host normalizado
+    /// (lowercase, sem ponto final, sem prefixo <c>www.</c>, sem porta).
+    /// Não resolve aliases/CDN/proxy. Devolve <c>null</c> se não for
+    /// possível extrair um host (o selector trata como <c>Unknown</c>).
+    /// </summary>
+    internal static string? NormalizeProviderHost(string? url)
+    {
+        if (string.IsNullOrWhiteSpace(url)) return null;
+        if (!Uri.TryCreate(url.Trim(), UriKind.Absolute, out var uri)) return null;
+        var host = uri.Host;
+        if (string.IsNullOrEmpty(host)) return null;
+        host = host.TrimEnd('.');
+        if (host.StartsWith("www.", StringComparison.OrdinalIgnoreCase))
+        {
+            host = host.Substring(4);
+        }
+        return host.ToLowerInvariant();
+    }
+
+    /// <summary>
+    /// Critério 5 de DL-101 — timestamp da última validação bem sucedida do
+    /// candidato, quando determinável. Só uma stream funcional
+    /// (<see cref="M3uStream.IsWorking"/>) conta como validação bem sucedida;
+    /// caso contrário devolve <c>null</c> (tratado como o mais antigo pelo
+    /// selector). O critério só reordena quando a policy o activa.
+    /// </summary>
+    private static DateTime? ResolveSuccessfulValidationUtc(
+        M3uStream stream,
+        ChannelSourceEntity channelSource)
+    {
+        if (!stream.IsWorking) return null;
+        return channelSource.LastTestedAtUtc == default
+            ? null
+            : channelSource.LastTestedAtUtc;
+    }
+
+    /// <summary>
+    /// W4.1 / V2 — resolve as <c>ChannelSource</c> candidatas para uma URL de
+    /// runtime pela identidade interna: o fingerprint canónico
+    /// (<see cref="StreamFingerprint.Version"/>, actualmente <c>sfp1</c>).
+    /// É a única chave de junção; rows sem fingerprint persistido NÃO são
+    /// correspondidas (sem fallback por URL sanitizada). Devolve <c>null</c>
+    /// quando não há correspondência.
+    /// </summary>
+    private static List<ChannelSourceEntity>? ResolveHits(
+        string? url,
+        Dictionary<(string Version, string Fingerprint), List<ChannelSourceEntity>> byFingerprint)
+    {
+        var fingerprint = StreamFingerprint.TryComputeFingerprint(url);
+        if (!string.IsNullOrEmpty(fingerprint)
+            && byFingerprint.TryGetValue((StreamFingerprint.Version, fingerprint), out var fpHits)
+            && fpHits.Count > 0)
+        {
+            return fpHits;
+        }
+
+        return null;
+    }
+
+    private sealed class MatchedEntry
+    {
+        public MatchedEntry(M3uStream stream, ChannelSourceEntity channelSource, int sourcePriority)
+        {
+            Stream = stream;
+            ChannelSource = channelSource;
+            Candidate = new SelectionCandidate(
+                StreamUrl: stream.Url,
+                SourceId: channelSource.SourceId,
+                SourcePriority: sourcePriority,
+                Quality: StreamQuality.Unknown,
+                Epg: EpgState.Unknown,
+                Availability: stream.IsWorking ? AvailabilityState.Reachable : AvailabilityState.Dead,
+                LastResponseTimeMs: (long)stream.ResponseTime,
+                ExternalStreamId: channelSource.ExternalStreamId,
+                Provider: ProviderIdentity.Normalize(NormalizeProviderHost(stream.Url)),
+                IsWorking: stream.IsWorking,
+                StreamFingerprint: channelSource.Fingerprint,
+                LastSuccessfulValidationUtc: ResolveSuccessfulValidationUtc(stream, channelSource));
+        }
+
+        public M3uStream Stream { get; }
+        public ChannelSourceEntity ChannelSource { get; }
+        public SelectionCandidate Candidate { get; }
+    }
+}

@@ -134,15 +134,17 @@ public class ChannelCatalogIntegrationTests : IAsyncLifetime
         Assert.Equal(EditorialCategory.Desporto, benfica.EditorialCategory);
         Assert.Equal(PublicationPolicy.CreateEligible, benfica.PublicationPolicy);
 
-        // The aliases were seeded.
+        // The aliases were seeded in the single matchable form.
         var aliases = await ctx.ChannelAliases
             .Where(a => a.CanonicalChannelId == benfica.Id)
             .Select(a => a.NormalizedAlias)
             .ToListAsync();
         Assert.Contains("btv", aliases);
-        Assert.Contains("btv hevc pt", aliases);
         Assert.Contains("benficatv", aliases);
         Assert.Contains("benfica tv", aliases);
+        // Wave B: o alias em bruto "btv hevc pt" é normalizado para
+        // "btv" e o duplicado é removido.
+        Assert.DoesNotContain("btv hevc pt", aliases);
 
         // The sport-tv-nba canonical channel was seeded with
         // CreateEligible policy (no longer an IdentityRule).
@@ -156,8 +158,8 @@ public class ChannelCatalogIntegrationTests : IAsyncLifetime
             .Select(a => a.NormalizedAlias)
             .ToListAsync();
         Assert.Contains("sport tv nba", nbaAliases);
-        Assert.Contains("pt sport tv nba", nbaAliases);
-        Assert.Contains("sport tv nba hevc pt", nbaAliases);
+        Assert.DoesNotContain("pt sport tv nba", nbaAliases);
+        Assert.DoesNotContain("sport tv nba hevc pt", nbaAliases);
 
         // Idempotency: a second InitializeAsync() (without dropping
         // the file) must not duplicate channels.
@@ -181,7 +183,7 @@ public class ChannelCatalogIntegrationTests : IAsyncLifetime
                 Key = "user-custom",
                 DisplayName = "User Custom Channel",
                 EditorialCategory = EditorialCategory.Live,
-                EditorialGroup = CanonicalEditorialGroup.PortugalLive,
+                GroupId = null,
                 PublicationPolicy = PublicationPolicy.CreateEligible,
                 IsEnabled = true,
                 CreatedAtUtc = DateTime.UtcNow,

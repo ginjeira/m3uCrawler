@@ -114,4 +114,20 @@ public sealed class ChannelBaseline
 
     [JsonPropertyName("aliases")]
     public List<string> Aliases { get; set; } = new();
+
+    /// <summary>
+    /// Identidades externas conhecidas do canal (ex.: <c>tvg-id</c>).
+    /// Opcional: o baseline PT actual não as fornece, pelo que a
+    /// tabela <c>external_identities</c> permanece vazia após o
+    /// import. O mecanismo existe para baselines futuros.
+    /// </summary>
+    [JsonPropertyName("tvg_ids")]
+    public List<string> TvgIds { get; set; } = new();
+
+    /// <summary>
+    /// Mapa namespace → valor de identidades externas adicionais
+    /// (ex.: <c>"provider:meo": "rtp1"</c>). Opcional.
+    /// </summary>
+    [JsonPropertyName("external_ids")]
+    public Dictionary<string, string> ExternalIds { get; set; } = new();
 }

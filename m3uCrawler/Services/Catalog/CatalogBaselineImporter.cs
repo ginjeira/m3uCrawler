@@ -41,6 +41,23 @@ namespace m3uCrawler.Services.Catalog;
 public static class CatalogBaselineImporter
 {
     /// <summary>
+    /// Nome do ficheiro canónico versionado. Usado pelo resolver de
+    /// caminho (<see cref="ChannelCatalogBootstrapper"/>) e pelo
+    /// loader embutido.
+    /// </summary>
+    public const string BaselineFileName = "m3ucrawler_pt_canonical_catalog.json";
+
+    /// <summary>
+    /// Nome lógico do recurso embutido definido em
+    /// <c>m3uCrawler.csproj</c> (<c>LogicalName</c>). O loader
+    /// tolera variações de nome (procura qualquer recurso que termine
+    /// por <see cref="BaselineFileName"/>), mas o valor explícito é a
+    /// fonte canónica.
+    /// </summary>
+    public const string EmbeddedBaselineResourceName =
+        "m3uCrawler.docs.catalog.m3ucrawler_pt_canonical_catalog.json";
+
+    /// <summary>
     /// Resolve o <see cref="EditorialCategory"/> heurística a
     /// partir do <c>group id</c> do baseline (e.g.
     /// <c>pt-desporto</c> → <see cref="EditorialCategory.Desporto"/>).
@@ -58,40 +75,39 @@ public static class CatalogBaselineImporter
     }
 
     /// <summary>
-    /// Resolve o <see cref="CanonicalEditorialGroup"/> a partir do
-    /// prefixo do <c>group.id</c> do baseline. Mantido determinístico
-    /// — qualquer mapping novo deve ser adicionado aqui e coberto
-    /// por teste.
+    /// Resolve a <c>Key</c> do grupo canónico a partir do prefixo do
+    /// <c>group.id</c> do baseline. Mantido determinístico — qualquer
+    /// mapping novo deve ser adicionado aqui e coberto por teste.
     /// </summary>
-    public static CanonicalEditorialGroup ResolveEditorialGroup(string? groupId)
+    public static string ResolveGroupKey(string? groupId)
     {
-        if (string.IsNullOrWhiteSpace(groupId)) return CanonicalEditorialGroup.Other;
+        if (string.IsNullOrWhiteSpace(groupId)) return CanonicalGroupKeys.Other;
         var g = groupId.ToLowerInvariant();
         if (g == "pt-generalistas" || g.StartsWith("pt-generalistas"))
-            return CanonicalEditorialGroup.PortugalLive;
+            return CanonicalGroupKeys.PortugalGeneralistas;
         if (g == "pt-desporto" || g.StartsWith("pt-desporto"))
-            return CanonicalEditorialGroup.PortugalDesporto;
+            return CanonicalGroupKeys.PortugalDesporto;
         if (g == "pt-infantil" || g.StartsWith("pt-infantil"))
-            return CanonicalEditorialGroup.PortugalInfantil;
+            return CanonicalGroupKeys.PortugalInfantil;
         if (g == "pt-filmes-series" || g.StartsWith("pt-filmes-series"))
-            return CanonicalEditorialGroup.PortugalFilmes24_7;
+            return CanonicalGroupKeys.PortugalFilmesSeries;
         if (g == "pt-documentarios" || g.StartsWith("pt-documentarios"))
-            return CanonicalEditorialGroup.PortugalDocumentarios;
+            return CanonicalGroupKeys.PortugalDocumentarios;
         if (g == "pt-entretenimento" || g.StartsWith("pt-entretenimento"))
-            return CanonicalEditorialGroup.PortugalEntretenimento;
+            return CanonicalGroupKeys.PortugalEntretenimento;
         if (g == "pt-tematicos" || g.StartsWith("pt-tematicos"))
-            return CanonicalEditorialGroup.PortugalEntretenimento;
+            return CanonicalGroupKeys.PortugalEntretenimento;
         if (g == "pt-musica" || g.StartsWith("pt-musica"))
-            return CanonicalEditorialGroup.PortugalEntretenimento;
+            return CanonicalGroupKeys.PortugalEntretenimento;
         if (g.StartsWith("pt-") || g.StartsWith("radio-pt"))
-            return CanonicalEditorialGroup.PortugalLive;
+            return CanonicalGroupKeys.PortugalGeneralistas;
         if (g.StartsWith("international"))
-            return CanonicalEditorialGroup.Foreign;
+            return CanonicalGroupKeys.International;
         if (g == "adultos" || g.StartsWith("adultos"))
-            return CanonicalEditorialGroup.PortugalPPV;
+            return CanonicalGroupKeys.PortugalPPV;
         if (g.StartsWith("vod-"))
-            return CanonicalEditorialGroup.PortugalFilmes24_7;
-        return CanonicalEditorialGroup.Other;
+            return CanonicalGroupKeys.PortugalFilmesSeries;
+        return CanonicalGroupKeys.Other;
     }
 
     /// <summary>
@@ -120,12 +136,25 @@ public static class CatalogBaselineImporter
     }
 
     /// <summary>
+    /// Normaliza o país declarado no baseline para o campo
+    /// <see cref="CanonicalChannelEntity.Country"/>: trim, vazio →
+    /// null, truncado a 10 caracteres (o baseline é dados
+    /// controlados; não bloqueia a importação).
+    /// </summary>
+    private static string? NormalizeBaselineCountry(string? country)
+    {
+        if (string.IsNullOrWhiteSpace(country)) return null;
+        var trimmed = country.Trim();
+        return trimmed.Length > 10 ? trimmed[..10] : trimmed;
+    }
+
+    /// <summary>
     /// Resolve o grupo editorial de um canal a partir do baseline.
     /// Olha para o <see cref="MatchingBaseline.Examples"/> e
     /// casa pelo número de position no <see cref="CatalogBaseline.Numbering"/>
     /// com os <see cref="GroupBaseline.Range"/>s declarados.
     /// </summary>
-    public static (CanonicalEditorialGroup Group, EditorialCategory Category) ResolveEditorialFromBaseline(
+    public static (string GroupKey, EditorialCategory Category) ResolveEditorialFromBaseline(
         CatalogBaseline baseline,
         ChannelBaseline channelBaseline)
     {
@@ -138,18 +167,18 @@ public static class CatalogBaselineImporter
         foreach (var alias in channelBaseline.Aliases)
         {
             var a = alias.ToLowerInvariant();
-            if (a.Contains("noticias") || a.Contains("generalistas")) return (CanonicalEditorialGroup.PortugalLive, EditorialCategory.Live);
-            if (a.Contains("desporto") || a.Contains("sport")) return (CanonicalEditorialGroup.PortugalDesporto, EditorialCategory.Desporto);
-            if (a.Contains("infantil") || a.Contains("kids")) return (CanonicalEditorialGroup.PortugalInfantil, EditorialCategory.Infantil);
-            if (a.Contains("documentario") || a.Contains("history")) return (CanonicalEditorialGroup.PortugalDocumentarios, EditorialCategory.Documentarios);
+            if (a.Contains("noticias") || a.Contains("generalistas")) return (CanonicalGroupKeys.PortugalGeneralistas, EditorialCategory.Live);
+            if (a.Contains("desporto") || a.Contains("sport")) return (CanonicalGroupKeys.PortugalDesporto, EditorialCategory.Desporto);
+            if (a.Contains("infantil") || a.Contains("kids")) return (CanonicalGroupKeys.PortugalInfantil, EditorialCategory.Infantil);
+            if (a.Contains("documentario") || a.Contains("history")) return (CanonicalGroupKeys.PortugalDocumentarios, EditorialCategory.Documentarios);
         }
-        if (nameLower.Contains("noticias") || nameLower.Contains("news")) return (CanonicalEditorialGroup.PortugalLive, EditorialCategory.Live);
-        if (nameLower.Contains("sport")) return (CanonicalEditorialGroup.PortugalDesporto, EditorialCategory.Desporto);
-        if (nameLower.Contains("infantil") || nameLower.Contains("kids")) return (CanonicalEditorialGroup.PortugalInfantil, EditorialCategory.Infantil);
-        if (nameLower.Contains("documentario")) return (CanonicalEditorialGroup.PortugalDocumentarios, EditorialCategory.Documentarios);
+        if (nameLower.Contains("noticias") || nameLower.Contains("news")) return (CanonicalGroupKeys.PortugalGeneralistas, EditorialCategory.Live);
+        if (nameLower.Contains("sport")) return (CanonicalGroupKeys.PortugalDesporto, EditorialCategory.Desporto);
+        if (nameLower.Contains("infantil") || nameLower.Contains("kids")) return (CanonicalGroupKeys.PortugalInfantil, EditorialCategory.Infantil);
+        if (nameLower.Contains("documentario")) return (CanonicalGroupKeys.PortugalDocumentarios, EditorialCategory.Documentarios);
         // Fallback: canais sem keyword de categoria entram no
         // bucket "Entretenimento" (PT default).
-        return (CanonicalEditorialGroup.PortugalEntretenimento, EditorialCategory.Entretenimento);
+        return (CanonicalGroupKeys.PortugalEntretenimento, EditorialCategory.Entretenimento);
     }
 
     /// <summary>
@@ -163,6 +192,64 @@ public static class CatalogBaselineImporter
                 $"Catálogo baseline não encontrado: {jsonPath}", jsonPath);
 
         await using var stream = File.OpenRead(jsonPath);
+        return await DeserializeBaselineAsync(stream, jsonPath, ct);
+    }
+
+    /// <summary>
+    /// Lê o baseline canónico a partir do recurso embutido na
+    /// assembly (<c>EmbeddedResource</c> definido no
+    /// <c>m3uCrawler.csproj</c>). É a rede de segurança para
+    /// instalações em que o ficheiro <c>docs/catalog/…</c> não é
+    /// empacotado: o catálogo arranca sempre com os canais PT
+    /// generalistas em vez de ficar limitado ao <see cref="CatalogSeed"/>.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">
+    /// Se o recurso não existir na assembly (build mal configurado).
+    /// </exception>
+    public static async Task<CatalogBaseline> LoadEmbeddedAsync(CancellationToken ct = default)
+    {
+        var assembly = typeof(CatalogBaselineImporter).Assembly;
+        var resourceName = ResolveEmbeddedResourceName(assembly);
+        if (resourceName is null)
+        {
+            throw new InvalidOperationException(
+                $"Recurso embutido do baseline canónico não encontrado na assembly " +
+                $"'{assembly.GetName().Name}'. Esperado '{EmbeddedBaselineResourceName}' " +
+                $"ou um recurso com sufixo '{BaselineFileName}'.");
+        }
+
+        await using var stream = assembly.GetManifestResourceStream(resourceName)
+            ?? throw new InvalidOperationException(
+                $"Não foi possível abrir o recurso embutido '{resourceName}'.");
+
+        return await DeserializeBaselineAsync(stream, resourceName, ct);
+    }
+
+    private static string? ResolveEmbeddedResourceName(System.Reflection.Assembly assembly)
+    {
+        var names = assembly.GetManifestResourceNames();
+        foreach (var name in names)
+        {
+            if (string.Equals(name, EmbeddedBaselineResourceName, StringComparison.Ordinal))
+                return name;
+        }
+
+        // Tolerância a variações da derivação automática do nome lógico
+        // (e.g. se o LogicalName explícito for removido do csproj).
+        var suffix = "." + BaselineFileName;
+        foreach (var name in names)
+        {
+            if (name.EndsWith(suffix, StringComparison.Ordinal)
+                || string.Equals(name, BaselineFileName, StringComparison.Ordinal))
+                return name;
+        }
+
+        return null;
+    }
+
+    private static async Task<CatalogBaseline> DeserializeBaselineAsync(
+        Stream stream, string sourceLabel, CancellationToken ct)
+    {
         var baseline = await JsonSerializer.DeserializeAsync<CatalogBaseline>(
             stream, new JsonSerializerOptions
             {
@@ -173,7 +260,7 @@ public static class CatalogBaselineImporter
 
         if (baseline is null)
             throw new InvalidOperationException(
-                $"Catálogo baseline vazio ou inválido: {jsonPath}");
+                $"Catálogo baseline vazio ou inválido: {sourceLabel}");
 
         return baseline;
     }
@@ -208,6 +295,12 @@ public static class CatalogBaselineImporter
 
         var now = DateTime.UtcNow;
 
+        // Wave A — garantir os grupos canónicos por omissão e obter o
+        // mapa Key → Id para que os canais criados pelo baseline fiquem
+        // já com GroupId. Aditivo: não altera qualquer comportamento
+        // observável (o campo não é lido nesta wave).
+        var groupIds = await ChannelCatalogBootstrapper.EnsureCanonicalGroupsAsync(context, now, ct);
+
         // Indexar canais existentes por Key.
         var existingChannels = await context.CanonicalChannels
             .Include(c => c.Aliases)
@@ -219,6 +312,24 @@ public static class CatalogBaselineImporter
             existingChannels.SelectMany(c => c.Aliases.Select(a => a.NormalizedAlias)),
             StringComparer.Ordinal);
 
+        // Indexar identidades externas existentes por (Namespace, Value).
+        // Qualquer linha já existente é tratada como estado do
+        // runtime/operador: o import do baseline NUNCA a sobrepõe
+        // (ADR-0005 §4). O canal dono é guardado para reportar
+        // conflitos em vez de os aplicar silenciosamente.
+        var existingExternal = new Dictionary<(string Namespace, string Value), long>(
+            await context.ExternalIdentities
+                .AsNoTracking()
+                .Select(e => new { e.Namespace, e.Value, e.CanonicalChannelId })
+                .ToDictionaryAsync(
+                    e => (e.Namespace, e.Value),
+                    e => e.CanonicalChannelId,
+                    ct));
+
+        // Ownership das identidades externas criadas nesta importação
+        // (canal ainda sem Id atribuído). Mapeia para a Key do canal.
+        var externalOwnersThisImport = new Dictionary<(string Namespace, string Value), string>();
+
         foreach (var (sourceKey, channelBaseline) in baseline.Matching.Examples)
         {
             var key = CanonicalIdToKey(channelBaseline.CanonicalId);
@@ -229,7 +340,7 @@ public static class CatalogBaselineImporter
                 continue;
             }
 
-            var (group, category) = ResolveEditorialFromBaseline(baseline, channelBaseline);
+            var (groupKey, category) = ResolveEditorialFromBaseline(baseline, channelBaseline);
 
             if (!channelsByKey.TryGetValue(key, out var channel))
             {
@@ -237,8 +348,11 @@ public static class CatalogBaselineImporter
                 {
                     Key = key,
                     DisplayName = channelBaseline.Name,
+                    Country = NormalizeBaselineCountry(baseline.Country),
                     EditorialCategory = category,
-                    EditorialGroup = group,
+                    GroupId = groupIds.TryGetValue(groupKey, out var channelGroupId)
+                            ? channelGroupId
+                            : null,
                     PublicationPolicy = PublicationPolicy.CreateEligible,
                     IsEnabled = true,
                     CreatedAtUtc = now,
@@ -256,9 +370,13 @@ public static class CatalogBaselineImporter
                 // versão anterior do seed.
                 var displayNameChanged = !string.Equals(
                     channel.DisplayName, channelBaseline.Name, StringComparison.Ordinal);
-                if (displayNameChanged)
+                var baselineCountry = NormalizeBaselineCountry(baseline.Country);
+                var countryChanged = !string.Equals(
+                    channel.Country, baselineCountry, StringComparison.Ordinal);
+                if (displayNameChanged || countryChanged)
                 {
-                    channel.DisplayName = channelBaseline.Name;
+                    if (displayNameChanged) channel.DisplayName = channelBaseline.Name;
+                    if (countryChanged) channel.Country = baselineCountry;
                     channel.UpdatedAtUtc = now;
                     report.ChannelsUpdated++;
                 }
@@ -331,10 +449,98 @@ public static class CatalogBaselineImporter
                 existingAliases.Add(normalized);
                 report.AliasesAdded++;
             }
+
+            // Identidades externas conhecidas (tvg-id / provider).
+            // Mecanismo implementado mesmo quando o baseline não as
+            // fornece (o baseline PT actual não fornece): nesse caso
+            // nada é inserido e external_identities permanece vazia.
+            // Idempotente e nunca sobrepõe linhas existentes.
+            foreach (var (extNamespace, extRawValue) in EnumerateBaselineExternalIdentities(channelBaseline))
+            {
+                var ns = extNamespace.Trim();
+                var canonicalValue = ExternalIdentityNormalizer.Normalize(extRawValue);
+                if (ns.Length == 0 || canonicalValue.Length == 0)
+                {
+                    continue;
+                }
+
+                var extKey = (Namespace: ns, Value: canonicalValue);
+
+                if (existingExternal.TryGetValue(extKey, out var existingOwnerId))
+                {
+                    if (existingOwnerId != channel.Id)
+                    {
+                        report.ExternalIdentityConflicts++;
+                        report.Warnings.Add(
+                            $"external identity '{extKey.Namespace}:{canonicalValue}' já pertence a outro canal; não sobreposta.");
+                    }
+
+                    report.ExternalIdentitiesSkipped++;
+                    continue;
+                }
+
+                if (externalOwnersThisImport.TryGetValue(extKey, out var importOwnerKey))
+                {
+                    if (!string.Equals(importOwnerKey, channel.Key, StringComparison.Ordinal))
+                    {
+                        report.ExternalIdentityConflicts++;
+                        report.Warnings.Add(
+                            $"external identity '{extKey.Namespace}:{canonicalValue}' duplicada no baseline; ignorada.");
+                    }
+
+                    report.ExternalIdentitiesSkipped++;
+                    continue;
+                }
+
+                context.ExternalIdentities.Add(new ExternalIdentityEntity
+                {
+                    CanonicalChannel = channel,
+                    CanonicalChannelId = channel.Id,
+                    Namespace = extKey.Namespace,
+                    Value = canonicalValue,
+                    Origin = "baseline",
+                    Confidence = 1.0,
+                    CreatedAtUtc = now,
+                    UpdatedAtUtc = now,
+                });
+                externalOwnersThisImport[extKey] = channel.Key;
+                report.ExternalIdentitiesAdded++;
+            }
         }
 
         await context.SaveChangesAsync(ct);
         return report;
+    }
+
+    /// <summary>
+    /// Enumera as identidades externas declaradas por um canal do
+    /// baseline como pares (Namespace, Valor). O baseline PT actual
+    /// não declara nenhumas; a função existe para baselines futuros.
+    /// </summary>
+    private static IEnumerable<(string Namespace, string Value)> EnumerateBaselineExternalIdentities(
+        ChannelBaseline channelBaseline)
+    {
+        if (channelBaseline?.TvgIds is { Count: > 0 })
+        {
+            foreach (var tvgId in channelBaseline.TvgIds)
+            {
+                if (!string.IsNullOrWhiteSpace(tvgId))
+                {
+                    yield return (ExternalIdentityNamespaces.TvgId, tvgId);
+                }
+            }
+        }
+
+        if (channelBaseline?.ExternalIds is { Count: > 0 })
+        {
+            foreach (var pair in channelBaseline.ExternalIds)
+            {
+                if (!string.IsNullOrWhiteSpace(pair.Key) && !string.IsNullOrWhiteSpace(pair.Value))
+                {
+                    yield return (pair.Key, pair.Value);
+                }
+            }
+        }
     }
 }
 
@@ -354,7 +560,16 @@ public sealed class CatalogBaselineImportReport
     public int AliasesAdded { get; set; }
     public int AliasesSkipped { get; set; }
 
+    /// <summary>Identidades externas criadas a partir do baseline.</summary>
+    public int ExternalIdentitiesAdded { get; set; }
+
+    /// <summary>Identidades externas já existentes e preservadas (não sobrepostas).</summary>
+    public int ExternalIdentitiesSkipped { get; set; }
+
+    /// <summary>Identidades externas em conflito (valor já ligado a outro canal).</summary>
+    public int ExternalIdentityConflicts { get; set; }
+
     public List<string> Warnings { get; } = new();
 
-    public int TotalChanges => ChannelsCreated + ChannelsUpdated + AliasesAdded;
+    public int TotalChanges => ChannelsCreated + ChannelsUpdated + AliasesAdded + ExternalIdentitiesAdded;
 }

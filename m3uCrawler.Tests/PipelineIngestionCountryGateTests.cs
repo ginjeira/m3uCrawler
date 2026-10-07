@@ -241,28 +241,38 @@ public class PipelineIngestionCountryGateTests : IAsyncLifetime
     }
 
     // ════════════════════════════════════════════════════════════════
-    // G. Stream PT desconhecido continua a resultar em CreateEligible
-    //    (mas só se passar pelo country gate)
+    // G. Stream PT desconhecido NÃO cria identidade (Wave B):
+    //    fica como sinal de revisão, sem CanonicalChannel/ChannelSource.
     // ════════════════════════════════════════════════════════════════
 
     [Fact]
-    public async Task Unknown_PT_stream_with_country_token_still_results_in_CreateEligible()
+    public async Task Unknown_PT_stream_with_country_token_is_not_created_and_is_reviewed()
     {
         var validator = new CountryChannelValidator(CountriesDir());
         var ingestor = new PipelineIngestionService(_resolver, validator);
 
-        // "PT Canal Mistério" tem token PT no título, vai passar pelo
-        // gate, e cai em Unknown → auto-create CreateEligible.
+        // "PT Canal Mistério" tem token PT no título, passa o gate,
+        // mas não resolve para nenhum canal canónico.
         var stream = Stream("PT Canal Misterio", "http://x.example/misterio.ts", "Portugal");
         var result = await ingestor.IngestAsync(
             new[] { stream }, "r1-g", "Telegram", "pt");
 
-        Assert.Equal(1, result.IngestedCount);
+        Assert.Equal(0, result.IngestedCount);
         Assert.Equal(0, result.MatchedCount);
-        Assert.Equal(1, result.AutoCreatedCount);
+        Assert.Equal(0, result.AutoCreatedCount);
 
         var channels = await _resolver.ListCanonicalChannelsAsync();
-        Assert.Contains(channels, c => c.Key.Contains("canal-misterio") && c.PublicationPolicy == PublicationPolicy.CreateEligible);
+        Assert.DoesNotContain(channels, c => c.Key.Contains("canal-misterio"));
+
+        var src = (await _resolver.ListSourcesAsync()).Single(s => s.Key == "r1-g");
+        Assert.Empty(await _resolver.ListChannelSourcesAsync(sourceId: src.Id));
+
+        var normalized = ChannelNormalizer.Normalize(stream.Title);
+        var reviews = (await _resolver.ListAllReviewItemsAsync())
+            .Where(r => r.NormalizedIdentity == normalized)
+            .ToList();
+        Assert.Single(reviews);
+        Assert.Equal(ReviewItemState.Open, reviews[0].State);
     }
 
     // ════════════════════════════════════════════════════════════════

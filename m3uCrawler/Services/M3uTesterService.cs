@@ -44,7 +44,13 @@ public sealed class M3uTesterService : IDisposable
     private readonly StreamValidationCache _cache;
     private readonly HostFailureTracker _hostTracker;
     private readonly HttpClient _client;
+    private readonly SsrfGuard _guard;
     private StreamValidationMetrics? _lastMetrics;
+
+    // W2 (2026-09-19): hook de persistência de falhas de aquisição. Null por
+    // defeito (sem persistência); o caller liga-o via
+    // SetAcquisitionFailureObserver.
+    private IAcquisitionFailureObserver? _failureObserver;
 
     // PHASE-OBSERVABILITY (2026-09-15): sink de tracing por instancia. Por
     // defeito e' NullTraceSink.Instance (no-op) para nao alterar comportamento
@@ -57,14 +63,18 @@ public sealed class M3uTesterService : IDisposable
     /// Mantido para retro-compatibilidade com o Dashboard e com testes
     /// que precisam de tester isolado. Em produção, prefira o construtor
     /// que recebe <see cref="StreamValidationState"/>.
+    ///
+    /// <paramref name="guard"/> (W2) é injectável apenas para testes; o
+    /// default é a política SSRF estrita de produção.
     /// </summary>
-    public M3uTesterService(StreamValidationOptions? options = null)
+    public M3uTesterService(StreamValidationOptions? options = null, SsrfGuard? guard = null)
     {
         _options = (options ?? new StreamValidationOptions()).Clone();
         _options.Sanitize();
         _cache = new StreamValidationCache(_options);
         _hostTracker = new HostFailureTracker();
-        _client = HttpClientFactory.ResolveClient(_options.ConnectionTimeoutSeconds, _options.OverallTimeoutSeconds).Client;
+        _guard = guard ?? SsrfGuard.Default;
+        _client = HttpClientFactory.ResolveClient(_options.ConnectionTimeoutSeconds, _options.OverallTimeoutSeconds, _guard).Client;
     }
 
     /// <summary>
@@ -75,13 +85,33 @@ public sealed class M3uTesterService : IDisposable
     ///
     /// Introduzido em 2026-09-13 pela 9A-PROD-WIRING.
     /// </summary>
-    public M3uTesterService(StreamValidationState state)
+    public M3uTesterService(StreamValidationState state, SsrfGuard? guard = null)
     {
         if (state == null) throw new ArgumentNullException(nameof(state));
         _options = state.Options.Clone();
         _cache = state.Cache;
         _hostTracker = state.HostTracker;
-        _client = HttpClientFactory.ResolveClient(_options.ConnectionTimeoutSeconds, _options.OverallTimeoutSeconds).Client;
+        _guard = guard ?? SsrfGuard.Default;
+        _client = HttpClientFactory.ResolveClient(_options.ConnectionTimeoutSeconds, _options.OverallTimeoutSeconds, _guard).Client;
+    }
+
+    /// <summary>W2 — liga um observador de falhas de aquisição (persistência/agregação).</summary>
+    public void SetAcquisitionFailureObserver(IAcquisitionFailureObserver? observer)
+        => _failureObserver = observer;
+
+    /// <summary>
+    /// W2 — seam de teste: injecta um <see cref="HttpClient"/> com handler
+    /// stub para exercitar retry/redirect/body sem rede. Não é usado em
+    /// produção.
+    /// </summary>
+    internal M3uTesterService(StreamValidationOptions options, SsrfGuard guard, HttpClient client)
+    {
+        _options = (options ?? new StreamValidationOptions()).Clone();
+        _options.Sanitize();
+        _cache = new StreamValidationCache(_options);
+        _hostTracker = new HostFailureTracker();
+        _guard = guard ?? SsrfGuard.Default;
+        _client = client ?? throw new ArgumentNullException(nameof(client));
     }
 
     // PHASE-OBSERVABILITY (2026-09-15): permite associar um sink de tracing
@@ -512,7 +542,7 @@ public sealed class M3uTesterService : IDisposable
         return final;
     }
 
-    private static async Task<StreamTestOutcome> ProbeOnceAsync(string url, StreamValidationOptions options, CancellationToken cancellationToken)
+    private async Task<StreamTestOutcome> ProbeOnceAsync(string url, StreamValidationOptions options, CancellationToken cancellationToken)
     {
         var sw = Stopwatch.StartNew();
         try
@@ -520,16 +550,34 @@ public sealed class M3uTesterService : IDisposable
             // Resolve (ou reusa) o HttpClient partilhado que corresponde
             // as options deste tester. Em producao isto devolve sempre
             // o mesmo client para a mesma combinacao de timeouts.
-            var client = HttpClientFactory.ResolveClient(options.ConnectionTimeoutSeconds, options.OverallTimeoutSeconds).Client;
+            var client = HttpClientFactory.ResolveClient(options.ConnectionTimeoutSeconds, options.OverallTimeoutSeconds, _guard).Client;
 
-            using var request = new HttpRequestMessage(HttpMethod.Get, url);
-            request.Headers.UserAgent.ParseAdd(options.UserAgent);
-
-            using var response = await client
-                .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
-                .ConfigureAwait(false);
+            // W2 — send com redirects manuais reclassificados pela política
+            // SSRF. O ConnectCallback do handler valida/fixa o endereço
+            // efectivo (anti-rebinding).
+            var send = await GuardedHttpRequest.SendFollowingRedirectsAsync(
+                client,
+                url,
+                _guard,
+                options,
+                uri =>
+                {
+                    var req = new HttpRequestMessage(HttpMethod.Get, uri);
+                    req.Headers.UserAgent.ParseAdd(options.UserAgent);
+                    return req;
+                },
+                cancellationToken).ConfigureAwait(false);
 
             sw.Stop();
+            if (send.FailureKind != AcquisitionFailureKind.None)
+            {
+                return new StreamTestOutcome(
+                    url, false, null,
+                    AcquisitionFailureClassifier.ToStreamFailureKind(send.FailureKind),
+                    sw.ElapsedMilliseconds, false, 0, false);
+            }
+
+            using var response = send.Response!;
             if (!response.IsSuccessStatusCode)
             {
                 return new StreamTestOutcome(
@@ -613,117 +661,268 @@ public sealed class M3uTesterService : IDisposable
         attemptCts.CancelAfter(_options.OverallTimeout);
         var headersSw = Stopwatch.StartNew();
 
-        try
-        {
-            using var request = new HttpRequestMessage(HttpMethod.Get, url);
-            request.Headers.UserAgent.ParseAdd(_options.UserAgent);
-            request.Headers.Add("X-Request-Id", requestId);
-            var sendSw = Stopwatch.StartNew();
-            using var response = await _client
-                .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, attemptCts.Token)
-                .ConfigureAwait(false);
-            var elapsedHeaders = (int)headersSw.ElapsedMilliseconds;
-            var contentType = response.Content.Headers.ContentType?.ToString() ?? string.Empty;
-            var contentLength = response.Content.Headers.ContentLength?.ToString() ?? "unknown";
-            trace.Information(Validation.TraceCategory.HttpRequestHeaders, ctx,
-                $"status={(int)response.StatusCode} timeToHeadersMs={elapsedHeaders} contentType={contentType} contentLength={contentLength}");
+        // W2 — retry técnico DENTRO da mesma operação. Nunca cria nova Run
+        // nem novo RunId (13-RUNS §8, 19-FAILURE-MODEL §4). Tecto finito:
+        // MaxRetries + 1 tentativas (MaxRetries é clamped em Sanitize).
+        var maxAttempts = Math.Max(1, Math.Min(_options.MaxRetries + 1, 11));
+        var lastKind = AcquisitionFailureKind.Unknown;
+        int? lastStatus = null;
 
-            var elapsed = (int)sw.ElapsedMilliseconds;
-            if (!response.IsSuccessStatusCode)
+        for (var attempt = 0; attempt < maxAttempts; attempt++)
+        {
+            try
             {
-                int status = (int)response.StatusCode;
-                var kind = status == 429
-                    ? "Http429"
-                    : (status >= 500 ? "Http5xx" : "Http4xx");
-                trace.Warning(Validation.TraceCategory.HttpRequestEnd, ctx,
-                    $"kind={kind} status={status} durationMs={elapsed}");
-                LogPlaylistDownloadOutcome(url, kind: kind, durationMs: elapsed, status: status);
+                var send = await GuardedHttpRequest.SendFollowingRedirectsAsync(
+                    _client,
+                    url,
+                    _guard,
+                    _options,
+                    uri =>
+                    {
+                        var request = new HttpRequestMessage(HttpMethod.Get, uri);
+                        request.Headers.UserAgent.ParseAdd(_options.UserAgent);
+                        request.Headers.Add("X-Request-Id", requestId);
+                        return request;
+                    },
+                    attemptCts.Token).ConfigureAwait(false);
+
+                if (send.FailureKind != AcquisitionFailureKind.None)
+                {
+                    lastKind = send.FailureKind;
+                    var elapsedFail = (int)sw.ElapsedMilliseconds;
+                    trace.Warning(Validation.TraceCategory.HttpRequestFailed, ctx,
+                        $"kind={send.FailureKind} durationMs={elapsedFail} detail={send.Detail}");
+                    if (CanRetryAcquisition(lastKind, attempt, maxAttempts, attemptCts, cancellationToken))
+                    {
+                        await DelayBeforeRetryAsync(attemptCts.Token);
+                        continue;
+                    }
+                    await CompleteAcquisitionFailureAsync(url, lastKind, null, send.Detail, attempt + 1, sw.ElapsedMilliseconds);
+                    return (null, false);
+                }
+
+                using var response = send.Response!;
+                var elapsedHeaders = (int)headersSw.ElapsedMilliseconds;
+                var contentType = response.Content.Headers.ContentType?.ToString() ?? string.Empty;
+                var contentLength = response.Content.Headers.ContentLength?.ToString() ?? "unknown";
+                trace.Information(Validation.TraceCategory.HttpRequestHeaders, ctx,
+                    $"status={(int)response.StatusCode} timeToHeadersMs={elapsedHeaders} contentType={contentType} contentLength={contentLength}");
+
+                var elapsed = (int)sw.ElapsedMilliseconds;
+                if (!response.IsSuccessStatusCode)
+                {
+                    int status = (int)response.StatusCode;
+                    lastStatus = status;
+                    lastKind = AcquisitionFailureClassifier.FromHttpStatus(response.StatusCode);
+                    var kind = status == 429
+                        ? "Http429"
+                        : (status >= 500 ? "Http5xx" : "Http4xx");
+                    trace.Warning(Validation.TraceCategory.HttpRequestEnd, ctx,
+                        $"kind={kind} status={status} durationMs={elapsed}");
+                    if (CanRetryAcquisition(lastKind, attempt, maxAttempts, attemptCts, cancellationToken))
+                    {
+                        await DelayBeforeRetryAsync(attemptCts.Token);
+                        continue;
+                    }
+                    await CompleteAcquisitionFailureAsync(url, lastKind, status, null, attempt + 1, sw.ElapsedMilliseconds);
+                    return (null, false);
+                }
+
+                // Body read com timer separado + validação W2:
+                // vazio/oversized/encoding inválido são terminais.
+                var bodySw = Stopwatch.StartNew();
+                var body = await GuardedHttpRequest.ReadBodyAsync(response, _options, attemptCts.Token).ConfigureAwait(false);
+                var bodyMs = (int)bodySw.ElapsedMilliseconds;
+                if (body.FailureKind != AcquisitionFailureKind.None)
+                {
+                    lastKind = body.FailureKind;
+                    lastStatus = (int)response.StatusCode;
+                    trace.Warning(Validation.TraceCategory.HttpRequestFailed, ctx,
+                        $"kind={body.FailureKind} durationMs={elapsed} detail={body.Detail}");
+                    if (CanRetryAcquisition(lastKind, attempt, maxAttempts, attemptCts, cancellationToken))
+                    {
+                        await DelayBeforeRetryAsync(attemptCts.Token);
+                        continue;
+                    }
+                    await CompleteAcquisitionFailureAsync(url, lastKind, lastStatus, body.Detail, attempt + 1, sw.ElapsedMilliseconds);
+                    return (null, false);
+                }
+
+                var bytesRead = body.Content?.Length ?? 0;
+                trace.Information(Validation.TraceCategory.HttpRequestBody, ctx,
+                    $"bodyBytes={bytesRead} bodyReadMs={bodyMs}");
+                trace.Information(Validation.TraceCategory.HttpRequestEnd, ctx,
+                    $"kind=HttpSuccess status=200 durationMs={elapsed}");
+                return (body.Content, true);
+            }
+            catch (Exception ex) when (ex is OperationCanceledException && IsHttpClientInternalTimeout(ex))
+            {
+                var elapsed = (int)sw.ElapsedMilliseconds;
+                var connectMs = _options.ConnectionTimeoutSeconds * 1000;
+                var kind = elapsed < connectMs + 500
+                    ? "HttpConnectTimeout"
+                    : "HttpRequestTimeout";
+                trace.Warning(Validation.TraceCategory.HttpRequestFailed, ctx,
+                    $"kind={kind} durationMs={elapsed} innerException={ex.InnerException?.GetType().Name} innerMessage='{(ex.InnerException?.Message ?? "").Substring(0, Math.Min(120, (ex.InnerException?.Message ?? "").Length))}'",
+                    ex);
+                lastKind = AcquisitionFailureKind.Timeout;
+                if (CanRetryAcquisition(lastKind, attempt, maxAttempts, attemptCts, cancellationToken))
+                {
+                    await DelayBeforeRetryAsync(attemptCts.Token);
+                    continue;
+                }
+                await CompleteAcquisitionFailureAsync(url, lastKind, null, kind, attempt + 1, sw.ElapsedMilliseconds);
                 return (null, false);
             }
+            catch (OperationCanceledException) when (attemptCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+            {
+                var elapsed = (int)sw.ElapsedMilliseconds;
+                trace.Warning(Validation.TraceCategory.HttpRequestFailed, ctx,
+                    $"kind=Timeout durationMs={elapsed} attemptCts fired");
+                await CompleteAcquisitionFailureAsync(url, AcquisitionFailureKind.Timeout, null, "overall-timeout", attempt + 1, sw.ElapsedMilliseconds);
+                return (null, false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                var elapsed = (int)sw.ElapsedMilliseconds;
+                trace.Warning(Validation.TraceCategory.HttpRequestFailed, ctx,
+                    $"kind=Cancellation durationMs={elapsed} caller cancellation");
+                LogPlaylistDownloadOutcome(url, kind: "Cancellation", durationMs: elapsed, status: 0);
+                return (null, false);
+            }
+            catch (System.Security.Authentication.AuthenticationException ex)
+            {
+                var elapsed = (int)sw.ElapsedMilliseconds;
+                trace.Error(Validation.TraceCategory.HttpRequestFailed, ctx,
+                    $"kind=TlsOrConnection durationMs={elapsed} ex={ex.GetType().Name} message='{ex.Message.Substring(0, Math.Min(120, ex.Message.Length))}'", ex);
+                lastKind = AcquisitionFailureKind.Network;
+                if (CanRetryAcquisition(lastKind, attempt, maxAttempts, attemptCts, cancellationToken))
+                {
+                    await DelayBeforeRetryAsync(attemptCts.Token);
+                    continue;
+                }
+                await CompleteAcquisitionFailureAsync(url, lastKind, null, "tls", attempt + 1, sw.ElapsedMilliseconds);
+                return (null, false);
+            }
+            catch (System.Net.Sockets.SocketException ex) when (ex.SocketErrorCode == System.Net.Sockets.SocketError.HostNotFound)
+            {
+                var elapsed = (int)sw.ElapsedMilliseconds;
+                trace.Error(Validation.TraceCategory.HttpRequestFailed, ctx,
+                    $"kind=Dns durationMs={elapsed} socketError={ex.SocketErrorCode}", ex);
+                lastKind = AcquisitionFailureKind.Dns;
+                if (CanRetryAcquisition(lastKind, attempt, maxAttempts, attemptCts, cancellationToken))
+                {
+                    await DelayBeforeRetryAsync(attemptCts.Token);
+                    continue;
+                }
+                await CompleteAcquisitionFailureAsync(url, lastKind, null, "dns", attempt + 1, sw.ElapsedMilliseconds);
+                return (null, false);
+            }
+            catch (System.Net.Sockets.SocketException ex)
+            {
+                var elapsed = (int)sw.ElapsedMilliseconds;
+                trace.Error(Validation.TraceCategory.HttpRequestFailed, ctx,
+                    $"kind=Socket durationMs={elapsed} socketError={ex.SocketErrorCode}", ex);
+                lastKind = AcquisitionFailureKind.Network;
+                if (CanRetryAcquisition(lastKind, attempt, maxAttempts, attemptCts, cancellationToken))
+                {
+                    await DelayBeforeRetryAsync(attemptCts.Token);
+                    continue;
+                }
+                await CompleteAcquisitionFailureAsync(url, lastKind, null, "socket", attempt + 1, sw.ElapsedMilliseconds);
+                return (null, false);
+            }
+            catch (HttpRequestException ex)
+            {
+                var elapsed = (int)sw.ElapsedMilliseconds;
+                var inner = ex.InnerException;
+                trace.Error(Validation.TraceCategory.HttpRequestFailed, ctx,
+                    $"kind=Network durationMs={elapsed} innerType={inner?.GetType().Name} innerMessage='{(inner?.Message ?? "").Substring(0, Math.Min(120, (inner?.Message ?? "").Length))}'", ex);
+                lastKind = AcquisitionFailureClassifier.FromStreamFailureKind(StreamFailureClassifier.ClassifyException(ex));
+                if (CanRetryAcquisition(lastKind, attempt, maxAttempts, attemptCts, cancellationToken))
+                {
+                    await DelayBeforeRetryAsync(attemptCts.Token);
+                    continue;
+                }
+                await CompleteAcquisitionFailureAsync(url, lastKind, null, "network", attempt + 1, sw.ElapsedMilliseconds);
+                return (null, false);
+            }
+            catch (Exception ex)
+            {
+                var elapsed = (int)sw.ElapsedMilliseconds;
+                trace.Error(Validation.TraceCategory.HttpRequestFailed, ctx,
+                    $"kind=Unknown durationMs={elapsed} ex={ex.GetType().Name} message='{ex.Message.Substring(0, Math.Min(120, ex.Message.Length))}'", ex);
+                lastKind = AcquisitionFailureClassifier.FromStreamFailureKind(StreamFailureClassifier.ClassifyException(ex));
+                if (CanRetryAcquisition(lastKind, attempt, maxAttempts, attemptCts, cancellationToken))
+                {
+                    await DelayBeforeRetryAsync(attemptCts.Token);
+                    continue;
+                }
+                await CompleteAcquisitionFailureAsync(url, lastKind, null, "unknown", attempt + 1, sw.ElapsedMilliseconds);
+                return (null, false);
+            }
+        }
 
-            // Body read com timer separado.
-            var bodySw = Stopwatch.StartNew();
-            var content = await response.Content
-                .ReadAsStringAsync(attemptCts.Token)
-                .ConfigureAwait(false);
-            var bodyMs = (int)bodySw.ElapsedMilliseconds;
-            var bytesRead = content?.Length ?? 0;
-            trace.Information(Validation.TraceCategory.HttpRequestBody, ctx,
-                $"bodyBytes={bytesRead} bodyReadMs={bodyMs}");
-            trace.Information(Validation.TraceCategory.HttpRequestEnd, ctx,
-                $"kind=HttpSuccess status=200 durationMs={elapsed}");
-            return (content, true);
-        }
-        catch (Exception ex) when (ex is OperationCanceledException && IsHttpClientInternalTimeout(ex))
+        // Defensivo: garante terminação e registo mesmo que o loop não
+        // tenha produzido uma saída (não deve acontecer).
+        await CompleteAcquisitionFailureAsync(url, lastKind, lastStatus, null, maxAttempts, sw.ElapsedMilliseconds);
+        return (null, false);
+    }
+
+    private static bool CanRetryAcquisition(
+        AcquisitionFailureKind kind,
+        int attempt,
+        int maxAttempts,
+        CancellationTokenSource attemptCts,
+        CancellationToken callerToken)
+        => attempt + 1 < maxAttempts
+           && !callerToken.IsCancellationRequested
+           && !attemptCts.IsCancellationRequested
+           && AcquisitionFailureClassifier.IsRetryable(kind);
+
+    private async Task DelayBeforeRetryAsync(CancellationToken token)
+    {
+        try
         {
-            var elapsed = (int)sw.ElapsedMilliseconds;
-            var connectMs = _options.ConnectionTimeoutSeconds * 1000;
-            var kind = elapsed < connectMs + 500
-                ? "HttpConnectTimeout"
-                : "HttpRequestTimeout";
-            trace.Warning(Validation.TraceCategory.HttpRequestFailed, ctx,
-                $"kind={kind} durationMs={elapsed} innerException={ex.InnerException?.GetType().Name} innerMessage='{(ex.InnerException?.Message ?? "").Substring(0, Math.Min(120, (ex.InnerException?.Message ?? "").Length))}'",
-                ex);
-            LogPlaylistDownloadOutcome(url, kind: kind, durationMs: elapsed, status: 0, errorName: ex.GetType().Name);
-            return (null, false);
+            await Task.Delay(_options.RetryDelay, token).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (attemptCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException)
         {
-            var elapsed = (int)sw.ElapsedMilliseconds;
-            trace.Warning(Validation.TraceCategory.HttpRequestFailed, ctx,
-                $"kind=Timeout durationMs={elapsed} attemptCts fired");
-            LogPlaylistDownloadOutcome(url, kind: "Timeout", durationMs: elapsed, status: 0);
-            return (null, false);
+            // O tecto global da operação foi atingido: a próxima iteração
+            // termina via cancellation.
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+    }
+
+    /// <summary>
+    /// W2 — terminaliza uma falha de aquisição: notifica o observador (que
+    /// persiste na Source e agrega na Run) e regista o diagnóstico. A falha
+    /// persistida e a agregação representam a MESMA falha
+    /// (19-FAILURE-MODEL §6).
+    /// </summary>
+    private async Task CompleteAcquisitionFailureAsync(
+        string url,
+        AcquisitionFailureKind kind,
+        int? status,
+        string? detail,
+        int attempts,
+        long durationMs)
+    {
+        if (_failureObserver is not null && kind != AcquisitionFailureKind.None)
         {
-            var elapsed = (int)sw.ElapsedMilliseconds;
-            trace.Warning(Validation.TraceCategory.HttpRequestFailed, ctx,
-                $"kind=Cancellation durationMs={elapsed} caller cancellation");
-            LogPlaylistDownloadOutcome(url, kind: "Cancellation", durationMs: elapsed, status: 0);
-            return (null, false);
+            try
+            {
+                var info = new AcquisitionFailureInfo(
+                    url, kind, status, detail,
+                    RetryExhausted: AcquisitionFailureClassifier.IsRetryable(kind),
+                    Attempts: attempts);
+                await _failureObserver.OnAcquisitionFailureAsync(info, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch
+            {
+                // Persistência nunca pode quebrar a aquisição.
+            }
         }
-        catch (System.Security.Authentication.AuthenticationException ex)
-        {
-            var elapsed = (int)sw.ElapsedMilliseconds;
-            trace.Error(Validation.TraceCategory.HttpRequestFailed, ctx,
-                $"kind=TlsOrConnection durationMs={elapsed} ex={ex.GetType().Name} message='{ex.Message.Substring(0, Math.Min(120, ex.Message.Length))}'", ex);
-            LogPlaylistDownloadOutcome(url, kind: "TlsOrConnection", durationMs: elapsed, status: 0, errorName: ex.GetType().Name);
-            return (null, false);
-        }
-        catch (System.Net.Sockets.SocketException ex) when (ex.SocketErrorCode == System.Net.Sockets.SocketError.HostNotFound)
-        {
-            var elapsed = (int)sw.ElapsedMilliseconds;
-            trace.Error(Validation.TraceCategory.HttpRequestFailed, ctx,
-                $"kind=Dns durationMs={elapsed} socketError={ex.SocketErrorCode}", ex);
-            LogPlaylistDownloadOutcome(url, kind: "Dns", durationMs: elapsed, status: 0, errorName: ex.GetType().Name);
-            return (null, false);
-        }
-        catch (System.Net.Sockets.SocketException ex)
-        {
-            var elapsed = (int)sw.ElapsedMilliseconds;
-            trace.Error(Validation.TraceCategory.HttpRequestFailed, ctx,
-                $"kind=Socket durationMs={elapsed} socketError={ex.SocketErrorCode}", ex);
-            LogPlaylistDownloadOutcome(url, kind: "TlsOrConnection", durationMs: elapsed, status: 0, errorName: ex.GetType().Name);
-            return (null, false);
-        }
-        catch (HttpRequestException ex)
-        {
-            var elapsed = (int)sw.ElapsedMilliseconds;
-            var inner = ex.InnerException;
-            trace.Error(Validation.TraceCategory.HttpRequestFailed, ctx,
-                $"kind=Network durationMs={elapsed} innerType={inner?.GetType().Name} innerMessage='{(inner?.Message ?? "").Substring(0, Math.Min(120, (inner?.Message ?? "").Length))}'", ex);
-            LogPlaylistDownloadOutcome(url, kind: "Network", durationMs: elapsed, status: 0, errorName: ex.GetType().Name);
-            return (null, false);
-        }
-        catch (Exception ex)
-        {
-            var elapsed = (int)sw.ElapsedMilliseconds;
-            trace.Error(Validation.TraceCategory.HttpRequestFailed, ctx,
-                $"kind=Unknown durationMs={elapsed} ex={ex.GetType().Name} message='{ex.Message.Substring(0, Math.Min(120, ex.Message.Length))}'", ex);
-            LogPlaylistDownloadOutcome(url, kind: "Unknown", durationMs: elapsed, status: 0, errorName: ex.GetType().Name);
-            return (null, false);
-        }
+        LogPlaylistDownloadOutcome(url, kind: kind.ToString(), durationMs: (int)durationMs, status: status ?? 0);
     }
 
     private static string SafeHost(string url)
@@ -800,7 +999,11 @@ public sealed class M3uTesterService : IDisposable
             Url = url,
             Title = string.IsNullOrEmpty(title) ? ExtractTitleFromUrl(url) : title,
             Group = group,
-            LastTested = DateTime.Now,
+            // W-DEDUP (2026-10-01): um resultado reutilizado nao fabrica um
+            // novo timestamp de teste fisico. O PipelineIngestionService so'
+            // regista uma observacao quando LastTested != default, pelo que
+            // LastTested default sinaliza correctamente "sem GET fisico".
+            LastTested = outcome.ReusedKnownWorking ? default : DateTime.Now,
             IsWorking = outcome.IsWorking,
             ResponseTime = outcome.DurationMs,
         };

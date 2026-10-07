@@ -287,6 +287,27 @@ public class DashboardMetricsTests
     }
 
     [Fact]
+    public void DeduplicateBySourceName_propagates_provenance_from_first_non_null()
+    {
+        // PHASE W-DASHBOARD — o representante do grupo (source,name) propaga
+        // candidateId/messageId/messageDateUtc; escolhe o primeiro valor
+        // não-nulo na ordem do input.
+        var date = new DateTime(2026, 10, 2, 12, 0, 0, DateTimeKind.Utc);
+        var items = new List<DiscoveredPlaylist>
+        {
+            new() { Source = "Chat A", Name = "X", State = "accepted" },
+            new() { Source = "Chat A", Name = "X", CandidateId = "c-2", MessageId = 42, MessageDateUtc = date, State = "accepted" },
+        };
+
+        var dedup = DashboardMetrics.DeduplicateBySourceName(items);
+
+        Assert.Single(dedup);
+        Assert.Equal("c-2", dedup[0].CandidateId);
+        Assert.Equal(42, dedup[0].MessageId);
+        Assert.Equal(date, dedup[0].MessageDateUtc);
+    }
+
+    [Fact]
     public void ReadLatestDispatcharrSync_returns_null_when_no_files()
     {
         var dir = Path.Combine(Path.GetTempPath(), "dash-no-files-" + Guid.NewGuid().ToString("N"));

@@ -7,6 +7,7 @@ using m3uCrawler.Models;
 using m3uCrawler.Services;
 using m3uCrawler.Services.Catalog;
 using m3uCrawler.Services.Matching;
+using m3uCrawler.Services.Recognition;
 using Xunit;
 
 namespace m3uCrawler.Tests;
@@ -153,37 +154,53 @@ public class PipelineIngestionBridgeTests : IAsyncLifetime
     }
 
     // ============================================================
-    // D. Canal desconhecido: não é eliminado e fica disponível
-    //    para resolução posterior via Dashboard
+    // D. Canal desconhecido: NÃO vira identidade canónica.
+    //    A identidade de canal é Key + ChannelAlias; um título que
+    //    não resolve fica apenas como sinal de revisão/observabilidade.
     // ============================================================
 
     [Fact]
-    public async Task Unknown_channel_gets_a_canonical_with_CreateEligible_and_is_visible_in_catalogue()
+    public async Task Unknown_channel_is_not_created_as_canonical_and_is_reviewed_idempotently()
     {
         // Slug único por execução para evitar colisões em paralelo.
         var slug = $"desconhecido-{Guid.NewGuid():N}".Substring(0, 24);
-        // O título contém "PT" (passa country gate) e o slug garante
-        // unicidade da canonical criada.
-        var stream = MakeStream($"PT CANAL {slug.ToUpperInvariant()}", $"http://x.example/{slug}.ts", "Portugal");
+        var title = $"PT CANAL {slug.ToUpperInvariant()}";
+        // O título contém "PT" (passa country gate).
+        var stream = MakeStream(title, $"http://x.example/{slug}.ts", "Portugal");
         var sourceKey = $"test-bridge-d-{Guid.NewGuid():N}".Substring(0, 32);
 
-        var result = await NewIngestor().IngestAsync(
+        var first = await NewIngestor().IngestAsync(
+            new[] { stream }, sourceKey, "Telegram", "pt");
+        var second = await NewIngestor().IngestAsync(
             new[] { stream }, sourceKey, "Telegram", "pt");
 
-        Assert.Equal(1, result.IngestedCount);
-        Assert.Equal(0, result.RejectedByCountryCount);
+        // Ingestão NÃO cria identidade nem liga a stream.
+        Assert.Equal(0, first.IngestedCount);
+        Assert.Equal(0, first.MatchedCount);
+        Assert.Equal(0, first.AutoCreatedCount);
+        Assert.Equal(0, second.IngestedCount);
 
         var channels = await _resolver.ListCanonicalChannelsAsync();
-        var ch = channels.FirstOrDefault(c => c.Key.Contains(slug));
-        Assert.NotNull(ch);
-        Assert.Equal(stream.Title, ch!.DisplayName);
-        Assert.Equal(PublicationPolicy.CreateEligible, ch.PublicationPolicy);
+        Assert.DoesNotContain(channels, c => c.Key.Contains(slug) || c.DisplayName == title);
 
         var sources = await _resolver.ListSourcesAsync();
         var src = sources.Single(s => s.Key == sourceKey);
         var channelSources = await _resolver.ListChannelSourcesAsync(sourceId: src.Id);
-        Assert.Single(channelSources);
-        Assert.Equal(ch.Id, channelSources[0].CanonicalChannelId);
+        Assert.Empty(channelSources);
+
+        // Sinal de revisão persistido e idempotente (sem duplicados).
+        var normalized = ChannelNormalizer.Normalize(title);
+        var reviews = (await _resolver.ListAllReviewItemsAsync())
+            .Where(r => r.NormalizedIdentity == normalized)
+            .ToList();
+        Assert.Single(reviews);
+        Assert.Equal(ReviewItemState.Open, reviews[0].State);
+
+        // Observabilidade registada sem identidade canónica.
+        var audits = await _resolver.GetRecentMatchingAuditsAsync(100);
+        Assert.Contains(audits, a => a.NormalizedIdentity == normalized
+            && a.ResolutionKind == nameof(CatalogResolutionKind.Unknown)
+            && a.CanonicalChannelId == null);
     }
 
     // ============================================================
@@ -238,7 +255,11 @@ public class PipelineIngestionBridgeTests : IAsyncLifetime
         var cs = (await _resolver.ListChannelSourcesAsync(sourceId: src.Id)).Single();
         // MatchMethod deve indicar o tipo de decisão.
         Assert.False(string.IsNullOrWhiteSpace(cs.MatchMethod));
-        Assert.True(cs.MatchConfidence >= 0 && cs.MatchConfidence <= 1.0);
+        // W5.6 — MatchConfidence passou a nullable; para um match canónico
+        // o pipeline transporta o valor decidido pela Recognition.
+        Assert.NotNull(cs.MatchConfidence);
+        Assert.InRange(cs.MatchConfidence!.Value, 0.0, 1.0);
+        Assert.Equal(RecognitionMatchMethods.MatchSemanticsVersion, cs.MatchSemanticsVersion);
         // StreamUrl persistida deve estar sanitizada (sem credenciais).
         Assert.Equal(stream.Url, cs.StreamUrl); // sem credenciais aqui, mas passa pelo sanitizer
     }
@@ -340,11 +361,36 @@ public class PipelineIngestionBridgeTests : IAsyncLifetime
         var src = (await _resolver.ListSourcesAsync()).Single(s => s.Key == sourceKey);
         var cs = (await _resolver.ListChannelSourcesAsync(sourceId: src.Id)).Single();
 
-        // Cada ingestão deve persistir uma observação do stream
-        // (PHASE 9 b continua a funcionar via ingestor).
+        // Wave W6b-2 — a ingestão regista automaticamente uma observação
+        // para streams validados (LastTested preenchido). O registo manual
+        // do dashboard adiciona uma segunda amostra ao histórico.
+        var autoRecorded = await _resolver.GetChannelSourceObservationsAsync(cs.Id);
+        Assert.Single(autoRecorded);
+
         await _resolver.RecordChannelSourceObservationAsync(
             cs.Id, StreamQuality.HD, EpgState.Available, AvailabilityState.Reachable, 120);
         var obs = await _resolver.GetChannelSourceObservationsAsync(cs.Id);
-        Assert.Single(obs);
+        Assert.Equal(2, obs.Count);
+    }
+
+    // ============================================================
+    // J. Prioridade de Source existente não é reescrita pela ingestão
+    // ============================================================
+
+    [Fact]
+    public async Task Ingest_does_not_overwrite_existing_source_priority()
+    {
+        var sourceKey = "test-bridge-j";
+        await _resolver.EnsureSourceAsync(
+            sourceKey, sourceKey, SourceKind.Telegram,
+            $"telegram://{sourceKey}?country=pt", priority: 50,
+            updatePriority: true);
+
+        await NewIngestor().IngestAsync(
+            new[] { MakeStream("RTP 1", "http://x.example/rtp1-j.ts", "Portugal") },
+            sourceKey, "Telegram", "pt");
+
+        var src = (await _resolver.ListSourcesAsync()).Single(s => s.Key == sourceKey);
+        Assert.Equal(50, src.Priority);
     }
 }

@@ -33,6 +33,26 @@ public static class StreamValidationTesterFactory
     }
 
     /// <summary>
+    /// W2-FU-1 (2026-09-22) — sobrecarga aditiva: cria o tester e liga um
+    /// <see cref="Validation.IAcquisitionFailureObserver"/> via
+    /// <c>SetAcquisitionFailureObserver</c>. Usado pelo wiring do
+    /// observer em produção no caminho Telegram live
+    /// (<see cref="TelegramScraperService.SearchAndTestM3UInTelegramAsync"/>).
+    /// Passar <c>null</c> preserva o comportamento da sobrecarga legacy.
+    /// </summary>
+    public static M3uTesterService CreateTester(
+        StreamValidationState state,
+        Validation.IAcquisitionFailureObserver? observer)
+    {
+        var tester = CreateTester(state);
+        if (observer is not null)
+        {
+            tester.SetAcquisitionFailureObserver(observer);
+        }
+        return tester;
+    }
+
+    /// <summary>
     /// Helper de conveniência: cria um state efémero (sem policy store).
     /// Útil em testes e em call sites onde a policy não é relevante.
     /// Em produção, prefira <see cref="StreamValidationState(StreamValidationPolicyStore)"/>.

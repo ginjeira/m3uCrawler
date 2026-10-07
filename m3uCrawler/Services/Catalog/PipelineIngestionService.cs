@@ -6,6 +6,8 @@ using System.Threading.Tasks;
 using m3uCrawler.Models;
 using m3uCrawler.Services.Catalog;
 using m3uCrawler.Services.Matching;
+using m3uCrawler.Services.Recognition;
+using m3uCrawler.Services.Validation;
 
 namespace m3uCrawler.Services.Catalog;
 
@@ -15,30 +17,40 @@ namespace m3uCrawler.Services.Catalog;
 /// (SourceEntity, ChannelSourceEntity, CanonicalChannelEntity).
 ///
 /// <para>
+/// <b>Invariante de identidade (Wave B).</b> <see cref="CanonicalChannelEntity"/>
+/// (Key) + <see cref="ChannelAliasEntity"/> é a ÚNICA fonte de
+/// identidade de canal. A ingestão NUNCA cria canais canónicos nem
+/// inventa identidade a partir de títulos desconhecidos: se o
+/// <see cref="CatalogResolver.ResolveAsync"/> não devolver um canal
+/// canónico real, o stream não é ligado ao catálogo.
+/// </para>
+///
+/// <para>
 /// Para cada <see cref="M3uStream"/> recebido:
 /// </para>
 /// <list type="number">
 ///   <item>Normaliza o título via <see cref="ChannelNormalizer.Normalize"/>;</item>
 ///   <item>Resolve a identidade via
 ///         <see cref="CatalogResolver.ResolveAsync"/>
-///         (mecanismo de matching existente — não é introduzido um
+///         (IdentityRule → Affinity(Channel) → ChannelAlias — o
+///         mecanismo de matching existente; não é introduzido um
 ///         segundo algoritmo);</item>
-///   <item>Se Canonical → usa o canal existente.</item>
-///   <item>Se Unknown → cria um CanonicalChannel via
-///         <see cref="CatalogResolver.EnsureCanonicalChannelAsync"/>
-///         com <see cref="PublicationPolicy.CreateEligible"/>;
-///         o canal permanece disponível para revisão posterior
-///         via Dashboard (não é eliminado);</item>
-///   <item>Cria/atualiza <see cref="ChannelSourceEntity"/>
+///   <item>Se Canonical → liga a stream ao canal existente,
+///         criando/atualizando <see cref="ChannelSourceEntity"/>
 ///         via <see cref="CatalogResolver.RecordChannelSourceAsync"/>
 ///         (já idempotente por (channelId, sourceId, streamUrl));</item>
-///   <item>Regista <see cref="MatchingAuditEntity"/>
-///         via <see cref="CatalogResolver.RecordMatchingAuditAsync"/>.</item>
+///   <item>Se Unknown/ReviewOnly/Excluded → NÃO cria canal canónico,
+///         NÃO cria <see cref="ChannelSourceEntity"/>. Regista
+///         observabilidade (<see cref="MatchingAuditEntity"/> via
+///         <see cref="CatalogResolver.RecordMatchingAuditAsync"/>) e,
+///         para Unknown/ReviewOnly, um item de revisão idempotente via
+///         <see cref="CatalogResolver.UpsertReviewItemAsync"/>. O
+///         stream fica visível sem se tornar identidade;</item>
 /// </list>
 ///
 /// <para>
-/// <b>Country gate (R1).</b> Quando o constructor recebe um
-/// <see cref="CountryChannelValidator"/> (recomendado), o
+/// <b>Country gate (R1).</b> O constructor exige um
+/// <see cref="CountryChannelValidator"/>. O
 /// <see cref="IngestAsync"/> chama <see cref="CountryChannelValidator.ValidateStreams"/>
 /// internamente. Streams REJECTED pelo country policy
 /// (estrangeiros, sem token PT, etc.) são silenciosamente
@@ -48,8 +60,8 @@ namespace m3uCrawler.Services.Catalog;
 /// <para>
 /// <b>REJECT ≠ UNKNOWN.</b> O country gate é executado antes do
 /// matching de canal. Um stream que viola a política de país
-/// nunca é convertido em CanonicalChannel CreateEligible —
-/// apenas streams que passam o gate podem ser Unknown/auto-created.
+/// nunca é convertido em identidade canónica — e um stream que passa
+/// o gate mas não resolve continua a não criar identidade.
 /// </para>
 ///
 /// <para>
@@ -67,18 +79,25 @@ namespace m3uCrawler.Services.Catalog;
 /// <list type="bullet">
 ///   <item><c>SourceEntity.Origin</c> = chave da source + origem
 ///         legível (sanitizada);</item>
-///   <item><c>ChannelSourceEntity.MatchMethod</c> =
-///         "canonical-alias", "canonical-key", "auto-create" ou
-///         "auto-create-existing-alias";</item>
-///   <item><c>ChannelSourceEntity.MatchConfidence</c> = 1.0 (canonical
-///         existente), 0.5 (auto-criado), ou conforme o caso.</item>
+    ///   <item><c>ChannelSourceEntity.MatchMethod</c> =
+    ///         método efectivo de <c>CatalogResolution.MatchMethod</c>
+    ///         (ex.: <c>NormalizedName</c>, <c>KnownAlias</c>); fallback
+    ///         historico <c>"canonical-alias"</c> quando ausente;</item>
+    ///   <item><c>ChannelSourceEntity.MatchConfidence</c> = valor transportado
+    ///         por <c>CatalogResolution.MatchConfidence</c> (W5.6; nunca
+    ///         recalculado nem fixado pelo pipeline); e
+    ///         <c>ChannelSourceEntity.MatchSemanticsVersion</c> =
+    ///         <c>"msm1"</c>.</item>
 /// </list>
 ///
 /// <para>
 /// Idempotência: <see cref="CatalogResolver.EnsureSourceAsync"/>
-/// (por Key) e <see cref="CatalogResolver.RecordChannelSourceAsync"/>
-/// (por (channelId, sourceId, streamUrl)) garantem que uma segunda
-/// passagem sobre os mesmos streams não cria duplicados.
+/// (por Key, sem reescrever a prioridade existente),
+/// <see cref="CatalogResolver.RecordChannelSourceAsync"/>
+/// (por (channelId, sourceId, streamUrl)) e
+/// <see cref="CatalogResolver.UpsertReviewItemAsync"/>
+/// (por fingerprint) garantem que uma segunda passagem sobre os
+/// mesmos streams não cria duplicados.
 /// </para>
 /// </summary>
 public sealed class PipelineIngestionService
@@ -106,7 +125,9 @@ public sealed class PipelineIngestionService
     }
 
     /// <summary>
-    /// Resultado agregado de uma ingestão.
+    /// Resultado agregado de uma ingestão. <c>AutoCreatedCount</c> é
+    /// sempre 0 (a ingestão não cria canais); mantido no contrato por
+    /// compatibilidade.
     /// </summary>
     public sealed record IngestionResult(
         int ReceivedCount,
@@ -117,13 +138,14 @@ public sealed class PipelineIngestionService
         IReadOnlyList<IngestionEntry> Entries);
 
     /// <summary>
-    /// Entrada individual do resultado, útil para diagnóstico e teste.
+    /// Entrada individual do resultado (apenas streams ligados a um
+    /// canal canónico resolvido), útil para diagnóstico e teste.
     /// </summary>
     public sealed record IngestionEntry(
         string NormalizedIdentity,
         long CanonicalChannelId,
         string MatchMethod,
-        double MatchConfidence,
+        double? MatchConfidence,
         bool AutoCreated);
 
     public async Task<IngestionResult> IngestAsync(
@@ -131,7 +153,9 @@ public sealed class PipelineIngestionService
         string sourceKey,
         string sourceKindName,
         string countryCode,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string? runId = null,
+        RecognitionPolicy? policy = null)
     {
         if (streams == null) throw new ArgumentNullException(nameof(streams));
         if (string.IsNullOrWhiteSpace(sourceKey))
@@ -169,18 +193,71 @@ public sealed class PipelineIngestionService
         var kind = ParseKind(sourceKindName);
         var origin = BuildOrigin(sourceKey, sourceKindName, countryCode);
 
+        // W1 (2026-09-19) — identidade funcional das contas presentes no
+        // lote. A identidade é derivada da evidência funcional estável já
+        // usada pelo pipeline Xtream (endpoint + username; password nunca
+        // participa). Sem identidade estável NÃO se inventa conta: o
+        // candidato é preservado como ocorrência distinta.
+        var accounts = await ResolveFunctionalAccountsAsync(streams, cancellationToken);
+        long? singleAccountId = accounts.Count == 1 ? accounts.Values.First().AccountId : null;
+
+        // A prioridade de uma Source existente é estado do operador
+        // (Dashboard/ordenação) e NÃO deve ser reescrita pela ingestion.
+        // A prioridade 0 só se aplica quando a Source é criada agora.
         var source = await _catalog.EnsureSourceAsync(
             key: sourceKey,
             name: sourceKey,
             kind: kind,
             origin: origin,
             priority: 0,
-            cancellationToken: cancellationToken);
+            updatePriority: false,
+            cancellationToken: cancellationToken,
+            providerAccountId: singleAccountId);
         await _catalog.MarkSourceDiscoveryAsync(source.Id, DateTime.UtcNow, cancellationToken);
+
+        // W1 — persistir as ocorrências de descoberta associadas ao Run.
+        // Com conta funcional, a dedup por (RunId, ProviderAccountId)
+        // garante uma única ocorrência por conta no mesmo Run. Sem conta,
+        // a ocorrência é sempre preservada (nunca dedup silenciosa).
+        var evidence = BuildDiscoveryEvidence(sourceKey, sourceKindName, countryCode);
+        if (accounts.Count > 0)
+        {
+            var xtreamProvider = await _catalog.EnsureProviderAsync(
+                ProviderNamespaces.Xtream,
+                "Xtream Codes",
+                ProviderType.Xtream,
+                cancellationToken: cancellationToken);
+
+            foreach (var account in accounts.Values)
+            {
+                await _catalog.RecordDiscoveryCandidateAsync(
+                    runId: runId,
+                    providerId: xtreamProvider.Id,
+                    providerAccountId: account.AccountId,
+                    externalIdentity: account.ExternalIdentity,
+                    normalizedIdentity: account.ExternalIdentity,
+                    evidence: evidence,
+                    status: DiscoveryCandidateStatus.Normalized,
+                    sourceId: source.Id,
+                    cancellationToken: cancellationToken);
+            }
+        }
+        else
+        {
+            await _catalog.RecordDiscoveryCandidateAsync(
+                runId: runId,
+                providerId: null,
+                providerAccountId: null,
+                externalIdentity: null,
+                normalizedIdentity: null,
+                evidence: evidence,
+                status: DiscoveryCandidateStatus.Discovered,
+                sourceId: source.Id,
+                cancellationToken: cancellationToken);
+        }
 
         var entries = new List<IngestionEntry>(streams.Count);
         int matched = 0;
-        int autoCreated = 0;
 
         foreach (var stream in streams)
         {
@@ -198,93 +275,163 @@ public sealed class PipelineIngestionService
             }
 
             var normalized = ChannelNormalizer.Normalize(stream.Title);
-            var resolution = await _catalog.ResolveAsync(normalized, cancellationToken);
-
-            long canonicalId;
-            string matchMethod;
-            double confidence;
-            bool autoCreatedThis = false;
+            // D-M4-02 — quando o caller passou uma `RecognitionPolicy`
+            // derivada do snapshot do Run, propaga-a ao núcleo de
+            // `ResolveAsync`. Quando `policy == null`, a forma do
+            // overload legado (3-arg com `policy: null`) é equivalente
+            // ao comportamento anterior (B1: nunca fallback para policy
+            // viva; sem policy ⇒ sem policy).
+            var resolution = await _catalog.ResolveAsync(
+                normalized, stream.OriginalTvgId, policy, cancellationToken);
+            var auditIdentity = string.IsNullOrEmpty(normalized) ? stream.Url : normalized;
+            var originalTitle = stream.Title ?? string.Empty;
 
             if (resolution.Kind == CatalogResolutionKind.Canonical
                 && resolution.CanonicalChannelId.HasValue
                 && resolution.CanonicalChannelId.Value > 0)
             {
-                canonicalId = resolution.CanonicalChannelId.Value;
-                matchMethod = "canonical-alias";
-                confidence = 1.0;
+                var canonicalId = resolution.CanonicalChannelId.Value;
+                var matchMethod = resolution.MatchMethod ?? "canonical-alias";
+                // W5.6 — o pipeline apenas transporta a confiança decidida pela
+                // Recognition; nunca a calcula, altera ou infere. Não existe
+                // fallback para 0 quando o valor é null (o pipeline não pode
+                // fabricar confiança).
+                var matchConfidence = resolution.MatchConfidence;
+                // Confiança de evidência legacy (audit/identidade externa),
+                // conceito distinto de MatchConfidence; comportamento inalterado.
+                const double legacyEvidenceConfidence = 1.0;
                 matched++;
-            }
-            else if (resolution.Kind == CatalogResolutionKind.Rule
-                && resolution.RuleDisposition == RuleDisposition.Excluded)
-            {
-                // Excluded by IdentityRule — não ingere.
-                continue;
-            }
-            else
-            {
-                // Unknown: cria canonical com CreateEligible. O canal
-                // permanece disponível para revisão futura via
-                // Dashboard.
-                var slug = ToSlug(stream.Title);
-                var displayName = string.IsNullOrWhiteSpace(stream.Title)
-                    ? stream.Url
-                    : stream.Title.Trim();
 
-                var (ch, created) = await _catalog.EnsureCanonicalChannelAsync(
-                    key: $"{countryCode}-{slug}",
-                    displayName: displayName,
-                    editorialCategory: EditorialCategory.Live,
-                    editorialGroup: GroupFor(countryCode),
-                    publicationPolicy: PublicationPolicy.CreateEligible,
-                    isEnabled: true,
-                    normalizedAlias: string.IsNullOrEmpty(normalized) ? null : normalized,
+                var availability = stream.IsWorking
+                    ? AvailabilityState.Reachable
+                    : AvailabilityState.Dead;
+
+                var channelSource = await _catalog.RecordChannelSourceAsync(
+                    canonicalChannelId: canonicalId,
+                    sourceId: source.Id,
+                    streamUrl: stream.Url,
+                    quality: StreamQuality.Unknown,
+                    epg: EpgState.Unknown,
+                    availability: availability,
+                    matchConfidence: matchConfidence,
+                    matchMethod: matchMethod,
+                    isEnabled: stream.IsWorking,
                     cancellationToken: cancellationToken);
 
-                canonicalId = ch.Id;
-                matchMethod = created ? "auto-create" : "auto-create-existing-alias";
-                confidence = created ? 0.5 : 0.7;
-                if (created) autoCreated++;
-                autoCreatedThis = created;
+                // Wave W6b-2 — observação histórica apenas para streams
+                // efectivamente validados (LastTested != default). Nunca se
+                // fabrica uma observação para um stream por testar. A
+                // re-ingerir o mesmo evento de validação (mesmo LastTested)
+                // não cria duplicados: a dedupe é por
+                // (ChannelSourceId, ObservedAtUtc).
+                if (stream.LastTested != default)
+                {
+                    var observedAtUtc = stream.LastTested.Kind == DateTimeKind.Utc
+                        ? stream.LastTested
+                        : stream.LastTested.ToUniversalTime();
+                    var responseTimeMs = stream.ResponseTime > 0
+                        ? (long)Math.Round(stream.ResponseTime)
+                        : 0L;
+                    await _catalog.RecordChannelSourceObservationIfAbsentAsync(
+                        channelSourceId: channelSource.Id,
+                        quality: StreamQuality.Unknown,
+                        epg: EpgState.Unknown,
+                        availability: availability,
+                        responseTimeMs: responseTimeMs,
+                        observedAtUtc: observedAtUtc,
+                        cancellationToken: cancellationToken);
+                }
+
+                await _catalog.RecordMatchingAuditAsync(
+                    normalizedIdentity: auditIdentity,
+                    originalTitle: originalTitle,
+                    sourceGroup: stream.Group,
+                    kind: CatalogResolutionKind.Canonical,
+                    canonicalChannelId: canonicalId,
+                    confidence: legacyEvidenceConfidence,
+                    reasonSignature: "matched-via-pipeline",
+                    cancellationToken: cancellationToken);
+
+                // Evidência externa (tvg-id) do stream, associada ao
+                // canal canónico JÁ resolvido. Idempotente por
+                // (Namespace, Value); nunca sobrepõe uma associação
+                // existente a outro canal. Não cria identidade nova
+                // (DL-002) — apenas registra evidência.
+                await _catalog.RecordExternalIdentityAsync(
+                    canonicalChannelId: canonicalId,
+                    providerId: sourceKey,
+                    @namespace: ExternalIdentityNamespaces.TvgId,
+                    rawValue: stream.OriginalTvgId,
+                    origin: "ingestion",
+                    confidence: legacyEvidenceConfidence,
+                    cancellationToken: cancellationToken);
+
+                entries.Add(new IngestionEntry(
+                    NormalizedIdentity: normalized,
+                    CanonicalChannelId: canonicalId,
+                    MatchMethod: matchMethod,
+                    MatchConfidence: matchConfidence,
+                    AutoCreated: false));
+                continue;
             }
 
-            var availability = stream.IsWorking
-                ? AvailabilityState.Reachable
-                : AvailabilityState.Dead;
-
-            await _catalog.RecordChannelSourceAsync(
-                canonicalChannelId: canonicalId,
-                sourceId: source.Id,
-                streamUrl: stream.Url,
-                quality: StreamQuality.Unknown,
-                epg: EpgState.Unknown,
-                availability: availability,
-                matchConfidence: confidence,
-                matchMethod: matchMethod,
-                isEnabled: stream.IsWorking,
-                cancellationToken: cancellationToken);
+            // Não-canónico. A identidade de canal é apenas
+            // Key + ChannelAlias: NUNCA criar um CanonicalChannel a
+            // partir de um título desconhecido, e NUNCA fabricar um
+            // ChannelSource sob uma identidade inventada. O stream é
+            // registado apenas como sinal de revisão/observabilidade.
+            var (auditKind, reasonSignature) = resolution.Kind switch
+            {
+                CatalogResolutionKind.Rule => (CatalogResolutionKind.Rule,
+                    resolution.RuleDisposition == RuleDisposition.Excluded
+                        ? "excluded-via-pipeline"
+                        : "review-only-via-pipeline"),
+                CatalogResolutionKind.Ambiguous =>
+                    (CatalogResolutionKind.Unknown, AmbiguousReasonSignature(resolution)),
+                _ => (CatalogResolutionKind.Unknown, "unknown-via-pipeline"),
+            };
 
             await _catalog.RecordMatchingAuditAsync(
-                normalizedIdentity: string.IsNullOrEmpty(normalized) ? stream.Url : normalized,
-                originalTitle: stream.Title,
+                normalizedIdentity: auditIdentity,
+                originalTitle: originalTitle,
                 sourceGroup: stream.Group,
-                kind: autoCreatedThis
-                    ? CatalogResolutionKind.Unknown
-                    : (resolution.Kind == CatalogResolutionKind.Canonical
-                        ? CatalogResolutionKind.Canonical
-                        : resolution.Kind == CatalogResolutionKind.Rule
-                            ? CatalogResolutionKind.Rule
-                            : CatalogResolutionKind.Unknown),
-                canonicalChannelId: canonicalId,
-                confidence: confidence,
-                reasonSignature: autoCreatedThis ? "auto-created-via-pipeline" : "matched-via-pipeline",
+                kind: auditKind,
+                canonicalChannelId: null,
+                confidence: 0.0,
+                reasonSignature: reasonSignature,
                 cancellationToken: cancellationToken);
 
-            entries.Add(new IngestionEntry(
-                NormalizedIdentity: normalized,
-                CanonicalChannelId: canonicalId,
-                MatchMethod: matchMethod,
-                MatchConfidence: confidence,
-                AutoCreated: autoCreatedThis));
+            // Excluded é uma decisão explícita de identidade: não a
+            // transformamos em pedido de revisão. Unknown/ReviewOnly
+            // ficam visíveis para decisão humana.
+            if (resolution.Kind != CatalogResolutionKind.Rule
+                || resolution.RuleDisposition != RuleDisposition.Excluded)
+            {
+                if (!string.IsNullOrEmpty(normalized))
+                {
+                    // W-REVIEW-01 — captura evidência da ocorrência actual
+                    // (StreamUrl + Source.Id + fingerprint sfp1 + RunId
+                    // operacional). NUNCA reconstruir de outros Runs ou
+                    // candidates: o que fica persistido é o que esta
+                    // ingestion observou.
+                    var streamUrl = stream.Url;
+                    var streamFingerprint = m3uCrawler.Services.Matching.StreamFingerprint
+                        .TryComputeFingerprint(streamUrl);
+                    await _catalog.UpsertReviewItemAsync(
+                        normalizedIdentity: normalized,
+                        sourceGroup: stream.Group ?? string.Empty,
+                        reasonSignature: reasonSignature,
+                        reasonText: "Ingestion não encontrou canal canónico; stream não foi ligado ao catálogo.",
+                        cancellationToken: cancellationToken,
+                        streamUrl: streamUrl,
+                        sourceId: source.Id,
+                        streamFingerprint: streamFingerprint,
+                        streamFingerprintVersion: streamFingerprint != null
+                            ? m3uCrawler.Services.Matching.StreamFingerprint.Version
+                            : null,
+                        runId: runId);
+                }
+            }
         }
 
         return new IngestionResult(
@@ -292,8 +439,25 @@ public sealed class PipelineIngestionService
             RejectedByCountryCount: streams.Count - passedStreams.Count,
             IngestedCount: entries.Count,
             MatchedCount: matched,
-            AutoCreatedCount: autoCreated,
+            // A ingestão já não cria canais: mantido no contrato por
+            // compatibilidade e sempre 0.
+            AutoCreatedCount: 0,
             Entries: entries);
+    }
+
+    /// <summary>
+    /// W5.4 — Uma ambiguidade de Recognition que traz diagnóstico fuzzy de
+    /// W5.3 preserva o motivo técnico (<c>fuzzy-ambiguous</c> /
+    /// <c>fuzzy-below-threshold</c>) como <c>reasonSignature</c> do
+    /// <see cref="ReviewItemEntity"/>; as restantes ambiguidades mantêm o
+    /// motivo histórico. Não altera o motor fuzzy nem cria identidade.
+    /// </summary>
+    internal static string AmbiguousReasonSignature(CatalogResolution resolution)
+    {
+        var fuzzyReason = resolution.FuzzyDiagnostic?.DecisionReason;
+        return string.IsNullOrWhiteSpace(fuzzyReason)
+            ? "ambiguous-external-identity"
+            : fuzzyReason!;
     }
 
     private static SourceKind ParseKind(string name) => name?.Trim().ToLowerInvariant() switch
@@ -310,26 +474,52 @@ public sealed class PipelineIngestionService
     private static string BuildOrigin(string sourceKey, string sourceKindName, string countryCode) =>
         $"{sourceKindName}://{sourceKey}?country={countryCode}";
 
-    private static CanonicalEditorialGroup GroupFor(string countryCode) =>
-        countryCode?.Trim().ToLowerInvariant() switch
-        {
-            "pt" => CanonicalEditorialGroup.PortugalLive,
-            "es" => CanonicalEditorialGroup.Foreign,
-            "br" => CanonicalEditorialGroup.Foreign,
-            _ => CanonicalEditorialGroup.Other,
-        };
+    /// <summary>
+    /// W1 — resolve as contas funcionais distintas presentes num lote de
+    /// streams. Reutiliza a identidade funcional Xtream existente
+    /// (<see cref="AccountIdentity.TryComputeXtreamExternalIdentity"/>):
+    /// endpoint + username, password excluída. Streams sem identidade
+    /// funcional estável não contribuem para nenhuma conta.
+    /// </summary>
+    private sealed record FunctionalAccount(string ExternalIdentity, long AccountId);
 
-    private static string ToSlug(string? s)
+    private async Task<Dictionary<string, FunctionalAccount>> ResolveFunctionalAccountsAsync(
+        IReadOnlyList<M3uStream> streams, CancellationToken cancellationToken)
     {
-        if (string.IsNullOrWhiteSpace(s)) return "unknown";
-        var arr = s.Trim().ToLowerInvariant().ToCharArray();
-        var sb = new System.Text.StringBuilder(arr.Length);
-        foreach (var c in arr)
+        var result = new Dictionary<string, FunctionalAccount>(StringComparer.Ordinal);
+        ProviderEntity? xtreamProvider = null;
+        foreach (var stream in streams)
         {
-            if (char.IsLetterOrDigit(c)) sb.Append(c);
-            else if (c == ' ' || c == '-' || c == '_') sb.Append('-');
+            cancellationToken.ThrowIfCancellationRequested();
+            if (stream == null || string.IsNullOrWhiteSpace(stream.Url)) continue;
+            if (!AccountIdentity.TryComputeXtreamExternalIdentity(stream.Url, out var external)
+                || string.IsNullOrEmpty(external))
+            {
+                continue;
+            }
+
+            var accountKey = AccountKey.Compose(ProviderNamespaces.Xtream, external);
+            if (accountKey is null || result.ContainsKey(accountKey)) continue;
+
+            xtreamProvider ??= await _catalog.EnsureProviderAsync(
+                ProviderNamespaces.Xtream,
+                "Xtream Codes",
+                ProviderType.Xtream,
+                cancellationToken: cancellationToken);
+            var account = await _catalog.EnsureProviderAccountAsync(
+                xtreamProvider.Id,
+                accountKey,
+                accountKey,
+                ProviderAccountStatus.Discovered,
+                cancellationToken: cancellationToken);
+            result[accountKey] = new FunctionalAccount(external, account.Id);
         }
-        var slug = sb.ToString().Trim('-');
-        return string.IsNullOrEmpty(slug) ? "unknown" : slug;
+        return result;
     }
+
+    /// <summary>
+    /// Evidência sanitizada da descoberta. Nunca contém credenciais.
+    /// </summary>
+    private static string BuildDiscoveryEvidence(string sourceKey, string sourceKindName, string countryCode)
+        => CredentialSanitizer.SanitizeText($"{sourceKindName}:{sourceKey}:country={countryCode}");
 }

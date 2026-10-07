@@ -9,8 +9,21 @@ namespace m3uCrawler.Services
         public List<string> Channels { get; set; } = new();
     }
 
+    /// <summary>
+    /// W6 — O país é <b>configuração/validação</b>, não uma entidade de
+    /// domínio: não existe entidade <c>Country</c> na base de dados. Cada
+    /// país vive como um ficheiro JSON de aliases em
+    /// <c>runtime-data/countries/&lt;code&gt;.json</c>. Este serviço é a
+    /// única fonte de verdade para criar/ler/actualizar/eliminar essa
+    /// configuração; a validação da playlist é feita por
+    /// <see cref="CountryChannelValidator"/> sobre a mesma configuração.
+    /// O separador "Canais / Países" do Dashboard é, por isso, uma
+    /// ferramenta de configuração/validação e não um CRUD de país.
+    /// </summary>
     public class CountryChannelListService
     {
+        private static readonly JsonSerializerOptions ReadOptions = new() { PropertyNameCaseInsensitive = true };
+
         private readonly string _rootDirectory;
 
         public CountryChannelListService(string? rootDirectory = null)
@@ -18,12 +31,15 @@ namespace m3uCrawler.Services
             _rootDirectory = string.IsNullOrWhiteSpace(rootDirectory)
                 ? Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries")
                 : rootDirectory;
-
-            Directory.CreateDirectory(_rootDirectory);
         }
 
         public List<CountryChannelList> GetAllCountries()
         {
+            if (!Directory.Exists(_rootDirectory))
+            {
+                return new List<CountryChannelList>();
+            }
+
             var files = Directory.EnumerateFiles(_rootDirectory, "*.json", SearchOption.TopDirectoryOnly)
                 .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
                 .ToList();
@@ -34,7 +50,7 @@ namespace m3uCrawler.Services
                 try
                 {
                     var content = File.ReadAllText(file);
-                    var item = JsonSerializer.Deserialize<CountryChannelList>(content);
+                    var item = JsonSerializer.Deserialize<CountryChannelList>(content, ReadOptions);
                     if (item is not null && !string.IsNullOrWhiteSpace(item.Country))
                     {
                         item.Channels ??= new List<string>();
@@ -52,13 +68,9 @@ namespace m3uCrawler.Services
                 }
             }
 
-            if (items.Count == 0)
-            {
-                var ptFallback = CreateDefaultList("pt", "Portugal");
-                SaveCountry(ptFallback);
-                items.Add(ptFallback);
-            }
-
+            // Leitura pura: nunca cria nem sobrepõe ficheiros. A baseline é
+            // provisionada no arranque (CountryConfigProvisioner) e gravações
+            // são explícitas via SaveCountry (POST /api/country/save).
             return items;
         }
 
@@ -71,9 +83,13 @@ namespace m3uCrawler.Services
                 return config;
             }
 
-            var fallback = CreateDefaultList(normalized, GetDisplayName(normalized));
-            SaveCountry(fallback);
-            return fallback;
+            // Sem ficheiro, devolve um resultado vazio sem persistir nada.
+            return new CountryChannelList
+            {
+                Country = normalized,
+                DisplayName = GetDisplayName(normalized),
+                Channels = new List<string>(),
+            };
         }
 
         public void SaveCountry(CountryChannelList country)
@@ -95,49 +111,37 @@ namespace m3uCrawler.Services
                 .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
                 .ToList();
 
+            Directory.CreateDirectory(_rootDirectory);
             var filePath = Path.Combine(_rootDirectory, $"{normalizedCountry}.json");
             var json = JsonSerializer.Serialize(country, new JsonSerializerOptions { WriteIndented = true });
             File.WriteAllText(filePath, json);
         }
 
-        public string GetCountryDirectory() => _rootDirectory;
-
-        private static CountryChannelList CreateDefaultList(string countryCode, string displayName)
+        /// <summary>
+        /// W6 — Elimina a configuração de país
+        /// (<c>&lt;code&gt;.json</c>). Devolve <c>true</c> quando um ficheiro
+        /// foi eliminado; <c>false</c> quando não existia (ou o código é
+        /// vazio). Não toca na playlist publicada nem no catálogo.
+        /// </summary>
+        public bool DeleteCountry(string countryCode)
         {
-            var fallback = countryCode.ToLowerInvariant() switch
+            var normalized = NormalizeCountryCode(countryCode);
+            if (string.IsNullOrWhiteSpace(normalized))
             {
-                "pt" => new CountryChannelList
-                {
-                    Country = "pt",
-                    DisplayName = "Portugal",
-                    Channels = new List<string>
-                    {
-                        "RTP1", "RTP 1", "RTP2", "RTP 2", "SIC", "TVI", "SPORT TV 1",
-                        "SPORTTV1", "BTV", "BENFICATV", "BENFICA TV", "TVI24", "CANAL 11"
-                    }
-                },
-                "es" => new CountryChannelList
-                {
-                    Country = "es",
-                    DisplayName = "Espanha",
-                    Channels = new List<string> { "La 1", "Antena 3", "Telecinco", "LaSexta", "Cuatro" }
-                },
-                "br" => new CountryChannelList
-                {
-                    Country = "br",
-                    DisplayName = "Brasil",
-                    Channels = new List<string> { "Globo", "SBT", "Band", "Record", "Rede TV", "TV Brasil" }
-                },
-                _ => new CountryChannelList
-                {
-                    Country = countryCode,
-                    DisplayName = displayName,
-                    Channels = new List<string>()
-                }
-            };
+                return false;
+            }
 
-            return fallback;
+            var filePath = Path.Combine(_rootDirectory, $"{normalized}.json");
+            if (!File.Exists(filePath))
+            {
+                return false;
+            }
+
+            File.Delete(filePath);
+            return true;
         }
+
+        public string GetCountryDirectory() => _rootDirectory;
 
         private static string NormalizeCountryCode(string? countryCode)
         {

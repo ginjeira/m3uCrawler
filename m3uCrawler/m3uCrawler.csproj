@@ -12,6 +12,19 @@
   </ItemGroup>
 
   <ItemGroup>
+    <EmbeddedResource Include="runtime-data/countries/*.json" />
+    <!-- Baseline canónico PT. Vive em docs/catalog/ (fora do projecto) mas é
+         embutido como recurso para garantir que uma instalação fresca tem os
+         canais generalistas mesmo quando o ficheiro não é empacotado. O
+         LogicalName é explícito e determinístico para o loader poder resolvê-lo
+         sem depender da derivação automática a partir do Link. -->
+    <EmbeddedResource Include="$(MSBuildThisFileDirectory)../docs/catalog/m3ucrawler_pt_canonical_catalog.json">
+      <Link>docs/catalog/m3ucrawler_pt_canonical_catalog.json</Link>
+      <LogicalName>m3uCrawler.docs.catalog.m3ucrawler_pt_canonical_catalog.json</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="HtmlAgilityPack" Version="1.12.4" />
     <PackageReference Include="Microsoft.EntityFrameworkCore" Version="9.0.0" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="9.0.0" />

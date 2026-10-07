@@ -1,14 +1,24 @@
 using m3uCrawler.Build;
 using m3uCrawler.Models;
+using m3uCrawler.Services.Audit;
+using m3uCrawler.Services.Auth;
 using m3uCrawler.Services.Automation;
 using m3uCrawler.Services.Catalog;
+using m3uCrawler.Services.Configuration;
+using m3uCrawler.Services.Dispatcharr;
+using m3uCrawler.Services.LiveRun;
+using m3uCrawler.Services.Recognition;
+using m3uCrawler.Services.SourceSelection;
 using m3uCrawler.Services.Sync;
+using m3uCrawler.Services.Telegram;
 using m3uCrawler.Services.Validation;
+using System.IO;
 using System.Net;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Microsoft.EntityFrameworkCore;
 
 namespace m3uCrawler.Services
 {
@@ -16,6 +26,80 @@ namespace m3uCrawler.Services
     {
         private static CatalogResolver? _catalogResolver;
         private static IReadOnlyList<IScheduledAction>? _scheduledActions;
+        private static ConfigurationLifecycleService? _configurationLifecycle;
+        private static AuthService? _authService;
+        private static BootstrapService? _bootstrapService;
+        private static LiveRunHost? _liveRunHost;
+        private static bool _webAllowTrigger;
+
+        // DL-130 (Phase 5) — Serviço que calcula os cursores de publicação do
+        // catálogo para o endpoint GET /api/publication/status. Opcional:
+        // quando ausente, o endpoint devolve 503 (fail-closed), tal como
+        // _liveRunHost.
+        private static PublicationStatusService? _publicationStatusService;
+
+        // Wave C — Override do directório de runtime-data para testes
+        // isolados (sem tocar no runtime-data real). Produção usa sempre
+        // <c><cwd>/runtime-data</c>. Restaurado por StaticRuntimeDataDirScope.
+        private static string? _runtimeDataDirOverride;
+
+        // Wave 5 (PHASE 9C) — Serviços de setup/configuração expostos pela
+        // API. Todos opcionais: quando ausentes, os respectivos endpoints
+        // respondem 503 <serviço>-unavailable (nunca fail-open).
+        private static TelegramAuthService? _telegramAuthService;
+        private static DispatcharrConfigurationService? _dispatcharrConfigurationService;
+        private static DispatcharrConnectionTester? _dispatcharrConnectionTester;
+        private static OperationalReadinessService? _operationalReadinessService;
+        private static DispatcharrConnectionTestStore? _dispatcharrConnectionTestStore;
+
+        // W6a — Serviço de auditoria administrativa. Opcional: quando ausente
+        // (ex.: testes que não o injectam) as mutações correm normalmente sem
+        // auditoria; GET /api/audit responde 503 audit-unavailable.
+        private static IAuditService? _auditService;
+
+        // W-API-DISPATCHARR-HTTP-IMPLEMENTATION (DL-128 D8) —
+        // Coordenador + gate de concorrência dedicado ao Dispatcharr.
+        // Injectados em produção por Program.cs; nos testes pelo
+        // StaticDispatcharrSyncScope. Quando ausentes, os endpoints
+        // /api/dispatcharr/{dry-run,sync} respondem 503
+        // dispatcharr-unavailable.
+        private static DispatcharrSyncCoordinator? _dispatcharrSyncCoordinator;
+        private static DispatcharrConcurrencyGate? _dispatcharrConcurrencyGate;
+
+        // Lifecycle do processo residente — listener do dashboard
+        // registado no arranque e parado no shutdown coerente (Ctrl+C /
+        // SIGTERM), para que GetContextAsync() não fique bloqueado.
+        private static HttpListener? _dashboardListener;
+
+        // W3 — Rastreio de respostas já escritas. O HttpListenerResponse só é
+        // fechado pelos helpers de escrita; um `return` sem escrita (rota/método
+        // não correspondido, ou ramo que fixa um status de erro) deixaria o
+        // cliente pendurado indefinidamente. O `HandleRequestAsync` usa este
+        // marcador num `finally` para garantir sempre uma resposta. Usa-se
+        // ConditionalWeakTable para não reter respostas (chave fraca).
+        private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<HttpListenerResponse, object> _writtenResponses = new();
+        private static readonly object _writtenResponseMarker = new();
+
+        private static void MarkResponseWritten(HttpListenerResponse response)
+            => _writtenResponses.AddOrUpdate(response, _writtenResponseMarker);
+
+        private static bool WasResponseWritten(HttpListenerResponse response)
+            => _writtenResponses.TryGetValue(response, out _);
+
+        /// <summary>
+        /// PHASE 9C.2 (S1-E) — Indica que o Dashboard corre num contexto
+        /// explicitamente standalone/testes, onde a ausência simultânea de
+        /// lifecycle e auth é legítima (comportamento legacy preservado).
+        ///
+        /// Em produção é sempre <c>false</c>: nesse caso, lifecycle e auth
+        /// ambos ausentes (p.ex. falha na inicialização do catálogo) é
+        /// fail-closed — nunca <c>Legacy</c> aberto.
+        /// </summary>
+        private static bool _standaloneAuthContext;
+
+        /// <summary>Nome do cookie de sessão de administrador.</summary>
+        public const string SessionCookieName = "m3u_session";
+        private const string CsrfHeaderName = "X-CSRF-Token";
 
         public static void SetCatalogResolver(CatalogResolver resolver)
         {
@@ -23,20 +107,171 @@ namespace m3uCrawler.Services
         }
 
         /// <summary>
+        /// PHASE 9C.2 — Regista os serviços de autenticação/bootstrap.
+        /// Passar <c>null</c> repõe o comportamento "não ligado" (equivalente
+        /// a legacy), usado em testes.
+        /// </summary>
+        public static void SetAuth(AuthService? authService, BootstrapService? bootstrapService)
+        {
+            _authService = authService;
+            _bootstrapService = bootstrapService;
+        }
+
+        /// <summary>
+        /// PHASE 9C.1 — Regista o serviço de lifecycle para que o dashboard
+        /// possa reportar o estado de configuração. Passar <c>null</c> em
+        /// testes repõe o comportamento "não ligado".
+        /// </summary>
+        public static void SetConfigurationLifecycle(ConfigurationLifecycleService? lifecycle)
+        {
+            _configurationLifecycle = lifecycle;
+        }
+
+        /// <summary>
         /// Regista a lista de <see cref="IScheduledAction"/> resolvidas
-        /// pelo <c>ScheduledAutomationHost</c> para que o formulário
-        /// de Scheduled Jobs apresente opções válidas. Mantém-se
-        /// retro-compatibilidade: se não for chamado, o formulário
-        /// aceita qualquer <c>actionName</c> livre.
+        /// pelo <c>ScheduledAutomationHost</c>. O registry alimenta tanto a
+        /// lista de opções apresentada no formulário de Scheduled Jobs como
+        /// a validação do <c>actionName</c> no POST. Mantém-se
+        /// retro-compatibilidade: se não for chamado (registry vazio), o
+        /// formulário aceita qualquer <c>actionName</c> livre.
         /// </summary>
         public static void SetScheduledActions(IEnumerable<IScheduledAction> actions)
         {
             _scheduledActions = actions.ToArray();
         }
 
+        /// <summary>
+        /// PHASE 9C.4 — Regista o <see cref="LiveRunHost"/> que faz a ponte
+        /// entre o <see cref="RunCoordinator"/> único e os endpoints
+        /// <c>GET /api/run/status</c> e <c>POST /api/run/start</c>. Sem
+        /// host, os endpoints respondem <c>pipeline-not-configured</c>.
+        /// </summary>
+        public static void SetLiveRunHost(LiveRunHost? host)
+        {
+            _liveRunHost = host;
+        }
+
+        /// <summary>
+        /// DL-130 (Phase 5) — Regista o serviço que calcula os cursores
+        /// de publicação do catálogo. Sem este serviço, o endpoint
+        /// <c>GET /api/publication/status</c> devolve 503
+        /// (fail-closed; nunca expõe estado vazio como se fosse "ok").
+        /// </summary>
+        public static void SetPublicationStatusService(PublicationStatusService service)
+        {
+            _publicationStatusService = service ?? throw new ArgumentNullException(nameof(service));
+        }
+
+        /// <summary>
+        /// PHASE 9C.4 — Activa o trigger manual (botão "Run now") no
+        /// dashboard. Default: <c>false</c>. Quando <c>false</c>,
+        /// <c>POST /api/run/start</c> devolve 503
+        /// <c>web-allow-trigger-disabled</c>; <c>GET /api/run/status</c>
+        /// não é afectado.
+        /// </summary>
+        public static void SetWebAllowTrigger(bool allow)
+        {
+            _webAllowTrigger = allow;
+        }
+
+        /// <summary>
+        /// Wave C — Regista os serviços de setup/configuração
+        /// (Telegram, Dispatcharr e prontidão operacional). Todos os
+        /// parâmetros são opcionais; passar <c>null</c> repõe o estado
+        /// "não ligado" (os endpoints respondem 503).
+        /// </summary>
+        public static void SetSetupServices(
+            TelegramAuthService? telegramAuth,
+            DispatcharrConfigurationService? dispatcharrConfig,
+            DispatcharrConnectionTester? dispatcharrTester,
+            OperationalReadinessService? readiness,
+            DispatcharrConnectionTestStore? dispatcharrTestStore = null)
+        {
+            _telegramAuthService = telegramAuth;
+            _dispatcharrConfigurationService = dispatcharrConfig;
+            _dispatcharrConnectionTester = dispatcharrTester;
+            _operationalReadinessService = readiness;
+            _dispatcharrConnectionTestStore = dispatcharrTestStore;
+        }
+
+        /// <summary>
+        /// W6a — Regista o serviço de auditoria administrativa. Passar
+        /// <c>null</c> repõe o comportamento "não ligado" (usado em testes).
+        /// </summary>
+        public static void SetAuditService(IAuditService? auditService)
+        {
+            _auditService = auditService;
+        }
+
+        /// <summary>
+        /// W-API-DISPATCHARR-HTTP-IMPLEMENTATION (DL-128) — Regista o
+        /// coordenador e o gate de concorrência dedicado ao Dispatcharr.
+        /// Quando o coordenador é <c>null</c>, os endpoints
+        /// <c>/api/dispatcharr/{dry-run,sync}</c> respondem 503
+        /// <c>dispatcharr-unavailable</c>. Quando o gate é <c>null</c>,
+        /// os endpoints respondem 503 <c>dispatcharr-unavailable</c> (o gate
+        /// é parte do contrato de concorrência — não pode ser omitido).
+        /// </summary>
+        public static void SetDispatcharrSync(
+            DispatcharrSyncCoordinator? coordinator,
+            DispatcharrConcurrencyGate? gate)
+        {
+            _dispatcharrSyncCoordinator = coordinator;
+            _dispatcharrConcurrencyGate = gate;
+        }
+
+        /// <summary>
+        /// Wave C — Directório de runtime-data usado pelos endpoints de
+        /// configuração operacional. Produção: <c><cwd>/runtime-data</c>.
+        /// Testes podem sobrepor via <see cref="StaticRuntimeDataDirScope"/>
+        /// para isolar o ficheiro <c>app_settings.json</c>.
+        /// </summary>
+        private static string ResolveRuntimeDataDir() =>
+            string.IsNullOrWhiteSpace(_runtimeDataDirOverride)
+                ? Path.Combine(Directory.GetCurrentDirectory(), "runtime-data")
+                : _runtimeDataDirOverride!;
+
+        /// <summary>
+        /// W6 — Directório das configurações de país
+        /// (<c>runtime-data/countries</c>). Deriva de
+        /// <see cref="ResolveRuntimeDataDir"/>, pelo que os testes isolam os
+        /// endpoints <c>/api/countries</c>, <c>/api/country</c>,
+        /// <c>/api/country/save</c>, <c>/api/country/validate</c> e
+        /// <c>DELETE /api/country</c> via
+        /// <see cref="StaticRuntimeDataDirScope"/> sem tocar no
+        /// <c>runtime-data</c> real. Em produção o override é nulo e o
+        /// caminho é idêntico ao histórico.
+        /// </summary>
+        private static string ResolveCountriesDir() =>
+            Path.Combine(ResolveRuntimeDataDir(), "countries");
+
+        /// <summary>
+        /// Lifecycle — Para o listener do dashboard de forma coerente
+        /// (Ctrl+C / SIGTERM). Usado pelo mecanismo de shutdown de
+        /// Program.Main; desbloqueia o <c>GetContextAsync()</c> pendente.
+        /// </summary>
+        public static void StopDashboard()
+        {
+            var listener = _dashboardListener;
+            if (listener is null)
+            {
+                return;
+            }
+
+            try
+            {
+                listener.Stop();
+            }
+            catch (Exception ex) when (ex is ObjectDisposedException or HttpListenerException or InvalidOperationException)
+            {
+                // Esperado durante shutdown ordenado; não é uma falha.
+            }
+        }
+
         public static async Task RunDashboardAsync(string outputDir, int port, ImportHistoryService historyService, string? webToken = null, CancellationToken cancellationToken = default)
         {
             var listener = new HttpListener();
+            _dashboardListener = listener;
             var prefix = $"http://+:{port}/";
             listener.Prefixes.Add(prefix);
             listener.AuthenticationSchemes = AuthenticationSchemes.Anonymous;
@@ -57,20 +292,43 @@ namespace m3uCrawler.Services
                 return;
             }
 
-            while (!cancellationToken.IsCancellationRequested)
+            try
+            {
+                while (!cancellationToken.IsCancellationRequested)
+                {
+                    HttpListenerContext? context;
+                    try
+                    {
+                        context = await listener.GetContextAsync();
+                    }
+                    catch (Exception ex) when (
+                        cancellationToken.IsCancellationRequested
+                        || ex is ObjectDisposedException
+                        || (ex is HttpListenerException hle && hle.ErrorCode == 995))
+                    {
+                        // Shutdown ordenado: listener parado ou processo
+                        // encerrado. Não é uma falha da aplicação.
+                        break;
+                    }
+
+                    _ = Task.Run(async () => await HandleRequestAsync(context, outputDir, historyService, webToken));
+                }
+            }
+            finally
             {
                 try
                 {
-                    var context = await listener.GetContextAsync();
-                    _ = Task.Run(async () => await HandleRequestAsync(context, outputDir, historyService, webToken));
+                    listener.Stop();
                 }
-                catch (Exception ex)
+                catch (Exception ex) when (ex is ObjectDisposedException or HttpListenerException or InvalidOperationException)
                 {
-                    Console.WriteLine($"❌ Erro no dashboard web: {ex.Message}");
+                    // Esperado no shutdown: já parado pelo StopDashboard().
+                }
+                if (ReferenceEquals(_dashboardListener, listener))
+                {
+                    _dashboardListener = null;
                 }
             }
-
-            listener.Stop();
         }
 
         /// <summary>
@@ -88,8 +346,207 @@ namespace m3uCrawler.Services
             ImportHistoryService historyService,
             string? webToken = null)
         {
-            using var scope = new StaticResolverScope(resolver);
+            using var scope = new StaticResolverScope(resolver, standaloneAuthContext: true);
             await HandleRequestAsync(context, outputDir, historyService, webToken);
+        }
+
+        /// <summary>
+        /// PHASE 9C.2 — Variante testável com lifecycle/auth/bootstrap
+        /// isolados por chamada. Evita interferência entre testes que correm
+        /// em paralelo através dos campos estáticos. Não marca contexto
+        /// standalone: sem lifecycle/auth o resultado é fail-closed.
+        /// </summary>
+        public static async Task HandleRequestWithAuthOnTestAsync(
+            HttpListenerContext context,
+            string outputDir,
+            CatalogResolver resolver,
+            PlaylistComposerService composer,
+            ImportHistoryService historyService,
+            ConfigurationLifecycleService? lifecycle,
+            AuthService? authService,
+            BootstrapService? bootstrapService,
+            string? webToken = null,
+            TelegramAuthService? telegramAuth = null,
+            DispatcharrConfigurationService? dispatcharrConfig = null,
+            DispatcharrConnectionTester? dispatcharrTester = null,
+            OperationalReadinessService? readiness = null,
+            IAuditService? auditService = null,
+            DispatcharrConnectionTestStore? dispatcharrTestStore = null,
+            DispatcharrSyncCoordinator? dispatcharrSyncCoordinator = null,
+            DispatcharrConcurrencyGate? dispatcharrConcurrencyGate = null)
+        {
+            using var scope = new StaticResolverScope(resolver);
+            using var authScope = new StaticAuthScope(lifecycle, authService, bootstrapService);
+            using var setupScope = new StaticSetupScope(
+                telegramAuth, dispatcharrConfig, dispatcharrTester, readiness, dispatcharrTestStore);
+            using var auditScope = new StaticAuditScope(auditService);
+            using var syncScope = new StaticDispatcharrSyncScope(dispatcharrSyncCoordinator, dispatcharrConcurrencyGate);
+            await HandleRequestAsync(context, outputDir, historyService, webToken);
+        }
+
+        /// <summary>
+        /// Wave 5 (PHASE 9C) — Scope testável para os serviços de
+        /// setup/configuração. Restaura o estado anterior em
+        /// <see cref="Dispose"/>, isolando testes paralelos.
+        /// </summary>
+        public sealed class StaticSetupScope : IDisposable
+        {
+            private readonly TelegramAuthService? _previousTelegram;
+            private readonly DispatcharrConfigurationService? _previousDispatcharrConfig;
+            private readonly DispatcharrConnectionTester? _previousDispatcharrTester;
+            private readonly OperationalReadinessService? _previousReadiness;
+            private readonly DispatcharrConnectionTestStore? _previousDispatcharrTestStore;
+
+            public StaticSetupScope(
+                TelegramAuthService? telegramAuth,
+                DispatcharrConfigurationService? dispatcharrConfig,
+                DispatcharrConnectionTester? dispatcharrTester,
+                OperationalReadinessService? readiness,
+                DispatcharrConnectionTestStore? dispatcharrTestStore = null)
+            {
+                _previousTelegram = _telegramAuthService;
+                _previousDispatcharrConfig = _dispatcharrConfigurationService;
+                _previousDispatcharrTester = _dispatcharrConnectionTester;
+                _previousReadiness = _operationalReadinessService;
+                _previousDispatcharrTestStore = _dispatcharrConnectionTestStore;
+
+                _telegramAuthService = telegramAuth;
+                _dispatcharrConfigurationService = dispatcharrConfig;
+                _dispatcharrConnectionTester = dispatcharrTester;
+                _operationalReadinessService = readiness;
+                _dispatcharrConnectionTestStore = dispatcharrTestStore;
+            }
+
+            public void Dispose()
+            {
+                _telegramAuthService = _previousTelegram;
+                _dispatcharrConfigurationService = _previousDispatcharrConfig;
+                _dispatcharrConnectionTester = _previousDispatcharrTester;
+                _operationalReadinessService = _previousReadiness;
+                _dispatcharrConnectionTestStore = _previousDispatcharrTestStore;
+            }
+        }
+
+        /// <summary>
+        /// W6a — Scope testável para o serviço de auditoria. Restaura o valor
+        /// anterior em <see cref="Dispose"/>, isolando testes paralelos.
+        /// </summary>
+        public sealed class StaticAuditScope : IDisposable
+        {
+            private readonly IAuditService? _previous;
+
+            public StaticAuditScope(IAuditService? auditService)
+            {
+                _previous = _auditService;
+                _auditService = auditService;
+            }
+
+            public void Dispose()
+            {
+                _auditService = _previous;
+            }
+        }
+
+        /// <summary>
+        /// W-API-DISPATCHARR-HTTP-IMPLEMENTATION (DL-128) — Scope testável
+        /// para o coordenador e o gate de concorrência dedicado ao
+        /// Dispatcharr. Restaura o estado anterior em <see cref="Dispose"/>,
+        /// isolando testes paralelos.
+        /// </summary>
+        public sealed class StaticDispatcharrSyncScope : IDisposable
+        {
+            private readonly DispatcharrSyncCoordinator? _previousCoordinator;
+            private readonly DispatcharrConcurrencyGate? _previousGate;
+
+            public StaticDispatcharrSyncScope(
+                DispatcharrSyncCoordinator? coordinator,
+                DispatcharrConcurrencyGate? gate)
+            {
+                _previousCoordinator = _dispatcharrSyncCoordinator;
+                _previousGate = _dispatcharrConcurrencyGate;
+                _dispatcharrSyncCoordinator = coordinator;
+                _dispatcharrConcurrencyGate = gate;
+            }
+
+            public void Dispose()
+            {
+                _dispatcharrSyncCoordinator = _previousCoordinator;
+                _dispatcharrConcurrencyGate = _previousGate;
+            }
+        }
+
+        private sealed class StaticAuthScope : IDisposable
+        {
+            private readonly ConfigurationLifecycleService? _previousLifecycle;
+            private readonly AuthService? _previousAuth;
+            private readonly BootstrapService? _previousBootstrap;
+
+            public StaticAuthScope(
+                ConfigurationLifecycleService? lifecycle,
+                AuthService? authService,
+                BootstrapService? bootstrapService)
+            {
+                _previousLifecycle = _configurationLifecycle;
+                _previousAuth = _authService;
+                _previousBootstrap = _bootstrapService;
+                _configurationLifecycle = lifecycle;
+                _authService = authService;
+                _bootstrapService = bootstrapService;
+            }
+
+            public void Dispose()
+            {
+                _configurationLifecycle = _previousLifecycle;
+                _authService = _previousAuth;
+                _bootstrapService = _previousBootstrap;
+            }
+        }
+
+        /// <summary>
+        /// PHASE 9C.4 — Scope testável para o <see cref="LiveRunHost"/> e
+        /// o flag <c>--web-allow-trigger</c>. Restaura o estado anterior
+        /// em <see cref="Dispose"/>, garantindo isolamento entre testes
+        /// paralelos.
+        /// </summary>
+        public sealed class StaticLiveRunHostScope : IDisposable
+        {
+            private readonly LiveRunHost? _previousHost;
+            private readonly bool _previousAllow;
+
+            public StaticLiveRunHostScope(LiveRunHost? host, bool allowTrigger)
+            {
+                _previousHost = _liveRunHost;
+                _previousAllow = _webAllowTrigger;
+                _liveRunHost = host;
+                _webAllowTrigger = allowTrigger;
+            }
+
+            public void Dispose()
+            {
+                _liveRunHost = _previousHost;
+                _webAllowTrigger = _previousAllow;
+            }
+        }
+
+        /// <summary>
+        /// Wave C — Scope testável para o directório de runtime-data,
+        /// usado pelos endpoints de settings de discovery. Restaura o
+        /// valor anterior em <see cref="Dispose"/>.
+        /// </summary>
+        public sealed class StaticRuntimeDataDirScope : IDisposable
+        {
+            private readonly string? _previous;
+
+            public StaticRuntimeDataDirScope(string? runtimeDataDir)
+            {
+                _previous = _runtimeDataDirOverride;
+                _runtimeDataDirOverride = runtimeDataDir;
+            }
+
+            public void Dispose()
+            {
+                _runtimeDataDirOverride = _previous;
+            }
         }
 
         /// <summary>
@@ -105,19 +562,28 @@ namespace m3uCrawler.Services
             string? webToken = null,
             CancellationToken cancellationToken = default)
         {
-            using var scope = new StaticResolverScope(resolver);
+            using var scope = new StaticResolverScope(resolver, standaloneAuthContext: true);
             await RunDashboardAsync(outputDir, port, historyService, webToken, cancellationToken);
         }
 
         private sealed class StaticResolverScope : IDisposable
         {
             private readonly CatalogResolver? _previous;
-            public StaticResolverScope(CatalogResolver resolver)
+            private readonly bool _previousStandaloneAuthContext;
+
+            public StaticResolverScope(CatalogResolver resolver, bool standaloneAuthContext = false)
             {
                 _previous = _catalogResolver;
+                _previousStandaloneAuthContext = _standaloneAuthContext;
                 _catalogResolver = resolver;
+                _standaloneAuthContext = standaloneAuthContext;
             }
-            public void Dispose() => _catalogResolver = _previous;
+
+            public void Dispose()
+            {
+                _catalogResolver = _previous;
+                _standaloneAuthContext = _previousStandaloneAuthContext;
+            }
         }
 
         private static async Task HandleRequestAsync(HttpListenerContext context, string outputDir, ImportHistoryService historyService, string? webToken = null)
@@ -125,15 +591,146 @@ namespace m3uCrawler.Services
             var requestPath = context.Request.Url?.AbsolutePath ?? "/";
             var query = context.Request.Url?.Query ?? string.Empty;
 
+            // W3 — Todo o encaminhamento/resposta corre dentro deste try: o
+            // catch e o finally garantem que QUALQUER pedido termina com uma
+            // resposta fechada (sem hangs) e que o status fixado pelo handler
+            // nunca é mascarado.
+            try
+            {
+
             // Protecção opcional por token partilhado: se --web-token foi configurado,
-            // todos os endpoints (incluindo /api/playlist* que servem a playlist funcional
-            // com URLs Xtream reais) exigem o token via header Authorization: Bearer
+            // todos os endpoints exigem o token via header Authorization: Bearer
             // ou query ?token=. Se não configurado, mantém-se o comportamento aberto
             // (compatibilidade com deployments locais).
-            if (!IsRequestAuthorized(context.Request, webToken))
+            //
+            // PHASE 9C.2 (B1) — O token é uma credencial de MÁQUINA. Quando válido,
+            // autoriza o pedido sem exigir sessão humana, incluindo em READY + admin
+            // (UserAuth). É distinto da autenticação humana e não cria utilizador
+            // nem sessão.
+            var tokenAuthorization = EvaluateTokenAuthorization(context.Request, webToken);
+            if (tokenAuthorization == TokenAuthorization.Rejected)
             {
-                await WriteUnauthorizedAsync(context.Response);
+                if (IsReviewApiPath(requestPath))
+                {
+                    // W5.5 (B2) — as novas Review APIs usam o envelope
+                    // {error,message,correlationId} também nos 401 do gate.
+                    await WriteReviewApiErrorAsync(
+                        context.Response, HttpStatusCode.Unauthorized,
+                        "authentication-required", "Autenticação necessária.",
+                        NewReviewCorrelationId());
+                }
+                else
+                {
+                    await WriteUnauthorizedAsync(context.Response);
+                }
                 return;
+            }
+            var machineAuthorized = tokenAuthorization == TokenAuthorization.Authorized;
+
+            // === PHASE 9C.2 — Authentication / bootstrap ===
+            // Gate único, avaliado antes de qualquer rota não pública.
+            // PHASE 9C.2/9C.5 — modo e estado de lifecycle numa única decisão.
+            var (authMode, lifecycleState) = await ResolveAuthDecisionAsync();
+            var sessionId = GetCookieValue(context.Request, SessionCookieName);
+            var isRootPath = requestPath.Length == 0 || requestPath == "/";
+            // W5.5 (B2) — os erros de gate (401/403) das novas Review APIs usam o
+            // envelope {error,message,correlationId}; os restantes endpoints
+            // mantêm o formato existente.
+            var isReviewApiRequest = IsReviewApiPath(requestPath);
+            var gateCorrelationId = isReviewApiRequest ? NewReviewCorrelationId() : string.Empty;
+            // W6a — Sessão humana validada pelo gate, usada para atribuir o actor
+            // dos registos de auditoria das mutações administrativas.
+            AdminSessionEntity? auditSession = null;
+
+            // --- Bootstrap HTML + endpoints (só activos em bootstrap) ---
+            if (requestPath.Equals("/bootstrap", StringComparison.OrdinalIgnoreCase))
+            {
+                if (authMode == AuthMode.Bootstrap)
+                {
+                    await WriteHtmlAsync(context.Response, BuildBootstrapHtml());
+                }
+                else
+                {
+                    RedirectTo(context.Response, "/");
+                }
+                return;
+            }
+
+            if (requestPath.StartsWith("/api/bootstrap/", StringComparison.OrdinalIgnoreCase))
+            {
+                await HandleBootstrapEndpointAsync(context, requestPath, authMode);
+                return;
+            }
+
+            // --- Sessão (login/logout/user actual/alterar password) ---
+            // Nota: /api/session/password é encaminhado AQUI, antes do gate
+            // genérico de enforcement, e faz as suas próprias verificações de
+            // sessão + CSRF (tal como DELETE /api/session).
+            if (requestPath.Equals("/api/session", StringComparison.OrdinalIgnoreCase)
+                || requestPath.Equals("/api/session/password", StringComparison.OrdinalIgnoreCase))
+            {
+                await HandleSessionEndpointAsync(context);
+                return;
+            }
+
+            // --- Enforcement para os restantes endpoints existentes ---
+            // Não é um segundo pipeline: é um único gate que decide, por modo,
+            // se o handler existente pode correr.
+            if (!isRootPath && !IsAlwaysPublicPath(requestPath))
+            {
+                if (authMode == AuthMode.Bootstrap && !machineAuthorized)
+                {
+                    // PHASE 9C.5 (F6) — reportar o estado real (pode ser READY
+                    // em BOOTSTRAP_REQUIRED), nunca um valor fixo.
+                    if (isReviewApiRequest)
+                    {
+                        await WriteReviewApiErrorAsync(
+                            context.Response, HttpStatusCode.Forbidden,
+                            "bootstrap-required", "Aplicação em bootstrap.",
+                            gateCorrelationId);
+                    }
+                    else
+                    {
+                        await WriteJsonAsync(
+                            context.Response,
+                            new { error = "bootstrap-required", state = lifecycleState.ToWireName() },
+                            HttpStatusCode.Forbidden);
+                    }
+                    return;
+                }
+
+                if (authMode == AuthMode.UserAuth && !machineAuthorized)
+                {
+                    // Sem credencial de máquina válida, exige sessão humana.
+                    // Se o serviço de autenticação não estiver disponível, o
+                    // resultado é 401 (fail-closed) — nunca autorização implícita.
+                    var session = _authService != null
+                        ? await _authService.ValidateSessionAsync(sessionId)
+                        : null;
+                    if (session == null)
+                    {
+                        await WriteGateErrorAsync(
+                            context.Response, HttpStatusCode.Unauthorized,
+                            "authentication-required", "Autenticação necessária.",
+                            isReviewApiRequest, gateCorrelationId);
+                        return;
+                    }
+
+                    auditSession = session;
+                    var method = context.Request.HttpMethod;
+                    if (IsMutatingMethod(method))
+                    {
+                        var presented = context.Request.Headers[CsrfHeaderName];
+                        if (string.IsNullOrEmpty(presented) || !FixedEquals(presented, session.CsrfToken))
+                        {
+                            await WriteGateErrorAsync(
+                                context.Response, HttpStatusCode.Forbidden,
+                                "csrf-invalid", "Token CSRF inválido.",
+                                isReviewApiRequest, gateCorrelationId);
+                            return;
+                        }
+                    }
+                }
             }
 
             if (requestPath.Equals("/api/history", StringComparison.OrdinalIgnoreCase))
@@ -148,9 +745,54 @@ namespace m3uCrawler.Services
                 return;
             }
 
+            // W6a — Auditoria administrativa (read-only). Requer sessão humana
+            // (ou credencial de máquina) como qualquer rota não pública. Filtros
+            // opcionais: objectType, objectId, limit. Método ≠ GET → 405.
+            if (requestPath.Equals("/api/audit", StringComparison.OrdinalIgnoreCase))
+            {
+                await HandleAuditEndpointAsync(context);
+                return;
+            }
+
+            // W6a — Actor atribuído a todas as mutações administrativas.
+            var auditActor = auditSession is not null
+                ? await ResolveAuditActorAsync(auditSession)
+                : (machineAuthorized ? AuditActor.System("machine-token") : AuditActor.System("system"));
+
+            // PHASE 9C.1 — Estado do ciclo de vida de configuração.
+            // Endpoint de leitura apenas: em NOT_CONFIGURED o dashboard
+            // continua acessível e mostra inequivocamente que a aplicação
+            // ainda não está configurada. Não expõe operações destrutivas
+            // nem contorna a autenticação (o gate de token é avaliado
+            // antes, no topo do handler).
+            if (requestPath.Equals("/api/configuration/lifecycle", StringComparison.OrdinalIgnoreCase))
+            {
+                await WriteJsonAsync(context.Response, await BuildLifecyclePayloadAsync(_configurationLifecycle));
+                return;
+            }
+
+            // Wave 5 (PHASE 9C) — API de setup: configuração Telegram,
+            // login interactivo, configuração/teste Dispatcharr e
+            // prontidão operacional. Todas atrás do gate único acima
+            // (sessão + CSRF para métodos mutantes). Método errado → 405.
+            if (IsSetupPath(requestPath))
+            {
+                await HandleSetupEndpointAsync(context, requestPath, auditActor);
+                return;
+            }
+
+            // W6 — Decisão de âmbito para "Canais / Países": o país NÃO é uma
+            // entidade de domínio (não existe entidade `Country`). É
+            // configuração/validação: ficheiros JSON de aliases em
+            // `runtime-data/countries/<code>.json` geridos por
+            // `CountryChannelListService`. Por isso o separador é uma
+            // ferramenta de configuração/validação (criar/editar/eliminar
+            // configs + validar a playlist), não um CRUD de entidade. A
+            // identidade persistida continua em `CanonicalChannelEntity` e a
+            // validação em `CountryChannelValidator`.
             if (requestPath.Equals("/api/countries", StringComparison.OrdinalIgnoreCase))
             {
-                var service = new CountryChannelListService(Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries"));
+                var service = new CountryChannelListService(ResolveCountriesDir());
                 await WriteJsonAsync(context.Response, service.GetAllCountries());
                 return;
             }
@@ -160,12 +802,41 @@ namespace m3uCrawler.Services
                 var countryCode = context.Request.QueryString["country"];
                 if (string.IsNullOrWhiteSpace(countryCode))
                 {
-                    await WriteJsonAsync(context.Response, new { error = "Parâmetro country é obrigatório." });
-                    context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                    // W6 — usar o overload com status: o overload anterior
+                    // escrevia o corpo com 200 e só depois fixava o status,
+                    // que já não tinha efeito (masking P1). Agora 400 é real.
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = "Parâmetro country é obrigatório." },
+                        HttpStatusCode.BadRequest);
                     return;
                 }
 
-                var service = new CountryChannelListService(Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries"));
+                var service = new CountryChannelListService(ResolveCountriesDir());
+
+                // W6 — DELETE /api/country?country=<code>: remove a config de
+                // país (`runtime-data/countries/<code>.json`). 200 quando
+                // eliminada; 404 quando ausente. A leitura (GET) preserva o
+                // comportamento anterior.
+                if (context.Request.HttpMethod.Equals("DELETE", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!service.DeleteCountry(countryCode))
+                    {
+                        await WriteJsonAsync(
+                            context.Response,
+                            new { error = "Configuração de país não encontrada." },
+                            HttpStatusCode.NotFound);
+                        return;
+                    }
+
+                    await WriteJsonAsync(context.Response, new
+                    {
+                        country = countryCode.Trim().ToLowerInvariant(),
+                        deleted = true,
+                    });
+                    return;
+                }
+
                 await WriteJsonAsync(context.Response, service.GetCountry(countryCode));
                 return;
             }
@@ -173,8 +844,11 @@ namespace m3uCrawler.Services
             if (requestPath.Equals("/api/country/validate", StringComparison.OrdinalIgnoreCase))
             {
                 var countryCode = context.Request.QueryString["country"] ?? "pt";
-                var countryList = new CountryChannelListService(Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries"));
-                var validator = new CountryChannelValidator(Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries"));
+                var countryList = new CountryChannelListService(ResolveCountriesDir());
+                var affinityMembers = await LoadCountryAffinityMembersAsync();
+                var validator = new CountryChannelValidator(
+                    ResolveCountriesDir(),
+                    affinityMembers);
                 var playlistPath = Path.Combine(outputDir, "playlist.m3u");
                 var playlistText = File.Exists(playlistPath) ? await File.ReadAllTextAsync(playlistPath, Encoding.UTF8) : string.Empty;
 
@@ -210,7 +884,7 @@ namespace m3uCrawler.Services
                         return;
                     }
 
-                    var service = new CountryChannelListService(Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries"));
+                    var service = new CountryChannelListService(ResolveCountriesDir());
                     service.SaveCountry(country);
                     await WriteJsonAsync(context.Response, country);
                     return;
@@ -334,6 +1008,16 @@ namespace m3uCrawler.Services
                 return;
             }
 
+            // Wave C — Configuração operacional de discovery (fonte de verdade
+            // única). GET devolve os valores persistidos; POST valida e
+            // persiste no mesmo app_settings.json (o gate 9C.2 exige sessão +
+            // CSRF para este método mutante).
+            if (requestPath.Equals("/api/discovery/settings", StringComparison.OrdinalIgnoreCase))
+            {
+                await HandleDiscoverySettingsEndpointAsync(context, auditActor);
+                return;
+            }
+
             // Sumário de classificação do último MatchPlan publicado.
             // Lê o ficheiro dispatcharr_plan_<ts>.json mais recente e
             // devolve as contagens por ChannelKind + uma amostra das
@@ -430,6 +1114,25 @@ namespace m3uCrawler.Services
                 return;
             }
 
+            // W-API-DISPATCHARR-HTTP-IMPLEMENTATION (DL-128 §20.6) —
+            // POST /api/dispatcharr/dry-run: gera MatchPlan + SyncReport
+            // sem aplicar (sem chamadas HTTP de escrita ao Dispatcharr).
+            if (requestPath.Equals("/api/dispatcharr/dry-run", StringComparison.OrdinalIgnoreCase))
+            {
+                await HandleDispatcharrDryRunOrSyncAsync(
+                    context, outputDir, forceDryRun: true);
+                return;
+            }
+
+            // W-API-DISPATCHARR-HTTP-IMPLEMENTATION (DL-128 §20.7) —
+            // POST /api/dispatcharr/sync: aplica o desired via Dispatcharr.
+            if (requestPath.Equals("/api/dispatcharr/sync", StringComparison.OrdinalIgnoreCase))
+            {
+                await HandleDispatcharrDryRunOrSyncAsync(
+                    context, outputDir, forceDryRun: false);
+                return;
+            }
+
             // Ficheiros disponíveis na pasta de output (preview/sanity).
             // Devolve um objecto por ficheiro com {present, size, exists}, para distinguir
             // "ficheiro ausente" de "ficheiro presente mas vazio".
@@ -456,11 +1159,61 @@ namespace m3uCrawler.Services
                 return;
             }
 
+            // === PHASE 9C.4 — Live Run endpoints ===
+            // Gate único já avaliado acima (UserAuth + CSRF, Bootstrap,
+            // machine token). O host decide se há pipeline configurada.
+            if (requestPath.Equals("/api/run/status", StringComparison.OrdinalIgnoreCase))
+            {
+                await HandleRunStatusEndpointAsync(context);
+                return;
+            }
+            if (requestPath.Equals("/api/run/start", StringComparison.OrdinalIgnoreCase)
+                && context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+            {
+                await HandleRunStartEndpointAsync(context);
+                return;
+            }
+
+            // === Publication status endpoint ===
+            if (requestPath.Equals("/api/publication/status", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = "Método não permitido." },
+                        HttpStatusCode.MethodNotAllowed);
+                    return;
+                }
+
+                // O endpoint depende de duas peças: o serviço de cursores
+                // (calcula o snapshot) e o catálogo (já exigido por todos os
+                // endpoints catalog/* abaixo). Sem qualquer uma, devolvemos
+                // 503 com a mesma mensagem usada pelo gate geral do catálogo
+                // — o operador não vê "ok" enquanto a infra-estrutura não
+                // estiver pronta.
+                if (_publicationStatusService is null || _catalogResolver is null)
+                {
+                    context.Response.StatusCode = (int)HttpStatusCode.ServiceUnavailable;
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = "Catálogo não inicializado." },
+                        HttpStatusCode.ServiceUnavailable);
+                    return;
+                }
+
+                await HandlePublicationStatusEndpointAsync(context);
+                return;
+            }
+
             // === Catalog API endpoints ===
             if (_catalogResolver == null)
             {
                 context.Response.StatusCode = (int)HttpStatusCode.ServiceUnavailable;
-                await WriteJsonAsync(context.Response, new { error = "Catálogo não inicializado." });
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = "Catálogo não inicializado." },
+                    HttpStatusCode.ServiceUnavailable);
                 return;
             }
 
@@ -472,9 +1225,24 @@ namespace m3uCrawler.Services
 
             if (requestPath.Equals("/api/catalog/channels", StringComparison.OrdinalIgnoreCase))
             {
-                var channels = await _catalogResolver.ListCanonicalChannelsAsync();
-                await WriteJsonAsync(context.Response, channels.Select(ChannelToJson).ToList());
-                return;
+                // Apenas GET lista. POST é tratado pelo handler de criação
+                // abaixo; sem este guard o POST era capturado aqui e
+                // devolvia a lista (200) sem criar nada.
+                if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    var channels = await _catalogResolver.ListCanonicalChannelsAsync();
+                    await WriteJsonAsync(context.Response, channels.Select(ChannelToJson).ToList());
+                    return;
+                }
+
+                if (!context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = "Método não permitido." },
+                        HttpStatusCode.MethodNotAllowed);
+                    return;
+                }
             }
 
             if (requestPath.Equals("/api/catalog/identity-rules", StringComparison.OrdinalIgnoreCase))
@@ -510,6 +1278,16 @@ namespace m3uCrawler.Services
 
                         var disposition = Enum.TryParse<RuleDisposition>(payload.Disposition, true, out var d) ? d : RuleDisposition.ReviewOnly;
                         var rule = await _catalogResolver.CreateIdentityRuleAsync(payload.NormalizedIdentity, disposition, payload.Reason ?? string.Empty);
+                        await RecordAuditAsync(auditActor, "catalog.identity-rule.create", "identity-rule",
+                            rule.NormalizedIdentity, null,
+                            new
+                            {
+                                id = rule.Id,
+                                normalizedIdentity = rule.NormalizedIdentity,
+                                disposition = rule.Disposition.ToString(),
+                                reason = rule.Reason,
+                            },
+                            AuditResult.Success);
                         await WriteJsonAsync(context.Response, new
                         {
                             id = rule.Id,
@@ -547,10 +1325,14 @@ namespace m3uCrawler.Services
                     var deleted = await _catalogResolver.DeleteIdentityRuleAsync(identity);
                     if (!deleted)
                     {
+                        await RecordAuditAsync(auditActor, "catalog.identity-rule.delete", "identity-rule",
+                            identity, new { normalizedIdentity = identity }, null, AuditResult.Failure, "not-found");
                         context.Response.StatusCode = (int)HttpStatusCode.NotFound;
                         await WriteJsonAsync(context.Response, new { error = $"Regra não encontrada: {identity}" });
                         return;
                     }
+                    await RecordAuditAsync(auditActor, "catalog.identity-rule.delete", "identity-rule",
+                        identity, new { normalizedIdentity = identity }, null, AuditResult.Success);
                     await WriteJsonAsync(context.Response, new { deleted = true, identity });
                     return;
                 }
@@ -568,9 +1350,12 @@ namespace m3uCrawler.Services
                     {
                         id = g.Id,
                         name = g.Name,
+                        kind = g.Kind.ToString(),
+                        canonicalChannelKey = g.CanonicalChannelKey,
                         countryCode = g.CountryCode,
                         canonicalChannelId = g.CanonicalChannelId,
                         canonicalChannelDisplayName = g.CanonicalChannel?.DisplayName,
+                        canonicalChannelCountry = g.CanonicalChannel?.Country,
                         members = g.Members.Select(m => m.NormalizedMember).ToList(),
                         createdAtUtc = g.CreatedAtUtc.ToString("o"),
                         updatedAtUtc = g.UpdatedAtUtc.ToString("o"),
@@ -598,12 +1383,34 @@ namespace m3uCrawler.Services
                             return;
                         }
 
+                        var resolved = await ResolveAffinityPayloadAsync(payload);
+                        if (resolved.Error != null)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = resolved.Error });
+                            return;
+                        }
                         var group = await _catalogResolver.CreateAffinityGroupAsync(
-                            payload.Name, payload.CanonicalChannelId, payload.CountryCode, payload.Members);
+                            payload.Name, resolved.Kind, resolved.Key, resolved.Country, payload.Members);
+                        await RecordAuditAsync(auditActor, "catalog.affinity-group.create", "affinity-group",
+                            group.Id.ToString(),
+                            null,
+                            new
+                            {
+                                id = group.Id,
+                                name = group.Name,
+                                kind = group.Kind.ToString(),
+                                canonicalChannelKey = group.CanonicalChannelKey,
+                                countryCode = group.CountryCode,
+                                members = group.Members.Select(m => m.NormalizedMember).ToList(),
+                            },
+                            AuditResult.Success);
                         await WriteJsonAsync(context.Response, new
                         {
                             id = group.Id,
                             name = group.Name,
+                            kind = group.Kind.ToString(),
+                            canonicalChannelKey = group.CanonicalChannelKey,
                             countryCode = group.CountryCode,
                             canonicalChannelId = group.CanonicalChannelId,
                             members = group.Members.Select(m => m.NormalizedMember).ToList(),
@@ -644,10 +1451,14 @@ namespace m3uCrawler.Services
                 var deleted = await _catalogResolver.DeleteAffinityGroupAsync(groupId);
                 if (!deleted)
                 {
+                    await RecordAuditAsync(auditActor, "catalog.affinity-group.delete", "affinity-group",
+                        groupId.ToString(), null, null, AuditResult.Failure, "not-found");
                     context.Response.StatusCode = (int)HttpStatusCode.NotFound;
                     await WriteJsonAsync(context.Response, new { error = "Grupo não encontrado." });
                     return;
                 }
+                await RecordAuditAsync(auditActor, "catalog.affinity-group.delete", "affinity-group",
+                    groupId.ToString(), new { id = groupId }, null, AuditResult.Success);
                 await WriteJsonAsync(context.Response, new { deleted = true, id = groupId });
                 return;
             }
@@ -684,18 +1495,34 @@ namespace m3uCrawler.Services
                             return;
                         }
 
+                        var resolved = await ResolveAffinityPayloadAsync(payload);
+                        if (resolved.Error != null)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = resolved.Error });
+                            return;
+                        }
+                        var beforeGroup = (await _catalogResolver.ListAffinityGroupsAsync())
+                            .FirstOrDefault(g => g.Id == groupId);
                         var group = await _catalogResolver.UpdateAffinityGroupAsync(
-                            groupId, payload.Name, payload.CanonicalChannelId, payload.CountryCode, payload.Members);
+                            groupId, payload.Name, resolved.Kind, resolved.Key, resolved.Country, payload.Members);
                         if (group == null)
                         {
                             context.Response.StatusCode = (int)HttpStatusCode.NotFound;
                             await WriteJsonAsync(context.Response, new { error = "Grupo não encontrado." });
                             return;
                         }
+                        await RecordAuditAsync(auditActor, "catalog.affinity-group.update", "affinity-group",
+                            group.Id.ToString(),
+                            AffinityGroupToAuditJson(beforeGroup),
+                            AffinityGroupToAuditJson(group),
+                            AuditResult.Success);
                         await WriteJsonAsync(context.Response, new
                         {
                             id = group.Id,
                             name = group.Name,
+                            kind = group.Kind.ToString(),
+                            canonicalChannelKey = group.CanonicalChannelKey,
                             countryCode = group.CountryCode,
                             canonicalChannelId = group.CanonicalChannelId,
                             members = group.Members.Select(m => m.NormalizedMember).ToList(),
@@ -721,10 +1548,59 @@ namespace m3uCrawler.Services
                 return;
             }
 
+            // W5.5 — API HTTP de Review (DL-120). Novas rotas /api/reviews e
+            // /api/review[/*]. As rotas legacy /api/catalog/reviews/... mantêm-se
+            // inalteradas mais abaixo (D5).
+            if (IsReviewApiPath(requestPath))
+            {
+                await HandleReviewApiAsync(context, requestPath, auditActor);
+                return;
+            }
+
             if (requestPath.Equals("/api/catalog/reviews", StringComparison.OrdinalIgnoreCase))
             {
+                if (!context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = "Método não permitido." },
+                        HttpStatusCode.MethodNotAllowed);
+                    return;
+                }
+
+                // W5 — Por omissão a lista mostra apenas itens activos
+                // (Open/InReview); Resolved/Ignored são histórico, acessível
+                // explicitamente via ?state= ou ?includeResolved=true.
+                var reviewQuery = context.Request.QueryString;
+                ReviewItemState? stateFilter = null;
+                var rawState = reviewQuery["state"];
+                if (!string.IsNullOrWhiteSpace(rawState))
+                {
+                    if (!Enum.TryParse<ReviewItemState>(rawState.Trim(), ignoreCase: true, out var parsed)
+                        || !Enum.IsDefined(parsed))
+                    {
+                        await WriteJsonAsync(context.Response, new { error = "state inválido." },
+                            HttpStatusCode.BadRequest);
+                        return;
+                    }
+                    stateFilter = parsed;
+                }
+                var includeResolved = string.Equals(
+                    reviewQuery["includeResolved"], "true", StringComparison.OrdinalIgnoreCase);
+
                 var reviews = await _catalogResolver.ListAllReviewItemsAsync();
-                await WriteJsonAsync(context.Response, reviews.Select(r => new
+                IEnumerable<ReviewItemEntity> filtered = reviews;
+                if (stateFilter is not null)
+                {
+                    filtered = reviews.Where(r => r.State == stateFilter.Value);
+                }
+                else if (!includeResolved)
+                {
+                    filtered = reviews.Where(r =>
+                        r.State != ReviewItemState.Resolved && r.State != ReviewItemState.Ignored);
+                }
+
+                await WriteJsonAsync(context.Response, filtered.Select(r => new
                 {
                     id = r.Id,
                     fingerprint = r.Fingerprint,
@@ -743,69 +1619,226 @@ namespace m3uCrawler.Services
 
             if (requestPath.StartsWith("/api/catalog/reviews/", StringComparison.OrdinalIgnoreCase))
             {
-                var fingerprint = requestPath.Substring("/api/catalog/reviews/".Length);
-                if (string.IsNullOrWhiteSpace(fingerprint))
+                var tail = requestPath.Substring("/api/catalog/reviews/".Length);
+                var segments = tail.Split('/', StringSplitOptions.RemoveEmptyEntries);
+                if (segments.Length == 0)
                 {
-                    context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
-                    await WriteJsonAsync(context.Response, new { error = "Fingerprint é obrigatório." });
+                    await WriteJsonAsync(context.Response, new { error = "Fingerprint é obrigatório." },
+                        HttpStatusCode.BadRequest);
+                    return;
+                }
+                if (segments.Length != 2)
+                {
+                    await WriteJsonAsync(context.Response, new { error = "Sub-path de review desconhecido." },
+                        HttpStatusCode.NotFound);
                     return;
                 }
 
-                if (requestPath.EndsWith("/approve", StringComparison.OrdinalIgnoreCase))
+                var fingerprint = Uri.UnescapeDataString(segments[0]);
+                var isApprove = segments[1].Equals("approve", StringComparison.OrdinalIgnoreCase);
+                var isExclude = segments[1].Equals("exclude", StringComparison.OrdinalIgnoreCase);
+                if (!isApprove && !isExclude)
                 {
-                    long? approvedId = null;
-                    if (context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                    await WriteJsonAsync(context.Response, new { error = "Sub-path de review desconhecido." },
+                        HttpStatusCode.NotFound);
+                    return;
+                }
+
+                if (!context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    context.Response.Headers["Allow"] = "POST";
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = "Método não permitido." },
+                        HttpStatusCode.MethodNotAllowed);
+                    return;
+                }
+
+                // W6b-1 — A aprovação declara explicitamente a mudança de
+                // catálogo que produz (05-CATALOGUE.md §9). Corpo opcional
+                // apenas no endpoint /exclude (assume a acção de exclusão).
+                ReviewDecisionPayload? payload = null;
+                using (var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8))
+                {
+                    var body = await reader.ReadToEndAsync();
+                    if (!string.IsNullOrWhiteSpace(body))
                     {
                         try
                         {
-                            using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
-                            var body = await reader.ReadToEndAsync();
-                            var payload = JsonSerializer.Deserialize<ApproveReviewPayload>(body, JsonOptions);
-                            approvedId = payload?.ApprovedCanonicalChannelId;
+                            payload = JsonSerializer.Deserialize<ReviewDecisionPayload>(body, JsonOptions);
                         }
-                        catch { }
+                        catch (JsonException)
+                        {
+                            payload = null;
+                        }
                     }
-
-                    var approved = await _catalogResolver.ApproveReviewAsync(fingerprint, approvedId);
-                    if (approved == null)
-                    {
-                        context.Response.StatusCode = (int)HttpStatusCode.NotFound;
-                        await WriteJsonAsync(context.Response, new { error = "Review item não encontrado." });
-                        return;
-                    }
-                    await WriteJsonAsync(context.Response, new
-                    {
-                        fingerprint = approved.Fingerprint,
-                        state = approved.State.ToString(),
-                        resolvedAtUtc = approved.ResolvedAtUtc?.ToString("o"),
-                    });
-                    return;
                 }
 
-                if (requestPath.EndsWith("/exclude", StringComparison.OrdinalIgnoreCase))
+                var actionRaw = payload?.Action?.Trim();
+                ReviewApprovalAction? action = actionRaw?.ToLowerInvariant() switch
                 {
-                    var excluded = await _catalogResolver.ExcludeReviewAsync(fingerprint);
-                    if (excluded == null)
-                    {
-                        context.Response.StatusCode = (int)HttpStatusCode.NotFound;
-                        await WriteJsonAsync(context.Response, new { error = "Review item não encontrado." });
-                        return;
-                    }
+                    "add-alias" or "add_alias" or "addalias" => ReviewApprovalAction.AddAlias,
+                    "create-channel" or "create_channel" or "createchannel" => ReviewApprovalAction.CreateChannel,
+                    "exclude" or "ignore" or "ignored" => ReviewApprovalAction.Exclude,
+                    _ => null,
+                };
+                if (action == null && isExclude)
+                {
+                    action = ReviewApprovalAction.Exclude;
+                }
+                if (action == null)
+                {
                     await WriteJsonAsync(context.Response, new
                     {
-                        fingerprint = excluded.Fingerprint,
-                        state = excluded.State.ToString(),
-                        resolvedAtUtc = excluded.ResolvedAtUtc?.ToString("o"),
-                    });
+                        error = "Campo 'action' é obrigatório e deve ser 'add-alias', 'create-channel' ou 'exclude'.",
+                    }, HttpStatusCode.BadRequest);
+                    return;
+                }
+                if (isExclude && action != ReviewApprovalAction.Exclude)
+                {
+                    await WriteJsonAsync(context.Response, new
+                    {
+                        error = "O endpoint /exclude só aceita action='exclude'.",
+                    }, HttpStatusCode.BadRequest);
                     return;
                 }
 
-                context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                ReviewChannelSpec? channelSpec = null;
+                if (action == ReviewApprovalAction.CreateChannel)
+                {
+                    var ch = payload?.Channel;
+                    if (ch == null || string.IsNullOrWhiteSpace(ch.Key) || string.IsNullOrWhiteSpace(ch.Name))
+                    {
+                        await WriteJsonAsync(context.Response, new
+                        {
+                            error = "channel.key e channel.name são obrigatórios para action='create-channel'.",
+                        }, HttpStatusCode.BadRequest);
+                        return;
+                    }
+                    if (!TryParseOptionalEnum(ch.EditorialCategory, out EditorialCategory? editorialCategory)
+                        || !TryParseOptionalEnum(ch.PublicationPolicy, out PublicationPolicy? publicationPolicy))
+                    {
+                        await WriteJsonAsync(context.Response, new { error = "Valor editorial inválido em channel." },
+                            HttpStatusCode.BadRequest);
+                        return;
+                    }
+                    var reviewGroupKey = await ResolveValidatedGroupKeyAsync(ch.GroupKey);
+                    if (reviewGroupKey is null)
+                    {
+                        await WriteJsonAsync(context.Response, new { error = $"GroupKey inválido: '{ch.GroupKey}'." },
+                            HttpStatusCode.BadRequest);
+                        return;
+                    }
+                    channelSpec = new ReviewChannelSpec(
+                        ch.Key!, ch.Name!, ch.Country, editorialCategory, publicationPolicy, ch.IsEnabled,
+                        reviewGroupKey);
+                }
+                else if (action == ReviewApprovalAction.AddAlias
+                    && string.IsNullOrWhiteSpace(payload?.CanonicalChannelKey))
+                {
+                    await WriteJsonAsync(context.Response, new
+                    {
+                        error = "canonicalChannelKey é obrigatório para action='add-alias'.",
+                    }, HttpStatusCode.BadRequest);
+                    return;
+                }
+
+                var reason = CredentialSanitizer.SanitizeSensitiveText(payload?.Reason);
+                var decision = new ReviewApprovalDecision(
+                    action.Value,
+                    payload?.CanonicalChannelKey,
+                    payload?.Alias,
+                    reason,
+                    channelSpec);
+
+                var auditOperation = action.Value switch
+                {
+                    ReviewApprovalAction.AddAlias => "catalog.review.approve.add-alias",
+                    ReviewApprovalAction.CreateChannel => "catalog.review.approve.create-channel",
+                    _ => "catalog.review.exclude",
+                };
+
+                ReviewApprovalResult? result;
+                try
+                {
+                    result = await _catalogResolver.ApplyReviewApprovalAsync(fingerprint, decision);
+                }
+                catch (ChannelAdministrationException ex)
+                {
+                    await RecordAuditAsync(auditActor, auditOperation, "review-item", fingerprint,
+                        new { fingerprint }, null, AuditResult.Failure,
+                        ex.Error.ToString());
+                    await WriteChannelAdminError(context.Response, ex);
+                    return;
+                }
+
+                if (result == null)
+                {
+                    await WriteJsonAsync(context.Response, new { error = "Review item não encontrado." },
+                        HttpStatusCode.NotFound);
+                    return;
+                }
+
+                var after = new
+                {
+                    action = result.Action,
+                    state = result.Review.State.ToString(),
+                    idempotent = result.Idempotent,
+                    catalogueChanged = result.CatalogueChanged,
+                    canonicalChannelId = result.Channel?.Id,
+                    canonicalChannelKey = result.Channel?.Key,
+                    alias = result.Alias?.NormalizedAlias,
+                    reason = result.Action == "exclude" ? result.Review.Note : null,
+                    materialized = result.MaterializedChannelSource != null,
+                };
+                await RecordAuditAsync(auditActor, auditOperation, "review-item", fingerprint,
+                    new { state = result.PriorState.ToString(), approvedCanonicalChannelId = result.PriorApprovedCanonicalChannelId },
+                    after, AuditResult.Success);
+
+                // W-REVIEW-02 — auditoria específica do efeito de materialização
+                // (cobre os endpoints legacy `add-alias` e `create-channel`).
+                if (result.Action is "add-alias" or "create-channel")
+                {
+                    var materializedOp = result.MaterializedChannelSource != null
+                        ? "catalog.review.approval.materialize_created"
+                        : "catalog.review.approval.materialize_skipped";
+                    var detail = result.MaterializedChannelSource != null
+                        ? $"channelSourceId={result.MaterializedChannelSource.Id};fingerprintVersion={result.MaterializedChannelSource.FingerprintVersion}"
+                        : "missing-evidence";
+                    await RecordAuditAsync(auditActor, materializedOp, "review-item", fingerprint,
+                        null,
+                        result.MaterializedChannelSource is null
+                            ? null
+                            : ChannelSourceToJson(result.MaterializedChannelSource),
+                        AuditResult.Success,
+                        detail);
+                }
+
+                await WriteJsonAsync(context.Response, new
+                {
+                    fingerprint = result.Review.Fingerprint,
+                    state = result.Review.State.ToString(),
+                    action = result.Action,
+                    idempotent = result.Idempotent,
+                    catalogueChanged = result.CatalogueChanged,
+                    canonicalChannelId = result.Channel?.Id,
+                    canonicalChannelKey = result.Channel?.Key,
+                    alias = result.Alias?.NormalizedAlias,
+                    resolvedAtUtc = result.Review.ResolvedAtUtc?.ToString("o"),
+                });
                 return;
             }
 
             if (requestPath.Equals("/api/catalog/sync-runs", StringComparison.OrdinalIgnoreCase))
             {
+                if (!context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = "Método não permitido." },
+                        HttpStatusCode.MethodNotAllowed);
+                    return;
+                }
                 var runs = await _catalogResolver.ListSyncRunsAsync();
                 await WriteJsonAsync(context.Response, runs.Select(r => new
                 {
@@ -880,6 +1913,14 @@ namespace m3uCrawler.Services
             // Pending country approvals
             if (requestPath.Equals("/api/catalog/pending-country-approvals", StringComparison.OrdinalIgnoreCase))
             {
+                if (!context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = "Método não permitido." },
+                        HttpStatusCode.MethodNotAllowed);
+                    return;
+                }
                 var pending = await _catalogResolver.ListPendingCountryApprovalsAsync();
                 await WriteJsonAsync(context.Response, pending.Select(r => new
                 {
@@ -898,17 +1939,35 @@ namespace m3uCrawler.Services
                 return;
             }
 
+            // W6 — sub-rotas de decisão: /{id}/approve e /{id}/reject.
+            // O parser anterior fazia TryParse sobre "5/approve" (falhava
+            // sempre → 400 antes de chegar ao ramo approve/reject), deixando
+            // ApprovePendingCountryApprovalAsync/RejectPendingCountryApprovalAsync
+            // inalcançáveis por HTTP. Aqui separam-se os segmentos e lê-se o
+            // id do penúltimo segmento e a acção do último.
             if (requestPath.StartsWith("/api/catalog/pending-country-approvals/", StringComparison.OrdinalIgnoreCase))
             {
-                var idStr = requestPath.Substring("/api/catalog/pending-country-approvals/".Length);
-                if (!long.TryParse(idStr, out var pendingId))
+                if (!context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = "Método não permitido." },
+                        HttpStatusCode.MethodNotAllowed);
+                    return;
+                }
+
+                var segments = requestPath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+                // .../pending-country-approvals/{id}/{approve|reject}
+                if (segments.Length < 2 || !long.TryParse(segments[^2], out var pendingId))
                 {
                     context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
                     await WriteJsonAsync(context.Response, new { error = "ID inválido." });
                     return;
                 }
 
-                if (requestPath.EndsWith("/approve", StringComparison.OrdinalIgnoreCase))
+                var action = segments[^1];
+                if (action.Equals("approve", StringComparison.OrdinalIgnoreCase))
                 {
                     var approved = await _catalogResolver.ApprovePendingCountryApprovalAsync(pendingId);
                     if (approved == null)
@@ -926,7 +1985,7 @@ namespace m3uCrawler.Services
                     return;
                 }
 
-                if (requestPath.EndsWith("/reject", StringComparison.OrdinalIgnoreCase))
+                if (action.Equals("reject", StringComparison.OrdinalIgnoreCase))
                 {
                     var rejected = await _catalogResolver.RejectPendingCountryApprovalAsync(pendingId);
                     if (rejected == null)
@@ -980,6 +2039,8 @@ namespace m3uCrawler.Services
                         }
                         var list = await _catalogResolver.CreateOrderingListAsync(
                             payload.Key, payload.Name, payload.Country, payload.Description, payload.IsEnabled);
+                        await RecordAuditAsync(auditActor, "catalog.ordering-list.create", "ordering-list",
+                            list.Id.ToString(), null, OrderingListSummaryToJson(list), AuditResult.Success);
                         await WriteJsonAsync(context.Response, OrderingListSummaryToJson(list), HttpStatusCode.Created);
                         return;
                     }
@@ -1026,15 +2087,59 @@ namespace m3uCrawler.Services
                     }
                     if (context.Request.HttpMethod.Equals("DELETE", StringComparison.OrdinalIgnoreCase))
                     {
+                        var beforeList = await _catalogResolver.GetOrderingListAsync(listId, includeItems: false);
                         var ok = await _catalogResolver.DeleteOrderingListAsync(listId);
                         if (!ok)
                         {
+                            await RecordAuditAsync(auditActor, "catalog.ordering-list.delete", "ordering-list",
+                                listId.ToString(), beforeList is null ? null : OrderingListSummaryToJson(beforeList),
+                                null, AuditResult.Failure, "not-found");
                             context.Response.StatusCode = (int)HttpStatusCode.NotFound;
                             await WriteJsonAsync(context.Response, new { error = $"OrderingList #{listId} não encontrada." });
                             return;
                         }
+                        await RecordAuditAsync(auditActor, "catalog.ordering-list.delete", "ordering-list",
+                            listId.ToString(), beforeList is null ? null : OrderingListSummaryToJson(beforeList),
+                            null, AuditResult.Success);
                         await WriteJsonAsync(context.Response, new { deleted = true, id = listId });
                         return;
+                    }
+                    if (context.Request.HttpMethod.Equals("PUT", StringComparison.OrdinalIgnoreCase))
+                    {
+                        try
+                        {
+                            using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
+                            var body = await reader.ReadToEndAsync();
+                            var payload = JsonSerializer.Deserialize<OrderingListUpdatePayload>(body, JsonOptions);
+                            if (payload == null || string.IsNullOrWhiteSpace(payload.Name))
+                            {
+                                context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                                await WriteJsonAsync(context.Response, new { error = "Payload inválido: Name é obrigatório." });
+                                return;
+                            }
+                            var beforeList = await _catalogResolver.GetOrderingListAsync(listId, includeItems: false);
+                            var updated = await _catalogResolver.UpdateOrderingListAsync(
+                                listId, payload.Name, payload.Country, payload.Description,
+                                payload.IsEnabled ?? true);
+                            if (updated == null)
+                            {
+                                context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                                await WriteJsonAsync(context.Response, new { error = $"OrderingList #{listId} não encontrada." });
+                                return;
+                            }
+                            await RecordAuditAsync(auditActor, "catalog.ordering-list.update", "ordering-list",
+                                listId.ToString(),
+                                beforeList is null ? null : OrderingListSummaryToJson(beforeList),
+                                OrderingListSummaryToJson(updated), AuditResult.Success);
+                            await WriteJsonAsync(context.Response, new { updated = true, id = listId });
+                            return;
+                        }
+                        catch (Exception ex)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = ex.Message });
+                            return;
+                        }
                     }
                 }
 
@@ -1053,6 +2158,8 @@ namespace m3uCrawler.Services
                             return;
                         }
                         var clone = await _catalogResolver.DuplicateOrderingListAsync(listId, payload.NewKey, payload.NewName);
+                        await RecordAuditAsync(auditActor, "catalog.ordering-list.duplicate", "ordering-list",
+                            clone.Id.ToString(), null, OrderingListSummaryToJson(clone), AuditResult.Success);
                         await WriteJsonAsync(context.Response, OrderingListSummaryToJson(clone), HttpStatusCode.Created);
                         return;
                     }
@@ -1080,6 +2187,8 @@ namespace m3uCrawler.Services
                         }
                         var item = await _catalogResolver.AddOrderingItemAsync(
                             listId, payload.CanonicalChannelId, payload.Position, payload.IsEnabled);
+                        await RecordAuditAsync(auditActor, "catalog.ordering-item.add", "ordering-item",
+                            item.Id.ToString(), null, OrderingItemToJson(item), AuditResult.Success);
                         await WriteJsonAsync(context.Response, OrderingItemToJson(item), HttpStatusCode.Created);
                         return;
                     }
@@ -1119,10 +2228,14 @@ namespace m3uCrawler.Services
                     var ok = await _catalogResolver.RemoveOrderingItemAsync(itemId);
                     if (!ok)
                     {
+                        await RecordAuditAsync(auditActor, "catalog.ordering-item.delete", "ordering-item",
+                            itemId.ToString(), null, null, AuditResult.Failure, "not-found");
                         context.Response.StatusCode = (int)HttpStatusCode.NotFound;
                         await WriteJsonAsync(context.Response, new { error = $"OrderingItem #{itemId} não encontrado." });
                         return;
                     }
+                    await RecordAuditAsync(auditActor, "catalog.ordering-item.delete", "ordering-item",
+                        itemId.ToString(), new { id = itemId }, null, AuditResult.Success);
                     await WriteJsonAsync(context.Response, new { deleted = true, id = itemId });
                     return;
                 }
@@ -1147,6 +2260,10 @@ namespace m3uCrawler.Services
                         {
                             await _catalogResolver.SetOrderingItemEnabledAsync(itemId, payload.IsEnabled.Value);
                         }
+                        await RecordAuditAsync(auditActor, "catalog.ordering-item.update", "ordering-item",
+                            itemId.ToString(), null,
+                            new { id = itemId, position = payload.Position, isEnabled = payload.IsEnabled },
+                            AuditResult.Success);
                         await WriteJsonAsync(context.Response, new { updated = true, id = itemId });
                         return;
                     }
@@ -1196,6 +2313,8 @@ namespace m3uCrawler.Services
                             payload.Scope, payload.CanonicalChannelId,
                             payload.CriteriaJson ?? "[]", payload.PreferredQuality ?? "",
                             payload.AllowFallback);
+                        await RecordAuditAsync(auditActor, "catalog.priority-policy.upsert", "source-priority-policy",
+                            saved.Scope, null, PriorityPolicyToJson(saved), AuditResult.Success);
                         await WriteJsonAsync(context.Response, PriorityPolicyToJson(saved));
                         return;
                     }
@@ -1207,6 +2326,261 @@ namespace m3uCrawler.Services
                     }
                 }
                 context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
+                return;
+            }
+
+            // === PHASE 13 (Wave 13-4) — Global Source Selection Policy API ===
+            // GET  /api/catalog/source-selection-policies
+            // POST /api/catalog/source-selection-policies
+            if (requestPath.Equals("/api/catalog/source-selection-policies", StringComparison.OrdinalIgnoreCase))
+            {
+                if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    var global = await _catalogResolver.GetOrCreateGlobalSourceSelectionPolicyAsync();
+                    await WriteJsonAsync(context.Response, SourceSelectionPolicyToJson(global));
+                    return;
+                }
+                if (context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
+                        var body = await reader.ReadToEndAsync();
+                        var payload = JsonSerializer.Deserialize<SourceSelectionPolicyPayload>(body, JsonOptions);
+                        if (payload == null)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "Payload inválido." }, HttpStatusCode.BadRequest);
+                            return;
+                        }
+                        if (payload.MaxSourcesPerChannel is null)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "maxSourcesPerChannel é obrigatório." }, HttpStatusCode.BadRequest);
+                            return;
+                        }
+                        if (payload.MaxSourcesPerChannel.Value < 0)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "maxSourcesPerChannel não pode ser negativo." }, HttpStatusCode.BadRequest);
+                            return;
+                        }
+                        if (payload.PreferDistinctProviders is null)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "preferDistinctProviders é obrigatório." }, HttpStatusCode.BadRequest);
+                            return;
+                        }
+                        if (payload.AllowFallbackToSameProvider is null)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "allowFallbackToSameProvider é obrigatório." }, HttpStatusCode.BadRequest);
+                            return;
+                        }
+                        if (payload.MaxSourcesPerProvider is <= 0)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "maxSourcesPerProvider deve ser >= 1 ou ausente/null para sem limite." }, HttpStatusCode.BadRequest);
+                            return;
+                        }
+                        var saved = await _catalogResolver.UpsertGlobalSourceSelectionPolicyAsync(
+                            payload.MaxSourcesPerChannel.Value,
+                            payload.PreferDistinctProviders.Value,
+                            payload.MaxSourcesPerProvider,
+                            payload.AllowFallbackToSameProvider.Value);
+                        await RecordAuditAsync(auditActor, "catalog.source-selection-policy.upsert", "source-selection-policy",
+                            saved.ScopeKey, null, SourceSelectionPolicyToJson(saved), AuditResult.Success);
+                        await WriteJsonAsync(context.Response, SourceSelectionPolicyToJson(saved));
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                        await WriteJsonAsync(context.Response, new { error = ex.Message }, HttpStatusCode.BadRequest);
+                        return;
+                    }
+                }
+                context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
+                return;
+            }
+
+            // === PHASE 13 (Wave 13-4b) — Per-channel Source Selection Policy API ===
+            // GET    /api/catalog/source-selection-policies/channels
+            // POST   /api/catalog/source-selection-policies/channels
+            // GET    /api/catalog/source-selection-policies/channels/{key}
+            // DELETE /api/catalog/source-selection-policies/channels/{key}
+            //
+            // A identidade é a chave canónica pública (CanonicalChannel.Key).
+            // O CanonicalChannelId nunca é exposto nem aceite aqui.
+            const string channelSelectionPoliciesPath = "/api/catalog/source-selection-policies/channels";
+            if (requestPath.Equals(channelSelectionPoliciesPath, StringComparison.OrdinalIgnoreCase))
+            {
+                if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    var overrides = await _catalogResolver.ListChannelSourceSelectionPoliciesAsync();
+                    await WriteJsonAsync(context.Response, new
+                    {
+                        overrides = overrides.Select(ChannelSourceSelectionPolicyToJson).ToList(),
+                    });
+                    return;
+                }
+                if (context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
+                        var body = await reader.ReadToEndAsync();
+                        var payload = JsonSerializer.Deserialize<ChannelSourceSelectionPolicyPayload>(body, JsonOptions);
+                        if (payload == null)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "Payload inválido." }, HttpStatusCode.BadRequest);
+                            return;
+                        }
+                        var canonicalChannelKey = payload.CanonicalChannelKey?.Trim();
+                        if (string.IsNullOrEmpty(canonicalChannelKey))
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "canonicalChannelKey é obrigatório." }, HttpStatusCode.BadRequest);
+                            return;
+                        }
+                        if (payload.MaxSourcesPerChannel is null)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "maxSourcesPerChannel é obrigatório." }, HttpStatusCode.BadRequest);
+                            return;
+                        }
+                        if (payload.MaxSourcesPerChannel.Value < 0)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "maxSourcesPerChannel não pode ser negativo." }, HttpStatusCode.BadRequest);
+                            return;
+                        }
+                        if (payload.PreferDistinctProviders is null)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "preferDistinctProviders é obrigatório." }, HttpStatusCode.BadRequest);
+                            return;
+                        }
+                        if (payload.AllowFallbackToSameProvider is null)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "allowFallbackToSameProvider é obrigatório." }, HttpStatusCode.BadRequest);
+                            return;
+                        }
+                        if (payload.MaxSourcesPerProvider is <= 0)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "maxSourcesPerProvider deve ser >= 1 ou ausente/null para sem limite." }, HttpStatusCode.BadRequest);
+                            return;
+                        }
+                        var saved = await _catalogResolver.UpsertChannelSourceSelectionPolicyAsync(
+                            canonicalChannelKey,
+                            payload.MaxSourcesPerChannel.Value,
+                            payload.PreferDistinctProviders.Value,
+                            payload.MaxSourcesPerProvider,
+                            payload.AllowFallbackToSameProvider.Value);
+                        await RecordAuditAsync(auditActor, "catalog.source-selection-policy.channel.upsert", "source-selection-policy",
+                            saved.ScopeKey, null, ChannelSourceSelectionPolicyToJson(saved), AuditResult.Success);
+                        await WriteJsonAsync(context.Response, ChannelSourceSelectionPolicyToJson(saved));
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                        await WriteJsonAsync(context.Response, new { error = ex.Message }, HttpStatusCode.BadRequest);
+                        return;
+                    }
+                }
+                context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
+                return;
+            }
+
+            if (requestPath.StartsWith(channelSelectionPoliciesPath + "/", StringComparison.OrdinalIgnoreCase))
+            {
+                var canonicalChannelKey = Uri.UnescapeDataString(
+                    requestPath.Substring((channelSelectionPoliciesPath + "/").Length));
+
+                if (string.IsNullOrWhiteSpace(canonicalChannelKey))
+                {
+                    context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                    await WriteJsonAsync(context.Response, new { error = "Override não encontrado." }, HttpStatusCode.NotFound);
+                    return;
+                }
+
+                if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    var existing = await _catalogResolver.GetChannelSourceSelectionPolicyAsync(canonicalChannelKey);
+                    if (existing == null)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                        await WriteJsonAsync(context.Response, new { error = "Override não encontrado." }, HttpStatusCode.NotFound);
+                        return;
+                    }
+                    await WriteJsonAsync(context.Response, ChannelSourceSelectionPolicyToJson(existing));
+                    return;
+                }
+                if (context.Request.HttpMethod.Equals("DELETE", StringComparison.OrdinalIgnoreCase))
+                {
+                    var deleted = await _catalogResolver.DeleteChannelSourceSelectionPolicyAsync(canonicalChannelKey);
+                    if (!deleted)
+                    {
+                        await RecordAuditAsync(auditActor, "catalog.source-selection-policy.channel.delete", "source-selection-policy",
+                            canonicalChannelKey, null, null, AuditResult.Failure, "not-found");
+                        context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                        await WriteJsonAsync(context.Response, new { error = "Override não encontrado." }, HttpStatusCode.NotFound);
+                        return;
+                    }
+                    await RecordAuditAsync(auditActor, "catalog.source-selection-policy.channel.delete", "source-selection-policy",
+                        canonicalChannelKey, new { scopeKey = canonicalChannelKey }, null, AuditResult.Success);
+                    await WriteJsonAsync(context.Response, new { deleted = true });
+                    return;
+                }
+                context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
+                return;
+            }
+
+            // === PHASE 13 (Wave 13-5) — Source Selection Preview / Dry-Run ===
+            // GET /api/catalog/source-selection-policies/preview?channelKey={key}
+            //
+            // Read-only: não publica, não persiste, não muta o catálogo.
+            if (requestPath.Equals("/api/catalog/source-selection-policies/preview", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
+                    // Flush/close o response: sem isto o HttpClient fica à espera
+                    // indefinidamente (o HttpListener não envia a resposta).
+                    context.Response.Close();
+                    return;
+                }
+
+                try
+                {
+                    var channelKeyFilter = context.Request.QueryString["channelKey"];
+                    if (string.IsNullOrWhiteSpace(channelKeyFilter)) channelKeyFilter = null;
+
+                    var preview = await new SourceSelectionPreviewService(_catalogResolver)
+                        .PreviewAsync(channelKeyFilter);
+                    await WriteJsonAsync(context.Response, SourceSelectionPreviewToJson(preview));
+                }
+                catch (Exception)
+                {
+                    // O handler é fire-and-forget: uma excepção não pode escapar
+                    // nem deixar o cliente pendurado. Responde 500 e garante que
+                    // o response é sempre fechado.
+                    try
+                    {
+                        await WriteJsonAsync(
+                            context.Response,
+                            new { error = "preview-failed" },
+                            HttpStatusCode.InternalServerError);
+                    }
+                    catch (Exception)
+                    {
+                        try { context.Response.Close(); } catch (Exception) { }
+                    }
+                }
                 return;
             }
 
@@ -1255,10 +2629,17 @@ namespace m3uCrawler.Services
             if (requestPath.Equals("/api/scheduled-actions", StringComparison.OrdinalIgnoreCase)
                 && context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
             {
-                var names = _scheduledActions is null
-                    ? Array.Empty<string>()
-                    : _scheduledActions.Select(a => a.Name).ToArray();
-                await WriteJsonAsync(context.Response, names);
+                var actions = _scheduledActions is null
+                    ? Array.Empty<object>()
+                    : _scheduledActions.Select(a => (object)new
+                    {
+                        name = a.Name,
+                        description = a.Description,
+                        capabilities = a.RequiredCapabilities.ToString(),
+                        requiresTelegram = a.RequiredCapabilities.HasFlag(ScheduledActionCapabilities.Telegram),
+                        requiresDispatcharr = a.RequiredCapabilities.HasFlag(ScheduledActionCapabilities.Dispatcharr),
+                    }).ToArray();
+                await WriteJsonAsync(context.Response, actions);
                 return;
             }
             if (requestPath.Equals("/api/catalog/scheduled-jobs", StringComparison.OrdinalIgnoreCase))
@@ -1277,19 +2658,28 @@ namespace m3uCrawler.Services
                         var payload = JsonSerializer.Deserialize<ScheduledJobPayload>(body, JsonOptions);
                         if (payload == null || string.IsNullOrWhiteSpace(payload.Name) || string.IsNullOrWhiteSpace(payload.CronExpression) || string.IsNullOrWhiteSpace(payload.ActionName))
                         {
-                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
-                            await WriteJsonAsync(context.Response, new { error = "Payload inválido: Name, CronExpression e ActionName obrigatórios." });
+                            await WriteJsonAsync(context.Response, new { error = "Payload inválido: Name, CronExpression e ActionName obrigatórios." }, HttpStatusCode.BadRequest);
+                            return;
+                        }
+                        // O registry de acções alimenta também a validação do
+                        // actionName. Quando não está wired (null/vazio) não
+                        // rejeitamos: preserva o comportamento legacy/testes.
+                        if (_scheduledActions is { Count: > 0 }
+                            && !_scheduledActions.Any(a => string.Equals(a.Name, payload.ActionName, StringComparison.OrdinalIgnoreCase)))
+                        {
+                            await WriteJsonAsync(context.Response, new { error = $"ActionName inválido: '{payload.ActionName}'." }, HttpStatusCode.BadRequest);
                             return;
                         }
                         var saved = await _catalogResolver.UpsertScheduledJobAsync(
                             payload.Name, payload.CronExpression, payload.ActionName, payload.IsEnabled);
+                        await RecordAuditAsync(auditActor, "catalog.scheduled-job.upsert", "scheduled-job",
+                            saved.Id.ToString(), null, ScheduledJobToJson(saved), AuditResult.Success);
                         await WriteJsonAsync(context.Response, ScheduledJobToJson(saved));
                         return;
                     }
                     catch (Exception ex)
                     {
-                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
-                        await WriteJsonAsync(context.Response, new { error = ex.Message });
+                        await WriteJsonAsync(context.Response, new { error = ex.Message }, HttpStatusCode.BadRequest);
                         return;
                     }
                 }
@@ -1307,16 +2697,19 @@ namespace m3uCrawler.Services
                     {
                         if (!long.TryParse(segments[0], out var jid))
                         {
-                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
-                            await WriteJsonAsync(context.Response, new { error = "ID inválido." });
+                            await WriteJsonAsync(context.Response, new { error = "ID inválido." }, HttpStatusCode.BadRequest);
                             return;
                         }
                         var ok = await _catalogResolver.DeleteScheduledJobAsync(jid);
                         if (!ok)
                         {
-                            context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                            await RecordAuditAsync(auditActor, "catalog.scheduled-job.delete", "scheduled-job",
+                                jid.ToString(), null, null, AuditResult.Failure, "not-found");
+                            await WriteJsonAsync(context.Response, new { error = "Scheduled job não encontrado." }, HttpStatusCode.NotFound);
                             return;
                         }
+                        await RecordAuditAsync(auditActor, "catalog.scheduled-job.delete", "scheduled-job",
+                            jid.ToString(), new { id = jid }, null, AuditResult.Success);
                         await WriteJsonAsync(context.Response, new { deleted = true, id = jid });
                         return;
                     }
@@ -1325,7 +2718,7 @@ namespace m3uCrawler.Services
                 {
                     if (!long.TryParse(segments[0], out var jid))
                     {
-                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                        await WriteJsonAsync(context.Response, new { error = "ID inválido." }, HttpStatusCode.BadRequest);
                         return;
                     }
                     try
@@ -1335,22 +2728,25 @@ namespace m3uCrawler.Services
                         var payload = JsonSerializer.Deserialize<ScheduledJobEnablePayload>(body, JsonOptions);
                         if (payload == null)
                         {
-                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "Payload inválido." }, HttpStatusCode.BadRequest);
                             return;
                         }
                         var ok = await _catalogResolver.SetScheduledJobEnabledAsync(jid, payload.IsEnabled);
                         if (!ok)
                         {
-                            context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                            await RecordAuditAsync(auditActor, "catalog.scheduled-job.enabled", "scheduled-job",
+                                jid.ToString(), null, null, AuditResult.Failure, "not-found");
+                            await WriteJsonAsync(context.Response, new { error = "Scheduled job não encontrado." }, HttpStatusCode.NotFound);
                             return;
                         }
+                        await RecordAuditAsync(auditActor, "catalog.scheduled-job.enabled", "scheduled-job",
+                            jid.ToString(), null, new { id = jid, isEnabled = payload.IsEnabled }, AuditResult.Success);
                         await WriteJsonAsync(context.Response, new { updated = true, id = jid, isEnabled = payload.IsEnabled });
                         return;
                     }
                     catch (Exception ex)
                     {
-                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
-                        await WriteJsonAsync(context.Response, new { error = ex.Message });
+                        await WriteJsonAsync(context.Response, new { error = ex.Message }, HttpStatusCode.BadRequest);
                         return;
                     }
                 }
@@ -1387,15 +2783,12 @@ namespace m3uCrawler.Services
                 return;
             }
 
-            // === PHASE 8 — Import Policies + Canonical Groups + Group Mappings ===
+            // === PHASE 8 — Import Policies + Canonical Groups ===
             // GET    /api/catalog/import-policies
             // POST   /api/catalog/import-policies
             // GET    /api/catalog/canonical-groups
             // POST   /api/catalog/canonical-groups
             // DELETE /api/catalog/canonical-groups/{id}
-            // GET    /api/catalog/group-mappings
-            // POST   /api/catalog/group-mappings
-            // DELETE /api/catalog/group-mappings/{id}
             if (requestPath.Equals("/api/catalog/import-policies", StringComparison.OrdinalIgnoreCase))
             {
                 if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
@@ -1485,78 +2878,49 @@ namespace m3uCrawler.Services
                 }
                 if (context.Request.HttpMethod.Equals("DELETE", StringComparison.OrdinalIgnoreCase))
                 {
-                    var ok = await _catalogResolver.DeleteCanonicalGroupAsync(gid);
-                    if (!ok)
-                    {
-                        context.Response.StatusCode = (int)HttpStatusCode.NotFound;
-                        await WriteJsonAsync(context.Response, new { error = $"CanonicalGroup #{gid} não encontrada." });
-                        return;
-                    }
-                    await WriteJsonAsync(context.Response, new { deleted = true, id = gid });
-                    return;
-                }
-            }
-
-            if (requestPath.Equals("/api/catalog/group-mappings", StringComparison.OrdinalIgnoreCase))
-            {
-                if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
-                {
-                    await WriteJsonAsync(context.Response, (await _catalogResolver.ListGroupMappingsAsync()).Select(GroupMappingToJson));
-                    return;
-                }
-                if (context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
-                {
                     try
                     {
-                        using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
-                        var body = await reader.ReadToEndAsync();
-                        var payload = JsonSerializer.Deserialize<GroupMappingPayload>(body, JsonOptions);
-                        if (payload == null
-                            || !Enum.TryParse<SourceKind>(payload.SourceKind, true, out var sk)
-                            || string.IsNullOrWhiteSpace(payload.SourceGroupTitle)
-                            || payload.CanonicalGroupId <= 0)
+                        var ok = await _catalogResolver.DeleteCanonicalGroupAsync(gid);
+                        if (!ok)
                         {
-                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
-                            await WriteJsonAsync(context.Response, new { error = "Payload inválido." });
+                            context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                            await WriteJsonAsync(context.Response, new { error = $"CanonicalGroup #{gid} não encontrada." });
                             return;
                         }
-                        var saved = await _catalogResolver.UpsertGroupMappingAsync(
-                            sk, payload.SourceGroupTitle, payload.CanonicalGroupId, payload.IsEnabled);
-                        await WriteJsonAsync(context.Response, GroupMappingToJson(saved));
+                        await WriteJsonAsync(context.Response, new { deleted = true, id = gid });
                         return;
                     }
-                    catch (Exception ex)
+                    catch (InvalidOperationException ex)
                     {
                         context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
                         await WriteJsonAsync(context.Response, new { error = ex.Message });
                         return;
                     }
                 }
-                context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
-                return;
             }
 
-            if (requestPath.StartsWith("/api/catalog/group-mappings/", StringComparison.OrdinalIgnoreCase))
+            // === Wave D3 — sugestão de grupo canónico (pré-selecção apenas) ===
+            // GET /api/catalog/group-suggestion?group=<...>&title=<...>
+            // O group-title da source é apenas sugestão; o valor persistido é
+            // sempre a escolha explícita do operador no formulário de canal.
+            if (requestPath.Equals("/api/catalog/group-suggestion", StringComparison.OrdinalIgnoreCase))
             {
-                var idStr = requestPath.Substring("/api/catalog/group-mappings/".Length);
-                if (!long.TryParse(idStr, out var mid))
+                if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
                 {
-                    context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
-                    await WriteJsonAsync(context.Response, new { error = "ID inválido." });
-                    return;
-                }
-                if (context.Request.HttpMethod.Equals("DELETE", StringComparison.OrdinalIgnoreCase))
-                {
-                    var ok = await _catalogResolver.DeleteGroupMappingAsync(mid);
-                    if (!ok)
+                    var suggestionGroup = context.Request.QueryString["group"];
+                    var suggestionTitle = context.Request.QueryString["title"];
+                    var suggestedKey = GroupSuggester.SuggestGroupKey(suggestionGroup, suggestionTitle);
+                    string? suggestedName = null;
+                    if (!string.IsNullOrWhiteSpace(suggestedKey))
                     {
-                        context.Response.StatusCode = (int)HttpStatusCode.NotFound;
-                        await WriteJsonAsync(context.Response, new { error = $"GroupMapping #{mid} não encontrado." });
-                        return;
+                        var suggested = await _catalogResolver!.GetCanonicalGroupByKeyAsync(suggestedKey);
+                        suggestedName = suggested?.DisplayName;
                     }
-                    await WriteJsonAsync(context.Response, new { deleted = true, id = mid });
+                    await WriteJsonAsync(context.Response, new { groupKey = suggestedKey, groupName = suggestedName });
                     return;
                 }
+                context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
+                return;
             }
 
             // === PHASE 9 b — ChannelSource observation history ===
@@ -1663,6 +3027,8 @@ namespace m3uCrawler.Services
                         var source = await _catalogResolver.EnsureSourceAsync(
                             payload.Key, payload.Name, kind, payload.Origin ?? string.Empty,
                             payload.Priority, payload.IsEnabled);
+                        await RecordAuditAsync(auditActor, "catalog.source.upsert", "source",
+                            source.Key, null, SourceToJson(source), AuditResult.Success);
                         await WriteJsonAsync(context.Response, SourceToJson(source), HttpStatusCode.Created);
                         return;
                     }
@@ -1695,13 +3061,20 @@ namespace m3uCrawler.Services
 
                 if (segments.Length == 1 && context.Request.HttpMethod.Equals("DELETE", StringComparison.OrdinalIgnoreCase))
                 {
+                    var beforeSource = await _catalogResolver.GetSourceAsync(sourceId);
                     var ok = await _catalogResolver.DeleteSourceAsync(sourceId);
                     if (!ok)
                     {
+                        await RecordAuditAsync(auditActor, "catalog.source.delete", "source",
+                            sourceId.ToString(), beforeSource is null ? null : SourceToJson(beforeSource),
+                            null, AuditResult.Failure, "not-found");
                         context.Response.StatusCode = (int)HttpStatusCode.NotFound;
                         await WriteJsonAsync(context.Response, new { error = $"Source #{sourceId} não encontrada." });
                         return;
                     }
+                    await RecordAuditAsync(auditActor, "catalog.source.delete", "source",
+                        beforeSource?.Key ?? sourceId.ToString(),
+                        beforeSource is null ? null : SourceToJson(beforeSource), null, AuditResult.Success);
                     await WriteJsonAsync(context.Response, new { deleted = true, id = sourceId });
                     return;
                 }
@@ -1737,12 +3110,83 @@ namespace m3uCrawler.Services
                             if (!Enum.TryParse<StreamQuality>(payload.Quality, true, out var quality)) quality = StreamQuality.Unknown;
                             if (!Enum.TryParse<EpgState>(payload.Epg, true, out var epg)) epg = EpgState.Unknown;
                             if (!Enum.TryParse<AvailabilityState>(payload.Availability, true, out var availability)) availability = AvailabilityState.Discovered;
+
+                            // W5.6 §12 (OD-E) + F7-B (DL-123) — validação de
+                            // MatchMethod/MatchConfidence apenas na camada HTTP
+                            // (nunca em RecordChannelSourceAsync, para preservar
+                            // consumidores/testes legacy que usam métodos
+                            // arbitrários). MatchMethod ausente preserva o
+                            // comportamento legacy (persistido como "unknown").
+                            // MatchMethod presente torna MatchConfidence obrigatória:
+                            // ausência → 400 sem persistência; nunca auto-preencher.
+                            // MatchSemanticsVersion não é exigida ao cliente: o
+                            // servidor só carimba "msm1" quando o par é normativo.
+                            if (payload.MatchMethod is not null)
+                            {
+                                if (!RecognitionMatchMethods.TryGetMatchConfidence(
+                                        payload.MatchMethod, out var expectedConfidence))
+                                {
+                                    context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                                    await WriteJsonAsync(context.Response, new
+                                    {
+                                        error = $"MatchMethod inválido: '{payload.MatchMethod}'. Valores aceites: " +
+                                            "ExternalIdentityExact, TvgIdExact, CanonicalExact, NormalizedName, " +
+                                            "KnownAlias, ExplicitHeuristic, Fuzzy, ManualReview.",
+                                    }, HttpStatusCode.BadRequest);
+                                    return;
+                                }
+
+                                if (payload.MatchConfidence is not double providedWithMethod)
+                                {
+                                    context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                                    await WriteJsonAsync(context.Response, new
+                                    {
+                                        error = "MatchConfidence é obrigatória quando MatchMethod é fornecido.",
+                                    }, HttpStatusCode.BadRequest);
+                                    return;
+                                }
+
+                                if (providedWithMethod < 0 || providedWithMethod > 1)
+                                {
+                                    context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                                    await WriteJsonAsync(context.Response, new
+                                    {
+                                        error = "MatchConfidence fora do domínio 0..1.",
+                                    }, HttpStatusCode.BadRequest);
+                                    return;
+                                }
+
+                                if (Math.Abs(providedWithMethod - expectedConfidence) > 1e-9)
+                                {
+                                    context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                                    await WriteJsonAsync(context.Response, new
+                                    {
+                                        error = $"Combinação MatchMethod/MatchConfidence inválida: " +
+                                            $"'{payload.MatchMethod}' exige MatchConfidence " +
+                                            $"{expectedConfidence.ToString(System.Globalization.CultureInfo.InvariantCulture)}.",
+                                    }, HttpStatusCode.BadRequest);
+                                    return;
+                                }
+                            }
+                            else if (payload.MatchConfidence is double providedWithoutMethod
+                                && (providedWithoutMethod < 0 || providedWithoutMethod > 1))
+                            {
+                                context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                                await WriteJsonAsync(context.Response, new
+                                {
+                                    error = "MatchConfidence fora do domínio 0..1.",
+                                }, HttpStatusCode.BadRequest);
+                                return;
+                            }
+
                             var cs = await _catalogResolver.RecordChannelSourceAsync(
                                 payload.CanonicalChannelId, sourceId, payload.StreamUrl,
-                                quality, epg, availability, payload.MatchConfidence,
+                                quality, epg, availability, payload.MatchConfidence ?? 0,
                                 payload.MatchMethod ?? "unknown",
                                 payload.ExternalStreamId,
                                 payload.IsEnabled);
+                            await RecordAuditAsync(auditActor, "catalog.channel-source.record", "channel-source",
+                                cs.Id.ToString(), null, ChannelSourceToJson(cs), AuditResult.Success);
                             await WriteJsonAsync(context.Response, ChannelSourceToJson(cs), HttpStatusCode.Created);
                             return;
                         }
@@ -1773,10 +3217,14 @@ namespace m3uCrawler.Services
                     var ok = await _catalogResolver.DeleteChannelSourceAsync(csId);
                     if (!ok)
                     {
+                        await RecordAuditAsync(auditActor, "catalog.channel-source.delete", "channel-source",
+                            csId.ToString(), null, null, AuditResult.Failure, "not-found");
                         context.Response.StatusCode = (int)HttpStatusCode.NotFound;
                         await WriteJsonAsync(context.Response, new { error = $"ChannelSource #{csId} não encontrada." });
                         return;
                     }
+                    await RecordAuditAsync(auditActor, "catalog.channel-source.delete", "channel-source",
+                        csId.ToString(), new { id = csId }, null, AuditResult.Success);
                     await WriteJsonAsync(context.Response, new { deleted = true, id = csId });
                     return;
                 }
@@ -1800,6 +3248,8 @@ namespace m3uCrawler.Services
                             await WriteJsonAsync(context.Response, new { error = $"ChannelSource #{csId} não encontrada." });
                             return;
                         }
+                        await RecordAuditAsync(auditActor, "catalog.channel-source.update", "channel-source",
+                            csId.ToString(), null, new { id = csId, isEnabled = payload.IsEnabled }, AuditResult.Success);
                         await WriteJsonAsync(context.Response, new { updated = true, id = csId, isEnabled = payload.IsEnabled });
                         return;
                     }
@@ -1879,10 +3329,14 @@ namespace m3uCrawler.Services
                                 await WriteJsonAsync(context.Response, new { error = $"EditorialCategory inválido: '{payload.EditorialCategory}'." });
                                 return;
                             }
-                            if (!Enum.TryParse<CanonicalEditorialGroup>(payload.EditorialGroup, true, out var editorialGroup))
+                            // Wave D2 — o grupo é identificado apenas pela
+                            // Key/FK. A key ausente cai em "other"; uma key
+                            // desconhecida é rejeitada com 400.
+                            var groupKey = await ResolveValidatedGroupKeyAsync(payload.GroupKey);
+                            if (groupKey is null)
                             {
                                 context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
-                                await WriteJsonAsync(context.Response, new { error = $"EditorialGroup inválido: '{payload.EditorialGroup}'." });
+                                await WriteJsonAsync(context.Response, new { error = $"GroupKey inválido: '{payload.GroupKey}'." });
                                 return;
                             }
                             if (!Enum.TryParse<PublicationPolicy>(payload.PublicationPolicy, true, out var publicationPolicy))
@@ -1892,9 +3346,10 @@ namespace m3uCrawler.Services
                                 return;
                             }
                             var isEnabled = payload.IsEnabled ?? true;
+                            var beforeChannel = await _catalogResolver.GetCanonicalChannelAsync(channelId);
                             var updated = await _catalogResolver.UpdateCanonicalChannelAsync(
                                 channelId, payload.DisplayName, editorialCategory,
-                                editorialGroup, publicationPolicy, isEnabled);
+                                groupKey, publicationPolicy, isEnabled, payload.Country);
                             if (updated == null)
                             {
                                 context.Response.StatusCode = (int)HttpStatusCode.NotFound;
@@ -1902,6 +3357,11 @@ namespace m3uCrawler.Services
                                 return;
                             }
                             var reloaded = await _catalogResolver.GetCanonicalChannelAsync(channelId);
+                            await RecordAuditAsync(auditActor, "catalog.channel.update", "canonical-channel",
+                                channelId.ToString(),
+                                beforeChannel is null ? null : ChannelToJson(beforeChannel),
+                                reloaded is null ? null : ChannelToJson(reloaded),
+                                AuditResult.Success);
                             await WriteJsonAsync(context.Response, ChannelToJson(reloaded!));
                             return;
                         }
@@ -1916,13 +3376,22 @@ namespace m3uCrawler.Services
                     {
                         try
                         {
+                            var beforeChannel = await _catalogResolver.GetCanonicalChannelAsync(channelId);
                             var deleted = await _catalogResolver.DeleteCanonicalChannelAsync(channelId);
                             if (!deleted)
                             {
+                                await RecordAuditAsync(auditActor, "catalog.channel.delete", "canonical-channel",
+                                    channelId.ToString(),
+                                    beforeChannel is null ? null : ChannelToJson(beforeChannel),
+                                    null, AuditResult.Failure, "not-found");
                                 context.Response.StatusCode = (int)HttpStatusCode.NotFound;
                                 await WriteJsonAsync(context.Response, new { error = $"Canal #{channelId} não encontrado." });
                                 return;
                             }
+                            await RecordAuditAsync(auditActor, "catalog.channel.delete", "canonical-channel",
+                                channelId.ToString(),
+                                beforeChannel is null ? null : ChannelToJson(beforeChannel),
+                                null, AuditResult.Success);
                             await WriteJsonAsync(context.Response, new { deleted = true, id = channelId });
                             return;
                         }
@@ -1933,8 +3402,10 @@ namespace m3uCrawler.Services
                         }
                     }
 
-                    context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
-                    await WriteJsonAsync(context.Response, new { error = "Método não permitido." });
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = "Método não permitido." },
+                        HttpStatusCode.MethodNotAllowed);
                     return;
                 }
 
@@ -1956,6 +3427,9 @@ namespace m3uCrawler.Services
                                 return;
                             }
                             var alias = await _catalogResolver.AddAliasAsync(channelId, payload.NormalizedAlias);
+                            await RecordAuditAsync(auditActor, "catalog.channel.alias.add", "canonical-channel",
+                                channelId.ToString(), null, new { id = alias.Id, normalizedAlias = alias.NormalizedAlias },
+                                AuditResult.Success);
                             await WriteJsonAsync(context.Response, new
                             {
                                 id = alias.Id,
@@ -1979,10 +3453,14 @@ namespace m3uCrawler.Services
                         var removed = await _catalogResolver.RemoveAliasAsync(channelId, alias);
                         if (!removed)
                         {
+                            await RecordAuditAsync(auditActor, "catalog.channel.alias.remove", "canonical-channel",
+                                channelId.ToString(), new { alias }, null, AuditResult.Failure, "not-found");
                             context.Response.StatusCode = (int)HttpStatusCode.NotFound;
                             await WriteJsonAsync(context.Response, new { error = $"Alias '{alias}' não encontrado no canal #{channelId}." });
                             return;
                         }
+                        await RecordAuditAsync(auditActor, "catalog.channel.alias.remove", "canonical-channel",
+                            channelId.ToString(), new { alias }, null, AuditResult.Success);
                         await WriteJsonAsync(context.Response, new { deleted = true, channelId, alias });
                         return;
                     }
@@ -2018,10 +3496,14 @@ namespace m3uCrawler.Services
                         await WriteJsonAsync(context.Response, new { error = $"EditorialCategory inválido: '{payload.EditorialCategory}'." });
                         return;
                     }
-                    if (!Enum.TryParse<CanonicalEditorialGroup>(payload.EditorialGroup, true, out var editorialGroup))
+                    // Wave D2 — o grupo é identificado apenas pela
+                    // Key/FK. A key ausente cai em "other"; uma key
+                    // desconhecida é rejeitada com 400.
+                    var groupKey = await ResolveValidatedGroupKeyAsync(payload.GroupKey);
+                    if (groupKey is null)
                     {
                         context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
-                        await WriteJsonAsync(context.Response, new { error = $"EditorialGroup inválido: '{payload.EditorialGroup}'." });
+                        await WriteJsonAsync(context.Response, new { error = $"GroupKey inválido: '{payload.GroupKey}'." });
                         return;
                     }
                     if (!Enum.TryParse<PublicationPolicy>(payload.PublicationPolicy, true, out var publicationPolicy))
@@ -2036,9 +3518,12 @@ namespace m3uCrawler.Services
                         .ToList();
                     var created = await _catalogResolver.CreateCanonicalChannelAsync(
                         payload.Key.Trim(), payload.DisplayName,
-                        editorialCategory, editorialGroup, publicationPolicy,
-                        payload.IsEnabled, aliases);
+                        editorialCategory, groupKey, publicationPolicy,
+                        payload.IsEnabled, aliases, payload.Country);
                     var reloaded = await _catalogResolver.GetCanonicalChannelAsync(created.Id);
+                    await RecordAuditAsync(auditActor, "catalog.channel.create", "canonical-channel",
+                        reloaded?.Key ?? created.Key, null,
+                        reloaded is null ? null : ChannelToJson(reloaded), AuditResult.Success);
                     await WriteJsonAsync(context.Response, ChannelToJson(reloaded!), HttpStatusCode.Created);
                     return;
                 }
@@ -2076,7 +3561,63 @@ namespace m3uCrawler.Services
                             await WriteJsonAsync(context.Response, new { error = "Payload inválido." });
                             return;
                         }
+                        var beforePolicy = store.Load();
                         var saved = store.Save(incoming);
+                        await RecordAuditAsync(auditActor, "settings.validation-policy.update", "validation-policy",
+                            "global", beforePolicy, saved, AuditResult.Success);
+                        await WriteJsonAsync(context.Response, saved);
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                        await WriteJsonAsync(context.Response, new { error = ex.Message });
+                        return;
+                    }
+                }
+                context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
+                return;
+            }
+
+            // === App settings (PHASE 9C.3) ===
+            // GET  /api/settings
+            // POST /api/settings
+            if (requestPath.Equals("/api/settings", StringComparison.OrdinalIgnoreCase))
+            {
+                var runtimeDir = Path.Combine(Directory.GetCurrentDirectory(), "runtime-data");
+                var settingsStore = new AppSettingsStore(runtimeDir);
+                if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteJsonAsync(context.Response, settingsStore.Load());
+                    return;
+                }
+                if (context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
+                        var body = await reader.ReadToEndAsync();
+                        var payload = JsonSerializer.Deserialize<AppSettingsPayload>(body, JsonOptions);
+                        if (payload == null)
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            await WriteJsonAsync(context.Response, new { error = "Payload inválido." });
+                            return;
+                        }
+                        var current = settingsStore.Load();
+                        var beforeSettings = new
+                        {
+                            affinityVariantDelimiter = current.AffinityVariantDelimiter,
+                        };
+                        if (payload.AffinityVariantDelimiter != null)
+                        {
+                            current.AffinityVariantDelimiter = payload.AffinityVariantDelimiter;
+                        }
+                        var saved = settingsStore.Save(current);
+                        await RecordAuditAsync(auditActor, "settings.app.update", "app-settings",
+                            "global", beforeSettings,
+                            new { affinityVariantDelimiter = saved.AffinityVariantDelimiter },
+                            AuditResult.Success);
                         await WriteJsonAsync(context.Response, saved);
                         return;
                     }
@@ -2129,7 +3670,85 @@ namespace m3uCrawler.Services
                 }
             }
 
-            await WriteHtmlAsync(context.Response, BuildHtmlPage());
+            if (isRootPath && authMode == AuthMode.Bootstrap)
+            {
+                RedirectTo(context.Response, "/bootstrap");
+                return;
+            }
+
+            if (isRootPath && authMode == AuthMode.UserAuth)
+            {
+                var rootSession = _authService != null
+                    ? await _authService.ValidateSessionAsync(sessionId)
+                    : null;
+                if (rootSession == null)
+                {
+                    await WriteHtmlAsync(context.Response, BuildLoginHtml());
+                    return;
+                }
+
+                // PHASE 9C.2 (B2) — Entrega o token CSRF à página autenticada,
+                // apenas em memória JavaScript da página (nunca em URL, query,
+                // localStorage ou logs), para que o helper de fetch o envie
+                // automaticamente em métodos mutantes.
+                await WriteHtmlAsync(context.Response, BuildHtmlPage(rootSession.CsrfToken));
+                return;
+            }
+
+            if (isRootPath)
+            {
+                // W3 — A página do Dashboard só é servida na raiz. Qualquer
+                // outro path não correspondido NÃO pode devolver HTML 200 como
+                // se fosse uma API válida.
+                await WriteHtmlAsync(context.Response, BuildHtmlPage());
+                return;
+            }
+
+            // W3 — Rota não correspondida (não-root): 404 JSON. O `finally`
+            // abaixo é a rede de segurança para ramos que fixam um status de
+            // erro (ex.: 405) sem escrever corpo.
+            await WriteJsonAsync(
+                context.Response,
+                new { error = "not-found", path = requestPath },
+                HttpStatusCode.NotFound);
+            }
+            catch (Exception ex)
+            {
+                // W3 — Última linha de defesa: uma excepção não tratada não pode
+                // deixar o pedido pendurado. Log mínimo (método/path/tipo da
+                // excepção), sem mensagem (pode conter segredos/URLs com
+                // credenciais). A resposta não revela detalhes internos.
+                if (!WasResponseWritten(context.Response))
+                {
+                    Console.WriteLine($"❌ HTTP {context.Request.HttpMethod} {requestPath}: {ex.GetType().Name}");
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = "internal-error" },
+                        HttpStatusCode.InternalServerError);
+                }
+            }
+            finally
+            {
+                if (!WasResponseWritten(context.Response))
+                {
+                    if (context.Response.StatusCode == (int)HttpStatusCode.OK)
+                    {
+                        // Sem status fixado e sem resposta: rota não correspondida.
+                        await WriteJsonAsync(
+                            context.Response,
+                            new { error = "not-found", path = requestPath },
+                            HttpStatusCode.NotFound);
+                    }
+                    else
+                    {
+                        // O handler fixou um status (ex.: 405) mas não escreveu
+                        // corpo. WriteJsonAsync sem status preserva-o.
+                        await WriteJsonAsync(
+                            context.Response,
+                            new { error = "request-not-completed", status = context.Response.StatusCode, path = requestPath });
+                    }
+                }
+            }
         }
 
         private sealed class ValidationTestPayload
@@ -2149,10 +3768,614 @@ namespace m3uCrawler.Services
                 ChannelAdministrationError.AlreadyExists => HttpStatusCode.Conflict,
                 ChannelAdministrationError.ChannelNotFound => HttpStatusCode.NotFound,
                 ChannelAdministrationError.HasOwnership => HttpStatusCode.Conflict,
+                ChannelAdministrationError.ReviewConflict => HttpStatusCode.Conflict,
                 _ => HttpStatusCode.BadRequest,
             };
-            response.StatusCode = (int)status;
-            await WriteJsonAsync(response, new { error = ex.Message, code = ex.Error.ToString() });
+            // Nota: WriteJsonAsync repõe sempre o status; o código tem de
+            // ser passado explicitamente (senão o erro sairia como 200).
+            await WriteJsonAsync(response, new { error = ex.Message, code = ex.Error.ToString() }, status);
+        }
+
+        // ────────────────────────────────────────────────────────────────
+        // W5.5 — API HTTP de Review (DL-120; 22 §7).
+        // Cinco rotas: GET /api/reviews, GET /api/review?id, POST
+        // /api/review/{resolve|ignore|reopen}. Identidade = ReviewItem.Id;
+        // erros no formato { error, message, correlationId }. As rotas legacy
+        // /api/catalog/reviews/... mantêm-se inalteradas (D5).
+        // ────────────────────────────────────────────────────────────────
+
+        // Operational default (não normativo; `limit` default/máximo permanece
+        // PARAMETER GAP, DL-120/D6). Existe apenas para impedir consultas ilimitadas.
+        private const int ReviewListOperationalDefaultLimit = 100;
+        private const int ReviewListOperationalMaxLimit = 500;
+
+        private static bool IsReviewApiPath(string path)
+            => path.Equals("/api/reviews", StringComparison.OrdinalIgnoreCase)
+                || path.Equals("/api/review", StringComparison.OrdinalIgnoreCase)
+                || path.StartsWith("/api/review/", StringComparison.OrdinalIgnoreCase);
+
+        private static string NewReviewCorrelationId() => Guid.NewGuid().ToString("N");
+
+        /// <summary>
+        /// W5.5 (B2) — Erro de gate (401/403). Para as novas Review APIs usa o
+        /// envelope <c>{error,message,correlationId}</c>; para os restantes
+        /// endpoints mantém o corpo existente <c>{error}</c> (sem regressão).
+        /// </summary>
+        private static Task WriteGateErrorAsync(
+            HttpListenerResponse response, HttpStatusCode status, string code, string safeMessage,
+            bool reviewApi, string correlationId)
+            => reviewApi
+                ? WriteJsonAsync(response, new { error = code, message = safeMessage, correlationId }, status)
+                : WriteJsonAsync(response, new { error = code }, status);
+
+        private static async Task HandleReviewApiAsync(
+            HttpListenerContext context, string requestPath, AuditActor auditActor)
+        {
+            var correlationId = NewReviewCorrelationId();
+            try
+            {
+                await DispatchReviewApiAsync(context, requestPath, auditActor, correlationId);
+            }
+            catch (Exception)
+            {
+                // W5.5 (B1) — fallback para erros inesperados: HTTP 500
+                // `persistence-error` com envelope completo. Nunca expõe
+                // Exception.Message nem stack trace.
+                try
+                {
+                    await WriteReviewApiErrorAsync(
+                        context.Response, HttpStatusCode.InternalServerError,
+                        "persistence-error", "Erro interno.", correlationId);
+                }
+                catch
+                {
+                    // A resposta pode já ter sido parcialmente escrita/fechada.
+                }
+            }
+        }
+
+        private static async Task DispatchReviewApiAsync(
+            HttpListenerContext context, string requestPath, AuditActor auditActor, string correlationId)
+        {
+            if (requestPath.Equals("/api/reviews", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.MethodNotAllowed,
+                        "invalid-payload", "Método não permitido.", correlationId);
+                    return;
+                }
+                await HandleReviewListAsync(context, correlationId);
+                return;
+            }
+
+            if (requestPath.Equals("/api/review", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.MethodNotAllowed,
+                        "invalid-payload", "Método não permitido.", correlationId);
+                    return;
+                }
+                await HandleReviewDetailAsync(context, correlationId);
+                return;
+            }
+
+            var operation = requestPath.Substring("/api/review/".Length).Trim('/').ToLowerInvariant();
+            if (!context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+            {
+                await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.MethodNotAllowed,
+                    "invalid-payload", "Método não permitido.", correlationId);
+                return;
+            }
+
+            switch (operation)
+            {
+                case "ignore":
+                    await HandleReviewIgnoreAsync(context, auditActor, correlationId);
+                    return;
+                case "reopen":
+                    await HandleReviewReopenAsync(context, auditActor, correlationId);
+                    return;
+                case "resolve":
+                    await HandleReviewResolveAsync(context, auditActor, correlationId);
+                    return;
+                default:
+                    await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.NotFound,
+                        "review-not-found", "Operação de review desconhecida.", correlationId);
+                    return;
+            }
+        }
+
+        private static async Task HandleReviewListAsync(HttpListenerContext context, string correlationId)
+        {
+            var query = context.Request.QueryString;
+
+            ReviewItemState? stateFilter = null;
+            var rawState = query["state"];
+            if (!string.IsNullOrWhiteSpace(rawState))
+            {
+                if (!Enum.TryParse<ReviewItemState>(rawState.Trim(), ignoreCase: true, out var parsed)
+                    || !Enum.IsDefined(parsed))
+                {
+                    await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.BadRequest,
+                        "invalid-filter", "state inválido.", correlationId);
+                    return;
+                }
+                stateFilter = parsed;
+            }
+
+            if (!TryParseReviewInt(query["offset"], allowZero: true, defaultValue: 0, out var offset)
+                || offset < 0)
+            {
+                await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.BadRequest,
+                    "invalid-filter", "offset inválido.", correlationId);
+                return;
+            }
+
+            if (!TryParseReviewInt(query["limit"], allowZero: false,
+                    defaultValue: ReviewListOperationalDefaultLimit, out var limit))
+            {
+                await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.BadRequest,
+                    "invalid-filter", "limit inválido.", correlationId);
+                return;
+            }
+            if (limit > ReviewListOperationalMaxLimit)
+            {
+                limit = ReviewListOperationalMaxLimit;
+            }
+
+            var all = await _catalogResolver!.ListAllReviewItemsAsync();
+            IEnumerable<ReviewItemEntity> filtered = all;
+            if (stateFilter is not null)
+            {
+                // Filtro explícito (inclui estados terminais para histórico).
+                filtered = all.Where(r => r.State == stateFilter.Value);
+            }
+            else
+            {
+                // W5 — Por omissão a lista activa exclui estados terminais
+                // (Resolved/Ignored); o histórico obtém-se via ?state=.
+                filtered = all.Where(r =>
+                    r.State != ReviewItemState.Resolved && r.State != ReviewItemState.Ignored);
+            }
+
+            var page = filtered
+                .OrderByDescending(r => r.CreatedAtUtc)
+                .ThenByDescending(r => r.Id)
+                .Skip(offset)
+                .Take(limit)
+                .Select(ReviewSummaryJson)
+                .ToList();
+
+            await WriteJsonAsync(context.Response, page);
+        }
+
+        private static async Task HandleReviewDetailAsync(HttpListenerContext context, string correlationId)
+        {
+            var rawId = context.Request.QueryString["id"];
+            if (string.IsNullOrWhiteSpace(rawId)
+                || !long.TryParse(rawId.Trim(), out var id)
+                || id <= 0)
+            {
+                await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.BadRequest,
+                    "review-id-required", "id é obrigatório.", correlationId);
+                return;
+            }
+
+            var item = await _catalogResolver!.GetReviewItemAsync(id);
+            if (item is null)
+            {
+                await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.NotFound,
+                    "review-not-found", "Review não encontrada.", correlationId);
+                return;
+            }
+
+            await WriteJsonAsync(context.Response, ReviewDetailJson(item));
+        }
+
+        private static async Task HandleReviewIgnoreAsync(
+            HttpListenerContext context, AuditActor auditActor, string correlationId)
+        {
+            var payload = await ReadReviewApiBodyAsync(context.Request);
+            if (payload?.ReviewItemId is not > 0)
+            {
+                await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.BadRequest,
+                    "invalid-payload", "reviewItemId é obrigatório.", correlationId);
+                return;
+            }
+            if (string.IsNullOrWhiteSpace(payload.Reason))
+            {
+                await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.BadRequest,
+                    "reason-required", "reason é obrigatório.", correlationId);
+                return;
+            }
+
+            var item = await _catalogResolver!.GetReviewItemAsync(payload.ReviewItemId.Value);
+            if (item is null)
+            {
+                await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.NotFound,
+                    "review-not-found", "Review não encontrada.", correlationId);
+                return;
+            }
+
+            try
+            {
+                var reason = SanitizeReviewText(payload.Reason);
+                var result = await _catalogResolver.IgnoreReviewAsync(item.Fingerprint, reason);
+                if (result is null)
+                {
+                    await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.NotFound,
+                        "review-not-found", "Review não encontrada.", correlationId);
+                    return;
+                }
+
+                await RecordAuditAsync(auditActor, "catalog.review.ignore", "review-item",
+                    item.Id.ToString(),
+                    new { state = result.PriorState.ToString() },
+                    new { state = result.Review.State.ToString() },
+                    AuditResult.Success, reason);
+
+                await WriteJsonAsync(context.Response, ReviewLifecycleJson(result, correlationId));
+            }
+            catch (ChannelAdministrationException ex)
+            {
+                await WriteReviewDomainErrorAsync(context.Response, ex, correlationId);
+            }
+        }
+
+        private static async Task HandleReviewReopenAsync(
+            HttpListenerContext context, AuditActor auditActor, string correlationId)
+        {
+            var payload = await ReadReviewApiBodyAsync(context.Request);
+            if (payload?.ReviewItemId is not > 0)
+            {
+                await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.BadRequest,
+                    "invalid-payload", "reviewItemId é obrigatório.", correlationId);
+                return;
+            }
+
+            var justification = payload.Justification ?? payload.Reason;
+            if (string.IsNullOrWhiteSpace(justification))
+            {
+                await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.BadRequest,
+                    "reason-required", "justification é obrigatória.", correlationId);
+                return;
+            }
+
+            var item = await _catalogResolver!.GetReviewItemAsync(payload.ReviewItemId.Value);
+            if (item is null)
+            {
+                await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.NotFound,
+                    "review-not-found", "Review não encontrada.", correlationId);
+                return;
+            }
+
+            try
+            {
+                var reason = SanitizeReviewText(justification);
+                var result = await _catalogResolver.ReopenReviewAsync(item.Fingerprint, reason);
+                if (result is null)
+                {
+                    await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.NotFound,
+                        "review-not-found", "Review não encontrada.", correlationId);
+                    return;
+                }
+
+                await RecordAuditAsync(auditActor, "catalog.review.reopen", "review-item",
+                    item.Id.ToString(),
+                    new { state = result.PriorState.ToString() },
+                    new { state = result.Review.State.ToString() },
+                    AuditResult.Success, reason);
+
+                await WriteJsonAsync(context.Response, ReviewLifecycleJson(result, correlationId));
+            }
+            catch (ChannelAdministrationException ex)
+            {
+                await WriteReviewDomainErrorAsync(context.Response, ex, correlationId);
+            }
+        }
+
+        private static async Task HandleReviewResolveAsync(
+            HttpListenerContext context, AuditActor auditActor, string correlationId)
+        {
+            var payload = await ReadReviewApiBodyAsync(context.Request);
+            if (payload?.ReviewItemId is not > 0)
+            {
+                await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.BadRequest,
+                    "invalid-payload", "reviewItemId é obrigatório.", correlationId);
+                return;
+            }
+
+            var item = await _catalogResolver!.GetReviewItemAsync(payload.ReviewItemId.Value);
+            if (item is null)
+            {
+                await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.NotFound,
+                    "review-not-found", "Review não encontrada.", correlationId);
+                return;
+            }
+
+            var change = payload.Change;
+            if (change is null || string.IsNullOrWhiteSpace(change.Type))
+            {
+                await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.UnprocessableEntity,
+                    "declared-change-invalid", "change.type é obrigatório.", correlationId);
+                return;
+            }
+
+            var declaredType = change.Type.Trim();
+            var changeType = declaredType.ToLowerInvariant();
+
+            // W5.5 IMPLEMENTATION GAP (DL-120/D1): `externalIdentity` e
+            // `channelSource` não têm operação de domínio de Review *declarada*
+            // demonstrada (só existem gravadores de ingestão com parâmetros sem
+            // contrato: RecordExternalIdentityAsync/RecordChannelSourceAsync), e
+            // `none` não tem semântica definida em 22 §7.3. Não se inventa
+            // semântica: rejeita-se com 422 e documenta-se o gap.
+            if (changeType is "externalidentity" or "channelsource" or "none")
+            {
+                await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.UnprocessableEntity,
+                    "declared-change-invalid",
+                    $"change.type '{changeType}' não tem operação de domínio de Review suportada (W5.5 IMPLEMENTATION GAP).",
+                    correlationId);
+                return;
+            }
+
+            ReviewApprovalAction action;
+            ReviewChannelSpec? channelSpec = null;
+            switch (changeType)
+            {
+                case "channelalias":
+                    action = ReviewApprovalAction.AddAlias;
+                    if (string.IsNullOrWhiteSpace(change.CanonicalChannelKey))
+                    {
+                        await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.UnprocessableEntity,
+                            "declared-change-invalid",
+                            "canonicalChannelKey é obrigatório para change.type='channelAlias'.", correlationId);
+                        return;
+                    }
+                    break;
+
+                case "canonicalchannel":
+                    action = ReviewApprovalAction.CreateChannel;
+                    var ch = change.Channel;
+                    if (ch is null || string.IsNullOrWhiteSpace(ch.Key) || string.IsNullOrWhiteSpace(ch.Name))
+                    {
+                        await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.UnprocessableEntity,
+                            "declared-change-invalid",
+                            "channel.key e channel.name são obrigatórios para change.type='canonicalChannel'.",
+                            correlationId);
+                        return;
+                    }
+                    if (!TryParseOptionalEnum(ch.EditorialCategory, out EditorialCategory? editorialCategory)
+                        || !TryParseOptionalEnum(ch.PublicationPolicy, out PublicationPolicy? publicationPolicy))
+                    {
+                        await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.UnprocessableEntity,
+                            "declared-change-invalid", "Valor editorial inválido em channel.", correlationId);
+                        return;
+                    }
+                    var reviewGroupKey = await ResolveValidatedGroupKeyAsync(ch.GroupKey);
+                    if (reviewGroupKey is null)
+                    {
+                        await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.UnprocessableEntity,
+                            "declared-change-invalid", $"GroupKey inválido: '{ch.GroupKey}'.", correlationId);
+                        return;
+                    }
+                    channelSpec = new ReviewChannelSpec(
+                        ch.Key!, ch.Name!, ch.Country, editorialCategory, publicationPolicy, ch.IsEnabled,
+                        reviewGroupKey);
+                    break;
+
+                default:
+                    await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.UnprocessableEntity,
+                        "declared-change-invalid", "change.type inválido.", correlationId);
+                    return;
+            }
+
+            var note = SanitizeReviewText(payload.Note);
+            var decision = new ReviewApprovalDecision(
+                action, change.CanonicalChannelKey, change.Alias, note, channelSpec);
+
+            try
+            {
+                var result = await _catalogResolver.ApplyReviewApprovalAsync(item.Fingerprint, decision);
+                if (result is null)
+                {
+                    await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.NotFound,
+                        "review-not-found", "Review não encontrada.", correlationId);
+                    return;
+                }
+
+                var after = new
+                {
+                    state = result.Review.State.ToString(),
+                    change = declaredType,
+                    idempotent = result.Idempotent,
+                    catalogueChanged = result.CatalogueChanged,
+                    canonicalChannelId = result.Channel?.Id,
+                    canonicalChannelKey = result.Channel?.Key,
+                    alias = result.Alias?.NormalizedAlias,
+                    materialized = result.MaterializedChannelSource != null,
+                };
+                await RecordAuditAsync(auditActor, "catalog.review.resolve", "review-item",
+                    item.Id.ToString(),
+                    new
+                    {
+                        state = result.PriorState.ToString(),
+                        approvedCanonicalChannelId = result.PriorApprovedCanonicalChannelId,
+                    },
+                    after, AuditResult.Success, string.IsNullOrEmpty(note) ? null : note);
+
+                // W-REVIEW-02 — auditoria específica do efeito de materialização.
+                // Best-effort: uma falha aqui não reverte a approval (gestão
+                // central de erros do RecordAuditAsync engole excepções).
+                if (declaredType is "channelAlias" or "canonicalChannel")
+                {
+                    var materializedOp = result.MaterializedChannelSource != null
+                        ? "catalog.review.approval.materialize_created"
+                        : "catalog.review.approval.materialize_skipped";
+                    var detail = result.MaterializedChannelSource != null
+                        ? $"channelSourceId={result.MaterializedChannelSource.Id};fingerprintVersion={result.MaterializedChannelSource.FingerprintVersion}"
+                        : "missing-evidence";
+                    await RecordAuditAsync(auditActor, materializedOp, "review-item",
+                        item.Id.ToString(),
+                        null,
+                        result.MaterializedChannelSource is null
+                            ? null
+                            : ChannelSourceToJson(result.MaterializedChannelSource),
+                        AuditResult.Success,
+                        detail);
+                }
+
+                await WriteJsonAsync(context.Response, new
+                {
+                    id = result.Review.Id,
+                    state = result.Review.State.ToString(),
+                    change = declaredType,
+                    idempotent = result.Idempotent,
+                    catalogueChanged = result.CatalogueChanged,
+                    canonicalChannelId = result.Channel?.Id,
+                    canonicalChannelKey = result.Channel?.Key,
+                    alias = result.Alias?.NormalizedAlias,
+                    resolvedAt = result.Review.ResolvedAtUtc?.ToString("o"),
+                    correlationId,
+                });
+            }
+            catch (ChannelAdministrationException ex)
+            {
+                await WriteReviewDomainErrorAsync(context.Response, ex, correlationId, resolveDeclaration: true);
+            }
+        }
+
+        private static async Task<ReviewApiPayload?> ReadReviewApiBodyAsync(HttpListenerRequest request)
+        {
+            using var reader = new StreamReader(
+                request.InputStream, request.ContentEncoding ?? Encoding.UTF8);
+            var body = await reader.ReadToEndAsync();
+            if (string.IsNullOrWhiteSpace(body)) return null;
+            try
+            {
+                return JsonSerializer.Deserialize<ReviewApiPayload>(body, JsonOptions);
+            }
+            catch (JsonException)
+            {
+                return null;
+            }
+        }
+
+        private static object ReviewSummaryJson(ReviewItemEntity r) => new
+        {
+            id = r.Id,
+            subject = SanitizeReviewText(r.NormalizedIdentity),
+            state = r.State.ToString(),
+            createdAt = r.CreatedAtUtc.ToString("o"),
+            updatedAt = r.UpdatedAtUtc.ToString("o"),
+            // `runId` não existe no modelo actual (dependência C7/W5.6). Expõe-se
+            // null explicitamente como limitação, não como solução definitiva.
+            runId = (string?)null,
+        };
+
+        private static object ReviewDetailJson(ReviewItemEntity r) => new
+        {
+            id = r.Id,
+            subject = SanitizeReviewText(r.NormalizedIdentity),
+            state = r.State.ToString(),
+            sourceGroup = r.SourceGroup,
+            reason = SanitizeReviewText(r.ReasonSignature),
+            note = SanitizeReviewText(r.Note),
+            approvedCanonicalChannelId = r.ApprovedCanonicalChannelId,
+            createdAt = r.CreatedAtUtc.ToString("o"),
+            updatedAt = r.UpdatedAtUtc.ToString("o"),
+            resolvedAt = r.ResolvedAtUtc?.ToString("o"),
+        };
+
+        private static object ReviewLifecycleJson(ReviewLifecycleResult result, string correlationId) => new
+        {
+            id = result.Review.Id,
+            state = result.Review.State.ToString(),
+            changed = result.Changed,
+            operation = result.Operation,
+            correlationId,
+        };
+
+        private static string SanitizeReviewText(string? value)
+            => string.IsNullOrEmpty(value)
+                ? string.Empty
+                : (CredentialSanitizer.SanitizeSensitiveText(value) ?? string.Empty);
+
+        private static bool TryParseReviewInt(string? raw, bool allowZero, int defaultValue, out int value)
+        {
+            value = defaultValue;
+            if (string.IsNullOrWhiteSpace(raw)) return true;
+            if (!int.TryParse(raw.Trim(), out var parsed)) return false;
+            if (allowZero ? parsed < 0 : parsed <= 0) return false;
+            value = parsed;
+            return true;
+        }
+
+        private static Task WriteReviewApiErrorAsync(
+            HttpListenerResponse response, HttpStatusCode status, string code, string message, string correlationId)
+            => WriteJsonAsync(response, new { error = code, message, correlationId }, status);
+
+        /// <summary>
+        /// W5.5 — Traduz erros de domínio para o contrato de erro das novas rotas.
+        /// Nunca expõe <see cref="Exception.Message"/>. Conflito de estado → 409;
+        /// erros de declaração (resolve) → 422. As restantes causas de domínio
+        /// mapeiam para 400 (input inválido).
+        /// </summary>
+        private static async Task WriteReviewDomainErrorAsync(
+            HttpListenerResponse response, ChannelAdministrationException ex, string correlationId,
+            bool resolveDeclaration = false)
+        {
+            if (ex.Error == ChannelAdministrationError.ReviewConflict)
+            {
+                await WriteReviewApiErrorAsync(response, HttpStatusCode.Conflict,
+                    "state-conflict", "Conflito de estado da Review.", correlationId);
+                return;
+            }
+
+            if (resolveDeclaration)
+            {
+                await WriteReviewApiErrorAsync(response, HttpStatusCode.UnprocessableEntity,
+                    "declared-change-invalid", "Declaração de alteração inválida.", correlationId);
+                return;
+            }
+
+            await WriteReviewApiErrorAsync(response, HttpStatusCode.BadRequest,
+                "invalid-payload", "Pedido inválido.", correlationId);
+        }
+
+        private sealed class ReviewApiPayload
+        {
+            [JsonPropertyName("reviewItemId")]
+            public long? ReviewItemId { get; set; }
+
+            [JsonPropertyName("reason")]
+            public string? Reason { get; set; }
+
+            [JsonPropertyName("justification")]
+            public string? Justification { get; set; }
+
+            [JsonPropertyName("note")]
+            public string? Note { get; set; }
+
+            [JsonPropertyName("change")]
+            public ReviewChangePayload? Change { get; set; }
+        }
+
+        private sealed class ReviewChangePayload
+        {
+            [JsonPropertyName("type")]
+            public string? Type { get; set; }
+
+            [JsonPropertyName("canonicalChannelKey")]
+            public string? CanonicalChannelKey { get; set; }
+
+            [JsonPropertyName("alias")]
+            public string? Alias { get; set; }
+
+            [JsonPropertyName("channel")]
+            public ReviewChannelPayload? Channel { get; set; }
         }
 
         // Opções JSON partilhadas por todos os endpoints do dashboard: serializam
@@ -2185,14 +4408,68 @@ namespace m3uCrawler.Services
             };
         }
 
-        private static async Task WriteJsonAsync(HttpListenerResponse response, object data, HttpStatusCode statusCode = HttpStatusCode.OK)
+        /// <summary>
+        /// PHASE 9C.1 — Constrói o payload do endpoint
+        /// <c>GET /api/configuration/lifecycle</c>. Público para ser
+        /// testável sem levantar um HttpListener. Quando o lifecycle não
+        /// está ligado, reporta <c>available=false</c> e um estado
+        /// não-pronto (fail-safe), nunca uma falsa prontidão.
+        /// </summary>
+        public static async Task<object> BuildLifecyclePayloadAsync(ConfigurationLifecycleService? lifecycle)
         {
-            response.StatusCode = (int)statusCode;
+            if (lifecycle == null)
+            {
+                return new
+                {
+                    state = ConfigurationLifecycleState.NotConfigured.ToWireName(),
+                    available = false,
+                    isReady = false,
+                    adoptedFromLegacy = false,
+                    adoptedAtUtc = (string?)null,
+                    updatedAtUtc = (string?)null,
+                    reason = "lifecycle-not-wired",
+                    advisory = Array.Empty<object>(),
+                };
+            }
+
+            var snapshot = await lifecycle.GetStateAsync();
+            var advisory = await lifecycle.EvaluateAdvisoryAsync();
+
+            return new
+            {
+                state = snapshot.State.ToWireName(),
+                available = true,
+                isReady = snapshot.IsReady,
+                adoptedFromLegacy = snapshot.AdoptedFromLegacy,
+                adoptedAtUtc = snapshot.AdoptedAtUtc?.ToString("o"),
+                updatedAtUtc = snapshot.UpdatedAtUtc.ToString("o"),
+                reason = snapshot.LastReason,
+                advisory = advisory.Select(a => new
+                {
+                    key = a.Key,
+                    satisfied = a.Satisfied,
+                    detail = a.Detail,
+                }),
+            };
+        }
+
+        // W3 — `statusCode` é opcional: quando omitido, PRESERVA o status já
+        // fixado pelo chamador (ex.: `Response.StatusCode = BadRequest` antes de
+        // escrever o corpo). Antes, o default `OK` repunha sempre 200 e mascarava
+        // erros determinados pelos endpoints. Só sobrescreve quando o chamador
+        // passa um status explícito.
+        private static async Task WriteJsonAsync(HttpListenerResponse response, object data, HttpStatusCode? statusCode = null)
+        {
+            if (statusCode.HasValue)
+            {
+                response.StatusCode = (int)statusCode.Value;
+            }
             var json = JsonSerializer.Serialize(data, JsonOptions);
             response.ContentType = "application/json; charset=utf-8";
             var buffer = Encoding.UTF8.GetBytes(json);
             response.ContentLength64 = buffer.Length;
             await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
+            MarkResponseWritten(response);
             response.Close();
         }
 
@@ -2227,13 +4504,19 @@ namespace m3uCrawler.Services
             }
         }
 
-        private static async Task WriteTextAsync(HttpListenerResponse response, string text, HttpStatusCode statusCode = HttpStatusCode.OK, string contentType = "text/plain; charset=utf-8")
+        // W3 — `statusCode` opcional: quando omitido, PRESERVA o status já
+        // fixado pelo chamador (ver WriteJsonAsync).
+        private static async Task WriteTextAsync(HttpListenerResponse response, string text, HttpStatusCode? statusCode = null, string contentType = "text/plain; charset=utf-8")
         {
-            response.StatusCode = (int)statusCode;
+            if (statusCode.HasValue)
+            {
+                response.StatusCode = (int)statusCode.Value;
+            }
             response.ContentType = contentType;
             var buffer = Encoding.UTF8.GetBytes(text);
             response.ContentLength64 = buffer.Length;
             await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
+            MarkResponseWritten(response);
             response.Close();
         }
 
@@ -2243,12 +4526,44 @@ namespace m3uCrawler.Services
             var buffer = Encoding.UTF8.GetBytes(html);
             response.ContentLength64 = buffer.Length;
             await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
+            MarkResponseWritten(response);
             response.Close();
         }
 
-    private static string BuildHtmlPage()
+    /// <summary>
+    /// PHASE 9C.2 (B2) — Página do Dashboard. Quando <paramref name="csrfToken"/>
+    /// é fornecido (sessão humana autenticada), injecta um helper que adiciona o
+    /// header <c>X-CSRF-Token</c> a todos os <c>fetch</c> de mesma origem. O token
+    /// vive apenas em memória JavaScript da página — nunca em URL, query,
+    /// localStorage ou logs. Sem token (legacy/bootstrap) o helper não é injectado.
+    /// </summary>
+    private static string BuildHtmlPage(string? csrfToken = null)
     {
-        return BuildDashboardHtml();
+        var html = BuildDashboardHtml();
+        if (string.IsNullOrEmpty(csrfToken))
+        {
+            return html;
+        }
+
+        var tokenLiteral = JsonSerializer.Serialize(csrfToken);
+        var script =
+            "<script>(function(){var t=" + tokenLiteral + ";" +
+            "if(!t||typeof window.fetch!=='function'){return;}" +
+            "window.__m3uCrawlerCsrf=t;" +
+            "var f=window.fetch.bind(window);" +
+            "window.fetch=function(input,init){init=init||{};" +
+            "var h=new Headers(init.headers||{});" +
+            "if(!h.has('X-CSRF-Token')){h.set('X-CSRF-Token',t);}" +
+            "init.headers=h;return f(input,init);};})();</script>";
+
+        var bodyIndex = html.IndexOf("<body", StringComparison.OrdinalIgnoreCase);
+        if (bodyIndex < 0)
+        {
+            return script + html;
+        }
+
+        var bodyClose = html.IndexOf('>', bodyIndex);
+        return bodyClose < 0 ? script + html : html.Insert(bodyClose + 1, script);
     }
 
     private sealed class IdentityRulePayload
@@ -2265,18 +4580,168 @@ namespace m3uCrawler.Services
     {
         [JsonPropertyName("name")]
         public string Name { get; set; } = string.Empty;
-        [JsonPropertyName("countryCode")]
-        public string? CountryCode { get; set; }
+        [JsonPropertyName("kind")]
+        public string? Kind { get; set; }
+        [JsonPropertyName("canonicalChannelKey")]
+        public string? CanonicalChannelKey { get; set; }
         [JsonPropertyName("canonicalChannelId")]
         public long? CanonicalChannelId { get; set; }
+        [JsonPropertyName("countryCode")]
+        public string? CountryCode { get; set; }
         [JsonPropertyName("members")]
         public List<string> Members { get; set; } = new();
     }
 
-    private sealed class ApproveReviewPayload
+    private sealed class AppSettingsPayload
     {
-        [JsonPropertyName("approvedCanonicalChannelId")]
-        public long? ApprovedCanonicalChannelId { get; set; }
+        [JsonPropertyName("affinityVariantDelimiter")]
+        public string? AffinityVariantDelimiter { get; set; }
+    }
+
+    /// <summary>
+    /// Wave C — Payload de <c>POST /api/discovery/settings</c>. Campos
+    /// opcionais: apenas os fornecidos são aplicados sobre os valores
+    /// persistidos (patch semantics).
+    /// </summary>
+    private sealed class DiscoverySettingsPayload
+    {
+        [JsonPropertyName("historyHours")]
+        public int? HistoryHours { get; set; }
+
+        [JsonPropertyName("minHistoryHours")]
+        public int? MinHistoryHours { get; set; }
+
+        [JsonPropertyName("maxStreams")]
+        public int? MaxStreams { get; set; }
+
+        [JsonPropertyName("keyword")]
+        public string? Keyword { get; set; }
+    }
+
+    /// <summary>
+    /// Resolve o kind/país/canal de um payload de afinidade. O kind
+    /// explícito tem prioridade; caso ausente, é inferido
+    /// (canal → Channel, país → Country) para compatibilidade com
+    /// clientes antigos.
+    /// </summary>
+    private static async Task<(AffinityKind Kind, string? Key, string? Country, string? Error)>
+        ResolveAffinityPayloadAsync(AffinityGroupPayload payload)
+    {
+        var kindText = (payload.Kind ?? string.Empty).Trim().ToLowerInvariant();
+        AffinityKind? kind = kindText switch
+        {
+            "channel" => AffinityKind.Channel,
+            "country" => AffinityKind.Country,
+            "" => (AffinityKind?)null,
+            _ => (AffinityKind?)null,
+        };
+        if (kindText.Length > 0 && kind == null)
+        {
+            return (default, null, null, $"Kind inválido: '{payload.Kind}'.");
+        }
+
+        var key = (payload.CanonicalChannelKey ?? string.Empty).Trim();
+        if (key.Length == 0 && payload.CanonicalChannelId.HasValue && _catalogResolver != null)
+        {
+            var channel = await _catalogResolver.GetCanonicalChannelAsync(payload.CanonicalChannelId.Value);
+            key = channel?.Key ?? string.Empty;
+        }
+
+        if (kind == null)
+        {
+            if (key.Length > 0) kind = AffinityKind.Channel;
+            else if (!string.IsNullOrWhiteSpace(payload.CountryCode)) kind = AffinityKind.Country;
+        }
+        if (kind == null)
+        {
+            return (default, null, null, "Kind é obrigatório (Channel ou Country).");
+        }
+
+        return (kind.Value, key.Length > 0 ? key : null, payload.CountryCode, null);
+    }
+
+    /// <summary>
+    /// W6b-1 — corpo explícito de uma aprovação/exclusão de Review. A
+    /// mudança de catálogo é declarada em <c>action</c> e nos campos
+    /// correspondentes; a ausência de declaração é 400 (nunca um flip
+    /// silencioso de estado).
+    /// </summary>
+    private sealed class ReviewDecisionPayload
+    {
+        [JsonPropertyName("action")]
+        public string? Action { get; set; }
+
+        [JsonPropertyName("canonicalChannelKey")]
+        public string? CanonicalChannelKey { get; set; }
+
+        [JsonPropertyName("alias")]
+        public string? Alias { get; set; }
+
+        [JsonPropertyName("reason")]
+        public string? Reason { get; set; }
+
+        [JsonPropertyName("channel")]
+        public ReviewChannelPayload? Channel { get; set; }
+    }
+
+    private sealed class ReviewChannelPayload
+    {
+        [JsonPropertyName("key")]
+        public string? Key { get; set; }
+
+        [JsonPropertyName("name")]
+        public string? Name { get; set; }
+
+        [JsonPropertyName("country")]
+        public string? Country { get; set; }
+
+        [JsonPropertyName("editorialCategory")]
+        public string? EditorialCategory { get; set; }
+
+        [JsonPropertyName("groupKey")]
+        public string? GroupKey { get; set; }
+
+        [JsonPropertyName("publicationPolicy")]
+        public string? PublicationPolicy { get; set; }
+
+        [JsonPropertyName("isEnabled")]
+        public bool? IsEnabled { get; set; }
+    }
+
+    private static bool TryParseOptionalEnum<TEnum>(string? raw, out TEnum? value)
+        where TEnum : struct, Enum
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            value = null;
+            return true;
+        }
+        if (Enum.TryParse<TEnum>(raw, ignoreCase: true, out var parsed))
+        {
+            value = parsed;
+            return true;
+        }
+        value = null;
+        return false;
+    }
+
+    /// <summary>
+    /// Wave D2 — resolve e valida a <c>Key</c> do grupo canónico de um
+    /// payload HTTP. Devolve <see cref="CanonicalGroupKeys.Other"/>
+    /// quando a key está ausente, a própria key quando existe em
+    /// <c>canonical_groups</c>, ou <c>null</c> quando a key é
+    /// desconhecida (o caller responde 400/422).
+    /// </summary>
+    private static async Task<string?> ResolveValidatedGroupKeyAsync(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return CanonicalGroupKeys.Other;
+        }
+
+        var trimmed = raw.Trim();
+        var group = await _catalogResolver!.GetCanonicalGroupByKeyAsync(trimmed);
+        return group is null ? null : trimmed;
     }
 
     private sealed class CreateChannelPayload
@@ -2285,10 +4750,12 @@ namespace m3uCrawler.Services
         public string? Key { get; set; }
         [JsonPropertyName("displayName")]
         public string? DisplayName { get; set; }
+        [JsonPropertyName("country")]
+        public string? Country { get; set; }
         [JsonPropertyName("editorialCategory")]
         public string? EditorialCategory { get; set; }
-        [JsonPropertyName("editorialGroup")]
-        public string? EditorialGroup { get; set; }
+        [JsonPropertyName("groupKey")]
+        public string? GroupKey { get; set; }
         [JsonPropertyName("publicationPolicy")]
         public string? PublicationPolicy { get; set; }
         [JsonPropertyName("isEnabled")]
@@ -2301,10 +4768,12 @@ namespace m3uCrawler.Services
     {
         [JsonPropertyName("displayName")]
         public string? DisplayName { get; set; }
+        [JsonPropertyName("country")]
+        public string? Country { get; set; }
         [JsonPropertyName("editorialCategory")]
         public string? EditorialCategory { get; set; }
-        [JsonPropertyName("editorialGroup")]
-        public string? EditorialGroup { get; set; }
+        [JsonPropertyName("groupKey")]
+        public string? GroupKey { get; set; }
         [JsonPropertyName("publicationPolicy")]
         public string? PublicationPolicy { get; set; }
         [JsonPropertyName("isEnabled")]
@@ -2324,8 +4793,11 @@ namespace m3uCrawler.Services
             id = c.Id,
             key = c.Key,
             displayName = c.DisplayName,
+            country = c.Country,
             editorialCategory = c.EditorialCategory.ToString(),
-            editorialGroup = c.EditorialGroup.ToString(),
+            groupId = c.GroupId,
+            groupKey = c.Group?.Key,
+            groupName = c.Group?.DisplayName,
             publicationPolicy = c.PublicationPolicy.ToString(),
             isEnabled = c.IsEnabled,
             aliases = c.Aliases.OrderBy(a => a.NormalizedAlias, StringComparer.Ordinal)
@@ -2354,7 +4826,7 @@ namespace m3uCrawler.Services
         [JsonPropertyName("quality")] public string? Quality { get; set; }
         [JsonPropertyName("epg")] public string? Epg { get; set; }
         [JsonPropertyName("availability")] public string? Availability { get; set; }
-        [JsonPropertyName("matchConfidence")] public double MatchConfidence { get; set; }
+        [JsonPropertyName("matchConfidence")] public double? MatchConfidence { get; set; }
         [JsonPropertyName("matchMethod")] public string? MatchMethod { get; set; }
         [JsonPropertyName("isEnabled")] public bool IsEnabled { get; set; } = true;
     }
@@ -2431,6 +4903,7 @@ namespace m3uCrawler.Services
             availability = cs.Availability.ToString(),
             matchConfidence = cs.MatchConfidence,
             matchMethod = cs.MatchMethod,
+            matchSemanticsVersion = cs.MatchSemanticsVersion,
             isEnabled = cs.IsEnabled,
             firstSeenAtUtc = cs.FirstSeenAtUtc.ToString("o"),
             lastSeenAtUtc = cs.LastSeenAtUtc.ToString("o"),
@@ -2449,6 +4922,15 @@ namespace m3uCrawler.Services
         [JsonPropertyName("country")] public string? Country { get; set; }
         [JsonPropertyName("description")] public string? Description { get; set; }
         [JsonPropertyName("isEnabled")] public bool IsEnabled { get; set; } = true;
+    }
+
+    // W4 — actualização de metadados de uma ordering list (Key imutável).
+    private sealed class OrderingListUpdatePayload
+    {
+        [JsonPropertyName("name")] public string? Name { get; set; }
+        [JsonPropertyName("country")] public string? Country { get; set; }
+        [JsonPropertyName("description")] public string? Description { get; set; }
+        [JsonPropertyName("isEnabled")] public bool? IsEnabled { get; set; }
     }
 
     private sealed class OrderingListDuplicatePayload
@@ -2480,6 +4962,25 @@ namespace m3uCrawler.Services
         [JsonPropertyName("allowFallback")] public bool AllowFallback { get; set; } = true;
     }
 
+    // === PHASE 13 (Wave 13-4) — Source Selection Policy payload ===
+    private sealed class SourceSelectionPolicyPayload
+    {
+        [JsonPropertyName("maxSourcesPerChannel")] public int? MaxSourcesPerChannel { get; set; }
+        [JsonPropertyName("preferDistinctProviders")] public bool? PreferDistinctProviders { get; set; }
+        [JsonPropertyName("maxSourcesPerProvider")] public int? MaxSourcesPerProvider { get; set; }
+        [JsonPropertyName("allowFallbackToSameProvider")] public bool? AllowFallbackToSameProvider { get; set; }
+    }
+
+    // === PHASE 13 (Wave 13-4b) — Per-channel Source Selection Policy payload ===
+    private sealed class ChannelSourceSelectionPolicyPayload
+    {
+        [JsonPropertyName("canonicalChannelKey")] public string? CanonicalChannelKey { get; set; }
+        [JsonPropertyName("maxSourcesPerChannel")] public int? MaxSourcesPerChannel { get; set; }
+        [JsonPropertyName("preferDistinctProviders")] public bool? PreferDistinctProviders { get; set; }
+        [JsonPropertyName("maxSourcesPerProvider")] public int? MaxSourcesPerProvider { get; set; }
+        [JsonPropertyName("allowFallbackToSameProvider")] public bool? AllowFallbackToSameProvider { get; set; }
+    }
+
     // === PHASE 8 — payloads ===
     private sealed class ImportPolicyPayload
     {
@@ -2498,14 +4999,6 @@ namespace m3uCrawler.Services
         [JsonPropertyName("order")] public int Order { get; set; }
         [JsonPropertyName("isEnabled")] public bool IsEnabled { get; set; } = true;
         [JsonPropertyName("isDefault")] public bool IsDefault { get; set; }
-    }
-
-    private sealed class GroupMappingPayload
-    {
-        [JsonPropertyName("sourceKind")] public string? SourceKind { get; set; }
-        [JsonPropertyName("sourceGroupTitle")] public string? SourceGroupTitle { get; set; }
-        [JsonPropertyName("canonicalGroupId")] public long CanonicalGroupId { get; set; }
-        [JsonPropertyName("isEnabled")] public bool IsEnabled { get; set; } = true;
     }
 
     private static object ImportPolicyToJson(ImportPolicyEntity p)
@@ -2536,22 +5029,6 @@ namespace m3uCrawler.Services
             isDefault = g.IsDefault,
             createdAtUtc = g.CreatedAtUtc.ToString("o"),
             updatedAtUtc = g.UpdatedAtUtc.ToString("o"),
-        };
-    }
-
-    private static object GroupMappingToJson(GroupMappingEntity m)
-    {
-        return new
-        {
-            id = m.Id,
-            sourceKind = m.SourceKind.ToString(),
-            sourceGroupTitle = m.SourceGroupTitle,
-            canonicalGroupId = m.CanonicalGroupId,
-            canonicalGroupKey = m.CanonicalGroup?.Key,
-            canonicalGroupDisplayName = m.CanonicalGroup?.DisplayName,
-            isEnabled = m.IsEnabled,
-            createdAtUtc = m.CreatedAtUtc.ToString("o"),
-            updatedAtUtc = m.UpdatedAtUtc.ToString("o"),
         };
     }
 
@@ -2704,6 +5181,144 @@ namespace m3uCrawler.Services
         };
     }
 
+    private static object SourceSelectionPolicyToJson(SourceSelectionPolicyEntity p)
+    {
+        return new
+        {
+            id = p.Id,
+            scopeKey = p.ScopeKey,
+            canonicalChannelKey = p.CanonicalChannelKey,
+            maxSourcesPerChannel = p.MaxSourcesPerChannel,
+            preferDistinctProviders = p.PreferDistinctProviders,
+            maxSourcesPerProvider = p.MaxSourcesPerProvider,
+            allowFallbackToSameProvider = p.AllowFallbackToSameProvider,
+            createdAtUtc = p.CreatedAtUtc.ToString("o"),
+            updatedAtUtc = p.UpdatedAtUtc.ToString("o"),
+        };
+    }
+
+    private static object ChannelSourceSelectionPolicyToJson(SourceSelectionPolicyEntity p)
+    {
+        return new
+        {
+            scopeKey = p.ScopeKey,
+            canonicalChannelKey = p.CanonicalChannelKey,
+            maxSourcesPerChannel = p.MaxSourcesPerChannel,
+            preferDistinctProviders = p.PreferDistinctProviders,
+            maxSourcesPerProvider = p.MaxSourcesPerProvider,
+            allowFallbackToSameProvider = p.AllowFallbackToSameProvider,
+            createdAtUtc = p.CreatedAtUtc.ToString("o"),
+            updatedAtUtc = p.UpdatedAtUtc.ToString("o"),
+        };
+    }
+
+    // === PHASE 13 (Wave 13-5) — Source Selection Preview / Dry-Run JSON ===
+    //
+    // Projecção sanitizada: todas as URLs do output passam por
+    // SourceSelectionPreviewService (CredentialSanitizer.SanitizeUrl), pelo
+    // que este helper nunca expõe credenciais. Não expõe internals do
+    // CatalogResolver nem caminhos de filesystem (Origin é um rótulo curto).
+    private static object SourceSelectionPreviewToJson(SourceSelectionPreviewResult preview)
+    {
+        return new
+        {
+            applied = preview.Applied,
+            status = preview.Status,
+            generatedAtUtc = preview.GeneratedAtUtc.ToString("o"),
+            inputStreamCount = preview.InputStreamCount,
+            source = new
+            {
+                origin = preview.Source.Origin,
+                channelKeyFilter = preview.Source.ChannelKeyFilter is null
+                    ? null
+                    : CredentialSanitizer.SanitizeText(preview.Source.ChannelKeyFilter),
+                catalogChannelSourceCount = preview.Source.CatalogChannelSourceCount,
+                canonicalChannelCount = preview.Source.CanonicalChannelCount,
+            },
+            metrics = new
+            {
+                channelsProcessed = preview.Metrics.ChannelsProcessed,
+                channelsWithSources = preview.Metrics.ChannelsWithSources,
+                candidateStreamCount = preview.Metrics.CandidateStreamCount,
+                selectedStreamCount = preview.Metrics.SelectedStreamCount,
+                rejectedStreamCount = preview.Metrics.RejectedStreamCount,
+                unmatchedStreamCount = preview.Metrics.UnmatchedStreamCount,
+                ambiguousStreamCount = preview.Metrics.AmbiguousStreamCount,
+                totalUnmatchedStreamCount = preview.Metrics.TotalUnmatchedStreamCount,
+                channelsAtChannelLimit = preview.Metrics.ChannelsAtChannelLimit,
+                channelLimitRejectionCount = preview.Metrics.ChannelLimitRejectionCount,
+                providerLimitRejectionCount = preview.Metrics.ProviderLimitRejectionCount,
+                diversitySelectionCount = preview.Metrics.DiversitySelectionCount,
+                distinctProviderCount = preview.Metrics.DistinctProviderCount,
+                fillSelectionCount = preview.Metrics.FillSelectionCount,
+                fallbackDisabledRejectionCount = preview.Metrics.FallbackDisabledRejectionCount,
+                sourceDisabledRejectionCount = preview.Metrics.SourceDisabledRejectionCount,
+                // SortedDictionary (ordinal) construído pelo preview: ordem
+                // determinística das chaves sem re-ordenar aqui.
+                rejectionCounts = preview.Metrics.RejectionCounts,
+                providerDistribution = preview.Metrics.ProviderDistribution
+                    .Select(p => new
+                    {
+                        provider = p.Provider,
+                        selectedCount = p.SelectedCount,
+                        channelCount = p.ChannelCount,
+                    })
+                    .ToList(),
+            },
+            channels = preview.Channels.Select(c => new
+            {
+                canonicalChannelId = c.CanonicalChannelId,
+                canonicalChannelKey = c.CanonicalChannelKey,
+                displayName = c.DisplayName,
+                policyScope = c.PolicyScope,
+                policy = new
+                {
+                    maxSourcesPerChannel = c.Policy.MaxSourcesPerChannel,
+                    preferDistinctProviders = c.Policy.PreferDistinctProviders,
+                    maxSourcesPerProvider = c.Policy.MaxSourcesPerProvider,
+                    allowFallbackToSameProvider = c.Policy.AllowFallbackToSameProvider,
+                },
+                candidateCount = c.CandidateCount,
+                selectedCount = c.SelectedCount,
+                rejectedCount = c.RejectedCount,
+                selected = c.Selected.Select(SourceSelectionPreviewCandidateToJson).ToList(),
+                rejected = c.Rejected.Select(SourceSelectionPreviewCandidateToJson).ToList(),
+            }).ToList(),
+            unmatched = preview.Unmatched.Select(SourceSelectionPreviewUnmatchedToJson).ToList(),
+            ambiguous = preview.Ambiguous.Select(SourceSelectionPreviewUnmatchedToJson).ToList(),
+        };
+    }
+
+    private static object SourceSelectionPreviewUnmatchedToJson(SourceSelectionPreviewUnmatched u)
+    {
+        return new
+        {
+            streamUrlSanitized = u.StreamUrlSanitized,
+            title = u.Title,
+            reason = u.Reason,
+        };
+    }
+
+    private static object SourceSelectionPreviewCandidateToJson(SourceSelectionPreviewCandidate c)
+    {
+        return new
+        {
+            streamUrlSanitized = c.StreamUrlSanitized,
+            sourceId = c.SourceId,
+            sourcePriority = c.SourcePriority,
+            provider = c.Provider,
+            externalStreamId = c.ExternalStreamId,
+            quality = c.Quality,
+            epg = c.Epg,
+            availability = c.Availability,
+            lastResponseTimeMs = c.LastResponseTimeMs,
+            isWorking = c.IsWorking,
+            rank = c.Rank,
+            decision = c.Decision,
+            reason = c.Reason,
+        };
+    }
+
     // === PHASE 7 — Playlist Composer JSON ===
     private static object PlaylistCompositionToJson(PlaylistComposition c)
     {
@@ -2786,6 +5401,7 @@ namespace m3uCrawler.Services
     .badge.err { background: rgba(248, 81, 73, 0.18); color: var(--err); }
     .badge.info { background: rgba(121, 192, 255, 0.18); color: var(--info); }
     .badge.muted { background: rgba(139, 148, 158, 0.18); color: var(--muted); }
+    .badge.lr-cat { font-size: 10px; padding: 1px 6px; background: transparent; }
     .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
     .toolbar select, .toolbar input { background: var(--panel); color: var(--text); border: 1px solid var(--border); padding: 6px 10px; border-radius: 6px; font: inherit; }
     .toolbar button { background: var(--accent); color: white; border: none; padding: 6px 12px; border-radius: 6px; cursor: pointer; font: inherit; }
@@ -2800,6 +5416,23 @@ namespace m3uCrawler.Services
     .row-counts { color: var(--muted); font-size: 12px; margin-top: 8px; }
     details { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; margin-top: 8px; }
     summary { cursor: pointer; font-weight: 500; }
+    .setup-banner { display: block; padding: 12px 20px; border-bottom: 1px solid var(--border); }
+    .setup-banner.err { background: rgba(248, 81, 73, 0.12); border-bottom-color: var(--err); }
+    .setup-banner.warn { background: rgba(210, 153, 34, 0.12); border-bottom-color: var(--warn); }
+    .setup-banner.ok { background: rgba(63, 185, 80, 0.10); border-bottom-color: var(--ok); }
+    .setup-banner .title { font-weight: 600; font-size: 15px; margin-bottom: 6px; }
+    .setup-banner .sub { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+    .setup-items { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 6px 0; }
+    .setup-item { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; }
+    .setup-item .k { color: var(--muted); }
+    .setup-item button { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 2px 8px; font: inherit; font-size: 12px; cursor: pointer; }
+    .setup-status { margin-top: 8px; font-size: 13px; }
+    #modalRoot{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:2000;display:none;overflow:auto;padding:32px 12px}
+    #modalRoot.open{display:block}
+    .modal-panel{position:relative;margin:0 auto;width:min(760px,94vw);max-height:88vh;overflow:auto;background:var(--panel);border:1px solid var(--border);border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.5);padding:20px}
+    .modal-panel .card{border:none;background:transparent;padding:0;margin:0}
+    .modal-close{position:absolute;top:10px;right:12px;background:transparent;border:none;color:var(--muted);font-size:20px;cursor:pointer;line-height:1}
+    body.modal-open{overflow:hidden}
   </style>
 </head>
 <body>
@@ -2808,7 +5441,10 @@ namespace m3uCrawler.Services
     <span class='meta' id='metaLine'>a carregar…</span>
   </header>
 
+  <div id='setupBanner' class='setup-banner' style='display:none;'></div>
+
     <nav id='nav'>
+    <button data-view='setup' id='navSetupButton'>Setup <span id='setupNavBadge' class='badge err' style='margin-left:4px;padding:1px 6px;border-radius:999px;font-size:10px;display:none;'>!</span></button>
     <button data-view='overview' class='active'>Overview</button>
     <button data-view='executions'>Execuções</button>
     <button data-view='discovery'>Descoberta</button>
@@ -2817,6 +5453,7 @@ namespace m3uCrawler.Services
     <button data-view='dispatcharr'>Dispatcharr</button>
     <button data-view='catalog'>Catálogo</button>
     <button data-view='validation'>Stream Validation</button>
+    <button data-view='liverun'>Live Run</button>
     <button data-view='diagnostics'>Diagnóstico</button>
   </nav>
 
@@ -2845,6 +5482,29 @@ namespace m3uCrawler.Services
     <!-- DESCOBERTA -->
     <section id='view-discovery' hidden>
       <h2 style='font-size:18px;margin-top:0;'>Descoberta</h2>
+
+      <div class='card' style='margin-bottom:12px;'>
+        <h3 style='font-size:14px;margin-top:0;'>Configuração de descoberta</h3>
+        <div class='toolbar' style='flex-wrap:wrap;'>
+          <label class='muted' for='discoveryKeyword'>Pesquisa</label>
+          <input id='discoveryKeyword' type='text' placeholder='portugal' style='min-width:160px;'>
+          <label class='muted' for='discoveryMinHistoryHours'>Min (h)</label>
+          <input id='discoveryMinHistoryHours' type='number' min='0' step='1' style='width:90px;'>
+          <label class='muted' for='discoveryMaxHistoryHours'>Max (h)</label>
+          <input id='discoveryMaxHistoryHours' type='number' min='1' max='1440' step='1' style='width:90px;'>
+          <label class='muted' for='discoveryMaxStreams'>Máx streams</label>
+          <input id='discoveryMaxStreams' type='number' min='1' step='1' style='width:90px;'>
+          <button id='discoverySettingsSaveBtn'>Guardar</button>
+        </div>
+        <p class='muted' id='discoveryWindowExplainer' style='margin:8px 0 0;'>Janela inclusiva: 0h ≤ idade da mensagem ≤ 24h</p>
+        <div id='discoverySettingsStatus' style='margin-top:6px;'></div>
+        <p class='muted' style='font-size:12px;margin:8px 0 0;'>
+          Limites: Min ≥ 0; Max 1–1440h; Min ≤ Max; MaxStreams ≥ 1.
+          Min 0 = sem limite inferior (comportamento legacy).
+          Valores persistidos em <code>app_settings.json</code> e usados pela CLI, scheduler e runs manuais.
+        </p>
+      </div>
+
       <div class='toolbar'>
         <label class='muted'>Filtro estado:</label>
         <select id='discState'>
@@ -2868,14 +5528,22 @@ namespace m3uCrawler.Services
     <!-- CANAIS / PAÍSES -->
     <section id='view-countries' hidden>
       <h2 style='font-size:18px;margin-top:0;'>Canais / Países</h2>
-      <h3 style='font-size:14px;'>Validação da playlist atual</h3>
+      <p class='muted'>Configuração e validação por país. Os países vivem como ficheiros de aliases
+      (<code>runtime-data/countries/&lt;code&gt;.json</code>); este separador gere essa configuração e
+      valida a playlist actual — não é um CRUD de uma entidade de domínio.</p>
+      <h3 style='font-size:14px;'>Validação da playlist actual</h3>
       <div class='toolbar'>
         <label class='muted'>País:</label>
         <select id='countrySelect'></select>
         <button class='secondary' onclick='loadCountryValidation()'>Re-validar</button>
       </div>
       <div id='countryValidationResult'></div>
-      <h3 style='font-size:14px;margin-top:24px;'>Listas de canais por país (editáveis)</h3>
+      <h3 style='font-size:14px;margin-top:24px;'>Configuração de canais por país</h3>
+      <div class='toolbar' style='margin-bottom:8px;'>
+        <input id='newCountryCode' placeholder='código (ex: es)' style='width:140px;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+        <input id='newCountryName' placeholder='nome (ex: Espanha)' style='width:200px;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+        <button class='secondary' onclick='createCountry()'>Novo país</button>
+      </div>
       <div id='countrySection'></div>
     </section>
 
@@ -2897,6 +5565,14 @@ namespace m3uCrawler.Services
     <!-- DISPATCHARR -->
     <section id='view-dispatcharr' hidden>
       <h2 style='font-size:18px;margin-top:0;'>Dispatcharr</h2>
+      <div class='card' style='margin-bottom:12px;'>
+        <div class='toolbar'>
+          <button id='dispatcharrDryRunBtn' onclick='runDispatcharrDryRun()'>Dry Run</button>
+          <button id='dispatcharrSyncBtn' class='secondary' style='color:var(--err);' onclick='runDispatcharrSync()'>Sync Dispatcharr</button>
+          <span class='muted'>Dry Run gera o plano sem escrever no Dispatcharr; Sync aplica as alterações (mutação real).</span>
+        </div>
+        <div id='dispatcharrActionStatus' class='muted' style='margin-top:8px;'></div>
+      </div>
       <div id='dispatcharrOverview'></div>
       <h3 style='font-size:14px;margin-top:24px;'>Detalhes da última sincronização</h3>
       <div id='dispatcharrDetail'></div>
@@ -2916,10 +5592,12 @@ namespace m3uCrawler.Services
         <button data-ctab='sources' style='padding:8px 14px;'>Sources</button>
         <button data-ctab='ordering' style='padding:8px 14px;'>Ordering</button>
         <button data-ctab='priority' style='padding:8px 14px;'>Source Priority</button>
+        <button data-ctab='sourceselection' style='padding:8px 14px;'>Source Selection</button>
         <button data-ctab='matching' style='padding:8px 14px;'>Matching</button>
         <button data-ctab='degradation' style='padding:8px 14px;'>Degradação</button>
         <button data-ctab='scheduled' style='padding:8px 14px;'>Scheduled Jobs</button>
-        <button data-ctab='policies' style='padding:8px 14px;'>Import Policies</button>
+        <!-- Import Policies oculto até decisão W6b-3 (funcionalidade inerte, sem consumidor). Endpoints/entidade mantidos. -->
+        <button data-ctab='policies' hidden style='padding:8px 14px;'>Import Policies</button>
         <button data-ctab='groups' style='padding:8px 14px;'>Grupos</button>
         <button data-ctab='reviews' style='padding:8px 14px;'>Reviews</button>
         <button data-ctab='syncruns' style='padding:8px 14px;'>Sync Runs</button>
@@ -2967,7 +5645,7 @@ namespace m3uCrawler.Services
           </div>
           <div id='createChannelForm' hidden style='margin-bottom:16px;'>
             <div class='card'>
-              <h3>Novo Canal Canónico</h3>
+              <h3 id='createChannelTitle'>Novo Canal Canónico</h3>
               <div style='display:grid;gap:10px;grid-template-columns:1fr 1fr;'>
                 <div>
                   <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Key (slug único, imutável)</label>
@@ -2976,6 +5654,10 @@ namespace m3uCrawler.Services
                 <div>
                   <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Display Name</label>
                   <input id='newChannelDisplayName' type='text' placeholder='ex: RTP Memória' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                </div>
+                <div>
+                  <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>País (opcional, ex: pt)</label>
+                  <input id='newChannelCountry' type='text' maxlength='10' placeholder='pt, es…' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
                 </div>
                 <div>
                   <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Categoria</label>
@@ -2989,17 +5671,7 @@ namespace m3uCrawler.Services
                 </div>
                 <div>
                   <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Grupo Editorial</label>
-                  <select id='newChannelGroup' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
-                    <option value='PortugalLive'>PortugalLive</option>
-                    <option value='PortugalFilmes24_7'>PortugalFilmes24_7</option>
-                    <option value='PortugalEntretenimento'>PortugalEntretenimento</option>
-                    <option value='PortugalDesporto'>PortugalDesporto</option>
-                    <option value='PortugalInfantil'>PortugalInfantil</option>
-                    <option value='PortugalDocumentarios'>PortugalDocumentarios</option>
-                    <option value='PortugalPPV'>PortugalPPV</option>
-                    <option value='Foreign'>Foreign</option>
-                    <option value='Other'>Other</option>
-                  </select>
+                  <select id='newChannelGroup' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'></select>
                 </div>
                 <div>
                   <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Política de Publicação</label>
@@ -3017,19 +5689,19 @@ namespace m3uCrawler.Services
                     <option value='false'>não</option>
                   </select>
                 </div>
-                <div style='grid-column:1/-1;'>
+                <div id='newChannelAliasesBlock' style='grid-column:1/-1;'>
                   <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Aliases normalizados (um por linha)</label>
                   <textarea id='newChannelAliases' rows='4' placeholder='rtp memoria' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;resize:vertical;'></textarea>
                 </div>
               </div>
               <div style='margin-top:10px;display:flex;gap:8px;'>
-                <button onclick='submitCreateChannel()'>Guardar</button>
+                <button id='createChannelSubmitBtn' onclick='submitCreateChannel()'>Guardar</button>
                 <button class='secondary' onclick='hideCreateChannelForm()'>Cancelar</button>
               </div>
             </div>
           </div>
           <div id='catalogChannelsTable'></div>
-          <div id='channelDetailPanel' style='margin-top:24px;'></div>
+          <div id='channelDetailPanel' hidden style='margin-top:24px;'></div>
         </div>
       </div>
 
@@ -3074,27 +5746,40 @@ namespace m3uCrawler.Services
           <span class='muted' id='affinityCount'></span>
           <button onclick='showAddAffinityForm()'>+ Novo Grupo</button>
         </div>
+        <div class='card' style='margin-top:12px;'>
+          <h4 style='margin:0 0 8px 0;'>Separador de variantes (global)</h4>
+          <p class='muted' style='margin:0 0 8px 0;'>Separador usado no campo único de variantes. É apenas uma convenção de edição; as variantes são guardadas individualmente.</p>
+          <div style='display:flex;gap:8px;align-items:center;'>
+            <input id='affinityDelimiter' type='text' maxlength='3' value=',' style='width:80px;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+            <button class='secondary' onclick='saveAffinityDelimiter()'>Guardar separador</button>
+          </div>
+        </div>
         <div id='addAffinityForm' hidden style='margin-bottom:16px;'>
           <div class='card'>
-            <h3 id='affinityFormTitle'>Novo Grupo de Afinidade</h3>
+            <h3 id='affinityFormTitle'>Nova Afinidade</h3>
             <div style='display:grid;gap:10px;grid-template-columns:1fr 1fr 1fr;'>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Tipo</label>
+                <select id='affinityKind' onchange='onAffinityKindChange()' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                  <option value='channel'>Canal (variantes → canal canónico)</option>
+                  <option value='country'>País (indicadores country-level)</option>
+                </select>
+              </div>
               <div>
                 <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Nome do grupo</label>
                 <input id='affinityName' type='text' placeholder='ex: TVI' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
               </div>
-              <div>
+              <div id='affinityCountryField' hidden>
                 <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Código do país</label>
                 <input id='affinityCountryCode' type='text' maxlength='10' placeholder='pt, es, br...' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
               </div>
-              <div>
-                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Canal canónico (ID)</label>
-                <input id='affinityChannelId' type='number' min='1' placeholder='ID do canal (opicional)' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              <div id='affinityChannelField' style='grid-column:1/-1;'>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Canal canónico (catálogo por país)</label>
+                <select id='affinityChannelKey' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'></select>
               </div>
               <div style='grid-column:1/-1;'>
-                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Membros (um por linha, já normalizados)</label>
-                <textarea id='affinityMembers' rows='5' placeholder='tvi24
-tvi 24
-tvi noticias' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;resize:vertical;'></textarea>
+                <label id='affinityVariantsLabel' style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Variantes do canal (separadas por ",")</label>
+                <textarea id='affinityMembers' rows='5' placeholder='tvi24, tvi 24, tvi noticias' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;resize:vertical;'></textarea>
               </div>
             </div>
             <div style='margin-top:10px;display:flex;gap:8px;'>
@@ -3114,6 +5799,50 @@ tvi noticias' style='width:100%;background:var(--panel-2);color:var(--text);bord
           <button class='secondary' onclick='loadCatalogReviews()'>Recarregar</button>
         </div>
         <div id='catalogReviewsTable'></div>
+
+        <!-- W5 — Aprovação estruturada (sem prompt). Duas/três escolhas explícitas. -->
+        <div id='reviewApproveModal' hidden style='margin-top:16px;'>
+          <div class='card'>
+            <h3 id='reviewApproveTitle'>Aprovar Review</h3>
+            <p class='muted' id='reviewApproveSubject'></p>
+            <div id='reviewApproveActions' style='display:flex;gap:8px;flex-wrap:wrap;'>
+              <button onclick='selectReviewAction("add-alias")'>Add Alias</button>
+              <button class='secondary' onclick='selectReviewAction("create-channel")'>Create Channel</button>
+              <button class='secondary' onclick='selectReviewAction("exclude")'>Excluir</button>
+              <button class='secondary' onclick='closeReviewApproveModal()'>Cancelar</button>
+            </div>
+
+            <div id='reviewApproveAddAlias' hidden style='margin-top:12px;display:grid;gap:10px;grid-template-columns:1fr 1fr;'>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Canal canónico existente</label>
+                <select id='reviewAliasChannel' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                  <option value=''>— escolher canal —</option>
+                </select>
+              </div>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Alias (identidade observada)</label>
+                <input id='reviewAliasValue' type='text' placeholder='identidade normalizada' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              </div>
+              <div style='grid-column:1/-1;display:flex;gap:8px;margin-top:4px;'>
+                <button onclick='submitReviewAliasApproval()'>Confirmar Add Alias</button>
+                <button class='secondary' onclick='closeReviewApproveModal()'>Cancelar</button>
+              </div>
+            </div>
+
+            <div id='reviewApproveExclude' hidden style='margin-top:12px;display:grid;gap:10px;'>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Razão da exclusão</label>
+                <input id='reviewExcludeReason' type='text' placeholder='excluído por decisão administrativa' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              </div>
+              <div style='display:flex;gap:8px;'>
+                <button onclick='submitReviewExclude()'>Confirmar Exclusão</button>
+                <button class='secondary' onclick='closeReviewApproveModal()'>Cancelar</button>
+              </div>
+            </div>
+
+            <p id='reviewApproveStatus' class='muted' style='margin-top:10px;'></p>
+          </div>
+        </div>
       </div>
 
       <!-- TAB: Sync Runs -->
@@ -3194,7 +5923,10 @@ tvi noticias' style='width:100%;background:var(--panel-2);color:var(--text);bord
           <h3>Ordering Lists</h3>
           <p class='muted'>Listas que determinam a ordem dos canais na playlist gerada. Cada lista pode ser duplicada, editada e usada como entrada para a composição.</p>
           <div id='orderingListsTable'></div>
-          <div style='margin-top:16px;'>
+          <div style='margin-top:10px;'>
+            <button onclick='showCreateOrderingForm()'>+ Nova lista</button>
+          </div>
+          <div id='orderingCreateForm' hidden style='margin-top:16px;'>
             <h4 style='margin:0 0 8px 0;'>Nova lista</h4>
             <div style='display:grid;gap:8px;grid-template-columns:1fr 1fr 1fr;'>
               <div>
@@ -3212,6 +5944,35 @@ tvi noticias' style='width:100%;background:var(--panel-2);color:var(--text);bord
             </div>
             <div style='margin-top:10px;display:flex;gap:8px;'>
               <button onclick='submitCreateOrderingList()'>Guardar</button>
+              <button class='secondary' onclick='closeModalPanel()'>Cancelar</button>
+            </div>
+          </div>
+          <div id='orderingEditForm' hidden style='margin-top:16px;'>
+            <h4 style='margin:0 0 8px 0;'>Editar lista</h4>
+            <div style='display:grid;gap:8px;grid-template-columns:1fr 1fr 1fr;'>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Nome</label>
+                <input data-ordering-edit='name' placeholder='ex: PT Principal' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              </div>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>País (ISO)</label>
+                <input data-ordering-edit='country' placeholder='pt' maxlength='10' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              </div>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Activo</label>
+                <select data-ordering-edit='enabled' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                  <option value='true'>sim</option>
+                  <option value='false'>não</option>
+                </select>
+              </div>
+            </div>
+            <div style='margin-top:8px;'>
+              <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Descrição</label>
+              <textarea data-ordering-edit='description' rows='2' placeholder='opcional' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;resize:vertical;'></textarea>
+            </div>
+            <div style='margin-top:10px;display:flex;gap:8px;'>
+              <button onclick='saveOrderingListEdit()'>Guardar</button>
+              <button class='secondary' onclick='cancelOrderingListEdit()'>Cancelar</button>
             </div>
           </div>
         </div>
@@ -3248,6 +6009,74 @@ tvi noticias' style='width:100%;background:var(--panel-2);color:var(--text);bord
           <div style='margin-top:10px;display:flex;gap:8px;'>
             <button onclick='saveChannelPriority()'>Guardar override</button>
           </div>
+        </div>
+      </div>
+
+      <!-- TAB: Source Selection (PHASE 13, Wave 13-4) -->
+      <div id='ctab-sourceselection' hidden>
+        <div class='card' style='margin-top:16px;'>
+          <h3>Política global de selecção de fontes</h3>
+          <p class='muted'>Aplica-se por defeito a todos os canais quando não há override por canal. <strong>MaxSourcesPerChannel = 0</strong> é uma definição deliberada e válida: nenhuma fonte seleccionada é publicada para os canais. Não são aceites valores negativos. MaxSourcesPerProvider em branco significa sem limite.</p>
+          <div id='sourceSelectionPolicyForm' style='display:grid;gap:8px;grid-template-columns:1fr 1fr;'></div>
+          <div style='margin-top:10px;display:flex;gap:8px;'>
+            <button onclick='saveSourceSelectionPolicy()'>Guardar política</button>
+            <button class='secondary' onclick='loadSourceSelectionPolicy()'>Recarregar</button>
+          </div>
+          <div id='sourceSelectionPolicyStatus' class='muted' style='margin-top:8px;'></div>
+        </div>
+
+        <div class='card' style='margin-top:16px;'>
+          <h3>Overrides por canal</h3>
+          <p class='muted'>Cada linha representa um override por canal. Um override substitui por completo a política global para esse canal.</p>
+          <div style='margin-top:10px;display:flex;gap:8px;'>
+            <button onclick='newChannelSourceSelectionPolicy()'>+ Novo override</button>
+            <button class='secondary' onclick='loadChannelSourceSelectionPolicies()'>Recarregar</button>
+          </div>
+          <div id='channelSourceSelectionPoliciesTable' style='margin-top:12px;'></div>
+        </div>
+
+        <div class='card' id='channelSourceSelectionPolicyForm' hidden style='margin-top:16px;'>
+          <h3>Override por canal</h3>
+          <p class='muted'>Um override por canal <strong>substitui por completo a política global</strong> para esse canal. <strong>MaxSourcesPerChannel = 0</strong> é válido e significa que nenhuma fonte seleccionada é publicada para esse canal. Valores negativos são rejeitados. MaxSourcesPerProvider em branco significa sem limite. A identidade usada é a chave canónica do canal.</p>
+          <div style='display:grid;gap:8px;grid-template-columns:1fr 1fr;'>
+            <div>
+              <label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Chave canónica do canal</label>
+              <input id='cssp_channelKey' list='cssp_channelKeyList' placeholder='ex: sic-pt' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              <datalist id='cssp_channelKeyList'></datalist>
+            </div>
+            <div>
+              <label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Max sources per channel (0 = não publicar nenhuma)</label>
+              <input id='cssp_maxSourcesPerChannel' type='number' min='0' value='3' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+            </div>
+            <div>
+              <label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Max sources per provider (vazio = sem limite)</label>
+              <input id='cssp_maxSourcesPerProvider' type='number' min='1' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+            </div>
+            <div>
+              <label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Prefer distinct providers</label>
+              <select id='cssp_preferDistinctProviders'><option value='true'>sim</option><option value='false'>não</option></select>
+            </div>
+            <div>
+              <label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Allow fallback to same provider</label>
+              <select id='cssp_allowFallbackToSameProvider'><option value='true'>sim</option><option value='false'>não</option></select>
+            </div>
+          </div>
+          <div style='margin-top:10px;display:flex;gap:8px;'>
+            <button onclick='saveChannelSourceSelectionPolicy()'>Guardar override</button>
+            <button class='secondary' onclick='closeModalPanel()'>Cancelar</button>
+          </div>
+          <div id='channelSourceSelectionPolicyStatus' class='muted' style='margin-top:8px;'></div>
+        </div>
+
+        <!-- PHASE 13 (Wave 13-5) — Preview / Dry-Run -->
+        <div class='card' style='margin-top:16px;'>
+          <h3>Preview / Dry-Run</h3>
+          <p class='muted'>Corre a selecção de fontes em modo <strong>read-only</strong> sobre o catálogo actual: não publica, não escreve ficheiros, não cria a política global. Mostra as métricas agregadas e a decisão por candidato. Filtro opcional por chave canónica (aplica-se só aos canais considerados).</p>
+          <div style='display:flex;gap:8px;align-items:center;flex-wrap:wrap;'>
+            <input id='sourceSelectionPreviewChannelKey' list='cssp_channelKeyList' placeholder='filtro opcional: chave canónica (ex: sic-pt)' style='background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+            <button onclick='loadSourceSelectionPreview()'>Executar preview</button>
+          </div>
+          <div id='sourceSelectionPreviewResult' style='margin-top:12px;'></div>
         </div>
       </div>
 
@@ -3299,8 +6128,12 @@ tvi noticias' style='width:100%;background:var(--panel-2);color:var(--text);bord
           <h3>Scheduled Jobs</h3>
           <p class='muted'>Jobs persistidos em SQLite. O scheduler calcula o próximo tick a partir da expressão cron (5 campos) e persiste <code>lastRunAtUtc</code> + <code>nextRunAtUtc</code>.</p>
           <div id='scheduledJobsTable'></div>
-          <div style='margin-top:16px;'>
+          <div style='margin-top:10px;'>
+            <button onclick='newScheduledJob()'>+ Novo job</button>
+          </div>
+          <div id='scheduledJobForm' hidden style='margin-top:16px;'>
             <h4 style='margin:0 0 8px 0;'>Novo / actualizar job</h4>
+            <p class='muted' style='margin:0 0 8px 0;font-size:12px;'>Upsert por <strong>Name</strong>: o mesmo nome actualiza o job existente; um nome diferente cria um novo job.</p>
             <div style='display:grid;gap:8px;grid-template-columns:1fr 1fr 1fr 1fr;'>
               <div>
                 <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Name (único)</label>
@@ -3308,16 +6141,26 @@ tvi noticias' style='width:100%;background:var(--panel-2);color:var(--text);bord
               </div>
               <div>
                 <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Cron (5 campos)</label>
-                <input data-sched-create='cron' placeholder='ex: 0 * * * *' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                <input data-sched-create='cron' placeholder='ex: 0 * * * *' oninput='updateSchedCronStatus()' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                <div id='schedCronStatus' style='margin-top:4px;font-size:11px;color:var(--muted);'></div>
+                <div style='margin-top:6px;font-size:11px;color:var(--muted);background:var(--panel-2);border:1px solid var(--border);border-radius:6px;padding:6px 8px;'>
+                  <div style='font-weight:600;margin-bottom:4px;'>Ajuda cron (5 campos, UTC)</div>
+                  <pre style='margin:0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre;line-height:1.35;'>* * * * *
+│ │ │ │ │
+│ │ │ │ └── dia da semana (0-6, 0=Domingo)
+│ │ │ └──── mês (1-12)
+│ │ └────── dia do mês (1-31)
+│ └──────── hora (0-23)
+└────────── minuto (0-59)</pre>
+                  <div style='margin-top:4px;'>Ranges: minuto 0-59, hora 0-23, dia do mês 1-31, mês 1-12, dia da semana 0-6. Operadores: <code>*</code> (e <code>?</code>), listas <code>a,b</code>, ranges <code>a-b</code>, steps <code>*/n</code>, <code>a-b/n</code>, <code>a/n</code>. Timezone: UTC. Sem <code>L/W/#</code> e sem nomes de meses/dias.</div>
+                  <div style='margin-top:4px;'>São suportados exactamente <b>5 campos</b>. Expressões com <b>6 campos</b>, incluindo <b>segundos</b>, <b>não são suportadas</b>.</div>
+                  <div style='margin-top:4px;'>Exemplos: <code>0 8 * * *</code> = todos os dias às 08:00; <code>0 */6 * * *</code> = de 6 em 6 horas; <code>30 2 * * 1</code> = segunda-feira às 02:30.</div>
+                </div>
               </div>
               <div>
                 <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Action Name</label>
-                <input data-sched-create='action' placeholder='ex: discoverTelegram' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
-                <select data-sched-create='action-select' style='display:none;width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'></select>
-              <div>
-                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Action Name</label>
-                <input data-sched-create='action' placeholder='ex: discoverTelegram' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
-                <select data-sched-create='action-select' style='display:none;width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'></select>
+                <select data-sched-create='action' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'></select>
+                <div id='schedActionsHelp' style='margin-top:4px;font-size:11px;color:var(--muted);'></div>
               </div>
               <div>
                 <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Activo</label>
@@ -3327,8 +6170,43 @@ tvi noticias' style='width:100%;background:var(--panel-2);color:var(--text);bord
                 </select>
               </div>
             </div>
-            <div style='margin-top:10px;display:flex;gap:8px;'>
+            <div style='margin-top:10px;display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;'>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Frequência</label>
+                <select id='schedFreqKind' onchange='applySchedFrequency()' style='background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                  <option value='manual'>Manual (cron)</option>
+                  <option value='daily'>Todos os dias</option>
+                  <option value='hours'>A cada N horas</option>
+                  <option value='weekly'>Semanal</option>
+                </select>
+              </div>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Hora</label>
+                <input id='schedFreqTime' type='time' value='08:00' onchange='applySchedFrequency()' style='background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              </div>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>N (horas)</label>
+                <input id='schedFreqHours' type='number' min='1' max='23' value='6' oninput='applySchedFrequency()' style='width:80px;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              </div>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Dia da semana</label>
+                <select id='schedFreqWeekday' onchange='applySchedFrequency()' style='background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                  <option value='1'>Segunda-feira</option>
+                  <option value='2'>Terça-feira</option>
+                  <option value='3'>Quarta-feira</option>
+                  <option value='4'>Quinta-feira</option>
+                  <option value='5'>Sexta-feira</option>
+                  <option value='6'>Sábado</option>
+                  <option value='0'>Domingo</option>
+                </select>
+              </div>
+              <button type='button' class='secondary' onclick='applySchedFrequency()'>Aplicar frequência</button>
+            </div>
+            <div style='margin-top:10px;display:flex;gap:8px;align-items:center;'>
               <button onclick='submitCreateScheduledJob()'>Guardar</button>
+              <button class='secondary' onclick='newScheduledJob()'>Limpar / Novo</button>
+              <button class='secondary' onclick='closeModalPanel()'>Cancelar</button>
+              <span id='schedFormStatus' style='font-size:12px;'></span>
             </div>
           </div>
         </div>
@@ -3341,68 +6219,80 @@ tvi noticias' style='width:100%;background:var(--panel-2);color:var(--text);bord
           <p class='muted'>Define, por tipo de media, quais os grupos alvo e quais os excluídos. VOD tem ainda a política <i>Import / Keep / Exclude</i> separada de Linear TV.</p>
           <div id='importPoliciesTable'></div>
         </div>
+        <div class='card' id='importPolicyEditForm' hidden style='margin-top:16px;'>
+          <h3>Editar política de importação</h3>
+          <p class='muted'>MediaKind: <strong id='importPolicyEditMediaKindLabel'></strong> (não editável).</p>
+          <div style='display:grid;gap:8px;grid-template-columns:1fr 1fr;'>
+            <div>
+              <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>VOD Policy</label>
+              <select id='importPolicyEditVod' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                <option value='ImportVod'>ImportVod</option>
+                <option value='KeepVod'>KeepVod</option>
+                <option value='ExcludeVod'>ExcludeVod</option>
+              </select>
+            </div>
+            <div>
+              <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Targets (CSV)</label>
+              <input id='importPolicyEditTargets' placeholder='ex: Desporto,Notícias' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+            </div>
+            <div>
+              <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Excluded (CSV)</label>
+              <input id='importPolicyEditExcluded' placeholder='ex: Adultos' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+            </div>
+          </div>
+          <div style='margin-top:10px;display:flex;gap:8px;'>
+            <button onclick='submitImportPolicyEdit()'>Guardar</button>
+            <button class='secondary' onclick='closeModalPanel()'>Cancelar</button>
+          </div>
+        </div>
       </div>
 
       <!-- TAB: Groups (PHASE 8) -->
       <div id='ctab-groups' hidden>
         <div class='card' style='margin-top:16px;'>
           <h3>Grupos canónicos</h3>
-          <p class='muted'>Os grupos canónicos deixam de ser apenas enums rígidos. São entidades persistentes, configuráveis e associáveis a group-titles de cada source via mapping explícito.</p>
+          <p class='muted'>Cada grupo pertence ao canal canónico e é o grupo de publicação usado na playlist e no Dispatcharr. O <i>group-title</i> da source é apenas uma sugestão — não define o grupo do canal.</p>
           <div id='canonicalGroupsTable'></div>
           <div style='margin-top:16px;'>
-            <h4 style='margin:0 0 8px 0;'>Novo grupo</h4>
-            <div style='display:grid;gap:8px;grid-template-columns:1fr 1fr 1fr 1fr;'>
+            <button onclick='showCreateCanonicalGroup()'>+ Novo grupo</button>
+          </div>
+          <div class='card' id='canonicalGroupEditForm' hidden style='margin-top:16px;'>
+            <h4 id='canonicalGroupEditTitle' style='margin:0 0 8px 0;'>Novo grupo</h4>
+            <div style='display:grid;gap:8px;grid-template-columns:1fr 1fr;'>
               <div>
                 <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Key</label>
-                <input data-group-create='key' placeholder='ex: portugal-live' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                <input id='cgKey' placeholder='ex: portugal-live' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
               </div>
               <div>
                 <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Display Name</label>
-                <input data-group-create='name' placeholder='ex: Portugal Live' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                <input id='cgName' placeholder='ex: Portugal Live' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
               </div>
               <div>
                 <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>País (ISO)</label>
-                <input data-group-create='country' placeholder='pt' maxlength='10' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                <input id='cgCountry' placeholder='pt' maxlength='10' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
               </div>
               <div>
                 <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Ordem</label>
-                <input data-group-create='order' type='number' value='100' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                <input id='cgOrder' type='number' value='100' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
               </div>
-            </div>
-            <div style='margin-top:10px;display:flex;gap:8px;'>
-              <button onclick='submitCreateGroup()'>Guardar</button>
-            </div>
-          </div>
-        </div>
-        <div class='card' style='margin-top:16px;'>
-          <h3>Group Mappings</h3>
-          <p class='muted'>Associa <i>group-titles</i> de uma source a um grupo canónico. Nunca é automático — exige mapping explícito.</p>
-          <div id='groupMappingsTable'></div>
-          <div style='margin-top:16px;'>
-            <h4 style='margin:0 0 8px 0;'>Novo mapping</h4>
-            <div style='display:grid;gap:8px;grid-template-columns:1fr 1fr 1fr;'>
               <div>
-                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Source Kind</label>
-                <select data-mapping-create='kind'>
-                  <option value='M3U'>M3U</option>
-                  <option value='Xtream'>Xtream</option>
-                  <option value='Telegram'>Telegram</option>
-                  <option value='Http'>Http</option>
-                  <option value='File'>File</option>
-                  <option value='Manual'>Manual</option>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Default</label>
+                <select id='cgDefault' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                  <option value='false'>Não</option>
+                  <option value='true'>Sim</option>
                 </select>
               </div>
               <div>
-                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Source Group Title</label>
-                <input data-mapping-create='title' placeholder='ex: PORTUGAL SPORTS' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
-              </div>
-              <div>
-                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Canonical Group ID</label>
-                <input data-mapping-create='groupId' type='number' placeholder='id' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Activo</label>
+                <select id='cgEnabled' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                  <option value='true'>Sim</option>
+                  <option value='false'>Não</option>
+                </select>
               </div>
             </div>
             <div style='margin-top:10px;display:flex;gap:8px;'>
-              <button onclick='submitCreateGroupMapping()'>Guardar</button>
+              <button onclick='submitCanonicalGroupEdit()'>Guardar</button>
+              <button class='secondary' onclick='closeModalPanel()'>Cancelar</button>
             </div>
           </div>
         </div>
@@ -3457,7 +6347,140 @@ tvi noticias' style='width:100%;background:var(--panel-2);color:var(--text);bord
       <h3 style='font-size:14px;margin-top:24px;'>Glossário de métricas</h3>
       <div id='diagGlossary'></div>
     </section>
+
+    <!-- LIVE RUN (PHASE 9C.4) -->
+    <section id='view-liverun' hidden>
+      <h2 style='font-size:18px;margin-top:0;'>Live Run</h2>
+      <div class='toolbar'>
+        <span class='muted' id='liveRunPollState'>a actualizar automaticamente…</span>
+        <button id='liveRunStartBtn' onclick='startLiveRun()' disabled>Run now</button>
+        <button class='secondary' onclick='loadLiveRun()'>Recarregar</button>
+      </div>
+      <div class='card' style='margin-bottom:12px;'>
+        <div id='liveRunTriggerState' class='muted'></div>
+      </div>
+      <div id='liveRunStatus'></div>
+      <h3 style='font-size:14px;margin-top:24px;'>Contadores</h3>
+      <div class='grid' id='liveRunCounts'></div>
+      <h3 style='font-size:14px;margin-top:24px;'>Últimas actividades</h3>
+      <div id='liveRunActivities' class='muted'>—</div>
+      <h3 style='font-size:14px;margin-top:24px;'>Últimas execuções (24h)</h3>
+      <div id='liveRunRecent'></div>
+      <h3 style='font-size:14px;margin-top:24px;'>Execução agendada (Telegram)</h3>
+      <div class='muted' style='margin-bottom:8px;'>
+        O agendamento usa as expressões cron existentes em
+        <b>Scheduled Jobs</b> com as acções <code>telegramRun</code> e
+        <code>telegramMaintainRun</code>. Não há um segundo scheduler nem
+        <code>StartAtUtc</code>: a UI calcula a expressão cron.
+      </div>
+      <div id='liveRunScheduled'></div>
+    </section>
+
+    <!-- SETUP (PHASE 9C — Wave 6) -->
+    <section id='view-setup' hidden>
+      <h2 style='font-size:18px;margin-top:0;'>Setup</h2>
+
+      <div class='card' style='margin-bottom:16px;'>
+        <h3>Prontidão</h3>
+        <div id='setupReadiness' class='muted'>a carregar…</div>
+        <div class='toolbar' style='margin-top:12px;'>
+          <button class='secondary' onclick='loadSetupReadiness()'>Reavaliar</button>
+        </div>
+      </div>
+
+      <div class='card' style='margin-bottom:16px;'>
+        <h3>Telegram</h3>
+        <p class='muted'>Sessão Telegram usada pela pipeline. A <code>api_hash</code> nunca é devolvida pelo servidor depois de guardada (mostra <em>configurado</em>).</p>
+        <div style='display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));'>
+          <div>
+            <label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>api_id</label>
+            <input id='setupTelegramApiId' type='text' placeholder='ex: 123456' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+          </div>
+          <div>
+            <label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>api_hash</label>
+            <input id='setupTelegramApiHash' type='password' placeholder='configurado' autocomplete='off' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+          </div>
+          <div>
+            <label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>phone_number</label>
+            <input id='setupTelegramPhone' type='text' placeholder='+351…' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+          </div>
+        </div>
+        <div class='toolbar' style='margin-top:12px;'>
+          <button onclick='saveTelegramConfig()'>Guardar configuração</button>
+          <button class='secondary' onclick='startTelegramAuth()'>Iniciar autenticação</button>
+        </div>
+        <div class='toolbar' style='margin-top:8px;'>
+          <input id='setupTelegramCode' type='text' placeholder='código de verificação' style='background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+          <button onclick='submitTelegramCode()'>Submeter código</button>
+        </div>
+        <div class='toolbar' style='margin-top:8px;'>
+          <input id='setupTelegram2fa' type='password' placeholder='2FA' autocomplete='off' style='background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+          <button onclick='submitTelegram2fa()'>Submeter 2FA</button>
+        </div>
+        <div id='setupTelegramStatus' class='setup-status muted'>a carregar…</div>
+      </div>
+
+      <div class='card'>
+        <h3>Dispatcharr</h3>
+        <p class='muted'>Integração opt-in. A chave da API nunca é devolvida pelo servidor depois de guardada (mostra <em>configurado</em>).</p>
+        <div style='display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));'>
+          <div>
+            <label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>enabled</label>
+            <select id='setupDispatcharrEnabled' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              <option value='false'>não</option>
+              <option value='true'>sim</option>
+            </select>
+          </div>
+          <div>
+            <label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>base_url</label>
+            <input id='setupDispatcharrBaseUrl' type='text' placeholder='http://dispatcharr:8000' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+          </div>
+          <div>
+            <label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Chave API</label>
+            <input id='setupDispatcharrApiKey' type='password' placeholder='configurado' autocomplete='off' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+          </div>
+          <div>
+            <label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>dry_run</label>
+            <select id='setupDispatcharrDryRun' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              <option value='true'>sim</option>
+              <option value='false'>não</option>
+            </select>
+          </div>
+        </div>
+        <div class='toolbar' style='margin-top:12px;'>
+          <button onclick='saveDispatcharrConfig()'>Guardar configuração</button>
+          <button class='secondary' onclick='testDispatcharrConnection()'>Testar ligação</button>
+        </div>
+        <div id='setupDispatcharrStatus' class='setup-status muted'>—</div>
+      </div>
+
+      <!-- CONTA (W10b) -->
+      <div class='card' style='margin-top:16px;'>
+        <h3>Alterar password</h3>
+        <p class='muted'>Altera a password do administrador com sessão activa. Por segurança, todas as sessões são revogadas e será necessário voltar a autenticar-se.</p>
+        <div style='display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));'>
+          <div>
+            <label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Password actual</label>
+            <input id='accountCurrentPassword' type='password' autocomplete='off' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+          </div>
+          <div>
+            <label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Nova password</label>
+            <input id='accountNewPassword' type='password' autocomplete='off' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+          </div>
+          <div>
+            <label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Confirmar nova password</label>
+            <input id='accountConfirmPassword' type='password' autocomplete='off' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+          </div>
+        </div>
+        <div class='toolbar' style='margin-top:12px;'>
+          <button onclick='changePassword()'>Alterar password</button>
+        </div>
+        <div id='accountPasswordStatus' class='setup-status muted'>—</div>
+      </div>
+    </section>
   </main>
+
+  <div id='modalRoot' hidden></div>
 
   <script>
   (function(){
@@ -3490,11 +6513,12 @@ tvi noticias' style='width:100%;background:var(--panel-2);color:var(--text);bord
     }
 
     async function loadOverview() {
-      const [run, hist, dispatcharr, inv] = await Promise.all([
+      const [run, hist, dispatcharr, inv, pub] = await Promise.all([
         safeFetchJson('/api/run-report/summary', null),
         safeFetchJson('/api/history', []),
         safeFetchJson('/api/dispatcharr/state', null),
-        safeFetchJson('/api/output/inventory', {})
+        safeFetchJson('/api/output/inventory', {}),
+        safeFetchJson('/api/publication/status', null)
       ]);
 
       // Cabeçalho
@@ -3515,6 +6539,7 @@ tvi noticias' style='width:100%;background:var(--panel-2);color:var(--text);bord
         const rate = (w + f) > 0 ? (100 * w / (w + f)) : null;
         const sub = rate != null ? (pct(rate) + ' de sucesso · ' + nfmt(w) + ' OK / ' + nfmt(f) + ' KO') : '—';
         cards.push(metricCard('Última: testados / funcionais', nfmt(t) + ' · ' + nfmt(w), sub, helpFor('working')));
+        cards.push(metricCard('Última: reutilizados (W-DEDUP)', nfmt(run.streamsSkippedAlreadyValidated || 0), 'GETs físicos evitados', 'W-DEDUP: streams já Working neste run não são re-testados; apenas a validação física (streamsTested) é contabilizada.'));
         cards.push(metricCard('Última: candidatos', nfmt(run.candidates || 0), 'playlists: ' + nfmt(run.playlistsDownloaded || 0), helpFor('candidates')));
       } else {
         cards.push(metricCard('Última execução (resumo)', '—', 'sem run report disponível', ''));
@@ -3523,12 +6548,37 @@ tvi noticias' style='width:100%;background:var(--panel-2);color:var(--text);bord
         dispatcharr && dispatcharr.dispatchedDetailDisabled ? '' :
           (dispatcharr && dispatcharr.dispatcharrVersion ? ('versão ' + dispatcharr.dispatcharrVersion) : (dispatcharr ? (dispatcharr.reason || '—') : '')),
         'Sincronização opt-in (dispatcharr_enabled=true em wtelegram.config).'));
+      // Publicação do catálogo (DL-130 Slice 2): consome publicationPending calculado no backend.
+      // Não recalcula cursores — apenas apresenta o booleano e os timestamps via tsLocal(...).
+      let pubValue = '—', pubSub = 'sem dados';
+      const pubHelp = 'Estado de publicação da playlist.m3u derivado dos cursores (DL-130). publicationPending vem do backend; não é calculado no frontend.';
+      if (pub && pub.error) {
+        pubValue = `<span class='badge muted'>Indisponível</span>`;
+        pubSub = pub.error;
+      } else if (pub) {
+        const lastPub = pub.lastSuccessfulPublicationAtUtc;
+        const changed = pub.catalogChangedAtUtc;
+        if (lastPub) {
+          if (pub.publicationPending) {
+            pubValue = `<span class='badge warn'>Pendente</span>`;
+            pubSub = `catálogo: ${tsLocal(changed)} · última publicação: ${tsLocal(lastPub)}`;
+          } else {
+            pubValue = `<span class='badge ok'>Em dia</span>`;
+            pubSub = `última publicação: ${tsLocal(lastPub)}`;
+          }
+        } else {
+          pubValue = `<span class='badge warn'>Sem publicação anterior</span>`;
+          pubSub = changed ? `catálogo alterado: ${tsLocal(changed)}` : 'catálogo vazio';
+        }
+      }
+      cards.push(metricCard('Publicação do catálogo', pubValue, pubSub, pubHelp));
       document.getElementById('overviewCards').innerHTML = cards.join('');
 
       // Relações matemáticas
       let math = '<p class="muted">Sem dados do último run.</p>';
       if (run) {
         const w = run.streamsWorking || 0, f = run.streamsFailed || 0, t = run.streamsTested || 0;
+        const skipped = run.streamsSkippedAlreadyValidated || 0;
         const tested = w + f;
         const balanced = tested === t;
         const rate = tested > 0 ? (100 * w / tested) : null;
@@ -3557,6 +6607,7 @@ tvi noticias' style='width:100%;background:var(--panel-2);color:var(--text);bord
           ${t > 0 ? `
             <p>${nfmt(t)} streams testados = ${nfmt(w)} funcionais + ${nfmt(f)} falhados
               ${balanced ? '' : `<span class='badge warn' title='Funcionais+Falhados ≠ Testados (streams pulados)'>⚠ ${nfmt(t - tested)} não testados / pulados</span>`}
+              ${skipped > 0 ? `<span class='badge info' title='GETs físicos evitados por reutilização de conhecimento Working (W-DEDUP)'>♻ ${nfmt(skipped)} reutilizados (W-DEDUP)</span>` : ''}
             </p>
             <div class='bar' title='${pct(rate ?? 0)} de sucesso'>
               <div class='ok' style='width:${rate}%;'></div>
@@ -3582,6 +6633,7 @@ tvi noticias' style='width:100%;background:var(--panel-2);color:var(--text);bord
         const ts = new Date(e.timestamp).toLocaleString();
         const modeBadge = `<span class='badge ${e.mode === 'TelegramMaintenance' ? 'info' : 'muted'}'>${e.mode || ''}</span>`;
         const ratio = e.existingRetestedCount > 0 ? (e.existingStillWorkingCount + '/' + e.existingRetestedCount) : '—';
+        const skipped = (typeof e.streamsSkippedAlreadyValidated === 'number') ? e.streamsSkippedAlreadyValidated : '—';
         return `<tr data-idx='${idx}' style='cursor:pointer'>
           <td>${ts}</td>
           <td>${modeBadge}</td>
@@ -3590,11 +6642,12 @@ tvi noticias' style='width:100%;background:var(--panel-2);color:var(--text);bord
           <td>${e.maxStreams || '—'}</td>
           <td>${e.newFunctionalCount}</td>
           <td>${ratio}</td>
+          <td>${skipped}</td>
           <td>${e.finalPlaylistCount}</td>
         </tr>`;
       }).join('');
       document.getElementById('historyTable').innerHTML =
-        '<table><thead><tr><th>Quando</th><th>Modo</th><th>Pesquisa</th><th>História</th><th>Máx</th><th>Novos</th><th>Retestados</th><th>Total final</th></tr></thead><tbody>' + rows + '</tbody></table>';
+        '<table><thead><tr><th>Quando</th><th>Modo</th><th>Pesquisa</th><th>História</th><th>Máx</th><th>Novos</th><th>Retestados</th><th>Reutilizados (W-DEDUP)</th><th>Total final</th></tr></thead><tbody>' + rows + '</tbody></table>';
       document.querySelectorAll('#historyTable tr[data-idx]').forEach(tr => tr.addEventListener('click', () => showHistoryDetail(parseInt(tr.getAttribute('data-idx'), 10))));
     }
 
@@ -3656,9 +6709,17 @@ tvi noticias' style='width:100%;background:var(--panel-2);color:var(--text);bord
         const stateBadge = p.state === 'accepted'
           ? '<span class="badge ok">aceite</span>'
           : '<span class="badge err">rejeitada</span>';
+        const msgId = (p.messageId !== null && p.messageId !== undefined) ? ('<code>' + escapeHtml(String(p.messageId)) + '</code>') : '—';
+        const msgDate = p.messageDateUtc ? escapeHtml(fmtUtcDateTime(p.messageDateUtc)) : '—';
+        const candidateId = p.candidateId
+          ? ('<code title="' + escapeHtml(p.candidateId) + '">' + escapeHtml(String(p.candidateId).slice(0, 8)) + '</code>')
+          : '—';
         return `<tr>
           <td>${p.source || '—'}</td>
           <td>${p.name || '—'}</td>
+          <td>${msgId}</td>
+          <td>${msgDate}</td>
+          <td>${candidateId}</td>
           <td>${p.countryDetected || '—'}</td>
           <td>${nfmt(p.channelsRecognized || 0)}</td>
           <td>${nfmt(p.streamCount || 0)}</td>
@@ -3669,8 +6730,81 @@ tvi noticias' style='width:100%;background:var(--panel-2);color:var(--text);bord
         </tr>`;
       }).join('');
       document.getElementById('discoveryTable').innerHTML = items.length
-        ? `<table><thead><tr><th>Origem</th><th>Nome</th><th>País</th><th>Canais</th><th>Streams</th><th>Após país</th><th>Funcionais</th><th>Estado</th><th>Notas</th></tr></thead><tbody>${rows}</tbody></table>`
+        ? `<table><thead><tr><th>Origem</th><th>Nome</th><th>MessageId</th><th>Data mensagem</th><th>Candidato</th><th>País</th><th>Canais</th><th>Streams</th><th>Após país</th><th>Funcionais</th><th>Estado</th><th>Notas</th></tr></thead><tbody>${rows}</tbody></table>`
         : '<p class="muted">Nenhuma playlist encontrada para os filtros escolhidos.</p>';
+    }
+
+    function fmtUtcDateTime(iso) {
+      if (!iso) return '—';
+      const d = new Date(iso);
+      if (isNaN(d.getTime())) return String(iso);
+      const p = (n) => (n < 10 ? '0' : '') + n;
+      return d.getUTCFullYear() + '-' + p(d.getUTCMonth() + 1) + '-' + p(d.getUTCDate()) + ' ' + p(d.getUTCHours()) + ':' + p(d.getUTCMinutes());
+    }
+
+    function discoverySettingsBadge(kind, message) {
+      const el = document.getElementById('discoverySettingsStatus');
+      if (!el) return;
+      const cls = kind === 'error' ? 'err' : (kind === 'ok' ? 'ok' : 'info');
+      el.innerHTML = "<span class='badge " + cls + "'>" + escapeHtml(message) + "</span>";
+    }
+
+    function updateDiscoveryWindowExplainer() {
+      const minEl = document.getElementById('discoveryMinHistoryHours');
+      const maxEl = document.getElementById('discoveryMaxHistoryHours');
+      const out = document.getElementById('discoveryWindowExplainer');
+      if (!minEl || !maxEl || !out) return;
+      const min = parseInt(minEl.value, 10);
+      const max = parseInt(maxEl.value, 10);
+      out.textContent = 'Janela inclusiva: ' + (isNaN(min) ? '?' : min) + 'h ≤ idade da mensagem ≤ ' + (isNaN(max) ? '?' : max) + 'h';
+    }
+
+    async function loadDiscoverySettings() {
+      const s = await safeFetchJson('/api/discovery/settings', null);
+      if (!s || s.error) {
+        discoverySettingsBadge('error', (s && s.error) ? s.error : 'falha ao carregar configuração');
+        return false;
+      }
+      const kw = document.getElementById('discoveryKeyword');
+      const min = document.getElementById('discoveryMinHistoryHours');
+      const max = document.getElementById('discoveryMaxHistoryHours');
+      const ms = document.getElementById('discoveryMaxStreams');
+      if (kw && s.keyword !== null && s.keyword !== undefined) kw.value = s.keyword;
+      if (min && s.minHistoryHours !== null && s.minHistoryHours !== undefined) min.value = s.minHistoryHours;
+      if (max && s.historyHours !== null && s.historyHours !== undefined) max.value = s.historyHours;
+      if (ms && s.maxStreams !== null && s.maxStreams !== undefined) ms.value = s.maxStreams;
+      updateDiscoveryWindowExplainer();
+      return true;
+    }
+
+    async function saveDiscoverySettings() {
+      const kwEl = document.getElementById('discoveryKeyword');
+      const minEl = document.getElementById('discoveryMinHistoryHours');
+      const maxEl = document.getElementById('discoveryMaxHistoryHours');
+      const msEl = document.getElementById('discoveryMaxStreams');
+      const body = {
+        keyword: kwEl ? kwEl.value.trim() : '',
+        historyHours: maxEl ? parseInt(maxEl.value, 10) : NaN,
+        minHistoryHours: minEl ? parseInt(minEl.value, 10) : NaN,
+        maxStreams: msEl ? parseInt(msEl.value, 10) : NaN
+      };
+      try {
+        const r = await fetch('/api/discovery/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        let resp = null;
+        try { resp = await r.json(); } catch (e) { resp = null; }
+        if (!r.ok) {
+          discoverySettingsBadge('error', (resp && resp.error) ? resp.error : ('HTTP ' + r.status));
+          return;
+        }
+        const reloaded = await loadDiscoverySettings();
+        discoverySettingsBadge(reloaded ? 'info' : 'error', reloaded ? 'guardado' : 'guardado, mas falhou recarregar');
+      } catch (e) {
+        discoverySettingsBadge('error', (e && e.message) ? e.message : 'falha de rede');
+      }
     }
 
     let countryOptions = [];
@@ -3689,7 +6823,10 @@ tvi noticias' style='width:100%;background:var(--panel-2);color:var(--text);bord
         <div class='card' style='margin-bottom:12px;'>
           <h3>${c.displayName || c.country}</h3>
           <textarea id='country-${c.country}' rows='6'>${(c.channels || []).join('\n')}</textarea>
-          <div style='margin-top:8px;'><button class='secondary' data-country='${c.country}'>Guardar</button></div>
+          <div style='margin-top:8px;'>
+            <button class='secondary' data-country='${c.country}' data-displayname='${escapeAttr(c.displayName || c.country)}'>Guardar</button>
+            <button class='secondary' style='color:var(--err);' data-delete-country='${c.country}'>Eliminar</button>
+          </div>
         </div>`).join('');
       document.getElementById('countrySection').innerHTML = countryCards;
       document.querySelectorAll('button[data-country]').forEach(btn => {
@@ -3697,11 +6834,38 @@ tvi noticias' style='width:100%;background:var(--panel-2);color:var(--text);bord
           const code = btn.getAttribute('data-country');
           const t = document.getElementById(`country-${code}`);
           const channels = t.value.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
-          const r = await fetch('/api/country/save', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ country: code, displayName: code.toUpperCase(), channels }) });
+          // W6 — Preservar o displayName amigável existente; não o
+          // substituir por code.toUpperCase().
+          const displayName = btn.getAttribute('data-displayname') || code;
+          const r = await fetch('/api/country/save', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ country: code, displayName, channels }) });
           if (r.ok) { alert('Lista guardada.'); await loadCountries(); } else { alert('Erro: ' + (await r.text())); }
         });
       });
+      document.querySelectorAll('button[data-delete-country]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const code = btn.getAttribute('data-delete-country');
+          if (!confirm(`Eliminar a configuração de país '${code}'? A playlist publicada não é alterada.`)) return;
+          const r = await fetch('/api/country?country=' + encodeURIComponent(code), { method: 'DELETE' });
+          if (r.ok) { await loadCountries(); }
+          else { alert('Erro: ' + r.status + ' ' + (await r.text())); }
+        });
+      });
       await loadCountryValidation();
+    }
+
+    async function createCountry() {
+      const code = (document.getElementById('newCountryCode').value || '').trim().toLowerCase();
+      const displayName = (document.getElementById('newCountryName').value || '').trim();
+      if (!code) { alert('Código de país é obrigatório.'); return; }
+      const r = await fetch('/api/country/save', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ country: code, displayName: displayName, channels: [] })
+      });
+      if (!r.ok) { alert('Erro: ' + r.status + ' ' + (await r.text())); return; }
+      document.getElementById('newCountryCode').value = '';
+      document.getElementById('newCountryName').value = '';
+      await loadCountries();
     }
 
     async function loadCountryValidation() {
@@ -3800,6 +6964,74 @@ const rows = Object.entries(inv).map(([k, v]) => {
         </div>`;
     }
 
+    // W6 — Acções Dispatcharr (Dry Run / Sync). O payload usa o produto
+    // canónico `playlist.m3u`; o handler server-side resolve-o sob o
+    // outputDir. Um único flag de busy evita cliques concorrentes. Nunca
+    // são expostas credenciais: só mode/status/counts e paths.
+    let dispatcharrActionBusy = false;
+
+    function setDispatcharrActionBusy(busy, label) {
+      dispatcharrActionBusy = busy;
+      const dry = document.getElementById('dispatcharrDryRunBtn');
+      const sync = document.getElementById('dispatcharrSyncBtn');
+      if (dry) dry.disabled = busy;
+      if (sync) sync.disabled = busy;
+      const status = document.getElementById('dispatcharrActionStatus');
+      if (status && label !== undefined) status.textContent = label;
+    }
+
+    function renderDispatcharrActionResult(mode, r) {
+      const target = document.getElementById('dispatcharrActionStatus');
+      if (!target) return;
+      const c = (r && r.counts) ? r.counts : null;
+      const counts = c
+        ? `matched=${nfmt(c.matched||0)} · novosCanais=${nfmt(c.newChannels||0)} · novosStreams=${nfmt(c.newStreams||0)} · removidos=${nfmt(c.removedStreams||0)} · ignorados=${nfmt(c.skipped||0)} · ambíguos=${nfmt(c.ambiguous||0)} · inalterados=${nfmt(c.unchanged||0)} · falhas=${nfmt(c.failed||0)}`
+        : 'sem contagens';
+      const badge = mode === 'dry-run' ? 'info' : 'warn';
+      target.innerHTML =
+        `<span class='badge ${badge}'>${escapeHtml(mode)}</span> ${escapeHtml(r && r.status ? r.status : '—')} · ${counts}` +
+        (r && r.planPath ? `<br><span class='row-counts'>plano: <code>${escapeHtml(r.planPath)}</code></span>` : '') +
+        (r && r.reportPath ? `<br><span class='row-counts'>relatório: <code>${escapeHtml(r.reportPath)}</code></span>` : '');
+    }
+
+    async function runDispatcharrAction(path, mode) {
+      if (dispatcharrActionBusy) return;
+      setDispatcharrActionBusy(true, mode === 'dry-run' ? 'A executar Dry Run…' : 'A sincronizar Dispatcharr…');
+      try {
+        const r = await fetch(path, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ playlistPath: 'playlist.m3u' })
+        });
+        let body = null;
+        try { body = await r.json(); } catch (e) { body = null; }
+        if (!r.ok) {
+          const status = document.getElementById('dispatcharrActionStatus');
+          const code = (body && (body.error || body.message)) ? (body.error || body.message) : ('HTTP ' + r.status);
+          const detail = (body && body.message && body.message !== code) ? (' · ' + body.message) : '';
+          if (status) status.innerHTML = `<span class='badge err'>erro</span> ${escapeHtml(code)}${escapeHtml(detail)}`;
+          return;
+        }
+        renderDispatcharrActionResult(mode, body || {});
+      } catch (e) {
+        const status = document.getElementById('dispatcharrActionStatus');
+        if (status) status.innerHTML = `<span class='badge err'>erro</span> ${escapeHtml(e && e.message ? e.message : 'falha de rede')}`;
+      } finally {
+        setDispatcharrActionBusy(false);
+        await loadDispatcharr();
+      }
+    }
+
+    async function runDispatcharrDryRun() {
+      await runDispatcharrAction('/api/dispatcharr/dry-run', 'dry-run');
+    }
+
+    async function runDispatcharrSync() {
+      if (dispatcharrActionBusy) return;
+      if (!confirm('SYNC DISPATCHARR é uma mutação REAL e potencialmente destrutiva: cria, actualiza e remove canais/streams no Dispatcharr. Confirmar a sincronização?')) return;
+      await runDispatcharrAction('/api/dispatcharr/sync', 'sync');
+    }
+
     async function loadDiagnostics() {
       const r = await safeFetchJson('/api/run-report/summary', null);
       const target = document.getElementById('diagLastRun');
@@ -3865,8 +7097,9 @@ const rows = Object.entries(inv).map(([k, v]) => {
       cards.push(metricCard('Aliases', nfmt(stats.channelAliases || 0), '', 'Aliases normalizados activos.'));
       cards.push(metricCard('Regras', nfmt(stats.identityRules || 0), '', 'Regras de identidade explícitas.'));
       cards.push(metricCard('Reviews (Open)', nfmt(stats.reviewItemsOpen || 0), `<span class='badge warn'>${nfmt(stats.reviewItemsOpen || 0)}</span>`, 'Aguardam decisão humana.'));
-      cards.push(metricCard('Reviews (Approved)', nfmt(stats.reviewItemsApproved || 0), '', ''));
-      cards.push(metricCard('Reviews (Excluded)', nfmt(stats.reviewItemsExcluded || 0), '', ''));
+      cards.push(metricCard('Reviews (In review)', nfmt(stats.reviewItemsInReview || 0), '', ''));
+      cards.push(metricCard('Reviews (Resolved)', nfmt(stats.reviewItemsResolved || 0), '', ''));
+      cards.push(metricCard('Reviews (Ignored)', nfmt(stats.reviewItemsIgnored || 0), '', ''));
       cards.push(metricCard('Ownership canais', nfmt(stats.dispatcharrChannelOwnerships || 0), '', 'Canais do Dispatcharr registados.'));
       cards.push(metricCard('Ownership streams', nfmt(stats.dispatcharrStreamOwnerships || 0), '', 'Streams do Dispatcharr registadas.'));
       cards.push(metricCard('Sync runs', nfmt(stats.syncRuns || 0), '', 'Execuções de sync gravadas.'));
@@ -3874,8 +7107,8 @@ const rows = Object.entries(inv).map(([k, v]) => {
       cards.push(metricCard('Channel Sources', nfmt(stats.channelSources || 0), '', 'Associações canal-canónico ↔ stream ↔ source.'));
       cards.push(metricCard('Ordering Lists', nfmt(stats.orderingLists || 0) + ' · ' + nfmt(stats.orderingItems || 0) + ' items', '', 'Listas de ordenação e respectivos items.'));
       cards.push(metricCard('Priority Policies', nfmt(stats.sourcePriorityPolicies || 0), '', 'Políticas de Source Priority persistidas (global + overrides).'));
-      cards.push(metricCard('Import Policies', nfmt(stats.importPolicies || 0), '', 'Live/Radio/VOD policies configuráveis.'));
-      cards.push(metricCard('Canonical Groups', nfmt(stats.canonicalGroups || 0) + ' · ' + nfmt(stats.groupMappings || 0) + ' mappings', '', 'Grupos canónicos persistentes e mappings source→canónico.'));
+      // Import Policies (card) oculto até W6b-3.
+      cards.push(metricCard('Canonical Groups', nfmt(stats.canonicalGroups || 0), '', 'Grupos canónicos persistentes (grupo de publicação do canal).'));
       cards.push(metricCard('Matching Audits', nfmt(stats.matchingAudits || 0), '', 'Auditoria de cada resolução do CatalogResolver (PHASE 3).'));
       cards.push(metricCard('ChannelSource Observations', nfmt(stats.channelSourceObservations || 0), '', 'Histórico Quality/EPG/Availability por ChannelSource (PHASE 9 b).'));
       cards.push(metricCard('Sync Run Steps', nfmt(stats.syncRunSteps || 0), '', 'Passos detalhados por SyncRun (PHASE 11).'));
@@ -3905,26 +7138,101 @@ const rows = Object.entries(inv).map(([k, v]) => {
       else if (tab === 'sources') { loadSources(); loadChannelSources(); }
       else if (tab === 'ordering') loadOrderingLists();
       else if (tab === 'priority') loadGlobalPriority();
+      else if (tab === 'sourceselection') { loadSourceSelectionPolicy(); loadChannelSourceSelectionKeys(); loadChannelSourceSelectionPolicies(); }
       else if (tab === 'matching') loadMatchingAudits();
       else if (tab === 'degradation') loadDegradation();
       else if (tab === 'scheduled') { loadScheduledActions(); loadScheduledJobs(); }
       else if (tab === 'policies') loadImportPolicies();
-      else if (tab === 'groups') { loadCanonicalGroups(); loadGroupMappings(); }
+      else if (tab === 'groups') loadCanonicalGroups();
       else if (tab === 'reviews') loadCatalogReviews();
       else if (tab === 'syncruns') loadCatalogSyncRuns();
       else if (tab === 'pending') loadPendingCountryApprovals();
     }
 
     let _channelsCache = [];
+    // Wave C1 — grupos canónicos configuráveis (Key estável → DisplayName).
+    let _canonicalGroupsCache = [];
     let _selectedChannelId = null;
+    let _editingChannelId = null;
+    // W5 — estado do fluxo de aprovação de Review e do formulário de
+    // criação em modo Review.
+    let _pendingReviewFingerprint = null;
+    let _pendingReviewIdentity = '';
+    let _pendingReviewGroup = '';
+    let _reviewChannelFingerprint = null;
 
     async function loadCatalogChannels() {
+      await loadChannelGroupOptions();
       const channels = await safeFetchJson('/api/catalog/channels', []);
       if (!Array.isArray(channels)) { document.getElementById('catalogChannelsTable').innerHTML = '<p class="muted">Erro ao carregar canais.</p>'; return; }
       _channelsCache = channels;
       document.getElementById('channelsCount').textContent = `${channels.length} canal(is).`;
       renderChannelsTable();
       renderChannelDetail();
+    }
+
+    // Wave C1 — carrega os grupos canónicos configuráveis e popula o
+    // select do formulário de canal. Robusto a falhas: em erro mantém as
+    // opções actuais (o select existe no HTML sem opções estáticas).
+    async function loadChannelGroupOptions() {
+      const groups = await safeFetchJson('/api/catalog/canonical-groups', null);
+      if (!Array.isArray(groups)) return;
+      _canonicalGroupsCache = groups;
+      const sel = document.getElementById('newChannelGroup');
+      if (!sel) return;
+      const current = sel.value;
+      const ordered = groups
+        .filter(g => g && g.key)
+        .slice()
+        .sort((a, b) => (a.order || 0) - (b.order || 0));
+      sel.innerHTML = ordered
+        .map(g => `<option value='${escapeAttr(g.key)}'>${escapeHtml(g.displayName || g.key)}</option>`)
+        .join('');
+      if (current) sel.value = current;
+    }
+
+    // Wave C1 — default do formulário: grupo com isDefault=true ou o primeiro.
+    function defaultChannelGroupKey() {
+      if (Array.isArray(_canonicalGroupsCache) && _canonicalGroupsCache.length) {
+        const def = _canonicalGroupsCache.find(g => g && g.isDefault);
+        if (def && def.key) return def.key;
+        const first = _canonicalGroupsCache.find(g => g && g.key);
+        if (first) return first.key;
+      }
+      return '';
+    }
+
+    // Wave C1 — garante que uma key está presente no select (opções
+    // carregadas assincronamente podem ainda não incluir o valor do canal).
+    function ensureChannelGroupOption(key) {
+      const sel = document.getElementById('newChannelGroup');
+      if (!sel || !key) return;
+      if (Array.from(sel.options).some(o => o.value === key)) return;
+      const known = Array.isArray(_canonicalGroupsCache)
+        ? _canonicalGroupsCache.find(g => g && g.key === key)
+        : null;
+      const opt = document.createElement('option');
+      opt.value = key;
+      opt.textContent = (known && known.displayName) ? known.displayName : key;
+      sel.appendChild(opt);
+    }
+
+    // Wave D3 — pré-selecção do grupo a partir do group-title da Review.
+    // A sugestão é apenas um default: o submit continua a enviar a escolha
+    // explícita do operador. Falhas são ignoradas (mantém o default).
+    async function applyGroupSuggestion(sourceGroup, title) {
+      const sel = document.getElementById('newChannelGroup');
+      if (!sel) return;
+      try {
+        const url = '/api/catalog/group-suggestion?group=' + encodeURIComponent(sourceGroup || '')
+          + '&title=' + encodeURIComponent(title || '');
+        const suggestion = await safeFetchJson(url, null);
+        const key = suggestion && suggestion.groupKey;
+        if (!key) return;
+        if (Array.from(sel.options).some(o => o.value === key)) {
+          sel.value = key;
+        }
+      } catch (e) { /* sugestão é apenas pré-selecção */ }
     }
 
     function renderChannelsTable() {
@@ -3938,7 +7246,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
         if (status === 'disabled' && c.isEnabled) return false;
         if (policy && c.publicationPolicy !== policy) return false;
         if (search) {
-          const hay = [c.displayName, c.key, ...(c.aliases || [])].filter(Boolean).join(' ').toLowerCase();
+          const hay = [c.displayName, c.key, c.country, ...(c.aliases || [])].filter(Boolean).join(' ').toLowerCase();
           if (!hay.includes(search)) return false;
         }
         return true;
@@ -3955,21 +7263,23 @@ const rows = Object.entries(inv).map(([k, v]) => {
         return `<tr${selected}>
           <td><a href='#' onclick='event.preventDefault(); selectChannel(${c.id});'>${c.displayName || '—'}</a></td>
           <td><code>${c.key || '—'}</code></td>
+          <td>${c.country ? `<span class='badge' style='background:var(--accent);color:#fff;'>${escapeHtml(c.country)}</span>` : '—'}</td>
           <td>${c.editorialCategory || '—'}</td>
-          <td>${c.editorialGroup || '—'}</td>
+          <td>${escapeHtml(c.groupName || '—')}</td>
           <td>${policyBadge}</td>
           <td>${c.isEnabled ? '<span class="badge ok">sim</span>' : '<span class="badge err">não</span>'}</td>
           <td><span class='muted'>${aliases}</span></td>
         </tr>`;
       }).join('');
       document.getElementById('catalogChannelsTable').innerHTML = `
-        <table><thead><tr><th>Display Name</th><th>Key</th><th>Categoria</th><th>Grupo</th><th>Política</th><th>Activo</th><th>Aliases</th></tr></thead><tbody>${rows}</tbody></table>`;
+        <table><thead><tr><th>Display Name</th><th>Key</th><th>País</th><th>Categoria</th><th>Grupo</th><th>Política</th><th>Activo</th><th>Aliases</th></tr></thead><tbody>${rows}</tbody></table>`;
     }
 
     async function selectChannel(id) {
       _selectedChannelId = id;
       renderChannelsTable();
       renderChannelDetail();
+      openModalPanel('channelDetailPanel');
     }
 
     function renderChannelDetail() {
@@ -3993,9 +7303,10 @@ const rows = Object.entries(inv).map(([k, v]) => {
             <div><strong>Canonical ID:</strong> <code>${c.key}</code></div>
             <div><strong>Estado:</strong> ${c.isEnabled ? '<span class="badge ok">activo</span>' : '<span class="badge err">inactivo</span>'}</div>
             <div><strong>Display Name:</strong> <span id='detailDisplayName'>${escapeHtml(c.displayName)}</span></div>
+            <div><strong>País:</strong> ${c.country ? `<span class='badge' style='background:var(--accent);color:#fff;'>${escapeHtml(c.country)}</span>` : '<span class="muted">global</span>'}</div>
             <div><strong>Política:</strong> <span id='detailPolicyBadge'>${policyBadge}</span> <code>${c.publicationPolicy}</code></div>
             <div><strong>Categoria:</strong> ${c.editorialCategory}</div>
-            <div><strong>Grupo Editorial:</strong> ${c.editorialGroup}</div>
+            <div><strong>Grupo Editorial:</strong> ${escapeHtml(c.groupName || '—')}</div>
             <div><strong>Criado:</strong> <span class="muted">${tsLocal(c.createdAtUtc)}</span></div>
             <div><strong>Actualizado:</strong> <span class="muted">${tsLocal(c.updatedAtUtc)}</span></div>
           </div>
@@ -4063,8 +7374,9 @@ const rows = Object.entries(inv).map(([k, v]) => {
       if (!c) return;
       const payload = {
         displayName: c.displayName,
+        country: c.country,
         editorialCategory: c.editorialCategory,
-        editorialGroup: c.editorialGroup,
+        groupKey: c.groupKey,
         publicationPolicy: c.publicationPolicy,
         isEnabled: nextValue
       };
@@ -4091,8 +7403,9 @@ const rows = Object.entries(inv).map(([k, v]) => {
       if (!c) return;
       const payload = {
         displayName: c.displayName,
+        country: c.country,
         editorialCategory: c.editorialCategory,
-        editorialGroup: c.editorialGroup,
+        groupKey: c.groupKey,
         publicationPolicy: choice.trim(),
         isEnabled: c.isEnabled
       };
@@ -4112,25 +7425,24 @@ const rows = Object.entries(inv).map(([k, v]) => {
     async function editChannelInline(channelId) {
       const c = _channelsCache.find(x => x.id === channelId);
       if (!c) return;
-      const newDisplay = prompt('Display Name:', c.displayName);
-      if (newDisplay == null) return;
-      const payload = {
-        displayName: newDisplay,
-        editorialCategory: c.editorialCategory,
-        editorialGroup: c.editorialGroup,
-        publicationPolicy: c.publicationPolicy,
-        isEnabled: c.isEnabled
-      };
-      const r = await fetch('/api/catalog/channels/' + channelId, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-      if (r.ok) await reloadChannelDetail(channelId);
-      else {
-        const err = await r.json();
-        alert('Erro: ' + (err.error || r.status));
-      }
+      _editingChannelId = channelId;
+      _reviewChannelFingerprint = null;
+      document.getElementById('newChannelDisplayName').value = c.displayName || '';
+      document.getElementById('newChannelCountry').value = c.country || '';
+      document.getElementById('newChannelCategory').value = c.editorialCategory || 'Live';
+      await loadChannelGroupOptions();
+      const channelGroupKey = c.groupKey || '';
+      ensureChannelGroupOption(channelGroupKey);
+      document.getElementById('newChannelGroup').value = channelGroupKey;
+      document.getElementById('newChannelPolicy').value = c.publicationPolicy || 'CreateEligible';
+      document.getElementById('newChannelEnabled').value = String(!!c.isEnabled);
+      const keyEl = document.getElementById('newChannelKey');
+      keyEl.value = c.key || '';
+      keyEl.readOnly = true;
+      document.getElementById('newChannelAliasesBlock').hidden = true;
+      document.getElementById('createChannelTitle').textContent = 'Editar Canal Canónico';
+      document.getElementById('createChannelSubmitBtn').textContent = 'Guardar alterações';
+      openModalPanel('createChannelForm');
     }
 
     async function deleteChannel(channelId) {
@@ -4148,27 +7460,109 @@ const rows = Object.entries(inv).map(([k, v]) => {
       }
     }
 
-    function showCreateChannelForm() {
-      document.getElementById('newChannelKey').value = '';
+    async function showCreateChannelForm() {
+      _editingChannelId = null;
+      _reviewChannelFingerprint = null;
+      await loadChannelGroupOptions();
+      const keyEl = document.getElementById('newChannelKey');
+      keyEl.value = '';
+      keyEl.readOnly = false;
       document.getElementById('newChannelDisplayName').value = '';
+      document.getElementById('newChannelCountry').value = '';
       document.getElementById('newChannelCategory').value = 'Live';
-      document.getElementById('newChannelGroup').value = 'PortugalLive';
+      document.getElementById('newChannelGroup').value = defaultChannelGroupKey();
       document.getElementById('newChannelPolicy').value = 'CreateEligible';
       document.getElementById('newChannelEnabled').value = 'true';
       document.getElementById('newChannelAliases').value = '';
-      document.getElementById('createChannelForm').hidden = false;
-      document.getElementById('createChannelForm').scrollIntoView({ behavior: 'smooth' });
+      document.getElementById('newChannelAliasesBlock').hidden = false;
+      document.getElementById('createChannelTitle').textContent = 'Novo Canal Canónico';
+      document.getElementById('createChannelSubmitBtn').textContent = 'Guardar';
+      openModalPanel('createChannelForm');
     }
-    function hideCreateChannelForm() { document.getElementById('createChannelForm').hidden = true; }
+    function hideCreateChannelForm() {
+      _editingChannelId = null;
+      _reviewChannelFingerprint = null;
+      closeModalPanel();
+    }
 
     async function submitCreateChannel() {
+      const editingId = _editingChannelId;
+      const displayName = document.getElementById('newChannelDisplayName').value.trim();
+      const country = (document.getElementById('newChannelCountry').value || '').trim() || null;
+      const editorialCategory = document.getElementById('newChannelCategory').value;
+      const groupKey = document.getElementById('newChannelGroup').value;
+      const publicationPolicy = document.getElementById('newChannelPolicy').value;
+      const isEnabled = document.getElementById('newChannelEnabled').value === 'true';
+
+      if (editingId != null) {
+        if (!displayName) { alert('Display Name é obrigatório.'); return; }
+        const updatePayload = { displayName, country, editorialCategory, groupKey, publicationPolicy, isEnabled };
+        const r = await fetch('/api/catalog/channels/' + editingId, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(updatePayload)
+        });
+        if (r.ok) {
+          hideCreateChannelForm();
+          await loadCatalogChannels();
+          _selectedChannelId = editingId;
+          renderChannelsTable();
+          renderChannelDetail();
+          if (typeof loadCatalog === 'function') loadCatalog();
+        } else {
+          const err = await r.json();
+          alert('Erro: ' + (err.error || r.status));
+        }
+        return;
+      }
+
+      // W5 — Modo Review: o formulário W4 é reutilizado, mas a criação é
+      // declarada como mudança de catálogo na aprovação da Review.
+      const reviewFingerprint = _reviewChannelFingerprint;
+      if (reviewFingerprint) {
+        const key = document.getElementById('newChannelKey').value.trim();
+        if (!key) { alert('Key é obrigatória.'); return; }
+        if (!displayName) { alert('Display Name é obrigatório.'); return; }
+        const aliases = document.getElementById('newChannelAliases').value.split(/\r?\n/).map(a => a.trim()).filter(Boolean);
+        const reviewBody = {
+          action: 'create-channel',
+          channel: {
+            key,
+            name: displayName,
+            country,
+            editorialCategory,
+            groupKey,
+            publicationPolicy,
+            isEnabled,
+          },
+        };
+        if (aliases.length) reviewBody.alias = aliases[0];
+        const rr = await fetch('/api/catalog/reviews/' + encodeURIComponent(reviewFingerprint) + '/approve', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(reviewBody)
+        });
+        if (rr.ok) {
+          hideCreateChannelForm();
+          await loadCatalogChannels();
+          loadCatalogTab('reviews');
+          loadCatalogReviews();
+          if (typeof loadCatalog === 'function') loadCatalog();
+        } else {
+          const err = await rr.json().catch(() => ({}));
+          alert('Erro: ' + (err.error || rr.status));
+        }
+        return;
+      }
+
       const payload = {
         key: document.getElementById('newChannelKey').value.trim(),
-        displayName: document.getElementById('newChannelDisplayName').value.trim(),
-        editorialCategory: document.getElementById('newChannelCategory').value,
-        editorialGroup: document.getElementById('newChannelGroup').value,
-        publicationPolicy: document.getElementById('newChannelPolicy').value,
-        isEnabled: document.getElementById('newChannelEnabled').value === 'true',
+        displayName,
+        country,
+        editorialCategory,
+        groupKey,
+        publicationPolicy,
+        isEnabled,
         aliases: document.getElementById('newChannelAliases').value.split(/\r?\n/).map(a => a.trim()).filter(Boolean),
       };
       if (!payload.key) { alert('Key é obrigatória.'); return; }
@@ -4308,15 +7702,16 @@ const rows = Object.entries(inv).map(([k, v]) => {
     async function loadCatalogReviews() {
       const reviews = await safeFetchJson('/api/catalog/reviews', []);
       if (!Array.isArray(reviews)) { document.getElementById('catalogReviewsTable').innerHTML = '<p class="muted">Erro ao carregar reviews.</p>'; return; }
-      const open = reviews.filter(r => r.state === 'Open');
-      document.getElementById('reviewsCount').textContent = `${open.length} em open · ${reviews.length} total.`;
-      if (!reviews.length) { document.getElementById('catalogReviewsTable').innerHTML = '<p class="muted">Nenhum item de revisão.</p>'; return; }
-      const rows = reviews.map(r => {
+      // O endpoint devolve apenas itens activos (Open/InReview) por omissão;
+      // estados terminais ficam no histórico e não são apresentados aqui.
+      const active = reviews.filter(r => r.state !== 'Resolved' && r.state !== 'Ignored');
+      document.getElementById('reviewsCount').textContent = `${active.length} activo(s).`;
+      if (!active.length) { document.getElementById('catalogReviewsTable').innerHTML = '<p class="muted">Nenhum item de revisão activo.</p>'; return; }
+      const rows = active.map(r => {
         const stateBadge = r.state === 'Open' ? '<span class="badge warn">Open</span>'
-          : r.state === 'Approved' ? '<span class="badge ok">Approved</span>'
-          : '<span class="badge err">Excluded</span>';
-        const actions = r.state === 'Open'
-          ? `<button style='padding:4px 8px;' onclick='approveReview("${r.fingerprint.replace(/"/g, '\\"')}")'>Approve</button>
+          : '<span class="badge warn">InReview</span>';
+        const actions = (r.state === 'Open' || r.state === 'InReview')
+          ? `<button style='padding:4px 8px;' onclick='approveReview("${r.fingerprint.replace(/"/g, '\\"')}","${(r.normalizedIdentity || '').replace(/"/g, '\\"')}","${(r.sourceGroup || '').replace(/"/g, '\\"')}")'>Approve</button>
              <button class='secondary' style='padding:4px 8px;' onclick='excludeReview("${r.fingerprint.replace(/"/g, '\\"')}")'>Exclude</button>`
           : '—';
         return `<tr>
@@ -4473,12 +7868,63 @@ const rows = Object.entries(inv).map(([k, v]) => {
         <td>${l.itemCount || 0}</td>
         <td>${l.isEnabled ? '<span class="badge ok">sim</span>' : '<span class="badge err">não</span>'}</td>
         <td>
+          <button class='secondary' onclick='editOrderingList(${l.id})'>Editar</button>
           <button class='secondary' onclick='previewOrderingList(${l.id})'>Preview</button>
           <button class='secondary' onclick='duplicateOrderingList(${l.id}, "${escapeHtml(l.key)}")'>Duplicar</button>
           <button class='secondary' style='color:var(--err);' onclick='deleteOrderingList(${l.id})'>Eliminar</button>
         </td>
       </tr>`).join('');
       document.getElementById('orderingListsTable').innerHTML = `<table><thead><tr><th>#</th><th>Key</th><th>Nome</th><th>País</th><th>Items</th><th>Activo</th><th>Acções</th></tr></thead><tbody>${rows}</tbody></table>`;
+    }
+
+    let _orderingEditingId = null;
+
+    function editOrderingList(id) {
+      const l = _orderingListsCache.find(x => x.id === id);
+      if (!l) return;
+      document.querySelector("[data-ordering-edit='name']").value = l.name || '';
+      document.querySelector("[data-ordering-edit='country']").value = l.country || '';
+      document.querySelector("[data-ordering-edit='description']").value = l.description || '';
+      document.querySelector("[data-ordering-edit='enabled']").value = String(!!l.isEnabled);
+      _orderingEditingId = id;
+      openModalPanel('orderingEditForm');
+    }
+
+    function cancelOrderingListEdit() {
+      _orderingEditingId = null;
+      closeModalPanel();
+    }
+
+    async function saveOrderingListEdit() {
+      if (_orderingEditingId == null) return;
+      const id = _orderingEditingId;
+      const payload = {
+        name: document.querySelector("[data-ordering-edit='name']").value.trim(),
+        country: (document.querySelector("[data-ordering-edit='country']").value || '').trim() || null,
+        description: (document.querySelector("[data-ordering-edit='description']").value || '').trim() || null,
+        isEnabled: document.querySelector("[data-ordering-edit='enabled']").value === 'true',
+      };
+      if (!payload.name) { alert('Nome é obrigatório.'); return; }
+      const r = await fetch('/api/catalog/ordering-lists/' + id, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (r.ok) {
+        cancelOrderingListEdit();
+        await loadOrderingLists();
+        if (_orderingListDetailCache && _orderingListDetailCache.id === id) await openOrderingList(id);
+      } else {
+        const err = await r.json();
+        alert('Erro: ' + (err.error || r.status));
+      }
+    }
+
+    function showCreateOrderingForm() {
+      document.querySelector("[data-ordering-create='key']").value = '';
+      document.querySelector("[data-ordering-create='name']").value = '';
+      document.querySelector("[data-ordering-create='country']").value = '';
+      openModalPanel('orderingCreateForm');
     }
 
     async function submitCreateOrderingList() {
@@ -4499,6 +7945,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
         document.querySelector("[data-ordering-create='key']").value = '';
         document.querySelector("[data-ordering-create='name']").value = '';
         document.querySelector("[data-ordering-create='country']").value = '';
+        closeModalPanel();
         await loadOrderingLists();
       } else {
         const err = await r.json();
@@ -4518,9 +7965,9 @@ const rows = Object.entries(inv).map(([k, v]) => {
       const detailDiv = document.getElementById('orderingDetail');
       const items = (detail.items || []).slice().sort((a, b) => a.position - b.position);
       const itemRows = items.map(i => `<tr>
-        <td>${i.position}</td>
-        <td><code>${i.canonicalChannelId}</code></td>
-        <td>${escapeHtml((i.canonicalChannelDisplayName || '') + (i.canonicalChannelKey ? ' (' + i.canonicalChannelKey + ')' : ''))}</td>
+        <td>${i.position + 1}</td>
+        <td><code>${escapeHtml(i.canonicalChannelKey || ('#' + i.canonicalChannelId))}</code></td>
+        <td>${escapeHtml(i.canonicalChannelDisplayName || '—')}</td>
         <td>${i.isEnabled ? '<span class="badge ok">sim</span>' : '<span class="badge err">não</span>'}</td>
         <td>
           <button class='secondary' onclick='moveOrderingItem(${i.id}, ${i.position - 1})' ${i.position === 0 ? 'disabled' : ''}>↑</button>
@@ -4611,12 +8058,14 @@ const rows = Object.entries(inv).map(([k, v]) => {
         body: JSON.stringify({ isEnabled: next }),
       });
       if (r.ok && _orderingListDetailCache) await openOrderingList(_orderingListDetailCache.id);
+      else if (!r.ok) { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
     }
 
     async function removeOrderingItem(itemId) {
       if (!confirm('Remover o item?')) return;
       const r = await fetch('/api/catalog/ordering-items/' + itemId, { method: 'DELETE' });
       if (r.ok && _orderingListDetailCache) await openOrderingList(_orderingListDetailCache.id);
+      else if (!r.ok) { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
     }
 
     async function loadGlobalPriority() {
@@ -4685,9 +8134,261 @@ const rows = Object.entries(inv).map(([k, v]) => {
       else { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
     }
 
+    // === PHASE 13 (Wave 13-4) — Global Source Selection Policy ===
+    async function loadSourceSelectionPolicy() {
+      const p = await safeFetchJson('/api/catalog/source-selection-policies', null);
+      const form = document.getElementById('sourceSelectionPolicyForm');
+      const status = document.getElementById('sourceSelectionPolicyStatus');
+      if (!p) { form.innerHTML = '<p class="muted">Erro ao carregar política.</p>'; return; }
+      form.innerHTML = `
+        <div><label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Max sources per channel (0 = não publicar nenhuma)</label>
+          <input id='ssp_maxSourcesPerChannel' type='number' min='0' value='${p.maxSourcesPerChannel}' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+        </div>
+        <div><label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Max sources per provider (vazio = sem limite)</label>
+          <input id='ssp_maxSourcesPerProvider' type='number' min='1' value='${p.maxSourcesPerProvider ?? ''}' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+        </div>
+        <div><label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Prefer distinct providers</label>
+          <select id='ssp_preferDistinctProviders'><option value='true' ${p.preferDistinctProviders?'selected':''}>sim</option><option value='false' ${!p.preferDistinctProviders?'selected':''}>não</option></select>
+        </div>
+        <div><label class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Allow fallback to same provider</label>
+          <select id='ssp_allowFallbackToSameProvider'><option value='true' ${p.allowFallbackToSameProvider?'selected':''}>sim</option><option value='false' ${!p.allowFallbackToSameProvider?'selected':''}>não</option></select>
+        </div>
+      `;
+      status.textContent = 'Política carregada.';
+    }
+
+    async function saveSourceSelectionPolicy() {
+      const status = document.getElementById('sourceSelectionPolicyStatus');
+      const maxChannelRaw = document.getElementById('ssp_maxSourcesPerChannel').value.trim();
+      const maxProviderRaw = document.getElementById('ssp_maxSourcesPerProvider').value.trim();
+      const payload = {
+        maxSourcesPerChannel: maxChannelRaw === '' ? null : parseInt(maxChannelRaw, 10),
+        maxSourcesPerProvider: maxProviderRaw === '' ? null : parseInt(maxProviderRaw, 10),
+        preferDistinctProviders: document.getElementById('ssp_preferDistinctProviders').value === 'true',
+        allowFallbackToSameProvider: document.getElementById('ssp_allowFallbackToSameProvider').value === 'true',
+      };
+      const r = await fetch('/api/catalog/source-selection-policies', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (r.ok) {
+        status.textContent = 'Política guardada.';
+      } else {
+        const err = await r.json();
+        status.textContent = 'Erro: ' + (err.error || r.status);
+      }
+    }
+
+    // === PHASE 13 (Wave 13-4b) — Per-channel Source Selection Policy ===
+    let channelSourceSelectionPolicies = [];
+
+    async function loadChannelSourceSelectionKeys() {
+      const channels = await safeFetchJson('/api/catalog/channels', []);
+      const datalist = document.getElementById('cssp_channelKeyList');
+      if (!datalist || !Array.isArray(channels)) return;
+      datalist.innerHTML = channels
+        .filter(c => c && c.key)
+        .map(c => `<option value='${escapeHtml(c.key)}'>${escapeHtml(c.displayName || '')}</option>`)
+        .join('');
+    }
+
+    async function loadChannelSourceSelectionPolicies() {
+      const table = document.getElementById('channelSourceSelectionPoliciesTable');
+      const status = document.getElementById('channelSourceSelectionPolicyStatus');
+      const data = await safeFetchJson('/api/catalog/source-selection-policies/channels', null);
+      const list = data && Array.isArray(data.overrides) ? data.overrides : null;
+      channelSourceSelectionPolicies = list || [];
+      if (!list) { table.innerHTML = '<p class="muted">Erro ao carregar overrides.</p>'; return; }
+      if (!list.length) { table.innerHTML = '<p class="muted">Nenhum override por canal.</p>'; return; }
+      const rows = list.map((p, i) => `<tr>
+        <td><code>${escapeHtml(p.canonicalChannelKey || '')}</code></td>
+        <td>${p.maxSourcesPerChannel}</td>
+        <td>${p.preferDistinctProviders ? 'sim' : 'não'}</td>
+        <td>${p.maxSourcesPerProvider ?? '—'}</td>
+        <td>${p.allowFallbackToSameProvider ? 'sim' : 'não'}</td>
+        <td>
+          <button class='secondary' onclick='editChannelSourceSelectionPolicy(${i})'>Editar</button>
+          <button class='secondary' style='color:var(--err);' onclick='deleteChannelSourceSelectionPolicy(${i})'>Eliminar</button>
+        </td>
+      </tr>`).join('');
+      table.innerHTML = `<table><thead><tr><th>Chave canónica</th><th>Max/canal</th><th>Distintos</th><th>Max/provedor</th><th>Fallback</th><th>Acções</th></tr></thead><tbody>${rows}</tbody></table>`;
+      if (status) status.textContent = '';
+    }
+
+    function editChannelSourceSelectionPolicy(index) {
+      const p = channelSourceSelectionPolicies[index];
+      if (!p) return;
+      document.getElementById('cssp_channelKey').value = p.canonicalChannelKey || '';
+      document.getElementById('cssp_maxSourcesPerChannel').value = p.maxSourcesPerChannel;
+      document.getElementById('cssp_maxSourcesPerProvider').value = p.maxSourcesPerProvider ?? '';
+      document.getElementById('cssp_preferDistinctProviders').value = p.preferDistinctProviders ? 'true' : 'false';
+      document.getElementById('cssp_allowFallbackToSameProvider').value = p.allowFallbackToSameProvider ? 'true' : 'false';
+      document.getElementById('channelSourceSelectionPolicyStatus').textContent = 'Override carregado para edição.';
+      openModalPanel('channelSourceSelectionPolicyForm');
+    }
+
+    function newChannelSourceSelectionPolicy() {
+      document.getElementById('cssp_channelKey').value = '';
+      document.getElementById('cssp_maxSourcesPerChannel').value = '3';
+      document.getElementById('cssp_maxSourcesPerProvider').value = '';
+      document.getElementById('cssp_preferDistinctProviders').value = 'true';
+      document.getElementById('cssp_allowFallbackToSameProvider').value = 'false';
+      const status = document.getElementById('channelSourceSelectionPolicyStatus');
+      if (status) status.textContent = '';
+      openModalPanel('channelSourceSelectionPolicyForm');
+    }
+
+    async function saveChannelSourceSelectionPolicy() {
+      const status = document.getElementById('channelSourceSelectionPolicyStatus');
+      const key = document.getElementById('cssp_channelKey').value.trim();
+      if (!key) { status.textContent = 'Indica a chave canónica do canal.'; return; }
+      const maxChannelRaw = document.getElementById('cssp_maxSourcesPerChannel').value.trim();
+      const maxProviderRaw = document.getElementById('cssp_maxSourcesPerProvider').value.trim();
+      const payload = {
+        canonicalChannelKey: key,
+        maxSourcesPerChannel: maxChannelRaw === '' ? null : parseInt(maxChannelRaw, 10),
+        maxSourcesPerProvider: maxProviderRaw === '' ? null : parseInt(maxProviderRaw, 10),
+        preferDistinctProviders: document.getElementById('cssp_preferDistinctProviders').value === 'true',
+        allowFallbackToSameProvider: document.getElementById('cssp_allowFallbackToSameProvider').value === 'true',
+      };
+      const r = await fetch('/api/catalog/source-selection-policies/channels', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (r.ok) {
+        status.textContent = 'Override guardado.';
+        closeModalPanel();
+        await loadChannelSourceSelectionPolicies();
+      } else {
+        const err = await r.json();
+        status.textContent = 'Erro: ' + (err.error || r.status);
+      }
+    }
+
+    async function deleteChannelSourceSelectionPolicy(index) {
+      const p = channelSourceSelectionPolicies[index];
+      if (!p || !p.canonicalChannelKey) return;
+      if (!confirm('Eliminar o override do canal "' + p.canonicalChannelKey + '"?')) return;
+      const status = document.getElementById('channelSourceSelectionPolicyStatus');
+      const r = await fetch('/api/catalog/source-selection-policies/channels/' + encodeURIComponent(p.canonicalChannelKey), { method: 'DELETE' });
+      if (r.ok) {
+        status.textContent = 'Override eliminado.';
+        await loadChannelSourceSelectionPolicies();
+      } else {
+        const err = await r.json();
+        status.textContent = 'Erro: ' + (err.error || r.status);
+      }
+    }
+
+    // === PHASE 13 (Wave 13-5) — Source Selection Preview / Dry-Run ===
+    function sourceSelectionPreviewCandidateLine(c, decision) {
+      const badge = decision === 'selected' ? 'ok' : 'muted';
+      const rank = (c.rank === null || c.rank === undefined) ? '—' : c.rank;
+      return `<div class='muted' style='font-size:12px;margin:2px 0;'>` +
+        `<span class='badge ${badge}'>${escapeHtml(decision)}</span> ` +
+        `#${escapeHtml(String(rank))} · ${escapeHtml(c.provider || '—')} · ${escapeHtml(c.availability || '—')} · ${escapeHtml(c.quality || '—')} · ${escapeHtml(c.reason || '')} ` +
+        `<code>${escapeHtml(c.streamUrlSanitized || '')}</code></div>`;
+    }
+
+    async function loadSourceSelectionPreview() {
+      const out = document.getElementById('sourceSelectionPreviewResult');
+      if (!out) return;
+      out.innerHTML = '<p class="muted">A executar preview…</p>';
+      const filterEl = document.getElementById('sourceSelectionPreviewChannelKey');
+      const filter = filterEl ? filterEl.value.trim() : '';
+      const url = '/api/catalog/source-selection-policies/preview'
+        + (filter ? ('?channelKey=' + encodeURIComponent(filter)) : '');
+      const data = await safeFetchJson(url, null);
+      if (!data || data.error) {
+        out.innerHTML = '<p class="muted">Erro ao executar preview.</p>';
+        return;
+      }
+
+      const m = data.metrics || {};
+      const src = data.source || {};
+      const header = `<p class='muted'>Origem: ${escapeHtml(src.origin || 'catalog')}` +
+        ` · canais no catálogo: ${nfmt(src.canonicalChannelCount || 0)}` +
+        ` · channel sources: ${nfmt(src.catalogChannelSourceCount || 0)}` +
+        (src.channelKeyFilter ? ` · filtro: <code>${escapeHtml(src.channelKeyFilter)}</code>` : '') +
+        ` · streams de entrada: ${nfmt(data.inputStreamCount || 0)}` +
+        ` · gerado: ${escapeHtml(tsLocal(data.generatedAtUtc))}</p>`;
+
+      if (!data.applied) {
+        const nonAppliedMessages = {
+          'channel-not-found': 'channelKey não corresponde a nenhum canal canónico.',
+          'no-channels': 'O catálogo não tem canais canónicos.',
+          'no-input': 'Sem streams candidatas no âmbito (canais sem fontes).',
+        };
+        const msg = nonAppliedMessages[data.status] || 'Preview não aplicado.';
+        out.innerHTML = header + `<p class='muted'>${escapeHtml(msg)}</p>`;
+        return;
+      }
+
+      const cards = [
+        metricCard('Canais no âmbito', nfmt(m.channelsProcessed || 0), nfmt(m.channelsWithSources || 0) + ' com fontes', 'Canais canónicos no âmbito (após filtro), incluindo os que não têm ChannelSource.'),
+        metricCard('Candidatos', nfmt(m.candidateStreamCount || 0), nfmt(m.selectedStreamCount || 0) + ' seleccionados · ' + nfmt(m.rejectedStreamCount || 0) + ' rejeitados', ''),
+        metricCard('Sem correspondência', nfmt(m.unmatchedStreamCount || 0), nfmt(m.ambiguousStreamCount || 0) + ' ambíguos · ' + nfmt(m.totalUnmatchedStreamCount || 0) + ' no total', 'Disjuntos: unmatched (sem hit no catálogo) e ambíguos (URL mapeada a mais de um canal canónico).'),
+        metricCard('Diversidade / Fill', nfmt(m.diversitySelectionCount || 0) + ' / ' + nfmt(m.fillSelectionCount || 0), nfmt(m.distinctProviderCount || 0) + ' fornecedores distintos', 'DiversitySelectionCount = selecções por diversidade; FillSelectionCount é o proxy da Fase B (fallback fill).'),
+        metricCard('Limite de canal', nfmt(m.channelLimitRejectionCount || 0), nfmt(m.channelsAtChannelLimit || 0) + ' canais no limite', 'Rejeições limit-reached.'),
+        metricCard('Limites de fornecedor', nfmt(m.providerLimitRejectionCount || 0), nfmt(m.fallbackDisabledRejectionCount || 0) + ' fallback-disabled · ' + nfmt(m.sourceDisabledRejectionCount || 0) + ' source-disabled', ''),
+      ];
+
+      const rejectionCounts = m.rejectionCounts || {};
+      const rejectionKeys = Object.keys(rejectionCounts);
+      const rejectionLine = rejectionKeys.length
+        ? rejectionKeys.map(k => `<code>${escapeHtml(k)}</code>: ${nfmt(rejectionCounts[k])}`).join(' · ')
+        : '<span class="muted">—</span>';
+
+      const distribution = m.providerDistribution || [];
+      const distributionTable = distribution.length
+        ? `<div style='margin-top:12px;'><h4>Distribuição por fornecedor</h4><table><thead><tr><th>Fornecedor</th><th>Seleccionados</th><th>Canais</th></tr></thead><tbody>${distribution.map(p => `<tr><td><code>${escapeHtml(p.provider)}</code></td><td>${nfmt(p.selectedCount)}</td><td>${nfmt(p.channelCount)}</td></tr>`).join('')}</tbody></table></div>`
+        : '';
+
+      const channelBlocks = (data.channels || []).map(c => {
+        const selected = (c.selected || []).map(x => sourceSelectionPreviewCandidateLine(x, 'selected')).join('');
+        const rejected = (c.rejected || []).map(x => sourceSelectionPreviewCandidateLine(x, 'rejected')).join('');
+        const name = escapeHtml(c.displayName || '') || '<span class="muted">(sem nome)</span>';
+        const key = c.canonicalChannelKey ? ` <code>${escapeHtml(c.canonicalChannelKey)}</code>` : '';
+        return `<div class='card' style='margin-top:12px;'>
+          <div><strong>#${c.canonicalChannelId}</strong> ${name}${key} · âmbito: <strong>${escapeHtml(c.policyScope || '')}</strong> · ${nfmt(c.selectedCount)}/${nfmt(c.candidateCount)} seleccionados (${nfmt(c.rejectedCount)} rejeitados)</div>
+          <div class='muted' style='font-size:12px;margin-top:4px;'>Política: max/canal=${c.policy.maxSourcesPerChannel} · distintos=${c.policy.preferDistinctProviders ? 'sim' : 'não'} · max/fornecedor=${c.policy.maxSourcesPerProvider ?? '—'} · fallback=${c.policy.allowFallbackToSameProvider ? 'sim' : 'não'}</div>
+          ${selected ? `<div style='margin-top:6px;'><div class='muted'><strong>Seleccionadas</strong></div>${selected}</div>` : ''}
+          ${rejected ? `<div style='margin-top:6px;'><div class='muted'><strong>Rejeitadas</strong></div>${rejected}</div>` : ''}
+        </div>`;
+      }).join('');
+
+      const unmatchedList = data.unmatched || [];
+      const ambiguousList = data.ambiguous || [];
+      const unmatchedLines = (list, ambiguous) => list.map(u => `<div class='muted' style='font-size:12px;'><span class='badge ${ambiguous ? 'err' : 'muted'}'>${escapeHtml(u.reason || (ambiguous ? 'ambiguous' : 'unmatched'))}</span> ${escapeHtml(u.title || '')} <code>${escapeHtml(u.streamUrlSanitized || '')}</code></div>`).join('');
+      const unmatchedBlock = (unmatchedList.length || ambiguousList.length)
+        ? `<div style='margin-top:12px;'><h4>Sem correspondência</h4>`
+          + (unmatchedList.length
+            ? `<div class='muted' style='font-size:12px;'><strong>Sem hit (${nfmt(unmatchedList.length)})</strong></div>${unmatchedLines(unmatchedList, false)}`
+            : '')
+          + (ambiguousList.length
+            ? `<div class='muted' style='font-size:12px;margin-top:6px;'><strong>Ambíguos (${nfmt(ambiguousList.length)})</strong> — URL mapeada a mais de um canal canónico</div>${unmatchedLines(ambiguousList, true)}`
+            : '')
+          + `</div>`
+        : '';
+
+      out.innerHTML = `<div style='display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));'>${cards.join('')}</div>`
+        + header
+        + `<p class='muted' style='margin-top:8px;'>Rejeições por motivo: ${rejectionLine}</p>`
+        + distributionTable
+        + (channelBlocks || '<p class="muted" style="margin-top:12px;">Nenhum canal processado.</p>')
+        + unmatchedBlock;
+    }
+
+    let _importPoliciesCache = [];
+    let _importPolicyEditingId = null;
+    let _importPolicyEditingMediaKind = null;
+
     async function loadImportPolicies() {
       const list = await safeFetchJson('/api/catalog/import-policies', []);
       if (!Array.isArray(list)) { document.getElementById('importPoliciesTable').innerHTML = '<p class="muted">Erro.</p>'; return; }
+      _importPoliciesCache = list;
       if (!list.length) { document.getElementById('importPoliciesTable').innerHTML = '<p class="muted">Nenhuma política. Cria abaixo (Live, Radio, VOD).</p>'; return; }
       const rows = list.map(p => `<tr>
         <td><code>${p.id}</code></td>
@@ -4696,38 +8397,46 @@ const rows = Object.entries(inv).map(([k, v]) => {
         <td><code>${escapeHtml(p.targetGroupsCsv || '')}</code></td>
         <td><code>${escapeHtml(p.excludedGroupsCsv || '')}</code></td>
         <td>${p.isEnabled ? '<span class="badge ok">sim</span>' : '<span class="badge err">não</span>'}</td>
-        <td>
-          <select data-import-edit-vod data-row-key='${p.id}'>
-            <option value='ImportVod' ${p.vodPolicy==='ImportVod'?'selected':''}>ImportVod</option>
-            <option value='KeepVod' ${p.vodPolicy==='KeepVod'?'selected':''}>KeepVod</option>
-            <option value='ExcludeVod' ${p.vodPolicy==='ExcludeVod'?'selected':''}>ExcludeVod</option>
-          </select>
-          <input data-import-edit-target data-row-key='${p.id}' value='${escapeHtml(p.targetGroupsCsv||"")}' placeholder='targets' style='margin-left:4px;width:140px;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:4px 6px;border-radius:6px;font:inherit;'>
-          <input data-import-edit-excluded data-row-key='${p.id}' value='${escapeHtml(p.excludedGroupsCsv||"")}' placeholder='excluded' style='margin-left:4px;width:140px;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:4px 6px;border-radius:6px;font:inherit;'>
-          <button class='secondary' onclick='saveImportPolicy(` + p.id + `, "` + p.mediaKind + `")'>Guardar</button>
-        </td>
+        <td><button class='secondary' onclick='editImportPolicy(${p.id}, "${p.mediaKind}")'>Editar</button></td>
       </tr>`).join('');
       document.getElementById('importPoliciesTable').innerHTML = `<table><thead><tr><th>#</th><th>MediaKind</th><th>VodPolicy</th><th>Targets (CSV)</th><th>Excluded (CSV)</th><th>Activo</th><th>Editar</th></tr></thead><tbody>${rows}</tbody></table>`;
     }
 
-    async function saveImportPolicy(policyId, mediaKind) {
-      const sel = "[data-import-edit-vod][data-row-key='" + policyId + "']";
-      const vod = document.querySelector(sel).value;
-      const target = document.querySelector("[data-import-edit-target][data-row-key='" + policyId + "']").value;
-      const excluded = document.querySelector("[data-import-edit-excluded][data-row-key='" + policyId + "']").value;
+    function editImportPolicy(id, mediaKind) {
+      const p = _importPoliciesCache.find(x => x.id === id);
+      if (!p) return;
+      _importPolicyEditingId = id;
+      _importPolicyEditingMediaKind = mediaKind;
+      const label = document.getElementById('importPolicyEditMediaKindLabel');
+      if (label) label.textContent = mediaKind || '';
+      const vod = document.getElementById('importPolicyEditVod');
+      if (vod) vod.value = p.vodPolicy || 'ImportVod';
+      const target = document.getElementById('importPolicyEditTargets');
+      if (target) target.value = p.targetGroupsCsv || '';
+      const excluded = document.getElementById('importPolicyEditExcluded');
+      if (excluded) excluded.value = p.excludedGroupsCsv || '';
+      openModalPanel('importPolicyEditForm');
+    }
+
+    async function submitImportPolicyEdit() {
+      if (_importPolicyEditingId == null) return;
+      const vod = document.getElementById('importPolicyEditVod').value;
+      const target = document.getElementById('importPolicyEditTargets').value;
+      const excluded = document.getElementById('importPolicyEditExcluded').value;
       const r = await fetch('/api/catalog/import-policies', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mediaKind, vodPolicy: vod, targetGroupsCsv: target, excludedGroupsCsv: excluded, isEnabled: true }),
+        body: JSON.stringify({ mediaKind: _importPolicyEditingMediaKind, vodPolicy: vod, targetGroupsCsv: target, excludedGroupsCsv: excluded, isEnabled: true }),
       });
-      if (r.ok) { alert('Política guardada.'); await loadImportPolicies(); }
+      if (r.ok) { closeModalPanel(); await loadImportPolicies(); }
       else { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
     }
 
     async function loadCanonicalGroups() {
       const groups = await safeFetchJson('/api/catalog/canonical-groups', []);
       if (!Array.isArray(groups)) { document.getElementById('canonicalGroupsTable').innerHTML = '<p class="muted">Erro.</p>'; return; }
-      if (!groups.length) { document.getElementById('canonicalGroupsTable').innerHTML = '<p class="muted">Nenhum grupo canónico. Cria abaixo.</p>'; return; }
+      _canonicalGroupsCache = groups;
+      if (!groups.length) { document.getElementById('canonicalGroupsTable').innerHTML = '<p class="muted">Nenhum grupo canónico. Cria um novo.</p>'; return; }
       const rows = groups.map(g => `<tr>
         <td><code>${g.id}</code></td>
         <td><code>${escapeHtml(g.key)}</code></td>
@@ -4736,19 +8445,55 @@ const rows = Object.entries(inv).map(([k, v]) => {
         <td>${g.order}</td>
         <td>${g.isDefault ? '<span class="badge ok">default</span>' : '—'}</td>
         <td>${g.isEnabled ? '<span class="badge ok">sim</span>' : '<span class="badge err">não</span>'}</td>
-        <td><button class='secondary' style='color:var(--err);' onclick='deleteCanonicalGroup(${g.id})'>Eliminar</button></td>
+        <td>
+          <button class='secondary' onclick='editCanonicalGroup(${g.id})'>Editar</button>
+          <button class='secondary' style='color:var(--err);' onclick='deleteCanonicalGroup(${g.id})'>Eliminar</button>
+        </td>
       </tr>`).join('');
       document.getElementById('canonicalGroupsTable').innerHTML = `<table><thead><tr><th>#</th><th>Key</th><th>Display</th><th>País</th><th>Ordem</th><th>Default</th><th>Activo</th><th>Acções</th></tr></thead><tbody>${rows}</tbody></table>`;
     }
 
-    async function submitCreateGroup() {
+    let _editingCanonicalGroupId = null;
+
+    function showCreateCanonicalGroup() {
+      _editingCanonicalGroupId = null;
+      const key = document.getElementById('cgKey');
+      key.value = '';
+      key.readOnly = false;
+      document.getElementById('cgName').value = '';
+      document.getElementById('cgCountry').value = '';
+      document.getElementById('cgOrder').value = '100';
+      document.getElementById('cgDefault').value = 'false';
+      document.getElementById('cgEnabled').value = 'true';
+      document.getElementById('canonicalGroupEditTitle').textContent = 'Novo grupo';
+      openModalPanel('canonicalGroupEditForm');
+    }
+
+    function editCanonicalGroup(id) {
+      const list = Array.isArray(_canonicalGroupsCache) ? _canonicalGroupsCache : [];
+      const g = list.find(x => x && x.id === id);
+      if (!g) { alert('Grupo não encontrado. Recarrega a lista.'); return; }
+      _editingCanonicalGroupId = id;
+      const key = document.getElementById('cgKey');
+      key.value = g.key || '';
+      key.readOnly = true;
+      document.getElementById('cgName').value = g.displayName || '';
+      document.getElementById('cgCountry').value = g.country || '';
+      document.getElementById('cgOrder').value = String(g.order == null ? 100 : g.order);
+      document.getElementById('cgDefault').value = g.isDefault ? 'true' : 'false';
+      document.getElementById('cgEnabled').value = g.isEnabled ? 'true' : 'false';
+      document.getElementById('canonicalGroupEditTitle').textContent = 'Editar grupo';
+      openModalPanel('canonicalGroupEditForm');
+    }
+
+    async function submitCanonicalGroupEdit() {
       const payload = {
-        key: document.querySelector("[data-group-create='key']").value.trim(),
-        displayName: document.querySelector("[data-group-create='name']").value.trim(),
-        country: document.querySelector("[data-group-create='country']").value.trim() || null,
-        order: parseInt(document.querySelector("[data-group-create='order']").value, 10) || 0,
-        isEnabled: true,
-        isDefault: false,
+        key: document.getElementById('cgKey').value.trim(),
+        displayName: document.getElementById('cgName').value.trim(),
+        country: document.getElementById('cgCountry').value.trim() || null,
+        order: parseInt(document.getElementById('cgOrder').value, 10) || 0,
+        isEnabled: document.getElementById('cgEnabled').value === 'true',
+        isDefault: document.getElementById('cgDefault').value === 'true',
       };
       if (!payload.key || !payload.displayName) { alert('Key e Display Name obrigatórios.'); return; }
       const r = await fetch('/api/catalog/canonical-groups', {
@@ -4757,10 +8502,10 @@ const rows = Object.entries(inv).map(([k, v]) => {
         body: JSON.stringify(payload),
       });
       if (r.ok) {
-        document.querySelector("[data-group-create='key']").value = '';
-        document.querySelector("[data-group-create='name']").value = '';
-        document.querySelector("[data-group-create='country']").value = '';
+        _editingCanonicalGroupId = null;
+        closeModalPanel();
         await loadCanonicalGroups();
+        await loadChannelGroupOptions();
       } else {
         const err = await r.json();
         alert('Erro: ' + (err.error || r.status));
@@ -4771,52 +8516,6 @@ const rows = Object.entries(inv).map(([k, v]) => {
       if (!confirm('Eliminar o grupo #' + id + '?')) return;
       const r = await fetch('/api/catalog/canonical-groups/' + id, { method: 'DELETE' });
       if (r.ok) await loadCanonicalGroups();
-      else { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
-    }
-
-    async function loadGroupMappings() {
-      const list = await safeFetchJson('/api/catalog/group-mappings', []);
-      if (!Array.isArray(list)) { document.getElementById('groupMappingsTable').innerHTML = '<p class="muted">Erro.</p>'; return; }
-      if (!list.length) { document.getElementById('groupMappingsTable').innerHTML = '<p class="muted">Nenhum mapping. Cria abaixo.</p>'; return; }
-      const rows = list.map(m => `<tr>
-        <td><code>${m.id}</code></td>
-        <td>${m.sourceKind}</td>
-        <td><code>${escapeHtml(m.sourceGroupTitle)}</code></td>
-        <td>${m.canonicalGroupKey ? `<code>${escapeHtml(m.canonicalGroupKey)}</code>` : m.canonicalGroupId}</td>
-        <td>${escapeHtml(m.canonicalGroupDisplayName || '')}</td>
-        <td>${m.isEnabled ? '<span class="badge ok">sim</span>' : '<span class="badge err">não</span>'}</td>
-        <td><button class='secondary' style='color:var(--err);' onclick='deleteGroupMapping(${m.id})'>Eliminar</button></td>
-      </tr>`).join('');
-      document.getElementById('groupMappingsTable').innerHTML = `<table><thead><tr><th>#</th><th>Source</th><th>Group Title</th><th>Canonical Key</th><th>Display</th><th>Activo</th><th>Acções</th></tr></thead><tbody>${rows}</tbody></table>`;
-    }
-
-    async function submitCreateGroupMapping() {
-      const payload = {
-        sourceKind: document.querySelector("[data-mapping-create='kind']").value,
-        sourceGroupTitle: document.querySelector("[data-mapping-create='title']").value.trim(),
-        canonicalGroupId: parseInt(document.querySelector("[data-mapping-create='groupId']").value, 10),
-        isEnabled: true,
-      };
-      if (!payload.sourceGroupTitle || !payload.canonicalGroupId) { alert('Group title e groupId obrigatórios.'); return; }
-      const r = await fetch('/api/catalog/group-mappings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-      if (r.ok) {
-        document.querySelector("[data-mapping-create='title']").value = '';
-        document.querySelector("[data-mapping-create='groupId']").value = '';
-        await loadGroupMappings();
-      } else {
-        const err = await r.json();
-        alert('Erro: ' + (err.error || r.status));
-      }
-    }
-
-    async function deleteGroupMapping(id) {
-      if (!confirm('Eliminar o mapping #' + id + '?')) return;
-      const r = await fetch('/api/catalog/group-mappings/' + id, { method: 'DELETE' });
-      if (r.ok) await loadGroupMappings();
       else { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
     }
 
@@ -4867,17 +8566,37 @@ const rows = Object.entries(inv).map(([k, v]) => {
     }
 
     async function loadScheduledActions() {
-      const actions = await safeFetchJson('/api/scheduled-actions', []);
-      if (!actions || actions.length === 0) return;
-      const input = document.querySelector("[data-sched-create='action']");
-      const select = document.querySelector("[data-sched-create='action-select']");
-      if (!input || !select) return;
-      select.innerHTML = actions.map(a => `<option value='${escapeHtml(a)}'>${escapeHtml(a)}</option>`).join('');
-      input.style.display = 'none';
-      select.style.display = 'block';
+      const raw = await safeFetchJson('/api/scheduled-actions', []);
+      const list = Array.isArray(raw) ? raw : [];
+      const actions = list.map(a => (typeof a === 'string')
+        ? { name: a, description: '', capabilities: '' }
+        : { name: (a && a.name) || '', description: (a && a.description) || '', capabilities: (a && a.capabilities) || '' });
+      window.__schedActions = actions;
+      const select = document.querySelector("[data-sched-create=action]");
+      const help = document.getElementById('schedActionsHelp');
+      if (select) {
+        select.innerHTML = actions.length
+          ? actions.map(a => `<option value='${escapeHtml(a.name)}'>${escapeHtml(a.name)}</option>`).join('')
+          : "<option value=''>sem actions registadas</option>";
+      }
+      if (help) {
+        if (!actions.length) {
+          help.innerHTML = '<div style="margin-top:4px;">Sem actions registadas.</div>';
+        } else {
+          help.innerHTML = actions.map(a => {
+            const caps = a.capabilities ? ` <span class="muted">[${escapeHtml(a.capabilities)}]</span>` : '';
+            const desc = a.description ? ` — ${escapeHtml(a.description)}` : '';
+            return `<div style="margin:2px 0;"><code>${escapeHtml(a.name)}</code>${caps}${desc}</div>`;
+          }).join('');
+        }
+      }
     }
+    let _schedEditingId = null;
+    let _schedJobsCache = [];
+
     async function loadScheduledJobs() {
       const list = await safeFetchJson('/api/catalog/scheduled-jobs', []);
+      _schedJobsCache = Array.isArray(list) ? list : [];
       if (!Array.isArray(list)) { document.getElementById('scheduledJobsTable').innerHTML = '<p class="muted">Erro.</p>'; return; }
       if (!list.length) { document.getElementById('scheduledJobsTable').innerHTML = '<p class="muted">Sem jobs agendados.</p>'; return; }
       const rows = list.map(j => `<tr>
@@ -4890,6 +8609,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
         <td>${j.nextRunAtUtc ? tsLocal(j.nextRunAtUtc) : '—'}</td>
         <td>${escapeHtml(j.lastResult || '—')}</td>
         <td>
+          <button class='secondary' onclick='editScheduledJob(${j.id})'>Editar</button>
           <button class='secondary' onclick='toggleScheduledJob(${j.id}, ${!j.isEnabled})'>${j.isEnabled ? 'Desactivar' : 'Activar'}</button>
           <button class='secondary' style='color:var(--err);' onclick='deleteScheduledJob(${j.id})'>Eliminar</button>
         </td>
@@ -4897,36 +8617,201 @@ const rows = Object.entries(inv).map(([k, v]) => {
       document.getElementById('scheduledJobsTable').innerHTML = `<table><thead><tr><th>#</th><th>Name</th><th>Cron</th><th>Action</th><th>Activo</th><th>Último</th><th>Próximo</th><th>Resultado</th><th>Acções</th></tr></thead><tbody>${rows}</tbody></table>`;
     }
 
+    function editScheduledJob(id) {
+      const job = _schedJobsCache.find(x => x.id === id);
+      if (!job) return;
+      const nameEl = document.querySelector("[data-sched-create=name]");
+      const cronEl = document.querySelector("[data-sched-create=cron]");
+      const actionEl = document.querySelector("[data-sched-create=action]");
+      const enabledEl = document.querySelector("[data-sched-create=enabled]");
+      if (nameEl) { nameEl.value = job.name || ''; nameEl.readOnly = true; }
+      if (cronEl) cronEl.value = job.cronExpression || '';
+      if (actionEl) {
+        if (!Array.from(actionEl.options).some(o => o.value === job.actionName)) {
+          const opt = document.createElement('option');
+          opt.value = job.actionName;
+          opt.textContent = job.actionName;
+          actionEl.appendChild(opt);
+        }
+        actionEl.value = job.actionName;
+      }
+      if (enabledEl) enabledEl.value = String(!!job.isEnabled);
+      _schedEditingId = id;
+      updateSchedCronStatus();
+      setSchedFormStatus('A editar job #' + id + ' (Name bloqueado). Guardar actualiza este job.', true);
+      openModalPanel('scheduledJobForm');
+    }
+
+    function newScheduledJob() {
+      _schedEditingId = null;
+      const nameEl = document.querySelector("[data-sched-create=name]");
+      const cronEl = document.querySelector("[data-sched-create=cron]");
+      const enabledEl = document.querySelector("[data-sched-create=enabled]");
+      if (nameEl) { nameEl.value = ''; nameEl.readOnly = false; }
+      if (cronEl) cronEl.value = '';
+      if (enabledEl) enabledEl.value = 'true';
+      updateSchedCronStatus();
+      openModalPanel('scheduledJobForm');
+    }
+
     async function submitCreateScheduledJob() {
-      const actionInput = document.querySelector("[data-sched-create='action']");
-      const actionSelect = document.querySelector("[data-sched-create='action-select']");
-      const actionName = (actionSelect && actionSelect.style.display !== 'none')
-        ? actionSelect.value.trim()
-        : actionInput.value.trim();
+      const nameEl = document.querySelector("[data-sched-create=name]");
+      const cronEl = document.querySelector("[data-sched-create=cron]");
+      const actionEl = document.querySelector("[data-sched-create=action]");
+      const enabledEl = document.querySelector("[data-sched-create=enabled]");
       const payload = {
-        name: document.querySelector("[data-sched-create='name']").value.trim(),
-        cronExpression: document.querySelector("[data-sched-create='cron']").value.trim(),
-        actionName: actionName,
-        isEnabled: document.querySelector("[data-sched-create='enabled']").value === 'true',
+        name: nameEl ? nameEl.value.trim() : '',
+        cronExpression: cronEl ? cronEl.value.trim() : '',
+        actionName: actionEl ? actionEl.value.trim() : '',
+        isEnabled: enabledEl ? enabledEl.value === 'true' : true,
       };
       if (!payload.name || !payload.cronExpression || !payload.actionName) {
-        alert('Name, Cron e Action são obrigatórios.'); return;
+        setSchedFormStatus('Name, Cron e Action são obrigatórios.', false); return;
       }
+      const cronCheck = validateSchedCron(payload.cronExpression);
+      if (!cronCheck.ok) { setSchedFormStatus(cronCheck.message, false); return; }
       const r = await fetch('/api/catalog/scheduled-jobs', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
       if (r.ok) {
-        document.querySelector("[data-sched-create='name']").value = '';
-        document.querySelector("[data-sched-create='cron']").value = '';
-        actionInput.value = '';
-        if (actionSelect) actionSelect.value = '';
+        closeModalPanel();
+        _schedEditingId = null;
+        if (nameEl) { nameEl.value = ''; nameEl.readOnly = false; }
+        if (cronEl) cronEl.value = '';
+        if (enabledEl) enabledEl.value = 'true';
+        updateSchedCronStatus();
+        await loadScheduledActions();
+        if (actionEl && actionEl.options.length > 0) actionEl.selectedIndex = 0;
+        setSchedFormStatus(`Guardado: action '${payload.actionName}' com cron '${payload.cronExpression}'. Upsert por Name: o mesmo Name actualiza o job existente.`, true);
         await loadScheduledJobs();
       } else {
-        const err = await r.json();
-        alert('Erro: ' + (err.error || r.status));
+        const msg = await readErrorBody(r);
+        setSchedFormStatus('Erro: ' + msg, false);
       }
+    }
+
+    async function readErrorBody(r) {
+      try {
+        const txt = await r.text();
+        if (txt) {
+          try { const body = JSON.parse(txt); if (body && body.error) return body.error; } catch (e) { /* not JSON */ }
+          return txt;
+        }
+      } catch (e) { /* body indisponível */ }
+      return 'HTTP ' + r.status;
+    }
+    function setSchedFormStatus(msg, ok) {
+      const el = document.getElementById('schedFormStatus');
+      if (!el) return;
+      el.textContent = msg;
+      el.style.color = ok ? 'var(--ok)' : 'var(--err)';
+    }
+    function schedParseScalar(token, min, max) {
+      if (token === '*') return min;
+      if (!/^\d+$/.test(token)) return null;
+      const n = parseInt(token, 10);
+      return (n >= min && n <= max) ? n : null;
+    }
+    function schedParseField(field, min, max) {
+      if (field === '*' || field === '?') return true;
+      const bits = field.split(',');
+      for (const bit of bits) {
+        if (!bit) return false;
+        if (bit.indexOf('-') >= 0 && bit.indexOf('/') < 0) {
+          const idx = bit.indexOf('-');
+          const lo = schedParseScalar(bit.slice(0, idx), min, max);
+          const hi = schedParseScalar(bit.slice(idx + 1), min, max);
+          if (lo === null || hi === null || hi < lo) return false;
+          continue;
+        }
+        const parts = bit.split('/');
+        if (parts.length === 1) {
+          if (schedParseScalar(parts[0], min, max) === null) return false;
+        } else if (parts.length === 2) {
+          const rangeToken = parts[0];
+          if (rangeToken !== '*') {
+            if (rangeToken.indexOf('-') >= 0) {
+              const idx = rangeToken.indexOf('-');
+              const lo = schedParseScalar(rangeToken.slice(0, idx), min, max);
+              const hi = schedParseScalar(rangeToken.slice(idx + 1), min, max);
+              if (lo === null || hi === null || hi < lo) return false;
+            } else if (schedParseScalar(rangeToken, min, max) === null) {
+              return false;
+            }
+          }
+          if (!/^\d+$/.test(parts[1]) || parseInt(parts[1], 10) <= 0) return false;
+        } else {
+          return false;
+        }
+      }
+      return true;
+    }
+    function validateSchedCron(expr) {
+      const trimmed = (expr || '').trim();
+      if (!trimmed) return { ok: false, message: 'Introduza uma expressão cron.' };
+      const fields = trimmed.split(/\s+/);
+      if (fields.length === 6) return { ok: false, message: 'São suportados exactamente 5 campos; 6 campos com segundos não são suportados.' };
+      if (fields.length !== 5) return { ok: false, message: `Cron deve ter 5 campos (minuto hora dia-do-mês mês dia-da-semana); recebido ${fields.length}.` };
+      const ranges = [[0, 59], [0, 23], [1, 31], [1, 12], [0, 6]];
+      const names = ['minuto', 'hora', 'dia do mês', 'mês', 'dia da semana'];
+      for (let i = 0; i < 5; i++) {
+        if (!schedParseField(fields[i], ranges[i][0], ranges[i][1])) {
+          return { ok: false, message: `Campo ${names[i]} inválido: '${fields[i]}' (esperado ${ranges[i][0]}-${ranges[i][1]}).` };
+        }
+      }
+      return { ok: true, message: describeSchedCron(fields) };
+    }
+    function schedPad2(n) { return String(n).padStart(2, '0'); }
+    const schedWeekdays = { 0: 'domingo', 1: 'segunda-feira', 2: 'terça-feira', 3: 'quarta-feira', 4: 'quinta-feira', 5: 'sexta-feira', 6: 'sábado' };
+    function describeSchedCron(fields) {
+      const min = fields[0], hour = fields[1], dom = fields[2], mon = fields[3], dow = fields[4];
+      const hoursStep = hour.match(/^\*\/(\d+)$/);
+      if (/^\d+$/.test(min) && hoursStep) {
+        const n = parseInt(hoursStep[1], 10);
+        return `de ${n} em ${n} horas`;
+      }
+      if (/^\d+$/.test(min) && /^\d+$/.test(hour) && dom === '*' && mon === '*' && dow === '*') {
+        return `todos os dias às ${schedPad2(hour)}:${schedPad2(min)}`;
+      }
+      if (/^\d+$/.test(min) && /^\d+$/.test(hour) && dom === '*' && /^\d+$/.test(dow) && schedWeekdays[parseInt(dow, 10)]) {
+        return `${schedWeekdays[parseInt(dow, 10)]} às ${schedPad2(hour)}:${schedPad2(min)}`;
+      }
+      return 'cron válido (UTC)';
+    }
+    function updateSchedCronStatus() {
+      const input = document.querySelector("[data-sched-create=cron]");
+      const el = document.getElementById('schedCronStatus');
+      if (!input || !el) return;
+      const res = validateSchedCron(input.value);
+      el.textContent = res.message;
+      el.style.color = res.ok ? 'var(--ok)' : 'var(--err)';
+    }
+    function applySchedFrequency() {
+      const kindEl = document.getElementById('schedFreqKind');
+      const timeEl = document.getElementById('schedFreqTime');
+      const hoursEl = document.getElementById('schedFreqHours');
+      const weekdayEl = document.getElementById('schedFreqWeekday');
+      const cronEl = document.querySelector("[data-sched-create=cron]");
+      if (!kindEl || !cronEl) return;
+      const kind = kindEl.value;
+      if (kind === 'manual') return;
+      const timeVal = (timeEl && timeEl.value) ? timeEl.value : '08:00';
+      const timeBits = timeVal.split(':');
+      const hh = parseInt(timeBits[0], 10) || 0;
+      const mm = parseInt(timeBits[1], 10) || 0;
+      if (kind === 'daily') {
+        cronEl.value = `${mm} ${hh} * * *`;
+      } else if (kind === 'hours') {
+        let n = parseInt(hoursEl && hoursEl.value, 10);
+        if (!n || n < 1) n = 1;
+        if (n > 23) n = 23;
+        cronEl.value = `${mm} */${n} * * *`;
+      } else if (kind === 'weekly') {
+        cronEl.value = `${mm} ${hh} * * ${(weekdayEl && weekdayEl.value) || '1'}`;
+      }
+      updateSchedCronStatus();
     }
 
     async function toggleScheduledJob(id, next) {
@@ -4936,14 +8821,14 @@ const rows = Object.entries(inv).map(([k, v]) => {
         body: JSON.stringify({ isEnabled: next }),
       });
       if (r.ok) { await loadScheduledJobs(); }
-      else { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
+      else { const msg = await readErrorBody(r); setSchedFormStatus('Erro: ' + msg, false); }
     }
 
     async function deleteScheduledJob(id) {
       if (!confirm('Eliminar o scheduled job #' + id + '?')) return;
       const r = await fetch('/api/catalog/scheduled-jobs/' + id, { method: 'DELETE' });
       if (r.ok) { await loadScheduledJobs(); }
-      else { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
+      else { const msg = await readErrorBody(r); setSchedFormStatus('Erro: ' + msg, false); }
     }
 
     async function loadMatchingAudits() {
@@ -5078,8 +8963,8 @@ const rows = Object.entries(inv).map(([k, v]) => {
       else { alert('Erro: ' + r.status); }
     }
 
-    function showAddRuleForm() { document.getElementById('addRuleForm').hidden = false; }
-    function hideAddRuleForm() { document.getElementById('addRuleForm').hidden = true; }
+    function showAddRuleForm() { openModalPanel('addRuleForm'); }
+    function hideAddRuleForm() { closeModalPanel(); }
 
     async function submitAddRule() {
       const identity = document.getElementById('ruleIdentity').value.trim();
@@ -5109,19 +8994,31 @@ const rows = Object.entries(inv).map(([k, v]) => {
 
     let _affinityEditId = null;
 
+    let _affinityDelimiter = ',';
+    let _affinityEditKey = null;
+    let _affinityGroupsCache = [];
+
     async function loadAffinityGroups() {
+      await loadAppSettings();
       const groups = await safeFetchJson('/api/catalog/affinity-groups', []);
       if (!Array.isArray(groups)) { document.getElementById('catalogAffinityTable').innerHTML = '<p class="muted">Erro ao carregar grupos.</p>'; return; }
+      _affinityGroupsCache = groups;
       document.getElementById('affinityCount').textContent = `${groups.length} grupo(s).`;
       if (!groups.length) { document.getElementById('catalogAffinityTable').innerHTML = '<p class="muted">Nenhum grupo de afinidade.</p>'; return; }
       const rows = groups.map(g => {
         const members = (g.members || []).join(', ') || '—';
-        const ccBadge = g.countryCode ? `<span class='badge' style='background:var(--accent);color:#fff;'>${g.countryCode}</span>` : '—';
+        const ccBadge = g.countryCode ? `<span class='badge' style='background:var(--accent);color:#fff;'>${escapeHtml(g.countryCode)}</span>` : '—';
+        const isChannel = g.kind === 'Channel';
+        const kindBadge = isChannel ? "<span class='badge ok'>Canal</span>" : "<span class='badge warn'>País</span>";
+        const channel = isChannel
+          ? `${escapeHtml(g.canonicalChannelDisplayName || '—')} <code>${escapeHtml(g.canonicalChannelKey || '—')}</code>`
+          : '—';
         return `<tr>
-          <td>${g.name || '—'}</td>
+          <td>${escapeHtml(g.name || '—')}</td>
+          <td>${kindBadge}</td>
           <td>${ccBadge}</td>
-          <td>${g.canonicalChannelDisplayName || '—'} (${g.canonicalChannelId ?? '—'})</td>
-          <td><code>${members}</code></td>
+          <td>${channel}</td>
+          <td><code>${escapeHtml(members)}</code></td>
           <td>${tsLocal(g.createdAtUtc)}</td>
           <td>
             <button class='secondary' style='padding:4px 8px;' onclick='editAffinityGroup(${g.id})'>Editar</button>
@@ -5130,69 +9027,149 @@ const rows = Object.entries(inv).map(([k, v]) => {
         </tr>`;
       }).join('');
       document.getElementById('catalogAffinityTable').innerHTML = `
-        <table><thead><tr><th>Grupo</th><th>País</th><th>Canal</th><th>Membros</th><th>Criado</th><th>Ações</th></tr></thead><tbody>${rows}</tbody></table>`;
+        <table><thead><tr><th>Grupo</th><th>Tipo</th><th>País</th><th>Canal</th><th>Variantes</th><th>Criado</th><th>Ações</th></tr></thead><tbody>${rows}</tbody></table>`;
+    }
+
+    async function loadAppSettings() {
+      const s = await safeFetchJson('/api/settings', null);
+      if (s && s.affinityVariantDelimiter) {
+        _affinityDelimiter = s.affinityVariantDelimiter;
+        const input = document.getElementById('affinityDelimiter');
+        if (input) input.value = _affinityDelimiter;
+      }
+    }
+
+    async function saveAffinityDelimiter() {
+      const value = (document.getElementById('affinityDelimiter').value || '').trim();
+      const r = await fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ affinityVariantDelimiter: value })
+      });
+      if (r.ok) {
+        await loadAppSettings();
+        alert('Separador guardado: ' + _affinityDelimiter);
+      } else {
+        const err = await r.json();
+        alert('Erro: ' + (err.error || r.status));
+      }
+    }
+
+    async function loadAffinityFormOptions() {
+      await loadAppSettings();
+      const channels = await safeFetchJson('/api/catalog/channels', []);
+      const groups = _affinityGroupsCache.length
+        ? _affinityGroupsCache
+        : await safeFetchJson('/api/catalog/affinity-groups', []);
+      const usedKeys = new Set((groups || [])
+        .filter(g => g.kind === 'Channel')
+        .map(g => g.canonicalChannelKey));
+      const select = document.getElementById('affinityChannelKey');
+      if (!select) return;
+      const current = select.value;
+      const options = ['<option value="">— selecionar canal —</option>'];
+      (channels || [])
+        .filter(c => !usedKeys.has(c.key) || c.key === _affinityEditKey)
+        .sort((a, b) => (a.displayName || '').localeCompare(b.displayName || ''))
+        .forEach(c => {
+          const cc = c.country ? ' · ' + c.country : '';
+          options.push(`<option value="${escapeAttr(c.key)}">${escapeHtml(c.displayName)} (${escapeHtml(c.key)})${escapeHtml(cc)}</option>`);
+        });
+      select.innerHTML = options.join('');
+      if (current) select.value = current;
+    }
+
+    function onAffinityKindChange() {
+      const kind = document.getElementById('affinityKind').value;
+      const isChannel = kind !== 'country';
+      document.getElementById('affinityChannelField').hidden = !isChannel;
+      document.getElementById('affinityCountryField').hidden = isChannel;
+      const label = document.getElementById('affinityVariantsLabel');
+      if (label) {
+        label.textContent = (isChannel ? 'Variantes do canal' : 'Indicadores de país')
+          + ' (separadas por "' + _affinityDelimiter + '")';
+      }
     }
 
     function showAddAffinityForm() {
       _affinityEditId = null;
-      document.getElementById('affinityFormTitle').textContent = 'Novo Grupo de Afinidade';
+      _affinityEditKey = null;
+      document.getElementById('affinityFormTitle').textContent = 'Nova Afinidade';
       document.getElementById('affinitySubmitBtn').textContent = 'Guardar';
       document.getElementById('affinityEditCancelBtn').hidden = true;
+      document.getElementById('affinityKind').value = 'channel';
+      document.getElementById('affinityKind').disabled = false;
       document.getElementById('affinityName').value = '';
       document.getElementById('affinityCountryCode').value = '';
-      document.getElementById('affinityChannelId').value = '';
+      document.getElementById('affinityChannelKey').disabled = false;
       document.getElementById('affinityMembers').value = '';
-      document.getElementById('addAffinityForm').hidden = false;
+      openModalPanel('addAffinityForm');
+      loadAffinityFormOptions().then(onAffinityKindChange);
     }
 
     function hideAddAffinityForm() {
-      document.getElementById('addAffinityForm').hidden = true;
       _affinityEditId = null;
-      document.getElementById('affinityFormTitle').textContent = 'Novo Grupo de Afinidade';
+      _affinityEditKey = null;
+      document.getElementById('affinityFormTitle').textContent = 'Nova Afinidade';
       document.getElementById('affinitySubmitBtn').textContent = 'Guardar';
       document.getElementById('affinityEditCancelBtn').hidden = true;
+      closeModalPanel();
     }
 
     async function editAffinityGroup(id) {
       const groups = await safeFetchJson('/api/catalog/affinity-groups', []);
       if (!Array.isArray(groups)) return;
+      _affinityGroupsCache = groups;
       const g = groups.find(x => x.id === id);
       if (!g) return;
       _affinityEditId = id;
-      document.getElementById('affinityFormTitle').textContent = 'Editar Grupo de Afinidade';
+      _affinityEditKey = g.kind === 'Channel' ? g.canonicalChannelKey : null;
+      document.getElementById('affinityFormTitle').textContent = 'Editar Afinidade';
       document.getElementById('affinitySubmitBtn').textContent = 'Atualizar';
       document.getElementById('affinityEditCancelBtn').hidden = false;
+      document.getElementById('affinityKind').value = g.kind === 'Channel' ? 'channel' : 'country';
+      document.getElementById('affinityKind').disabled = true;
       document.getElementById('affinityName').value = g.name || '';
       document.getElementById('affinityCountryCode').value = g.countryCode || '';
-      document.getElementById('affinityChannelId').value = g.canonicalChannelId || '';
-      document.getElementById('affinityMembers').value = (g.members || []).join('\n');
-      document.getElementById('addAffinityForm').hidden = false;
-      document.getElementById('addAffinityForm').scrollIntoView({ behavior: 'smooth' });
+      document.getElementById('affinityMembers').value = (g.members || []).join(_affinityDelimiter + ' ');
+      openModalPanel('addAffinityForm');
+      await loadAffinityFormOptions();
+      if (g.kind === 'Channel') {
+        document.getElementById('affinityChannelKey').value = g.canonicalChannelKey || '';
+        document.getElementById('affinityChannelKey').disabled = true;
+      }
+      onAffinityKindChange();
     }
 
     function cancelAffinityEdit() {
       _affinityEditId = null;
-      document.getElementById('affinityFormTitle').textContent = 'Novo Grupo de Afinidade';
+      _affinityEditKey = null;
+      document.getElementById('affinityFormTitle').textContent = 'Nova Afinidade';
       document.getElementById('affinitySubmitBtn').textContent = 'Guardar';
       document.getElementById('affinityEditCancelBtn').hidden = true;
       document.getElementById('affinityName').value = '';
       document.getElementById('affinityCountryCode').value = '';
-      document.getElementById('affinityChannelId').value = '';
+      document.getElementById('affinityChannelKey').value = '';
       document.getElementById('affinityMembers').value = '';
+      closeModalPanel();
     }
 
     async function submitAddAffinityGroup() {
+      const kind = document.getElementById('affinityKind').value === 'country' ? 'country' : 'channel';
       const name = document.getElementById('affinityName').value.trim();
       const countryCode = document.getElementById('affinityCountryCode').value.trim() || null;
-      const channelIdStr = document.getElementById('affinityChannelId').value.trim();
-      const channelId = channelIdStr ? parseInt(channelIdStr, 10) : null;
+      const canonicalChannelKey = document.getElementById('affinityChannelKey').value || null;
       const membersRaw = document.getElementById('affinityMembers').value.trim();
       if (!name) { alert('Nome do grupo é obrigatório.'); return; }
-      if (!membersRaw) { alert('Membros são obrigatórios.'); return; }
-      const members = membersRaw.split('\n').map(m => m.trim()).filter(m => m.length > 0);
-      if (!members.length) { alert('Pelo menos um membro é obrigatório.'); return; }
-      const payload = { name, countryCode, members };
-      if (channelId && channelId > 0) payload.canonicalChannelId = channelId;
+      if (!membersRaw) { alert('Variantes são obrigatórias.'); return; }
+      if (kind === 'channel' && !canonicalChannelKey) { alert('Selecione o canal canónico.'); return; }
+      if (kind === 'country' && !countryCode) { alert('Indique o código do país.'); return; }
+      const delim = _affinityDelimiter || ',';
+      const members = membersRaw.split(delim).map(m => m.trim()).filter(m => m.length > 0);
+      if (!members.length) { alert('Pelo menos uma variante é obrigatória.'); return; }
+      const payload = { kind, name, members };
+      if (kind === 'channel') payload.canonicalChannelKey = canonicalChannelKey;
+      else payload.countryCode = countryCode;
       const url = _affinityEditId
         ? '/api/catalog/affinity-groups/' + _affinityEditId
         : '/api/catalog/affinity-groups';
@@ -5217,22 +9194,406 @@ const rows = Object.entries(inv).map(([k, v]) => {
       else { alert('Erro: ' + r.status); }
     }
 
-    async function approveReview(fingerprint) {
-      const r = await fetch('/api/catalog/reviews/' + encodeURIComponent(fingerprint) + '/approve', { method: 'POST' });
-      if (r.ok) { loadCatalogReviews(); loadCatalog(); }
-      else { alert('Erro: ' + r.status); }
+    // W5 — Aprovação estruturada: sem prompt, com escolha explícita
+    // Add Alias / Create Channel / Excluir e dropdown de canais existentes.
+    function approveReview(fingerprint, normalizedIdentity, sourceGroup) {
+      _pendingReviewFingerprint = fingerprint;
+      _pendingReviewIdentity = normalizedIdentity || '';
+      _pendingReviewGroup = sourceGroup || '';
+      document.getElementById('reviewApproveTitle').textContent = 'Aprovar Review';
+      document.getElementById('reviewApproveSubject').textContent = normalizedIdentity || fingerprint;
+      document.getElementById('reviewApproveStatus').textContent = '';
+      document.getElementById('reviewApproveActions').hidden = false;
+      document.getElementById('reviewApproveAddAlias').hidden = true;
+      document.getElementById('reviewApproveExclude').hidden = true;
+      openModalPanel('reviewApproveModal');
+      loadReviewAliasChannels();
     }
 
-    async function excludeReview(fingerprint) {
-      const r = await fetch('/api/catalog/reviews/' + encodeURIComponent(fingerprint) + '/exclude', { method: 'POST' });
-      if (r.ok) { loadCatalogReviews(); loadCatalog(); }
-      else { alert('Erro: ' + r.status); }
+    async function loadReviewAliasChannels() {
+      const channels = await safeFetchJson('/api/catalog/channels', []);
+      const sel = document.getElementById('reviewAliasChannel');
+      if (!sel) return;
+      const current = sel.value;
+      sel.innerHTML = '<option value="">— escolher canal —</option>' + (Array.isArray(channels) ? channels : [])
+        .map(c => `<option value="${escapeAttr(c.key)}">${escapeHtml(c.displayName || c.key)} (${escapeHtml(c.key)})</option>`)
+        .join('');
+      if (current) sel.value = current;
+    }
+
+    function selectReviewAction(action) {
+      const actionsEl = document.getElementById('reviewApproveActions');
+      const addAliasEl = document.getElementById('reviewApproveAddAlias');
+      const excludeEl = document.getElementById('reviewApproveExclude');
+      const statusEl = document.getElementById('reviewApproveStatus');
+      actionsEl.hidden = true;
+      addAliasEl.hidden = true;
+      excludeEl.hidden = true;
+      statusEl.textContent = '';
+      if (action === 'add-alias') {
+        document.getElementById('reviewApproveTitle').textContent = 'Add Alias';
+        const aliasInput = document.getElementById('reviewAliasValue');
+        if (aliasInput && !aliasInput.value) aliasInput.value = _pendingReviewIdentity || '';
+        addAliasEl.hidden = false;
+        loadReviewAliasChannels();
+      } else if (action === 'exclude') {
+        document.getElementById('reviewApproveTitle').textContent = 'Excluir Review';
+        const reasonEl = document.getElementById('reviewExcludeReason');
+        if (reasonEl && !reasonEl.value) reasonEl.value = 'excluído por decisão administrativa';
+        excludeEl.hidden = false;
+      } else if (action === 'create-channel') {
+        showCreateChannelFormForReview();
+      }
+    }
+
+    async function submitReviewAliasApproval() {
+      const fingerprint = _pendingReviewFingerprint;
+      if (!fingerprint) return;
+      const key = document.getElementById('reviewAliasChannel').value;
+      const alias = (document.getElementById('reviewAliasValue').value || '').trim();
+      const statusEl = document.getElementById('reviewApproveStatus');
+      if (!key) { statusEl.textContent = 'Selecione o canal canónico existente.'; return; }
+      statusEl.textContent = 'A aplicar…';
+      const body = { action: 'add-alias', canonicalChannelKey: key };
+      if (alias) body.alias = alias;
+      const r = await fetch('/api/catalog/reviews/' + encodeURIComponent(fingerprint) + '/approve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      if (r.ok) {
+        closeReviewApproveModal();
+        loadCatalogReviews(); loadCatalog();
+      } else {
+        const err = await r.json().catch(() => ({}));
+        statusEl.textContent = 'Erro: ' + (err.error || r.status);
+      }
+    }
+
+    async function submitReviewExclude() {
+      const fingerprint = _pendingReviewFingerprint;
+      if (!fingerprint) return;
+      const reason = (document.getElementById('reviewExcludeReason').value || '').trim();
+      const statusEl = document.getElementById('reviewApproveStatus');
+      if (!reason) { statusEl.textContent = 'A razão é obrigatória.'; return; }
+      statusEl.textContent = 'A excluir…';
+      const r = await fetch('/api/catalog/reviews/' + encodeURIComponent(fingerprint) + '/exclude', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'exclude', reason: reason })
+      });
+      if (r.ok) {
+        closeReviewApproveModal();
+        loadCatalogReviews(); loadCatalog();
+      } else {
+        const err = await r.json().catch(() => ({}));
+        statusEl.textContent = 'Erro: ' + (err.error || r.status);
+      }
+    }
+
+    async function showCreateChannelFormForReview() {
+      _reviewChannelFingerprint = _pendingReviewFingerprint;
+      _editingChannelId = null;
+      await loadChannelGroupOptions();
+      const keyEl = document.getElementById('newChannelKey');
+      keyEl.value = '';
+      keyEl.readOnly = false;
+      document.getElementById('newChannelDisplayName').value = _pendingReviewIdentity || '';
+      document.getElementById('newChannelCountry').value = '';
+      document.getElementById('newChannelCategory').value = 'Live';
+      document.getElementById('newChannelGroup').value = defaultChannelGroupKey();
+      await applyGroupSuggestion(_pendingReviewGroup, _pendingReviewIdentity);
+      document.getElementById('newChannelPolicy').value = 'CreateEligible';
+      document.getElementById('newChannelEnabled').value = 'true';
+      document.getElementById('newChannelAliases').value = _pendingReviewIdentity || '';
+      document.getElementById('newChannelAliasesBlock').hidden = false;
+      document.getElementById('createChannelTitle').textContent = 'Novo Canal Canónico (a partir de Review)';
+      document.getElementById('createChannelSubmitBtn').textContent = 'Criar e aprovar';
+      loadCatalogTab('channels');
+      openModalPanel('createChannelForm');
+    }
+
+    function closeReviewApproveModal() {
+      _pendingReviewFingerprint = null;
+      _pendingReviewIdentity = '';
+      _pendingReviewGroup = '';
+      document.getElementById('reviewApproveStatus').textContent = '';
+      document.getElementById('reviewApproveActions').hidden = false;
+      document.getElementById('reviewApproveAddAlias').hidden = true;
+      document.getElementById('reviewApproveExclude').hidden = true;
+      closeModalPanel();
+    }
+
+    function excludeReview(fingerprint) {
+      approveReview(fingerprint, '');
+      selectReviewAction('exclude');
     }
 
     document.querySelectorAll('#catalogTabs button').forEach(b => b.addEventListener('click', () => loadCatalogTab(b.dataset.ctab)));
 
+    // === PHASE 9C (Wave 6) — Setup / prontidão operacional ===
+    var setupSnapshot = null;
+
+    function setupHeaders() {
+      var headers = { 'Content-Type': 'application/json' };
+      // Same-origin CSRF: a página autenticada injecta o cabeçalho
+      // X-CSRF-Token num wrapper de fetch. Quando o token é exposto em
+      // memória (window), enviamo-lo também aqui, sem nunca o persistir.
+      if (window.__m3uCrawlerCsrf) { headers['X-CSRF-Token'] = window.__m3uCrawlerCsrf; }
+      return headers;
+    }
+
+    function setupFetch(path, method, body) {
+      return fetch(path, {
+        method: method,
+        headers: setupHeaders(),
+        body: body === undefined ? undefined : JSON.stringify(body)
+      }).then(function (r) {
+        return r.text().then(function (t) {
+          var j = null;
+          try { j = t ? JSON.parse(t) : null; } catch (e) { j = null; }
+          return { status: r.status, json: j };
+        });
+      });
+    }
+
+    function setupItemLabel(key) {
+      var labels = {
+        bootstrap: 'Bootstrap', admin: 'Administrador', telegram: 'Telegram',
+        dispatcharr: 'Dispatcharr', catalog: 'Catálogo',
+        countryData: 'Dados de país', output: 'Output', sources: 'Fontes'
+      };
+      return labels[key] || key;
+    }
+
+    function setupConfigure(key) {
+      if (key === 'catalog' || key === 'sources') { showView('catalog'); return; }
+      if (key === 'countryData') { showView('catalog'); return; }
+      if (key === 'output') { showView('diagnostics'); return; }
+      showView('setup');
+      var ids = { telegram: 'setupTelegramApiId', dispatcharr: 'setupDispatcharrBaseUrl' };
+      var el = ids[key] ? document.getElementById(ids[key]) : null;
+      if (el && el.scrollIntoView) { el.scrollIntoView({ block: 'center' }); }
+    }
+
+    function renderSetupBanner(s) {
+      var banner = document.getElementById('setupBanner');
+      var badge = document.getElementById('setupNavBadge');
+      if (!banner) { return; }
+      if (!s) {
+        banner.style.display = 'none';
+        banner.innerHTML = '';
+        if (badge) { badge.style.display = 'none'; }
+        return;
+      }
+      if (badge) { badge.style.display = s.operationalReady ? 'none' : 'inline-block'; }
+
+      if (!s.setupComplete) {
+        var items = (s.items || []).map(function (it) {
+          var mark = it.satisfied ? '✓' : '❌';
+          var btn = it.satisfied ? '' : " <button onclick='setupConfigure(\"" + it.key + "\")'>Configurar</button>";
+          return "<span class='setup-item'><span>" + mark + "</span><span class='k'>" + setupItemLabel(it.key) + "</span><span class='muted'>" + escapeHtml(it.detail || '') + "</span>" + btn + "</span>";
+        }).join('');
+        banner.className = 'setup-banner err';
+        banner.innerHTML = "<div class='title'>⚠️ SETUP REQUIRED</div>" +
+          "<div class='sub'>Bootstrap: " + (s.bootstrapReady ? 'READY' : 'não READY') +
+          " · Operational: " + (s.operationalReady ? '✓' : '✗') + "</div>" +
+          "<div class='setup-items'>" + items + "</div>";
+        banner.style.display = 'block';
+        return;
+      }
+
+      if (!s.operationalReady) {
+        banner.className = 'setup-banner warn';
+        banner.innerHTML = "<div class='title'>Setup complete — aguarda fontes (sources)</div>" +
+          "<div class='sub'>Bootstrap: READY · Operational: ✗ · fontes ingeridas: " + nfmt(s.sourcesCount || 0) + "</div>";
+        banner.style.display = 'block';
+        return;
+      }
+
+      banner.className = 'setup-banner ok';
+      banner.innerHTML = "<span class='setup-item'><span>✓</span> Operational Ready</span>";
+      banner.style.display = 'block';
+    }
+
+    function renderSetupReadiness(s) {
+      var el = document.getElementById('setupReadiness');
+      if (!el) { return; }
+      if (!s) { el.innerHTML = "<p class='muted'>Estado de prontidão indisponível.</p>"; return; }
+      var rows = (s.items || []).map(function (it) {
+        return "<tr><td>" + (it.satisfied ? '✓' : '❌') + "</td><td>" + setupItemLabel(it.key) +
+          (it.required ? " <span class='badge muted'>obrigatório</span>" : " <span class='badge muted'>opcional</span>") +
+          "</td><td class='muted'>" + escapeHtml(it.detail || '') + "</td></tr>";
+      }).join('');
+      el.innerHTML = "<p><strong>Bootstrap:</strong> " + (s.bootstrapReady ? 'READY' : 'não READY') +
+        " · <strong>Operational:</strong> " + (s.operationalReady ? '✓' : '✗') +
+        " · <strong>Setup completo:</strong> " + (s.setupComplete ? 'sim' : 'não') + "</p>" +
+        (s.adoptedFromLegacy ? "<p class='muted'>Instalação adoptada de configuração legacy.</p>" : '') +
+        "<table><thead><tr><th></th><th>Componente</th><th>Detalhe</th></tr></thead><tbody>" + rows + "</tbody></table>";
+    }
+
+    async function loadSetupReadiness() {
+      var s = await safeFetchJson('/api/configuration/readiness', null);
+      setupSnapshot = (s && !s.error) ? s : null;
+      renderSetupBanner(setupSnapshot);
+      renderSetupReadiness(setupSnapshot);
+      return setupSnapshot;
+    }
+
+    function renderTelegramAuthStatus(s) {
+      var el = document.getElementById('setupTelegramStatus');
+      if (!el) { return; }
+      if (!s) { el.textContent = 'Estado de autenticação indisponível.'; return; }
+      var state = s.state || '—';
+      var cls = state === 'Authenticated' ? 'ok' : (state === 'Error' ? 'err' : 'warn');
+      el.innerHTML = "<span class='badge " + cls + "'>" + escapeHtml(state) + "</span> " +
+        (s.userName ? ("utilizador: " + escapeHtml(s.userName)) : '') +
+        (s.detail ? (" · " + escapeHtml(s.detail)) : '');
+    }
+
+    async function refreshTelegramAuthStatus() {
+      var s = await safeFetchJson('/api/telegram/auth/status', null);
+      renderTelegramAuthStatus(s && !s.error ? s : null);
+    }
+
+    async function loadTelegramSetup() {
+      var s = await safeFetchJson('/api/telegram/config', null);
+      if (s && !s.error) {
+        document.getElementById('setupTelegramApiId').value = s.apiId || '';
+        document.getElementById('setupTelegramPhone').value = s.phoneNumber || '';
+        document.getElementById('setupTelegramApiHash').placeholder = s.hasApiHash ? 'configurado' : 'não configurado';
+      }
+      await refreshTelegramAuthStatus();
+    }
+
+    function telegramFormBody() {
+      var body = {
+        apiId: document.getElementById('setupTelegramApiId').value.trim(),
+        phoneNumber: document.getElementById('setupTelegramPhone').value.trim()
+      };
+      var apiHash = document.getElementById('setupTelegramApiHash').value.trim();
+      if (apiHash) { body.apiHash = apiHash; }
+      return body;
+    }
+
+    async function saveTelegramConfig() {
+      var r = await setupFetch('/api/telegram/config', 'POST', telegramFormBody());
+      if (r.status === 200 && r.json && r.json.hasApiHash) {
+        document.getElementById('setupTelegramApiHash').value = '';
+        document.getElementById('setupTelegramApiHash').placeholder = 'configurado';
+      }
+      await loadSetupReadiness();
+      await refreshTelegramAuthStatus();
+    }
+
+    async function startTelegramAuth() {
+      var r = await setupFetch('/api/telegram/auth/start', 'POST', telegramFormBody());
+      renderTelegramAuthStatus(r.json);
+      await loadSetupReadiness();
+    }
+
+    async function submitTelegramCode() {
+      var code = document.getElementById('setupTelegramCode').value.trim();
+      if (!code) { return; }
+      var r = await setupFetch('/api/telegram/auth/code', 'POST', { code: code });
+      document.getElementById('setupTelegramCode').value = '';
+      renderTelegramAuthStatus(r.json);
+      await loadSetupReadiness();
+    }
+
+    async function submitTelegram2fa() {
+      var code2fa = document.getElementById('setupTelegram2fa').value;
+      if (!code2fa) { return; }
+      var r = await setupFetch('/api/telegram/auth/password', 'POST', { password: code2fa });
+      document.getElementById('setupTelegram2fa').value = '';
+      renderTelegramAuthStatus(r.json);
+      await loadSetupReadiness();
+    }
+
+    async function loadDispatcharrSetup() {
+      var s = await safeFetchJson('/api/dispatcharr/config', null);
+      if (s && !s.error) {
+        document.getElementById('setupDispatcharrEnabled').value = s.enabled ? 'true' : 'false';
+        document.getElementById('setupDispatcharrBaseUrl').value = s.baseUrl || '';
+        document.getElementById('setupDispatcharrDryRun').value = s.dryRun ? 'true' : 'false';
+        document.getElementById('setupDispatcharrApiKey').placeholder = s.hasApiKey ? 'configurado' : 'não configurado';
+      }
+    }
+
+    async function saveDispatcharrConfig() {
+      var body = {
+        enabled: document.getElementById('setupDispatcharrEnabled').value === 'true',
+        baseUrl: document.getElementById('setupDispatcharrBaseUrl').value.trim(),
+        dryRun: document.getElementById('setupDispatcharrDryRun').value === 'true'
+      };
+      var apiKey = document.getElementById('setupDispatcharrApiKey').value.trim();
+      if (apiKey) { body.apiKey = apiKey; }
+      var r = await setupFetch('/api/dispatcharr/config', 'POST', body);
+      if (r.status === 200 && r.json && r.json.hasApiKey) {
+        document.getElementById('setupDispatcharrApiKey').value = '';
+        document.getElementById('setupDispatcharrApiKey').placeholder = 'configurado';
+      }
+      await loadSetupReadiness();
+    }
+
+    function dispatcharrStatusLabel(status) {
+      var map = {
+        Connected: 'CONNECTED', AuthenticationFailed: 'AUTHENTICATION_FAILED',
+        Unreachable: 'UNREACHABLE', InvalidConfiguration: 'INVALID_CONFIGURATION', Error: 'ERROR'
+      };
+      return map[status] || (status || '—');
+    }
+
+    async function testDispatcharrConnection() {
+      var el = document.getElementById('setupDispatcharrStatus');
+      el.textContent = 'a testar…';
+      var r = await setupFetch('/api/dispatcharr/test', 'POST', {});
+      if (!r.json) { el.textContent = 'Erro ao testar (HTTP ' + r.status + ').'; return; }
+      var ok = r.json.status === 'Connected';
+      el.innerHTML = "<span class='badge " + (ok ? 'ok' : 'err') + "'>" + dispatcharrStatusLabel(r.json.status) + "</span> " +
+        (r.json.version ? ("versão " + escapeHtml(r.json.version) + " ") : '') +
+        (r.json.detail ? ("· " + escapeHtml(r.json.detail)) : '');
+      await loadSetupReadiness();
+    }
+
+    async function loadSetup() {
+      await Promise.all([loadSetupReadiness(), loadTelegramSetup(), loadDispatcharrSetup()]);
+    }
+
+    // === W10b — Conta: alterar password ===
+    async function changePassword() {
+      var statusEl = document.getElementById('accountPasswordStatus');
+      var current = document.getElementById('accountCurrentPassword').value;
+      var next = document.getElementById('accountNewPassword').value;
+      var confirm = document.getElementById('accountConfirmPassword').value;
+      if (next !== confirm) { statusEl.textContent = 'nova password inválida'; return; }
+
+      var r = await setupFetch('/api/session/password', 'POST',
+        { currentPassword: current, newPassword: next });
+
+      document.getElementById('accountCurrentPassword').value = '';
+      document.getElementById('accountNewPassword').value = '';
+      document.getElementById('accountConfirmPassword').value = '';
+
+      if (r.status === 200) {
+        statusEl.textContent = 'password alterada — faça login novamente';
+        setTimeout(function () { location.href = '/'; }, 800);
+        return;
+      }
+      if (r.json && r.json.error === 'invalid-current-password') {
+        statusEl.textContent = 'password actual incorrecta';
+        return;
+      }
+      if (r.json && r.json.error === 'invalid-new-password') {
+        statusEl.textContent = 'nova password inválida';
+        return;
+      }
+      statusEl.textContent = 'erro inesperado';
+    }
+
     function showView(name) {
       console.log('[DEBUG] showView called:', name);
+      if (name !== 'liverun') stopLiveRunPolling();
       document.querySelectorAll('main > section').forEach(s => s.hidden = true);
       const targetSection = document.getElementById('view-' + name);
       targetSection.hidden = false;
@@ -5241,21 +9602,39 @@ const rows = Object.entries(inv).map(([k, v]) => {
       switch (name) {
         case 'overview': loadOverview(); break;
         case 'executions': loadHistory(); break;
-        case 'discovery': loadDiscovery(); break;
+        case 'discovery': loadDiscovery(); loadDiscoverySettings(); break;
         case 'countries': loadCountries(); break;
         case 'playlist': loadPlaylist(); break;
         case 'dispatcharr': loadDispatcharr(); break;
         case 'catalog': loadCatalog(); break;
         case 'validation': loadValidationPolicy(); break;
+        case 'liverun': loadLiveRun(); startLiveRunPolling(); break;
         case 'diagnostics': loadDiagnostics(); break;
+        case 'setup': loadSetup(); break;
       }
     }
 
     document.querySelectorAll('nav button').forEach(b => { if (!b.dataset.view) return; b.addEventListener('click', () => showView(b.dataset.view)); });
     document.getElementById('countrySelect').addEventListener('change', () => loadCountryValidation());
     ['discState','discSource','discCountry'].forEach(id => document.getElementById(id).addEventListener('change', renderDiscovery));
+    document.getElementById('discoverySettingsSaveBtn').addEventListener('click', saveDiscoverySettings);
+    ['discoveryMinHistoryHours','discoveryMaxHistoryHours'].forEach(id => document.getElementById(id).addEventListener('input', updateDiscoveryWindowExplainer));
 
     showView('overview');
+
+    // Banner de setup é populado no arranque, independentemente da vista.
+    loadSetupReadiness();
+
+    window.loadSetup = loadSetup;
+    window.loadSetupReadiness = loadSetupReadiness;
+    window.setupConfigure = setupConfigure;
+    window.saveTelegramConfig = saveTelegramConfig;
+    window.startTelegramAuth = startTelegramAuth;
+    window.submitTelegramCode = submitTelegramCode;
+    window.submitTelegram2fa = submitTelegram2fa;
+    window.saveDispatcharrConfig = saveDispatcharrConfig;
+    window.testDispatcharrConnection = testDispatcharrConnection;
+    window.changePassword = changePassword;
 
     window.showAddRuleForm = showAddRuleForm;
     window.hideAddRuleForm = hideAddRuleForm;
@@ -5266,11 +9645,459 @@ const rows = Object.entries(inv).map(([k, v]) => {
     window.deleteRule = deleteRule;
     window.approveReview = approveReview;
     window.excludeReview = excludeReview;
+    window.selectReviewAction = selectReviewAction;
+    window.submitReviewAliasApproval = submitReviewAliasApproval;
+    window.submitReviewExclude = submitReviewExclude;
+    window.closeReviewApproveModal = closeReviewApproveModal;
     window.loadAffinityGroups = loadAffinityGroups;
     window.showAddAffinityForm = showAddAffinityForm;
     window.hideAddAffinityForm = hideAddAffinityForm;
     window.submitAddAffinityGroup = submitAddAffinityGroup;
     window.deleteAffinityGroup = deleteAffinityGroup;
+    window.editAffinityGroup = editAffinityGroup;
+    window.cancelAffinityEdit = cancelAffinityEdit;
+    window.onAffinityKindChange = onAffinityKindChange;
+    window.saveAffinityDelimiter = saveAffinityDelimiter;
+    window.loadSourceSelectionPolicy = loadSourceSelectionPolicy;
+    window.saveSourceSelectionPolicy = saveSourceSelectionPolicy;
+    window.loadChannelSourceSelectionPolicies = loadChannelSourceSelectionPolicies;
+    window.loadChannelSourceSelectionKeys = loadChannelSourceSelectionKeys;
+    window.editChannelSourceSelectionPolicy = editChannelSourceSelectionPolicy;
+    window.newChannelSourceSelectionPolicy = newChannelSourceSelectionPolicy;
+    window.saveChannelSourceSelectionPolicy = saveChannelSourceSelectionPolicy;
+    window.deleteChannelSourceSelectionPolicy = deleteChannelSourceSelectionPolicy;
+    window.loadSourceSelectionPreview = loadSourceSelectionPreview;
+
+    // === PHASE 9C.4 — Live Run (polling leve; sem SSE/WebSocket, sem tail de logs) ===
+    var liveRunTimer = null;
+    var liveRunInFlight = false;
+    var liveRunLastPollUtc = null;
+
+    function liveRunStatusBadge(status) {
+      if (status === 'running') return "<span class='badge warn'>em execução</span>";
+      if (status === 'completed') return "<span class='badge ok'>concluída</span>";
+      if (status === 'failed') return "<span class='badge err'>falhada</span>";
+      if (status === 'pipeline-not-configured') return "<span class='badge muted'>pipeline não configurada</span>";
+      if (status === 'idle') return "<span class='badge muted'>idle</span>";
+      return "<span class='badge muted'>" + escapeHtml(status || '—') + "</span>";
+    }
+
+    function liveRunPhaseLabel(phase, phases) {
+      if (!phase) return '—';
+      var list = Array.isArray(phases) ? phases : [];
+      var idx = list.indexOf(phase);
+      var pos = idx >= 0 ? (' (' + (idx + 1) + '/' + list.length + ')') : '';
+      return escapeHtml(phase) + pos;
+    }
+
+    function liveRunDuration(ms) {
+      if (typeof ms !== 'number' || ms < 0 || !isFinite(ms)) return '—';
+      var s = Math.floor(ms / 1000);
+      if (s < 60) return s + 's';
+      var m = Math.floor(s / 60);
+      if (m < 60) return m + 'm ' + (s % 60) + 's';
+      var h = Math.floor(m / 60);
+      return h + 'h ' + (m % 60) + 'm';
+    }
+
+    function liveRunCountEntries(counts) {
+      if (!counts || typeof counts !== 'object') return [];
+      // Rótulos humanos para os contadores conhecidos de LiveRunCounts.
+      // Campos desconhecidos mantêm o nome camelCase cru (nunca inventamos).
+      var labels = {
+        dialogsTotal: 'Diálogos',
+        dialogsIncomplete: 'Diálogos incompletos',
+        messagesAnalyzed: 'Mensagens analisadas',
+        messagesWithMedia: 'Mensagens com media',
+        messagesWithDocumentMedia: 'Mensagens com documento',
+        candidatesFound: 'Candidatos',
+        playlistsDownloaded: 'Playlists descarregadas',
+        playlistsInvalid: 'Playlists inválidas',
+        playlistsPartial: 'Playlists parciais',
+        playlistsRejected: 'Playlists rejeitadas',
+        countryMatches: 'Country matches',
+        acquisitionFailures: 'Falhas de aquisição',
+        acquisitionRetryableFailures: 'Falhas de aquisição retryable',
+        acquisitionTerminalFailures: 'Falhas de aquisição terminais',
+        publicationsDiscovered: 'Publicações descobertas',
+        publicationsResolved: 'Publicações resolvidas',
+        publicationsResolutionFailed: 'Publicações falhadas',
+        publicationsRequiresReview: 'Publicações para revisão',
+        xtreamAccountsDiscovered: 'Contas Xtream descobertas',
+        xtreamAccountsAfterDedup: 'Contas Xtream após dedup',
+        xtreamAccountsForwarded: 'Contas Xtream encaminhadas',
+        channelsRecognized: 'Canais reconhecidos',
+        streamsExtracted: 'Streams extraídos',
+        streamsAfterCountryFilter: 'Streams após filtro de país',
+        streamsRejectedByCountry: 'Streams rejeitados por país',
+        streamsTested: 'Streams testados (físico)',
+        streamsWorking: 'Streams working',
+        streamsFailed: 'Streams falhados',
+        streamsSkippedAlreadyValidated: 'Streams reutilizados (W-DEDUP)',
+        targetPlaylistEntries: 'Entradas da playlist final',
+        existingPlaylistRetested: 'Existentes retestados',
+        dispatcharrSyncAttempted: 'Dispatcharr sync tentadas',
+        dispatcharrSyncCompleted: 'Dispatcharr sync concluídas',
+        dispatcharrSyncFailed: 'Dispatcharr sync falhadas',
+        dispatcharrSyncSkipped: 'Dispatcharr sync ignoradas'
+      };
+      var out = [];
+      Object.keys(counts).forEach(function (k) {
+        var v = counts[k];
+        if (typeof v !== 'number' || v === 0) return;
+        out.push([labels[k] || k, v]);
+      });
+      return out;
+    }
+
+    function liveRunCategoryBadge(category) {
+      if (!category) return '—';
+      var cat = String(category).toLowerCase();
+      var colors = {
+        telegram: 'var(--info)',
+        playlist: 'var(--ok)',
+        stream: 'var(--accent)',
+        xtream: 'var(--warn)',
+        dispatcharr: 'var(--err)',
+        system: 'var(--muted)',
+        phase: 'var(--accent-2)',
+        run: 'var(--info)'
+      };
+      var color = colors[cat] || 'var(--muted)';
+      return "<span class='badge lr-cat' style='color:" + color + ";border:1px solid " + color + ";'>" + escapeHtml(cat) + "</span>";
+    }
+
+    function renderLiveRun(data) {
+      var host = document.getElementById('liveRunStatus');
+      var trigger = document.getElementById('liveRunTriggerState');
+      var btn = document.getElementById('liveRunStartBtn');
+      var countsEl = document.getElementById('liveRunCounts');
+      var actsEl = document.getElementById('liveRunActivities');
+      var recentEl = document.getElementById('liveRunRecent');
+      var allow = !!(data && data.webAllowTrigger);
+
+      if (trigger) {
+        // W-PRE-FIRST-E2E: tornar o diagnóstico accionável. O 503
+        // web-allow-trigger-disabled é opt-in deliberado (architecture
+        // doc §12.2 Opção B) e não pode ser desligado pela UI. O admin
+        // precisa de reiniciar o container com a flag para activar.
+        trigger.innerHTML = allow
+          ? "Trigger manual: <span class='badge ok'>activado</span> (<code>--web-allow-trigger</code>)."
+          : "Trigger manual: <span class='badge muted'>desactivado</span>. " +
+            "Active <code>--web-allow-trigger</code> no <code>docker-compose.yml</code> " +
+            "e reinicie o container para disponibilizar o botão &quot;Run now&quot;.";
+      }
+      if (btn) {
+        btn.disabled = !allow || !!(data && data.isRunning);
+        btn.textContent = (data && data.isRunning) ? 'A executar…' : 'Run now';
+      }
+
+      if (!data || data.error) {
+        host.innerHTML = "<div class='card'><p class='badge err'>erro de API</p><p class='muted'>" +
+          escapeHtml((data && data.error) ? data.error : 'Sem resposta do servidor.') + "</p></div>";
+        if (countsEl) countsEl.innerHTML = '';
+        if (actsEl) actsEl.textContent = '—';
+        if (recentEl) recentEl.innerHTML = '';
+        return;
+      }
+
+      var status = data.status || 'idle';
+      var running = status === 'running';
+      var run = running ? data : (data.lastRun || null);
+
+      var rows = [];
+      rows.push(['Estado', liveRunStatusBadge(status)]);
+      rows.push(['Run ID', run && run.runId ? "<code>" + escapeHtml(run.runId) + "</code>" : '—']);
+      if (run && run.mode) rows.push(['Modo', "<code>" + escapeHtml(run.mode) + "</code>"]);
+      if (run && run.source) rows.push(['Origem', "<code>" + escapeHtml(run.source) + "</code>"]);
+      rows.push(['Fase', run ? liveRunPhaseLabel(run.phase, run.phases) : '—']);
+      if (run && run.phaseStartedAtUtc) rows.push(['Fase desde', escapeHtml(tsLocal(run.phaseStartedAtUtc))]);
+      if (run && run.startedAtUtc) rows.push(['Início', escapeHtml(tsLocal(run.startedAtUtc))]);
+      if (run) rows.push(['Duração', liveRunDuration(run.durationMs)]);
+      var updated = running ? data.lastUpdatedAtUtc : (run ? run.finishedAtUtc : null);
+      if (updated) rows.push(['Última actualização', escapeHtml(tsLocal(updated))]);
+      if (run && run.lastMessage) rows.push(['Mensagem', escapeHtml(run.lastMessage)]);
+
+      host.innerHTML = "<div class='card'><table><tbody>" + rows.map(function (r) {
+        return "<tr><th style='width:200px;'>" + escapeHtml(r[0]) + "</th><td>" + r[1] + "</td></tr>";
+      }).join('') + "</tbody></table></div>";
+
+      // Contadores (LiveRunCounts tipado; nunca derivado de logs).
+      var entries = liveRunCountEntries(run && run.counts ? run.counts : null);
+      if (countsEl) {
+        countsEl.innerHTML = entries.length
+          ? entries.map(function (e) {
+              return "<div class='card'><div class='muted'>" + escapeHtml(e[0]) + "</div><div style='font-size:20px;'>" + nfmt(e[1]) + "</div></div>";
+            }).join('')
+          : "<div class='muted'>Sem contadores para mostrar.</div>";
+      }
+
+      // Últimas actividades (feed ring buffer; só existe para o run em memória).
+      var acts = run && Array.isArray(run.recentActivities) ? run.recentActivities : [];
+      if (actsEl) {
+        if (!acts.length) {
+          actsEl.textContent = 'Sem actividades disponíveis (o feed é em memória e não é persistido).';
+        } else {
+          var lastActs = acts.slice(-25).reverse();
+          actsEl.innerHTML = "<table><thead><tr><th>Quando</th><th>Nível</th><th>Categoria</th><th>Mensagem</th></tr></thead><tbody>" +
+            lastActs.map(function (a) {
+              var cls = a.level === 'error' ? 'badge err' : (a.level === 'warning' ? 'badge warn' : 'badge muted');
+              var metaHtml = '';
+              var meta = a.metadata;
+              if (meta && typeof meta === 'object') {
+                var parts = Object.keys(meta).map(function (k) {
+                  var v = meta[k];
+                  if (v === null || v === undefined) return '';
+                  var s = String(v);
+                  if (s.length > 80) s = s.slice(0, 80) + '…';
+                  return "<span class='muted' style='margin-right:8px;'><code>" + escapeHtml(k) + "</code>=<span>" + escapeHtml(s) + "</span></span>";
+                }).filter(function (x) { return x; });
+                if (parts.length) metaHtml = "<div style='font-size:11px;margin-top:2px;'>" + parts.join('') + "</div>";
+              }
+              return "<tr><td>" + escapeHtml(tsLocal(a.timestampUtc)) + "</td><td><span class='" + cls + "'>" +
+                escapeHtml(a.level || 'info') + "</span></td><td>" + liveRunCategoryBadge(a.category) + "</td><td>" +
+                escapeHtml(a.message || '') + metaHtml + "</td></tr>";
+            }).join('') + "</tbody></table>";
+        }
+      }
+
+      // Últimas execuções (24h).
+      var recent = Array.isArray(data.recentRuns) ? data.recentRuns : [];
+      if (recentEl) {
+        if (!recent.length) {
+          recentEl.innerHTML = "<p class='muted'>Sem execuções registadas nas últimas 24h.</p>";
+        } else {
+          recentEl.innerHTML = "<table><thead><tr><th>Run ID</th><th>Modo</th><th>Origem</th><th>Início</th><th>Fim</th><th>Duração</th><th>Estado</th></tr></thead><tbody>" +
+            recent.map(function (r) {
+              var badge = r.terminalStatus === 'completed' ? "<span class='badge ok'>ok</span>"
+                : (r.terminalStatus === 'failed' ? "<span class='badge err'>falhou</span>" : "<span class='badge muted'>—</span>");
+              return "<tr><td><code>" + escapeHtml(r.runId || '') + "</code></td><td>" + escapeHtml(r.mode || '') +
+                "</td><td>" + escapeHtml(r.source || '') + "</td><td>" + escapeHtml(tsLocal(r.startedAtUtc)) +
+                "</td><td>" + escapeHtml(tsLocal(r.finishedAtUtc)) + "</td><td>" + liveRunDuration(r.durationMs) +
+                "</td><td>" + badge + "</td></tr>";
+            }).join('') + "</tbody></table>";
+        }
+      }
+    }
+
+    async function loadLiveRun() {
+      if (liveRunInFlight) return;
+      liveRunInFlight = true;
+      try {
+        var r = await fetch('/api/run/status');
+        var data = null;
+        try { data = await r.json(); } catch (e) { data = null; }
+        if (!r.ok && data && data.status !== 'pipeline-not-configured') {
+          data = data || { error: 'HTTP ' + r.status };
+        }
+        liveRunLastPollUtc = new Date();
+        renderLiveRun(data);
+        var st = document.getElementById('liveRunPollState');
+        if (st) st.textContent = 'actualizado às ' + liveRunLastPollUtc.toLocaleTimeString() + ' (polling 3s)';
+        await loadLiveRunScheduled();
+      } catch (e) {
+        renderLiveRun({ error: e && e.message ? e.message : 'falha de rede' });
+      } finally {
+        liveRunInFlight = false;
+      }
+    }
+
+    async function loadLiveRunScheduled() {
+      var el = document.getElementById('liveRunScheduled');
+      if (!el) return;
+      var list = await safeFetchJson('/api/catalog/scheduled-jobs', []);
+      if (!Array.isArray(list)) { el.innerHTML = "<p class='muted'>Erro ao carregar agendamentos.</p>"; return; }
+      var mine = list.filter(function (j) {
+        return j && (j.actionName === 'telegramRun' || j.actionName === 'telegramMaintainRun');
+      });
+      if (!mine.length) {
+        el.innerHTML = "<p class='muted'>Nenhuma execução Telegram agendada. Crie um job em <b>Scheduled Jobs</b> com a acção <code>telegramRun</code>.</p>";
+        return;
+      }
+      el.innerHTML = "<table><thead><tr><th>Nome</th><th>Cron</th><th>Acção</th><th>Activo</th><th>Próximo</th><th>Último resultado</th></tr></thead><tbody>" +
+        mine.map(function (j) {
+          return "<tr><td><code>" + escapeHtml(j.name || '') + "</code></td><td><code>" + escapeHtml(j.cronExpression || '') +
+            "</code></td><td>" + escapeHtml(j.actionName || '') + "</td><td>" +
+            (j.isEnabled ? "<span class='badge ok'>sim</span>" : "<span class='badge err'>não</span>") +
+            "</td><td>" + escapeHtml(j.nextRunAtUtc ? tsLocal(j.nextRunAtUtc) : '—') +
+            "</td><td>" + escapeHtml(j.lastResult || '—') + "</td></tr>";
+        }).join('') + "</tbody></table>";
+    }
+
+    async function startLiveRun() {
+      var btn = document.getElementById('liveRunStartBtn');
+      if (btn) { btn.disabled = true; btn.textContent = 'A arrancar…'; }
+      try {
+        var r = await fetch('/api/run/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: '{}'
+        });
+        var body = null;
+        try { body = await r.json(); } catch (e) { body = null; }
+        if (r.status === 503) {
+          var msg = (body && body.error) ? body.error : 'trigger indisponível';
+          if (btn) { btn.textContent = 'Run now'; }
+          renderLiveRun({ error: msg, webAllowTrigger: false });
+          return;
+        }
+        if (r.status === 409) {
+          // Já existe execução: o polling mostra o estado real.
+          if (btn) { btn.textContent = 'Run now'; }
+          await loadLiveRun();
+          return;
+        }
+        if (!r.ok) {
+          if (btn) { btn.textContent = 'Run now'; }
+          renderLiveRun({ error: (body && body.error) ? body.error : ('HTTP ' + r.status) });
+          return;
+        }
+        await loadLiveRun();
+      } catch (e) {
+        renderLiveRun({ error: e && e.message ? e.message : 'falha de rede' });
+      }
+    }
+
+    function stopLiveRunPolling() {
+      if (liveRunTimer !== null) { clearInterval(liveRunTimer); liveRunTimer = null; }
+    }
+
+    function startLiveRunPolling() {
+      stopLiveRunPolling();
+      // Polling leve: 3s, apenas enquanto a vista estiver activa e sem
+      // pedidos sobrepostos (liveRunInFlight). Sem SSE/WebSocket.
+      liveRunTimer = setInterval(function () {
+        var section = document.getElementById('view-liverun');
+        if (!section || section.hidden) { stopLiveRunPolling(); return; }
+        if (document.hidden) return;
+        loadLiveRun();
+      }, 3000);
+    }
+
+    window.startLiveRun = startLiveRun;
+    window.loadLiveRun = loadLiveRun;
+
+    // Modal centrado reutilizável. Os painéis de edição vivem dentro de tabs
+    // ocultas; openModalPanel adopta o elemento movendo-o para #modalRoot
+    // enquanto aberto e devolve-o à posição original no fecho.
+    var _modalEl = null, _modalParent = null, _modalAnchor = null, _modalPrevFocus = null;
+    function openModalPanel(id) {
+      var el = document.getElementById(id);
+      if (!el || _modalEl === el) return;
+      closeModalPanel();
+      _modalParent = el.parentNode;
+      _modalAnchor = el.nextSibling;
+      _modalPrevFocus = document.activeElement;
+      var root = document.getElementById('modalRoot');
+      root.appendChild(el);
+      el.hidden = false;
+      el.classList.add('modal-panel');
+      if (!el.querySelector('.modal-close')) {
+        var x = document.createElement('button');
+        x.className = 'modal-close';
+        x.type = 'button';
+        x.setAttribute('aria-label', 'Fechar');
+        x.textContent = '\u00d7';
+        x.onclick = closeModalPanel;
+        el.insertBefore(x, el.firstChild);
+      }
+      root.hidden = false;
+      root.classList.add('open');
+      document.body.classList.add('modal-open');
+      var f = el.querySelector('input:not([type=hidden]),select,textarea,button');
+      if (f && f.focus) f.focus();
+      _modalEl = el;
+    }
+    function closeModalPanel() {
+      if (_modalEl) {
+        _modalEl.classList.remove('modal-panel');
+        var x = _modalEl.querySelector('.modal-close');
+        if (x) x.remove();
+        _modalEl.hidden = true;
+        if (_modalParent) _modalParent.insertBefore(_modalEl, _modalAnchor);
+        _modalEl = null;
+      }
+      var root = document.getElementById('modalRoot');
+      if (root) { root.classList.remove('open'); root.hidden = true; }
+      document.body.classList.remove('modal-open');
+      if (_modalPrevFocus && _modalPrevFocus.focus) { try { _modalPrevFocus.focus(); } catch (e) {} }
+      _modalPrevFocus = null;
+    }
+    window.openModalPanel = openModalPanel;
+    window.closeModalPanel = closeModalPanel;
+    (function () {
+      var root = document.getElementById('modalRoot');
+      if (root) root.addEventListener('click', function (e) { if (e.target === root) closeModalPanel(); });
+      document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && _modalEl) closeModalPanel(); });
+    })();
+
+    // W1 — Restauro de escopo dos handlers inline. O script principal está
+    // dentro de uma IIFE, pelo que as funções declaradas aqui não são
+    // globais. Os atributos inline do HTML (onclick/onchange/oninput)
+    // resolvem os nomes em escopo global; qualquer função não exportada
+    // lança `ReferenceError` e o clique não faz nada. Este bloco re-exporta
+    // os handlers restantes para `window`. Coberto pela regressão
+    // `DashboardInlineHandlerScopeTests` (que impede novo HTML inline a
+    // chamar funções fora do escopo global).
+    window.showCreateChannelForm = showCreateChannelForm;
+    window.showCreateChannelFormForReview = showCreateChannelFormForReview;
+    window.hideCreateChannelForm = hideCreateChannelForm;
+    window.submitCreateChannel = submitCreateChannel;
+    window.selectChannel = selectChannel;
+    window.editChannelInline = editChannelInline;
+    window.deleteChannel = deleteChannel;
+    window.toggleChannelEnabled = toggleChannelEnabled;
+    window.toggleChannelPolicy = toggleChannelPolicy;
+    window.addAliasFromDetail = addAliasFromDetail;
+    window.removeAliasFromDetail = removeAliasFromDetail;
+    window.loadHistory = loadHistory;
+    window.loadCountryValidation = loadCountryValidation;
+    window.createCountry = createCountry;
+    window.runDispatcharrDryRun = runDispatcharrDryRun;
+    window.runDispatcharrSync = runDispatcharrSync;
+    window.loadChannelSources = loadChannelSources;
+    window.submitCreateSource = submitCreateSource;
+    window.deleteSource = deleteSource;
+    window.toggleChannelSource = toggleChannelSource;
+    window.deleteChannelSource = deleteChannelSource;
+    window.loadChannelPriority = loadChannelPriority;
+    window.saveChannelPriority = saveChannelPriority;
+    window.saveGlobalPriority = saveGlobalPriority;
+    window.loadValidationPolicy = loadValidationPolicy;
+    window.saveValidationPolicy = saveValidationPolicy;
+    window.runValidationTest = runValidationTest;
+    window.updateSchedCronStatus = updateSchedCronStatus;
+    window.applySchedFrequency = applySchedFrequency;
+    window.submitCreateScheduledJob = submitCreateScheduledJob;
+    window.editScheduledJob = editScheduledJob;
+    window.newScheduledJob = newScheduledJob;
+    window.toggleScheduledJob = toggleScheduledJob;
+    window.deleteScheduledJob = deleteScheduledJob;
+    window.submitCreateOrderingList = submitCreateOrderingList;
+    window.showCreateOrderingForm = showCreateOrderingForm;
+    window.editOrderingList = editOrderingList;
+    window.saveOrderingListEdit = saveOrderingListEdit;
+    window.cancelOrderingListEdit = cancelOrderingListEdit;
+    window.openOrderingList = openOrderingList;
+    window.previewOrderingList = previewOrderingList;
+    window.duplicateOrderingList = duplicateOrderingList;
+    window.deleteOrderingList = deleteOrderingList;
+    window.addOrderingItem = addOrderingItem;
+    window.moveOrderingItem = moveOrderingItem;
+    window.toggleOrderingItem = toggleOrderingItem;
+    window.removeOrderingItem = removeOrderingItem;
+    window.showCreateCanonicalGroup = showCreateCanonicalGroup;
+    window.editCanonicalGroup = editCanonicalGroup;
+    window.submitCanonicalGroupEdit = submitCanonicalGroupEdit;
+    window.deleteCanonicalGroup = deleteCanonicalGroup;
+    window.editImportPolicy = editImportPolicy;
+    window.submitImportPolicyEdit = submitImportPolicyEdit;
+    window.loadDegradation = loadDegradation;
+    window.loadMatchingAudits = loadMatchingAudits;
+    window.loadSyncRunSteps = loadSyncRunSteps;
+    window.loadPendingCountryApprovals = loadPendingCountryApprovals;
+    window.approvePendingCountryApproval = approvePendingCountryApproval;
+    window.rejectPendingCountryApproval = rejectPendingCountryApproval;
   })();
   </script>
 </body>
@@ -5288,6 +10115,1319 @@ const rows = Object.entries(inv).map(([k, v]) => {
         /// Caso contrário exige o token via header <c>Authorization: Bearer &lt;token&gt;</c>
         /// ou query string <c>?token=&lt;token&gt;</c>.
         /// </summary>
+        // ================= PHASE 9C.2 — Auth helpers =================
+
+        private sealed class CredentialsPayload
+        {
+            [JsonPropertyName("username")]
+            public string? Username { get; set; }
+
+            [JsonPropertyName("password")]
+            public string? Password { get; set; }
+        }
+
+        /// <summary>
+        /// W10b — Corpo de <c>POST /api/session/password</c>. Nunca é
+        /// registado nem ecoado; as passwords existem apenas em memória
+        /// durante o pedido.
+        /// </summary>
+        private sealed class PasswordChangePayload
+        {
+            [JsonPropertyName("currentPassword")]
+            public string? CurrentPassword { get; set; }
+
+            [JsonPropertyName("newPassword")]
+            public string? NewPassword { get; set; }
+        }
+
+        /// <summary>
+        /// PHASE 9C.5 (F6) — Decide o modo de autorização e devolve também o
+        /// estado de lifecycle efectivo, para que respostas de diagnóstico
+        /// (ex.: <c>403 bootstrap-required</c>) não mintam sobre o estado.
+        /// Numa só leitura, evitando divergência entre modo e estado reportado.
+        /// </summary>
+        private static async Task<(AuthMode Mode, ConfigurationLifecycleState State)> ResolveAuthDecisionAsync()
+        {
+            if (_configurationLifecycle == null && _authService == null)
+            {
+                // PHASE 9C.2 (S1-E) — Ausência simultânea de lifecycle e auth.
+                // Só é legítima num contexto explicitamente standalone/testes.
+                // Em produção (wiring falhou, p.ex. catálogo indisponível) é
+                // fail-closed: nunca Legacy aberto. UserAuth sem sessão resulta
+                // em 401, mantendo apenas os endpoints públicos de diagnóstico.
+                return (
+                    _standaloneAuthContext ? AuthMode.Legacy : AuthMode.UserAuth,
+                    ConfigurationLifecycleState.NotConfigured);
+            }
+
+            var state = _configurationLifecycle != null
+                ? (await _configurationLifecycle.GetStateAsync()).State
+                : ConfigurationLifecycleState.NotConfigured;
+
+            if (_authService == null)
+            {
+                // PHASE 9C.2 (S1) — Auth indisponível (falha de wiring). NUNCA
+                // tratar isto como autorização implícita (Legacy). Em READY
+                // exige autenticação (fail-closed, 401); fora de READY é
+                // bootstrap. Não há mecanismo de fallback novo.
+                return (
+                    state == ConfigurationLifecycleState.Ready
+                        ? AuthMode.UserAuth
+                        : AuthMode.Bootstrap,
+                    state);
+            }
+
+            var hasAdmin = await _authService.HasActiveAdminAsync();
+            return (AuthModeResolver.Resolve(state, hasAdmin), state);
+        }
+
+        private static bool IsAlwaysPublicPath(string requestPath)
+        {
+            return requestPath.Equals("/api/version", StringComparison.OrdinalIgnoreCase)
+                || requestPath.Equals("/api/configuration/lifecycle", StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// Resultado da avaliação do token partilhado de máquina
+        /// (<c>--web-token</c>).
+        /// </summary>
+        private enum TokenAuthorization
+        {
+            /// <summary>Nenhum token configurado (comportamento aberto).</summary>
+            NotConfigured = 0,
+
+            /// <summary>Token configurado e válido para este pedido.</summary>
+            Authorized = 1,
+
+            /// <summary>Token configurado mas ausente/incorrecto.</summary>
+            Rejected = 2,
+        }
+
+        /// <summary>
+        /// PHASE 9C.2 (B1) — Distingue "sem token configurado" de "autorizado por
+        /// token". Permite que a credencial de máquina autorize pedidos sem exigir
+        /// sessão humana em READY + admin.
+        /// </summary>
+        private static TokenAuthorization EvaluateTokenAuthorization(
+            HttpListenerRequest request,
+            string? expectedToken)
+        {
+            if (string.IsNullOrWhiteSpace(expectedToken))
+            {
+                return TokenAuthorization.NotConfigured;
+            }
+
+            var authorized = IsAuthorized(
+                request.Headers?["Authorization"],
+                request.QueryString?["token"],
+                expectedToken);
+            return authorized ? TokenAuthorization.Authorized : TokenAuthorization.Rejected;
+        }
+
+        private static bool IsMutatingMethod(string method)
+        {
+            return method.Equals("POST", StringComparison.OrdinalIgnoreCase)
+                || method.Equals("PUT", StringComparison.OrdinalIgnoreCase)
+                || method.Equals("PATCH", StringComparison.OrdinalIgnoreCase)
+                || method.Equals("DELETE", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string? GetCookieValue(HttpListenerRequest request, string name)
+        {
+            try
+            {
+                return request.Cookies?[name]?.Value;
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+
+        private static void RedirectTo(HttpListenerResponse response, string location)
+        {
+            response.StatusCode = (int)HttpStatusCode.Found;
+            response.RedirectLocation = location;
+            MarkResponseWritten(response);
+            response.Close();
+        }
+
+        private static void SetSessionCookie(
+            HttpListenerContext context,
+            string sessionId,
+            DateTime expiresUtc)
+        {
+            var secure = context.Request.IsSecureConnection ? "; Secure" : string.Empty;
+            context.Response.AppendHeader(
+                "Set-Cookie",
+                $"{SessionCookieName}={sessionId}; Path=/; HttpOnly; SameSite=Strict{secure}; " +
+                $"Expires={expiresUtc.ToUniversalTime():R}");
+        }
+
+        private static void ClearSessionCookie(HttpListenerContext context)
+        {
+            var secure = context.Request.IsSecureConnection ? "; Secure" : string.Empty;
+            context.Response.AppendHeader(
+                "Set-Cookie",
+                $"{SessionCookieName}=; Path=/; HttpOnly; SameSite=Strict{secure}; Max-Age=0");
+        }
+
+        private static async Task<string> ReadJsonBodyAsync(HttpListenerRequest request)
+        {
+            using var reader = new StreamReader(
+                request.InputStream, request.ContentEncoding ?? Encoding.UTF8);
+            return await reader.ReadToEndAsync();
+        }
+
+        private static bool CsrfValid(HttpListenerRequest request, AdminSessionEntity session)
+        {
+            var presented = request.Headers[CsrfHeaderName];
+            return !string.IsNullOrEmpty(presented) && FixedEquals(presented, session.CsrfToken);
+        }
+
+        private static object BootstrapStatusToJson(BootstrapStatus status)
+        {
+            return new
+            {
+                state = status.State.ToWireName(),
+                hasActiveAdmin = status.HasActiveAdmin,
+                checks = status.Checks.Select(CheckToJson),
+            };
+        }
+
+        private static object CheckToJson(BootstrapCheck check)
+        {
+            return new
+            {
+                key = check.Key,
+                satisfied = check.Satisfied,
+                detail = check.Detail,
+            };
+        }
+
+        // ================= W6a — Audit =================
+
+        private const string AuditUnavailableError = "audit-unavailable";
+
+        /// <summary>
+        /// Resolve o actor humano a partir da sessão validada. O username é uma
+        /// leitura best-effort: a ausência do utilizador não impede o registo.
+        /// </summary>
+        private static async Task<AuditActor> ResolveAuditActorAsync(AdminSessionEntity session)
+        {
+            string? name = null;
+            if (_authService is not null)
+            {
+                try
+                {
+                    name = await _authService.GetAdminUsernameAsync(session.AdminUserId);
+                }
+                catch
+                {
+                    // Best effort — nunca falhar a mutação por causa do actor.
+                }
+            }
+            return AuditActor.User(session.AdminUserId, name);
+        }
+
+        /// <summary>
+        /// W6a — Registo best-effort de uma mutação administrativa. Ausência do
+        /// serviço (ex.: testes antigos) ou falha de escrita nunca aborta a
+        /// mutação; a falha é observável via log.
+        /// </summary>
+        private static async Task RecordAuditAsync(
+            AuditActor actor,
+            string operation,
+            string objectType,
+            string? objectId,
+            object? before,
+            object? after,
+            string result,
+            string? detail = null)
+        {
+            var service = _auditService;
+            if (service is null) return;
+
+            try
+            {
+                await service.RecordAsync(new AuditRecord
+                {
+                    Actor = actor,
+                    Operation = operation,
+                    ObjectType = objectType,
+                    ObjectId = objectId,
+                    Before = before,
+                    After = after,
+                    Result = result,
+                    Detail = detail,
+                });
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"⚠️ Audit record failed ({operation}): {ex.GetType().Name}");
+            }
+        }
+
+        private static object AuditRecordToJson(AuditRecordEntity r) => new
+        {
+            id = r.Id,
+            occurredAtUtc = r.OccurredAtUtc.ToString("o"),
+            actorType = r.ActorType,
+            actorId = r.ActorId,
+            actorName = r.ActorName,
+            operation = r.Operation,
+            objectType = r.ObjectType,
+            objectId = r.ObjectId,
+            beforeJson = CredentialSanitizer.SanitizeJson(r.BeforeJson),
+            afterJson = CredentialSanitizer.SanitizeJson(r.AfterJson),
+            result = r.Result,
+            detail = CredentialSanitizer.SanitizeSensitiveText(r.Detail),
+        };
+
+        /// <summary>W6a — Projecção sanitizável (sem ciclos) de um grupo de afinidade.</summary>
+        private static object AffinityGroupToAuditJson(AffinityGroupEntity? g) => g is null
+            ? null!
+            : new
+            {
+                id = g.Id,
+                name = g.Name,
+                kind = g.Kind.ToString(),
+                canonicalChannelKey = g.CanonicalChannelKey,
+                countryCode = g.CountryCode,
+                members = g.Members.Select(m => m.NormalizedMember).ToList(),
+            };
+
+        /// <summary>
+        /// W6a — <c>GET /api/audit</c>: devolve registos de auditoria (nunca
+        /// segredos). Filtros opcionais <c>objectType</c>, <c>objectId</c> e
+        /// <c>limit</c> (1..1000, por defeito 100). Read-only; método errado → 405.
+        /// </summary>
+        private static async Task HandleAuditEndpointAsync(HttpListenerContext context)
+        {
+            if (!context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+            {
+                context.Response.Headers["Allow"] = "GET";
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = "method-not-allowed" },
+                    HttpStatusCode.MethodNotAllowed);
+                return;
+            }
+
+            var resolver = _catalogResolver;
+            if (resolver is null)
+            {
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = AuditUnavailableError },
+                    HttpStatusCode.ServiceUnavailable);
+                return;
+            }
+
+            var objectType = context.Request.QueryString["objectType"];
+            var objectId = context.Request.QueryString["objectId"];
+
+            var limit = 100;
+            var rawLimit = context.Request.QueryString["limit"];
+            if (!string.IsNullOrWhiteSpace(rawLimit)
+                && int.TryParse(rawLimit, out var parsedLimit)
+                && parsedLimit > 0)
+            {
+                limit = Math.Min(parsedLimit, 1000);
+            }
+
+            try
+            {
+                await using var auditContext = await resolver.GetFactory().CreateDbContextAsync();
+                var query = auditContext.AuditRecords.AsNoTracking().AsQueryable();
+                if (!string.IsNullOrWhiteSpace(objectType))
+                {
+                    query = query.Where(r => r.ObjectType == objectType);
+                }
+                if (!string.IsNullOrWhiteSpace(objectId))
+                {
+                    query = query.Where(r => r.ObjectId == objectId);
+                }
+
+                var rows = await query
+                    .OrderByDescending(r => r.OccurredAtUtc)
+                    .ThenByDescending(r => r.Id)
+                    .Take(limit)
+                    .ToListAsync();
+
+                await WriteJsonAsync(context.Response, rows.Select(AuditRecordToJson).ToList());
+            }
+            catch (Exception ex)
+            {
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = AuditUnavailableError, detail = CredentialSanitizer.SanitizeSensitiveText(ex.Message) },
+                    HttpStatusCode.ServiceUnavailable);
+            }
+        }
+
+        private static async Task HandleBootstrapEndpointAsync(
+            HttpListenerContext context,
+            string requestPath,
+            AuthMode mode)
+        {
+            if (mode != AuthMode.Bootstrap)
+            {
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = "bootstrap-closed" },
+                    HttpStatusCode.Conflict);
+                return;
+            }
+
+            if (_bootstrapService == null)
+            {
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = "bootstrap-unavailable" },
+                    HttpStatusCode.ServiceUnavailable);
+                return;
+            }
+
+            var method = context.Request.HttpMethod;
+
+            if (requestPath.Equals("/api/bootstrap/status", StringComparison.OrdinalIgnoreCase)
+                && method.Equals("GET", StringComparison.OrdinalIgnoreCase))
+            {
+                await WriteJsonAsync(
+                    context.Response,
+                    BootstrapStatusToJson(await _bootstrapService.GetStatusAsync()));
+                return;
+            }
+
+            if (requestPath.Equals("/api/bootstrap/start", StringComparison.OrdinalIgnoreCase)
+                && method.Equals("POST", StringComparison.OrdinalIgnoreCase))
+            {
+                var outcome = await _bootstrapService.StartAsync();
+                var status = await _bootstrapService.GetStatusAsync();
+                await WriteJsonAsync(
+                    context.Response,
+                    new { outcome = outcome.ToString(), state = status.State.ToWireName() });
+                return;
+            }
+
+            if (requestPath.Equals("/api/bootstrap/admin", StringComparison.OrdinalIgnoreCase)
+                && method.Equals("POST", StringComparison.OrdinalIgnoreCase))
+            {
+                var payload = await TryReadCredentialsAsync(context.Request);
+                var (outcome, error) = await _bootstrapService.CreateAdminAsync(
+                    payload?.Username, payload?.Password);
+
+                var code = outcome switch
+                {
+                    BootstrapAdminOutcome.Created => HttpStatusCode.OK,
+                    BootstrapAdminOutcome.AlreadyCreated => HttpStatusCode.OK,
+                    BootstrapAdminOutcome.AlreadyReady => HttpStatusCode.Conflict,
+                    BootstrapAdminOutcome.NotStarted => HttpStatusCode.Conflict,
+                    _ => HttpStatusCode.BadRequest,
+                };
+
+                var adminSucceeded = outcome is BootstrapAdminOutcome.Created or BootstrapAdminOutcome.AlreadyCreated;
+                await RecordAuditAsync(AuditActor.System("bootstrap"), "bootstrap.admin.create", "admin-user",
+                    payload?.Username, null,
+                    new { outcome = outcome.ToString() },
+                    adminSucceeded ? AuditResult.Success : AuditResult.Failure,
+                    adminSucceeded ? null : error);
+
+                // Nunca ecoar a password; apenas a chave de erro estável.
+                await WriteJsonAsync(
+                    context.Response,
+                    new { outcome = outcome.ToString(), error },
+                    code);
+                return;
+            }
+
+            if (requestPath.Equals("/api/bootstrap/complete", StringComparison.OrdinalIgnoreCase)
+                && method.Equals("POST", StringComparison.OrdinalIgnoreCase))
+            {
+                var validation = await _bootstrapService.CompleteAsync();
+                var status = await _bootstrapService.GetStatusAsync();
+                var code = validation.Outcome switch
+                {
+                    BootstrapCompleteOutcome.Completed => HttpStatusCode.OK,
+                    BootstrapCompleteOutcome.AlreadyReady => HttpStatusCode.OK,
+                    BootstrapCompleteOutcome.InvalidConfiguration => HttpStatusCode.BadRequest,
+                    _ => HttpStatusCode.Conflict,
+                };
+
+                await WriteJsonAsync(
+                    context.Response,
+                     new
+                     {
+                         outcome = validation.Outcome.ToString(),
+                         state = status.State.ToWireName(),
+                         checks = validation.Checks.Select(CheckToJson),
+                     },
+                     code);
+                return;
+            }
+
+            await WriteJsonAsync(context.Response, new { error = "not-found" }, HttpStatusCode.NotFound);
+        }
+
+        /// <summary>
+        /// W-API-DISPATCHARR-HTTP-IMPLEMENTATION (DL-128 §20.6/§20.7) —
+        /// Handler partilhado pelos endpoints
+        /// <c>POST /api/dispatcharr/dry-run</c> e
+        /// <c>POST /api/dispatcharr/sync</c>. O único ponto de
+        /// divergência é o valor de <paramref name="forceDryRun"/>: o
+        /// handler é deliberadamente thin — toda a lógica de
+        /// domínio vive no <see cref="DispatcharrSyncCoordinator"/>.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// Contrato:
+        /// <list type="bullet">
+        ///   <item>Body: apenas <c>{ "playlistPath": "..." }</c>. Qualquer
+        ///         campo <c>dry_run</c>/<c>dryRun</c>/<c>dry-run</c>/
+        ///         <c>apply</c> no body → 422 invalid-payload.</item>
+        ///   <item><c>playlistPath</c> tem de estar contido em
+        ///         <paramref name="outputDir"/> (path traversal guard) —
+        ///         caso contrário → 422.</item>
+        ///   <item>Método diferente de POST → 405.</item>
+        ///   <item>Coordenador/Gate ausentes → 503 dispatcharr-unavailable.</item>
+        ///   <item>Gate de concorrência ocupado → 409 concurrency-conflict.</item>
+        ///   <item><see cref="DispatcharrException"/> lançada pelo
+        ///         cliente → 502 dispatcharr-comm-error (apenas sync; nunca
+        ///         em dry-run porque dry-run não toca a rede).</item>
+        ///   <item>CatalogUnavailable → 503 dispatcharr-unavailable.</item>
+        /// </list>
+        /// </para>
+        /// <para>
+        /// Auth/CSRF: o gate único aplicado em <c>HandleRequestAsync</c>
+        /// (sessão humana + token de máquina; CSRF para métodos mutantes)
+        /// é responsável por 401/403 — não se duplica aqui.
+        /// </para>
+        /// <para>
+        /// Audit: o handler NÃO cria registos de auditoria próprios; o
+        /// <see cref="DispatcharrSyncCoordinator"/> continua a usar
+        /// <c>SyncRunEntity</c> como registo canónico.
+        /// </para>
+        /// </remarks>
+        private static async Task HandleDispatcharrDryRunOrSyncAsync(
+            HttpListenerContext context,
+            string outputDir,
+            bool forceDryRun)
+        {
+            var method = context.Request.HttpMethod;
+            if (!method.Equals("POST", StringComparison.OrdinalIgnoreCase))
+            {
+                await WriteMethodNotAllowedAsync(context.Response);
+                return;
+            }
+
+            if (_dispatcharrSyncCoordinator == null || _dispatcharrConcurrencyGate == null)
+            {
+                await WriteServiceUnavailableAsync(context.Response, "dispatcharr-unavailable");
+                return;
+            }
+
+            // === Validação de payload ===
+            // (1) Body tem de ser JSON bem-formado.
+            string body;
+            try
+            {
+                using var reader = new StreamReader(
+                    context.Request.InputStream,
+                    context.Request.ContentEncoding ?? Encoding.UTF8);
+                body = await reader.ReadToEndAsync();
+            }
+            catch (Exception)
+            {
+                await WriteDispatcharrApiErrorAsync(context, HttpStatusCode.BadRequest,
+                    "invalid-payload", "Corpo do pedido inválido.");
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(body))
+            {
+                await WriteDispatcharrApiErrorAsync(context,
+                    HttpStatusCode.UnprocessableEntity,
+                    "invalid-payload", "Corpo do pedido vazio.");
+                return;
+            }
+
+            JsonElement root;
+            try
+            {
+                using var doc = JsonDocument.Parse(body, new JsonDocumentOptions
+                {
+                    AllowTrailingCommas = false,
+                    CommentHandling = JsonCommentHandling.Disallow,
+                });
+                root = doc.RootElement.Clone();
+            }
+            catch (JsonException)
+            {
+                await WriteDispatcharrApiErrorAsync(context, HttpStatusCode.BadRequest,
+                    "invalid-payload", "JSON malformado.");
+                return;
+            }
+
+            if (root.ValueKind != JsonValueKind.Object)
+            {
+                await WriteDispatcharrApiErrorAsync(context,
+                    HttpStatusCode.UnprocessableEntity,
+                    "invalid-payload", "Body tem de ser um objecto JSON.");
+                return;
+            }
+
+            // (2) Rejeitar qualquer campo dry_run/dryRun/dry-run/apply.
+            foreach (var prop in root.EnumerateObject())
+            {
+                var name = prop.Name;
+                if (name.Equals("dry_run", StringComparison.OrdinalIgnoreCase)
+                    || name.Equals("dryRun", StringComparison.OrdinalIgnoreCase)
+                    || name.Equals("dry-run", StringComparison.OrdinalIgnoreCase)
+                    || name.Equals("apply", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteDispatcharrApiErrorAsync(context,
+                        HttpStatusCode.UnprocessableEntity,
+                        "invalid-payload",
+                        "Campo não permitido: " + name);
+                    return;
+                }
+            }
+
+            // (3) playlistPath é obrigatório e tem de ser string.
+            if (!root.TryGetProperty("playlistPath", out var playlistPathElement)
+                || playlistPathElement.ValueKind != JsonValueKind.String)
+            {
+                await WriteDispatcharrApiErrorAsync(context,
+                    HttpStatusCode.UnprocessableEntity,
+                    "invalid-payload", "Campo 'playlistPath' é obrigatório e tem de ser string.");
+                return;
+            }
+            var playlistPath = playlistPathElement.GetString();
+            if (string.IsNullOrWhiteSpace(playlistPath))
+            {
+                await WriteDispatcharrApiErrorAsync(context,
+                    HttpStatusCode.UnprocessableEntity,
+                    "invalid-payload", "'playlistPath' não pode estar vazio.");
+                return;
+            }
+
+            // (4) Path traversal guard — playlistPath tem de estar dentro de outputDir.
+            //     W6 — Um caminho relativo (ex.: "playlist.m3u", o produto
+            //     canónico do pipeline W2 consumido pelo Dispatcharr) é
+            //     resolvido a partir de outputDir. Caminhos absolutos mantêm
+            //     a regra anterior: têm de estar contidos em outputDir.
+            string normalizedPlaylist;
+            try
+            {
+                var fullOutputDir = Path.GetFullPath(outputDir);
+                var candidatePlaylist = Path.IsPathRooted(playlistPath)
+                    ? playlistPath
+                    : Path.Combine(fullOutputDir, playlistPath);
+                normalizedPlaylist = Path.GetFullPath(candidatePlaylist);
+                if (!normalizedPlaylist.StartsWith(
+                        fullOutputDir + Path.DirectorySeparatorChar,
+                        StringComparison.OrdinalIgnoreCase)
+                    && !normalizedPlaylist.Equals(fullOutputDir, StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteDispatcharrApiErrorAsync(context,
+                        HttpStatusCode.UnprocessableEntity,
+                        "invalid-payload",
+                        "'playlistPath' tem de estar dentro de outputDir.");
+                    return;
+                }
+            }
+            catch (Exception)
+            {
+                await WriteDispatcharrApiErrorAsync(context,
+                    HttpStatusCode.UnprocessableEntity,
+                    "invalid-payload", "'playlistPath' inválido.");
+                return;
+            }
+
+            // === Aquisição do gate de concorrência dedicado ===
+            DispatcharrSyncLease lease;
+            try
+            {
+                lease = _dispatcharrConcurrencyGate.Acquire();
+            }
+            catch (DispatcharrConcurrencyConflictException)
+            {
+                await WriteDispatcharrApiErrorAsync(context, HttpStatusCode.Conflict,
+                    "concurrency-conflict",
+                    "Outra sincronização Dispatcharr está activa. Aguarde pela conclusão.");
+                return;
+            }
+
+            // === Invocação do domínio ===
+            DispatcharrSyncOutcome outcome;
+            try
+            {
+                outcome = await _dispatcharrSyncCoordinator.RunAsync(
+                    playlistPath: normalizedPlaylist,
+                    outputDir: outputDir,
+                    catalog: _catalogResolver,
+                    selection: null,
+                    liveRunProgress: null,
+                    forceDryRun: forceDryRun,
+                    cancellationToken: CancellationToken.None);
+            }
+            catch (DispatcharrException)
+            {
+                // 502 — Dispatcharr HTTP falhou. Mensagem sanitizada vem
+                // do próprio DispatcharrException; nunca expor a string
+                // original. O envelope mantém correlationId.
+                await WriteDispatcharrApiErrorAsync(context, HttpStatusCode.BadGateway,
+                    "dispatcharr-comm-error",
+                    "Falha de comunicação com Dispatcharr.");
+                return;
+            }
+            catch (OperationCanceledException)
+            {
+                await WriteDispatcharrApiErrorAsync(context,
+                    HttpStatusCode.InternalServerError,
+                    "persistence-error", "Operação cancelada.");
+                return;
+            }
+            catch (Exception)
+            {
+                await WriteDispatcharrApiErrorAsync(context,
+                    HttpStatusCode.InternalServerError,
+                    "persistence-error", "Falha interna ao sincronizar Dispatcharr.");
+                return;
+            }
+            finally
+            {
+                lease.Dispose();
+            }
+
+            // === Mapeamento do resultado para a resposta HTTP ===
+            switch (outcome.Status)
+            {
+                case DispatcharrSyncStatus.Disabled:
+                    await WriteDispatcharrApiErrorAsync(context, HttpStatusCode.ServiceUnavailable,
+                        "dispatcharr-unavailable",
+                        "Dispatcharr está desactivado na configuração.");
+                    return;
+
+                case DispatcharrSyncStatus.CatalogUnavailable:
+                    await WriteDispatcharrApiErrorAsync(context, HttpStatusCode.ServiceUnavailable,
+                        "dispatcharr-unavailable",
+                        "Catálogo indisponível para sincronização.");
+                    return;
+
+                case DispatcharrSyncStatus.Failed:
+                    await WriteDispatcharrApiErrorAsync(context, HttpStatusCode.InternalServerError,
+                        "persistence-error",
+                        "Falha na sincronização Dispatcharr.");
+                    return;
+
+                case DispatcharrSyncStatus.Succeeded:
+                    var report = outcome.Report;
+                    var counts = report?.Report?.Counts;
+                    await WriteJsonAsync(context.Response, new
+                    {
+                        status = report?.DryRun == true
+                            ? "dry-run"
+                            : (counts?.Failed > 0 ? "partial" : "ok"),
+                        mode = forceDryRun ? "dry-run" : "sync",
+                        planPath = report?.PlanPath,
+                        reportPath = report?.ReportPath,
+                        counts = counts == null
+                            ? null
+                            : new
+                            {
+                                matched = counts.Matched,
+                                newChannels = counts.NewChannels,
+                                newStreams = counts.NewStreams,
+                                removedStreams = counts.RemovedStreams,
+                                skipped = counts.Skipped,
+                                ambiguous = counts.Ambiguous,
+                                unchanged = counts.Unchanged,
+                                failed = counts.Failed,
+                            },
+                    });
+                    return;
+            }
+        }
+
+        /// <summary>
+        /// W-API-DISPATCHARR-HTTP-IMPLEMENTATION (DL-128 D6) — Envelope
+        /// canónico de erro para as rotas Dispatcharr:
+        /// <c>{ error, message, correlationId }</c>. Reutiliza
+        /// <see cref="WriteReviewApiErrorAsync"/> (não duplica serialização).
+        /// </summary>
+        private static Task WriteDispatcharrApiErrorAsync(
+            HttpListenerContext context, HttpStatusCode status, string code, string message)
+        {
+            return WriteReviewApiErrorAsync(context.Response, status, code, message,
+                NewReviewCorrelationId());
+        }
+
+        private static async Task HandleSessionEndpointAsync(HttpListenerContext context)
+        {
+            var requestPath = context.Request.Url?.AbsolutePath ?? string.Empty;
+            if (requestPath.Equals("/api/session/password", StringComparison.OrdinalIgnoreCase))
+            {
+                await HandlePasswordChangeEndpointAsync(context);
+                return;
+            }
+
+            var method = context.Request.HttpMethod;
+
+            if (method.Equals("POST", StringComparison.OrdinalIgnoreCase))
+            {
+                if (_authService == null || !await _authService.HasActiveAdminAsync())
+                {
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = "login-unavailable" },
+                        HttpStatusCode.Conflict);
+                    return;
+                }
+
+                var payload = await TryReadCredentialsAsync(context.Request);
+                var throttleKey = context.Request.RemoteEndPoint?.Address?.ToString() ?? "unknown";
+                var outcome = await _authService.LoginAsync(
+                    payload?.Username, payload?.Password, throttleKey);
+
+                if (!outcome.Success || outcome.Session == null)
+                {
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = outcome.Error ?? "invalid-credentials" },
+                        HttpStatusCode.Unauthorized);
+                    return;
+                }
+
+                SetSessionCookie(context, outcome.Session.SessionId, outcome.Session.ExpiresAtUtc);
+                await WriteJsonAsync(context.Response, new
+                {
+                    authenticated = true,
+                    csrfToken = outcome.Session.CsrfToken,
+                    expiresAtUtc = outcome.Session.ExpiresAtUtc.ToString("o"),
+                });
+                return;
+            }
+
+            var sessionId = GetCookieValue(context.Request, SessionCookieName);
+
+            if (method.Equals("DELETE", StringComparison.OrdinalIgnoreCase))
+            {
+                var session = _authService != null
+                    ? await _authService.ValidateSessionAsync(sessionId)
+                    : null;
+
+                if (session == null || !CsrfValid(context.Request, session))
+                {
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = "authentication-required" },
+                        HttpStatusCode.Unauthorized);
+                    return;
+                }
+
+                await _authService!.LogoutAsync(sessionId);
+                ClearSessionCookie(context);
+                await WriteJsonAsync(context.Response, new { loggedOut = true });
+                return;
+            }
+
+            if (_authService == null)
+            {
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = "authentication-required" },
+                    HttpStatusCode.Unauthorized);
+                return;
+            }
+
+            var current = await _authService.ValidateSessionAsync(sessionId);
+            if (current == null)
+            {
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = "authentication-required" },
+                    HttpStatusCode.Unauthorized);
+                return;
+            }
+
+            await WriteJsonAsync(context.Response, new
+            {
+                authenticated = true,
+                csrfToken = current.CsrfToken,
+                expiresAtUtc = current.ExpiresAtUtc.ToString("o"),
+            });
+        }
+
+        /// <summary>
+        /// W10b — <c>POST /api/session/password</c>: altera a password do
+        /// administrador da sessão actual após reautenticação (password
+        /// actual) e validação CSRF.
+        ///
+        /// <para>
+        /// Contrato: apenas <c>POST</c> (restantes métodos → <c>405</c> com
+        /// <c>Allow: POST</c>). Sem sessão válida → <c>401
+        /// authentication-required</c>; CSRF inválido → <c>403 csrf-invalid</c>;
+        /// password actual incorrecta (ou utilizador desconhecido) →
+        /// <c>400 invalid-current-password</c>; nova password viola a política →
+        /// <c>400 invalid-new-password</c>; sucesso → <c>200
+        /// {message:"password-changed", reloginRequired:true}</c>. O store revoga
+        /// todas as sessões do utilizador (incluindo a actual), pelo que o
+        /// cliente tem de voltar a autenticar-se. Nunca devolve nem registra
+        /// passwords ou hashes.
+        /// </para>
+        /// </summary>
+        private static async Task HandlePasswordChangeEndpointAsync(HttpListenerContext context)
+        {
+            var method = context.Request.HttpMethod;
+            if (!method.Equals("POST", StringComparison.OrdinalIgnoreCase))
+            {
+                context.Response.Headers["Allow"] = "POST";
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = "method-not-allowed" },
+                    HttpStatusCode.MethodNotAllowed);
+                return;
+            }
+
+            var sessionId = GetCookieValue(context.Request, SessionCookieName);
+            var session = _authService != null
+                ? await _authService.ValidateSessionAsync(sessionId)
+                : null;
+            if (session == null)
+            {
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = "authentication-required" },
+                    HttpStatusCode.Unauthorized);
+                return;
+            }
+
+            if (!CsrfValid(context.Request, session))
+            {
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = "csrf-invalid" },
+                    HttpStatusCode.Forbidden);
+                return;
+            }
+
+            var payload = await TryReadJsonAsync<PasswordChangePayload>(context.Request);
+            if (payload == null)
+            {
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = "invalid-payload" },
+                    HttpStatusCode.BadRequest);
+                return;
+            }
+
+            // Reautenticação: a password actual é verificada pelo Id da sessão
+            // (a sessão não expõe o username). Utilizador desconhecido e
+            // password errada produzem a mesma resposta.
+            var userId = (int)session.AdminUserId;
+            var currentOk = await _authService!.VerifyCurrentPasswordAsync(
+                userId, payload.CurrentPassword ?? string.Empty);
+            if (!currentOk)
+            {
+                await RecordAuditAsync(await ResolveAuditActorAsync(session), "session.password.change", "admin-user",
+                    userId.ToString(), null, null, AuditResult.Failure, "invalid-current-password");
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = "invalid-current-password" },
+                    HttpStatusCode.BadRequest);
+                return;
+            }
+
+            var outcome = await _authService.ChangePasswordAsync(
+                userId, payload.NewPassword ?? string.Empty);
+            if (outcome != ChangePasswordResult.Changed)
+            {
+                var error = outcome == ChangePasswordResult.InvalidPassword
+                    ? "invalid-new-password"
+                    : "invalid-current-password";
+                await RecordAuditAsync(await ResolveAuditActorAsync(session), "session.password.change", "admin-user",
+                    userId.ToString(), null, null, AuditResult.Failure, error);
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error },
+                    HttpStatusCode.BadRequest);
+                return;
+            }
+
+            await RecordAuditAsync(await ResolveAuditActorAsync(session), "session.password.change", "admin-user",
+                userId.ToString(), null, new { changed = true }, AuditResult.Success);
+
+            // A password mudou e as sessões foram revogadas na mesma
+            // transacção pela store — o cliente tem de voltar a autenticar-se.
+            await WriteJsonAsync(
+                context.Response,
+                new { message = "password-changed", reloginRequired = true });
+        }
+
+        /// <summary>
+        /// PHASE 9C.4 — <c>GET /api/run/status</c>: devolve o estado
+        /// operacional seguro. Lê do host (que detém o coordinator);
+        /// se a pipeline Telegram não estiver configurada neste
+        /// processo (apenas <c>--web</c> sem <c>--telegram</c>) responde
+        /// 503 com <c>pipeline-not-configured</c> (ver §N do plano).
+        /// </summary>
+        private static async Task HandleRunStatusEndpointAsync(HttpListenerContext context)
+        {
+            var host = _liveRunHost;
+            var coordinator = host?.Coordinator;
+            var pipelineConfigured = host is not null && host.PipelineConfigured && coordinator is not null;
+
+            if (!pipelineConfigured)
+            {
+                await WriteJsonAsync(
+                    context.Response,
+                    LiveRunApiMappings.ToStatusPayload(
+                        live: null,
+                        recentFinished: null,
+                        pipelineConfigured: false,
+                        webAllowTrigger: _webAllowTrigger),
+                    HttpStatusCode.ServiceUnavailable);
+                return;
+            }
+
+            var running = coordinator!.IsRunning;
+            var current = coordinator.CurrentSnapshot;
+
+            // Últimas execuções terminadas (janela de 24h) para a lista do
+            // dashboard. Uma única query; nunca expõe credenciais.
+            var recentRuns = await coordinator
+                .GetRecentFinishedSnapshotsAsync(10, CancellationToken.None)
+                .ConfigureAwait(false);
+
+            LiveRunSnapshot? recent = null;
+            if (!running)
+            {
+                // Preferir o snapshot terminal em memória: é o único que
+                // transporta as actividades do feed (ring buffer em
+                // memória, deliberadamente não persistido). Só se aplica
+                // enquanto estiver dentro da janela de 24h; após restart a
+                // BD é a fonte de verdade.
+                var cutoff = DateTime.UtcNow.AddHours(-RunCoordinator.RecentRunWindowHours);
+                if (current is not null
+                    && current.TerminalStatus is LiveRunTerminalStatus.Completed or LiveRunTerminalStatus.Failed
+                    && current.FinishedAtUtc is { } finishedAt
+                    && finishedAt >= cutoff)
+                {
+                    recent = current;
+                }
+                else
+                {
+                    recent = recentRuns.Count > 0 ? recentRuns[0] : null;
+                }
+            }
+
+            await WriteJsonAsync(context.Response, LiveRunApiMappings.ToStatusPayload(
+                live: running ? current : null,
+                recentFinished: recent,
+                pipelineConfigured: true,
+                webAllowTrigger: _webAllowTrigger,
+                coordinatorRunning: running,
+                recentRuns: recentRuns));
+        }
+
+        /// <summary>
+        /// PHASE 9C.4 — <c>POST /api/run/start</c>: arranca uma execução
+        /// operacional. Não bloqueia até ao fim do run (devolve 202 com
+        /// o snapshot inicial; o caller usa <c>GET /api/run/status</c>
+        /// para seguir o progresso).
+        /// </summary>
+        private static async Task HandleRunStartEndpointAsync(HttpListenerContext context)
+        {
+            var host = _liveRunHost;
+            if (host is null || host.Coordinator is null)
+            {
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = "pipeline-not-configured" },
+                    HttpStatusCode.ServiceUnavailable);
+                return;
+            }
+
+            if (!_webAllowTrigger)
+            {
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = "web-allow-trigger-disabled" },
+                    HttpStatusCode.ServiceUnavailable);
+                return;
+            }
+
+            LiveRunStartPayload? payload;
+            try
+            {
+                using var reader = new StreamReader(
+                    context.Request.InputStream,
+                    context.Request.ContentEncoding ?? Encoding.UTF8);
+                var body = await reader.ReadToEndAsync().ConfigureAwait(false);
+                payload = string.IsNullOrWhiteSpace(body)
+                    ? new LiveRunStartPayload()
+                    : JsonSerializer.Deserialize<LiveRunStartPayload>(body, JsonOptions);
+            }
+            catch
+            {
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = "invalid payload" },
+                    HttpStatusCode.BadRequest);
+                return;
+            }
+
+            var request = LiveRunApiMappings.ParseStartPayload(payload);
+            if (request is null)
+            {
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = "invalid payload (mode/historyHours/maxStreams)" },
+                    HttpStatusCode.BadRequest);
+                return;
+            }
+
+            try
+            {
+                var outcome = await host.Coordinator.KickStartAsync(request, CancellationToken.None)
+                    .ConfigureAwait(false);
+                await WriteJsonAsync(
+                    context.Response,
+                    LiveRunApiMappings.ToStartAcceptedPayload(outcome.Snapshot),
+                    HttpStatusCode.Accepted);
+            }
+            catch (LiveRunPipelineNotConfiguredException)
+            {
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = "pipeline-not-configured" },
+                    HttpStatusCode.ServiceUnavailable);
+            }
+            catch (RunAlreadyInProgressException)
+            {
+                // 409: o snapshot corrente é construído pelo coordinator
+                // (se já terminou uma run entretanto e outra começou, é
+                // possível CurrentSnapshot ser null; nesse caso devolvemos
+                // apenas o erro com runId desconhecido).
+                var current = host.Coordinator.CurrentSnapshot;
+                if (current is null)
+                {
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = "already-running" },
+                        HttpStatusCode.Conflict);
+                    return;
+                }
+                await WriteJsonAsync(
+                    context.Response,
+                    LiveRunApiMappings.ToAlreadyRunningPayload(current),
+                    HttpStatusCode.Conflict);
+            }
+        }
+
+        /// <summary>
+        /// DL-130 (Phase 5) — <c>GET /api/publication/status</c>: devolve
+        /// o snapshot dos dois cursores de publicação do catálogo e o
+        /// booleano derivado. Os 405/503 já foram avaliados no caller;
+        /// aqui só calculamos e projectamos para camelCase. As datas
+        /// chegam como <c>DateTime?</c> em UTC; o <c>JsonSerializer</c>
+        /// com <c>PropertyNamingPolicy.CamelCase</c> (definido em
+        /// <see cref="JsonOptions"/>) emite-as no formato ISO-8601
+        /// default, consistente com o resto dos endpoints do dashboard.
+        /// </summary>
+        private static async Task HandlePublicationStatusEndpointAsync(HttpListenerContext context)
+        {
+            var service = _publicationStatusService;
+            if (service is null)
+            {
+                await WriteJsonAsync(
+                    context.Response,
+                    new { error = "Catálogo não inicializado." },
+                    HttpStatusCode.ServiceUnavailable);
+                return;
+            }
+
+            var status = await service.GetStatusAsync().ConfigureAwait(false);
+
+            await WriteJsonAsync(context.Response, new
+            {
+                CatalogChangedAtUtc = status.CatalogChangedAtUtc,
+                LastSuccessfulPublicationAtUtc = status.LastSuccessfulPublicationAtUtc,
+                PublicationPending = status.PublicationPending,
+            });
+        }
+
+        /// <summary>
+        /// Wave C — <c>GET/POST /api/discovery/settings</c>. Fonte de
+        /// verdade única dos parâmetros de discovery, persistida no mesmo
+        /// <c>runtime-data/app_settings.json</c> (secção <c>discovery</c>).
+        /// O POST é mutante e por isso já passou pelo gate 9C.2
+        /// (sessão humana + CSRF) ou por credencial de máquina.
+        /// </summary>
+        private static async Task HandleDiscoverySettingsEndpointAsync(
+            HttpListenerContext context,
+            AuditActor auditActor)
+        {
+            var store = new AppSettingsStore(ResolveRuntimeDataDir());
+
+            if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+            {
+                await WriteJsonAsync(context.Response, store.Load().Discovery);
+                return;
+            }
+
+            if (context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+            {
+                DiscoverySettingsPayload? payload;
+                try
+                {
+                    var body = await ReadJsonBodyAsync(context.Request);
+                    payload = string.IsNullOrWhiteSpace(body)
+                        ? new DiscoverySettingsPayload()
+                        : JsonSerializer.Deserialize<DiscoverySettingsPayload>(body, JsonOptions);
+                }
+                catch
+                {
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = "invalid payload" },
+                        HttpStatusCode.BadRequest);
+                    return;
+                }
+
+                if (payload is null)
+                {
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = "invalid payload" },
+                        HttpStatusCode.BadRequest);
+                    return;
+                }
+
+                var current = store.Load();
+                var candidate = current.Discovery.Clone();
+                if (payload.HistoryHours.HasValue) candidate.HistoryHours = payload.HistoryHours.Value;
+                if (payload.MinHistoryHours.HasValue) candidate.MinHistoryHours = payload.MinHistoryHours.Value;
+                if (payload.MaxStreams.HasValue) candidate.MaxStreams = payload.MaxStreams.Value;
+                if (payload.Keyword is not null) candidate.Keyword = payload.Keyword;
+
+                if (!candidate.TryValidate(out var error))
+                {
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error },
+                        HttpStatusCode.BadRequest);
+                    return;
+                }
+
+                var beforeDiscovery = new
+                {
+                    historyHours = current.Discovery.HistoryHours,
+                    minHistoryHours = current.Discovery.MinHistoryHours,
+                    maxStreams = current.Discovery.MaxStreams,
+                    keyword = current.Discovery.Keyword,
+                };
+                current.Discovery = candidate;
+                var saved = store.Save(current);
+                await RecordAuditAsync(auditActor, "settings.discovery.update", "discovery-settings",
+                    "global", beforeDiscovery,
+                    new
+                    {
+                        historyHours = saved.Discovery.HistoryHours,
+                        minHistoryHours = saved.Discovery.MinHistoryHours,
+                        maxStreams = saved.Discovery.MaxStreams,
+                        keyword = saved.Discovery.Keyword,
+                    },
+                    AuditResult.Success);
+                await WriteJsonAsync(context.Response, saved.Discovery);
+                return;
+            }
+
+            await WriteMethodNotAllowedAsync(context.Response);
+        }
+
+        private static async Task<CredentialsPayload?> TryReadCredentialsAsync(HttpListenerRequest request)
+        {
+            try
+            {
+                var body = await ReadJsonBodyAsync(request);
+                return string.IsNullOrWhiteSpace(body)
+                    ? null
+                    : JsonSerializer.Deserialize<CredentialsPayload>(body, JsonOptions);
+            }
+            catch (JsonException)
+            {
+                return null;
+            }
+        }
+
+        private static string BuildBootstrapHtml()
+        {
+            return """
+<!doctype html><html lang="pt"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>m3uCrawler — Configuração inicial</title>
+<style>
+body{font-family:system-ui,sans-serif;max-width:640px;margin:40px auto;padding:0 16px;color:#1b1b1b}
+h1{font-size:20px}fieldset{margin:16px 0;padding:12px;border:1px solid #ddd;border-radius:8px}
+label{display:block;margin:8px 0 4px}input{width:100%;padding:8px;box-sizing:border-box}
+button{margin-top:8px;padding:8px 14px;cursor:pointer}
+pre{background:#f6f6f6;padding:8px;border-radius:6px;white-space:pre-wrap;font-size:12px}
+#msg{margin-top:12px}
+</style></head><body>
+<h1>Configuração inicial</h1>
+<p>Estado: <b id="state">...</b></p>
+<p id="legacy" style="display:none">Configuração existente detectada (READY). Não é necessário iniciar o bootstrap: crie apenas o primeiro administrador.</p>
+<pre id="status"></pre>
+<fieldset><legend>1. Iniciar bootstrap</legend><button id="start">Iniciar</button></fieldset>
+<fieldset><legend>2. Primeiro administrador</legend>
+<label>Utilizador</label><input id="u" autocomplete="username"/>
+<label>Password (mínimo 12 caracteres)</label><input id="p" type="password" autocomplete="new-password"/>
+<label>Confirmar password</label><input id="p2" type="password" autocomplete="new-password"/>
+<button id="create">Criar administrador</button></fieldset>
+<fieldset><legend>3. Concluir</legend><button id="complete">Concluir e activar</button></fieldset>
+<p id="msg"></p>
+<script>
+var msg=document.getElementById('msg');
+function api(path,method,body){return fetch(path,{method:method,headers:body?{'Content-Type':'application/json'}:{},body:body?JSON.stringify(body):undefined}).then(function(r){return r.text().then(function(t){var j=null;try{j=t?JSON.parse(t):null}catch(e){}return {status:r.status,json:j};});});}
+function refresh(){return api('/api/bootstrap/status','GET').then(function(r){if(r.json){document.getElementById('state').textContent=r.json.state;document.getElementById('status').textContent=JSON.stringify(r.json,null,2);var ready=r.json.state==='READY';document.getElementById('legacy').style.display=ready?'block':'none';document.getElementById('start').disabled=ready;}});}
+document.getElementById('start').onclick=function(){api('/api/bootstrap/start','POST',{}).then(function(r){msg.textContent='start: '+r.status;return refresh();});};
+document.getElementById('create').onclick=function(){var u=document.getElementById('u').value,p=document.getElementById('p').value,p2=document.getElementById('p2').value;if(p!==p2){msg.textContent='As passwords não coincidem.';return;}api('/api/bootstrap/admin','POST',{username:u,password:p}).then(function(r){var e=r.json&&r.json.error?(' ('+r.json.error+')'):'';msg.textContent='admin: '+r.status+e;return refresh().then(function(){if(r.status===200&&document.getElementById('state').textContent==='READY'){location.href='/';}});});};
+document.getElementById('complete').onclick=function(){api('/api/bootstrap/complete','POST',{}).then(function(r){msg.textContent='complete: '+r.status;return refresh().then(function(){if(r.status===200){location.href='/';}});});};
+refresh();
+</script></body></html>
+""";
+        }
+
+        private static string BuildLoginHtml()
+        {
+            return """
+<!doctype html><html lang="pt"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>m3uCrawler — Login</title>
+<style>
+body{font-family:system-ui,sans-serif;max-width:420px;margin:80px auto;padding:0 16px;color:#1b1b1b}
+h1{font-size:20px}label{display:block;margin:10px 0 4px}
+input{width:100%;padding:8px;box-sizing:border-box}button{margin-top:12px;padding:8px 14px;cursor:pointer}
+#msg{margin-top:12px;color:#b00020}
+</style></head><body>
+<h1>Entrar</h1>
+<label>Utilizador</label><input id="u" autocomplete="username"/>
+<label>Password</label><input id="p" type="password" autocomplete="current-password"/>
+<button id="go">Entrar</button>
+<p id="msg"></p>
+<script>
+document.getElementById('go').onclick=function(){
+var u=document.getElementById('u').value,p=document.getElementById('p').value;
+fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})})
+.then(function(r){if(r.ok){location.href='/';return;}document.getElementById('msg').textContent='Credenciais inválidas.';});
+};
+</script></body></html>
+""";
+        }
+
         public static bool IsRequestAuthorized(HttpListenerRequest request, string? expectedToken)
         {
             if (string.IsNullOrWhiteSpace(expectedToken)) return true;
@@ -5327,6 +11467,462 @@ const rows = Object.entries(inv).map(([k, v]) => {
             var ab = Encoding.UTF8.GetBytes(a);
             var bb = Encoding.UTF8.GetBytes(b);
             return CryptographicOperations.FixedTimeEquals(ab, bb);
+        }
+
+        // ================= Wave 5 (PHASE 9C) — Setup endpoints =================
+
+        private sealed class TelegramConfigWritePayload
+        {
+            public string? ApiId { get; set; }
+            public string? ApiHash { get; set; }
+            public string? PhoneNumber { get; set; }
+            public string? SessionPath { get; set; }
+        }
+
+        private sealed class TelegramStartPayload
+        {
+            public string? ApiId { get; set; }
+            public string? ApiHash { get; set; }
+            public string? PhoneNumber { get; set; }
+        }
+
+        private sealed class TelegramCodePayload
+        {
+            public string? Code { get; set; }
+        }
+
+        private sealed class TelegramPasswordPayload
+        {
+            public string? Password { get; set; }
+        }
+
+        private sealed class DispatcharrConfigWritePayload
+        {
+            // W6c — todos os campos são opcionais: um campo ausente no JSON
+            // (null) preserva o valor persistido (patch semantics).
+            public bool? Enabled { get; set; }
+            public string? BaseUrl { get; set; }
+            public bool? DryRun { get; set; }
+            public string? ApiKey { get; set; }
+            public string? Username { get; set; }
+            public string? Password { get; set; }
+            public int? MatchThreshold { get; set; }
+            public string? TargetGroupName { get; set; }
+            public IReadOnlyList<string>? ProviderPriority { get; set; }
+            public string? AliasFile { get; set; }
+            public bool? AutoCreateGroups { get; set; }
+        }
+
+        private static bool IsSetupPath(string requestPath)
+        {
+            return requestPath.Equals("/api/telegram/config", StringComparison.OrdinalIgnoreCase)
+                || requestPath.Equals("/api/telegram/auth/start", StringComparison.OrdinalIgnoreCase)
+                || requestPath.Equals("/api/telegram/auth/code", StringComparison.OrdinalIgnoreCase)
+                || requestPath.Equals("/api/telegram/auth/password", StringComparison.OrdinalIgnoreCase)
+                || requestPath.Equals("/api/telegram/auth/status", StringComparison.OrdinalIgnoreCase)
+                || requestPath.Equals("/api/dispatcharr/config", StringComparison.OrdinalIgnoreCase)
+                || requestPath.Equals("/api/dispatcharr/test", StringComparison.OrdinalIgnoreCase)
+                || requestPath.Equals("/api/configuration/readiness", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static async Task HandleSetupEndpointAsync(
+            HttpListenerContext context,
+            string requestPath,
+            AuditActor auditActor)
+        {
+            var method = context.Request.HttpMethod;
+
+            if (requestPath.Equals("/api/telegram/config", StringComparison.OrdinalIgnoreCase))
+            {
+                if (method.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (_telegramAuthService == null)
+                    {
+                        await WriteServiceUnavailableAsync(context.Response, "telegram-unavailable");
+                        return;
+                    }
+
+                    var display = _telegramAuthService.GetConfigForDisplay();
+                    await WriteJsonAsync(context.Response, new
+                    {
+                        apiId = display.ApiId,
+                        phoneNumber = display.PhoneNumber,
+                        hasApiHash = display.HasApiHash,
+                        sessionPath = display.SessionPath,
+                    });
+                    return;
+                }
+
+                if (method.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (_telegramAuthService == null)
+                    {
+                        await WriteServiceUnavailableAsync(context.Response, "telegram-unavailable");
+                        return;
+                    }
+
+                    var payload = await TryReadJsonAsync<TelegramConfigWritePayload>(context.Request);
+                    if (payload == null)
+                    {
+                        await WriteJsonAsync(context.Response, new { error = "invalid-payload" }, HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var beforeConfig = _telegramAuthService.GetConfigForDisplay();
+                    var display = _telegramAuthService.SaveConfig(
+                        payload.ApiId, payload.ApiHash, payload.PhoneNumber, payload.SessionPath);
+                    await RecordAuditAsync(auditActor, "telegram.config.update", "telegram-config",
+                        "global",
+                        TelegramConfigDisplayToJson(beforeConfig),
+                        TelegramConfigDisplayToJson(display),
+                        AuditResult.Success);
+                    await WriteJsonAsync(context.Response, TelegramConfigDisplayToJson(display));
+                    return;
+                }
+
+                await WriteMethodNotAllowedAsync(context.Response);
+                return;
+            }
+
+            if (requestPath.StartsWith("/api/telegram/auth/", StringComparison.OrdinalIgnoreCase))
+            {
+                if (_telegramAuthService == null)
+                {
+                    await WriteServiceUnavailableAsync(context.Response, "telegram-unavailable");
+                    return;
+                }
+
+                if (requestPath.Equals("/api/telegram/auth/status", StringComparison.OrdinalIgnoreCase)
+                    && method.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    var status = await _telegramAuthService.GetStatusAsync();
+                    await WriteJsonAsync(context.Response, TelegramAuthStatusToJson(status));
+                    return;
+                }
+
+                if (requestPath.Equals("/api/telegram/auth/start", StringComparison.OrdinalIgnoreCase)
+                    && method.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Corpo opcional: os campos fornecidos são persistidos e
+                    // os em falta são preenchidos a partir da configuração
+                    // guardada (nunca exposta ao chamador).
+                    var payload = await TryReadJsonAsync<TelegramStartPayload>(context.Request);
+                    if (payload != null)
+                    {
+                        _telegramAuthService.SaveConfig(
+                            payload.ApiId, payload.ApiHash, payload.PhoneNumber, sessionPath: null);
+                    }
+
+                    var status = await _telegramAuthService.StartFromSavedAsync();
+                    await RecordAuditAsync(auditActor, "telegram.auth.start", "telegram-auth", "global",
+                        null, new { state = status.State.ToString() },
+                        status.State == TelegramAuthState.Error ? AuditResult.Failure : AuditResult.Success,
+                        status.Detail);
+                    await WriteJsonAsync(context.Response, TelegramAuthStatusToJson(status));
+                    return;
+                }
+
+                if (requestPath.Equals("/api/telegram/auth/code", StringComparison.OrdinalIgnoreCase)
+                    && method.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    var payload = await TryReadJsonAsync<TelegramCodePayload>(context.Request);
+                    if (payload?.Code is null)
+                    {
+                        await WriteJsonAsync(context.Response, new { error = "invalid-payload" }, HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var status = await _telegramAuthService.SubmitCodeAsync(payload.Code);
+                    await RecordAuditAsync(auditActor, "telegram.auth.code", "telegram-auth", "global",
+                        null, new { state = status.State.ToString() },
+                        status.State == TelegramAuthState.Error ? AuditResult.Failure : AuditResult.Success,
+                        status.Detail);
+                    await WriteJsonAsync(context.Response, TelegramAuthStatusToJson(status));
+                    return;
+                }
+
+                if (requestPath.Equals("/api/telegram/auth/password", StringComparison.OrdinalIgnoreCase)
+                    && method.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    var payload = await TryReadJsonAsync<TelegramPasswordPayload>(context.Request);
+                    if (payload?.Password is null)
+                    {
+                        await WriteJsonAsync(context.Response, new { error = "invalid-payload" }, HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var status = await _telegramAuthService.SubmitPasswordAsync(payload.Password);
+                    await RecordAuditAsync(auditActor, "telegram.auth.password", "telegram-auth", "global",
+                        null, new { state = status.State.ToString() },
+                        status.State == TelegramAuthState.Error ? AuditResult.Failure : AuditResult.Success,
+                        status.Detail);
+                    await WriteJsonAsync(context.Response, TelegramAuthStatusToJson(status));
+                    return;
+                }
+
+                await WriteMethodNotAllowedAsync(context.Response);
+                return;
+            }
+
+            if (requestPath.Equals("/api/dispatcharr/config", StringComparison.OrdinalIgnoreCase))
+            {
+                if (_dispatcharrConfigurationService == null)
+                {
+                    await WriteServiceUnavailableAsync(context.Response, "dispatcharr-unavailable");
+                    return;
+                }
+
+                if (method.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteJsonAsync(
+                        context.Response,
+                        DispatcharrConfigDisplayToJson(_dispatcharrConfigurationService.GetForDisplay()));
+                    return;
+                }
+
+                if (method.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    var payload = await TryReadJsonAsync<DispatcharrConfigWritePayload>(context.Request);
+                    if (payload == null)
+                    {
+                        await WriteJsonAsync(context.Response, new { error = "invalid-payload" }, HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var beforeDispatcharr = _dispatcharrConfigurationService.GetForDisplay();
+                    try
+                    {
+                        _dispatcharrConfigurationService.Save(new DispatcharrConfigurationWrite(
+                            Enabled: payload.Enabled,
+                            BaseUrl: payload.BaseUrl,
+                            DryRun: payload.DryRun,
+                            ApiKey: payload.ApiKey,
+                            Username: payload.Username,
+                            Password: payload.Password,
+                            MatchThreshold: payload.MatchThreshold,
+                            TargetGroupName: payload.TargetGroupName,
+                            ProviderPriority: payload.ProviderPriority,
+                            AliasFile: payload.AliasFile,
+                            AutoCreateGroups: payload.AutoCreateGroups));
+                    }
+                    catch (ArgumentOutOfRangeException)
+                    {
+                        await WriteJsonAsync(
+                            context.Response, new { error = "invalid-payload" }, HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var afterDispatcharr = _dispatcharrConfigurationService.GetForDisplay();
+                    await RecordAuditAsync(auditActor, "dispatcharr.config.update", "dispatcharr-config", "global",
+                        DispatcharrConfigDisplayToJson(beforeDispatcharr),
+                        DispatcharrConfigDisplayToJson(afterDispatcharr),
+                        AuditResult.Success);
+                    await WriteJsonAsync(
+                        context.Response,
+                        DispatcharrConfigDisplayToJson(afterDispatcharr));
+                    return;
+                }
+
+                await WriteMethodNotAllowedAsync(context.Response);
+                return;
+            }
+
+            if (requestPath.Equals("/api/dispatcharr/test", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!method.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteMethodNotAllowedAsync(context.Response);
+                    return;
+                }
+
+                if (_dispatcharrConnectionTester == null || _dispatcharrConfigurationService == null)
+                {
+                    await WriteServiceUnavailableAsync(context.Response, "dispatcharr-unavailable");
+                    return;
+                }
+
+                var result = await _dispatcharrConnectionTester.TestAsync(
+                    _dispatcharrConfigurationService.Get());
+                // W6c — persiste o resultado no settings store existente para
+                // que a prontidão possa exigir um teste bem sucedido. Falha de
+                // persistência é best-effort (a prontidão fica fail-safe).
+                DispatcharrTestRecord? persistedTest = null;
+                if (_dispatcharrConnectionTestStore is not null)
+                {
+                    try
+                    {
+                        persistedTest = new DispatcharrTestRecord(
+                            result.Status, result.Version, DateTimeOffset.UtcNow);
+                        _dispatcharrConnectionTestStore.Save(persistedTest);
+                    }
+                    catch (Exception persistEx)
+                    {
+                        persistedTest = null;
+                        Console.WriteLine(
+                            $"⚠️ Não foi possível persistir o teste Dispatcharr: {persistEx.GetType().Name}");
+                    }
+                }
+
+                await RecordAuditAsync(auditActor, "dispatcharr.test", "dispatcharr-config", "global",
+                    null, new { status = result.Status.ToString() },
+                    result.Status == DispatcharrConnectionStatus.Connected ? AuditResult.Success : AuditResult.Failure,
+                    result.SanitizedDetail);
+                await WriteJsonAsync(context.Response, new
+                {
+                    status = result.Status.ToString(),
+                    version = result.Version,
+                    httpStatusCode = result.HttpStatusCode,
+                    detail = result.SanitizedDetail,
+                    testedAtUtc = persistedTest?.TestedAtUtc,
+                });
+                return;
+            }
+
+            if (requestPath.Equals("/api/configuration/readiness", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!method.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteMethodNotAllowedAsync(context.Response);
+                    return;
+                }
+
+                if (_operationalReadinessService == null)
+                {
+                    await WriteServiceUnavailableAsync(context.Response, "readiness-unavailable");
+                    return;
+                }
+
+                var snapshot = await _operationalReadinessService.EvaluateAsync();
+                await WriteJsonAsync(context.Response, new
+                {
+                    bootstrapReady = snapshot.BootstrapReady,
+                    hasAdmin = snapshot.HasAdmin,
+                    telegramAuthenticated = snapshot.TelegramAuthenticated,
+                    dispatcharrEnabled = snapshot.DispatcharrEnabled,
+                    dispatcharrValid = snapshot.DispatcharrValid,
+                    catalogOk = snapshot.CatalogOk,
+                    countryDataOk = snapshot.CountryDataOk,
+                    outputOk = snapshot.OutputOk,
+                    sourcesCount = snapshot.SourcesCount,
+                    setupComplete = snapshot.SetupComplete,
+                    operationalReady = snapshot.OperationalReady,
+                    adoptedFromLegacy = snapshot.AdoptedFromLegacy,
+                    items = snapshot.Items.Select(i => new
+                    {
+                        key = i.Key,
+                        required = i.Required,
+                        satisfied = i.Satisfied,
+                        detail = i.Detail,
+                    }),
+                    missingRequired = snapshot.MissingRequired,
+                });
+                return;
+            }
+
+            await WriteJsonAsync(context.Response, new { error = "not-found" }, HttpStatusCode.NotFound);
+        }
+
+        /// <summary>
+        /// Carrega os membros de afinidade <c>Kind=Country</c> do catálogo
+        /// como mapa país→aliases para injectar na construção de um
+        /// <see cref="CountryChannelValidator"/>. Leitura pura e best-effort:
+        /// sem catálogo (ou em erro) devolve um mapa vazio. Estes membros são
+        /// classificadores de país e não criam identidade de canal.
+        /// </summary>
+        private static async Task<IReadOnlyDictionary<string, IEnumerable<string>>> LoadCountryAffinityMembersAsync()
+        {
+            var resolver = _catalogResolver;
+            if (resolver is null)
+            {
+                return new Dictionary<string, IEnumerable<string>>(StringComparer.OrdinalIgnoreCase);
+            }
+
+            try
+            {
+                var groups = await resolver.ListAffinityGroupsAsync();
+                var result = new Dictionary<string, IEnumerable<string>>(StringComparer.OrdinalIgnoreCase);
+                foreach (var group in groups
+                    .Where(g => g.Kind == AffinityKind.Country && !string.IsNullOrWhiteSpace(g.CountryCode))
+                    .GroupBy(g => g.CountryCode!.ToLowerInvariant()))
+                {
+                    var members = group
+                        .SelectMany(g => g.Members)
+                        .Select(m => m.NormalizedMember)
+                        .Distinct(StringComparer.OrdinalIgnoreCase)
+                        .ToList();
+                    if (members.Count > 0)
+                    {
+                        result[group.Key] = members;
+                    }
+                }
+
+                return result;
+            }
+            catch
+            {
+                return new Dictionary<string, IEnumerable<string>>(StringComparer.OrdinalIgnoreCase);
+            }
+        }
+
+        private static object TelegramConfigDisplayToJson(TelegramConfigDisplay display)
+            => new
+            {
+                apiId = display.ApiId,
+                phoneNumber = display.PhoneNumber,
+                hasApiHash = display.HasApiHash,
+                sessionPath = display.SessionPath,
+            };
+
+        private static object TelegramAuthStatusToJson(TelegramAuthStatus status)
+            => new
+            {
+                state = status.State.ToString(),
+                userName = status.UserName,
+                detail = status.Detail,
+                configured = status.Configured,
+            };
+
+        private static object DispatcharrConfigDisplayToJson(DispatcharrConfigDisplay display)
+            => new
+            {
+                enabled = display.Enabled,
+                baseUrl = display.BaseUrl,
+                dryRun = display.DryRun,
+                hasApiKey = display.HasApiKey,
+                hasUsername = display.HasUsername,
+                hasPassword = display.HasPassword,
+                matchThreshold = display.MatchThreshold,
+                targetGroupName = display.TargetGroupName,
+                aliasFile = display.AliasFile,
+                providerPriority = display.ProviderPriority,
+                autoCreateGroups = display.AutoCreateGroups,
+            };
+
+        private static async Task<T?> TryReadJsonAsync<T>(HttpListenerRequest request) where T : class
+        {
+            try
+            {
+                var body = await ReadJsonBodyAsync(request);
+                return string.IsNullOrWhiteSpace(body)
+                    ? null
+                    : JsonSerializer.Deserialize<T>(body, JsonOptions);
+            }
+            catch (JsonException)
+            {
+                return null;
+            }
+        }
+
+        private static Task WriteServiceUnavailableAsync(HttpListenerResponse response, string error)
+            => WriteJsonAsync(response, new { error }, HttpStatusCode.ServiceUnavailable);
+
+        private static async Task WriteMethodNotAllowedAsync(HttpListenerResponse response)
+        {
+            response.Headers["Allow"] = "GET, POST";
+            await WriteJsonAsync(
+                response,
+                new { error = "method-not-allowed" },
+                HttpStatusCode.MethodNotAllowed);
         }
 
         private static async Task WriteUnauthorizedAsync(HttpListenerResponse response)

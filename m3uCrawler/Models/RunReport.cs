@@ -47,6 +47,15 @@ namespace m3uCrawler.Models
 
         public int WorkingStreams { get; set; }
         public string State { get; set; } = string.Empty;
+
+        // W-HISTWIN-PROV (2026-10-02): proveniência da mensagem Telegram de origem do
+        // candidate que gerou esta playlist, para permitir reconstruir
+        // Run → mensagem (id, data, chat em Source) → candidate → resultado.
+        // null quando o candidate não veio de uma mensagem enumerada (ex.: --scan-domain)
+        // ou nas promoções t.me/c (id presente, data não disponível na resolução).
+        public string? CandidateId { get; set; }
+        public long? MessageId { get; set; }
+        public DateTime? MessageDateUtc { get; set; }
     }
 
     /// <summary>
@@ -87,6 +96,10 @@ namespace m3uCrawler.Models
         public int PlaylistsDownloaded { get => _PlaylistsDownloaded; set => _PlaylistsDownloaded = value; }
         internal int _PlaylistsInvalid;
         public int PlaylistsInvalid { get => _PlaylistsInvalid; set => _PlaylistsInvalid = value; }
+        // W3 — playlists com resultado de parsing Partial (>=1 entrada válida e
+        // >=1 malformada/inutilizável). Aditivo; Partial nunca conta como Success.
+        internal int _PlaylistsPartial;
+        public int PlaylistsPartial { get => _PlaylistsPartial; set => _PlaylistsPartial = value; }
         internal int _CountryMatches;
         public int CountryMatches { get => _CountryMatches; set => _CountryMatches = value; }
         internal int _PlaylistsRejected;
@@ -112,6 +125,12 @@ namespace m3uCrawler.Models
         public int StreamsWorking { get => _StreamsWorking; set => _StreamsWorking = value; }
         internal int _StreamsFailed;
         public int StreamsFailed { get => _StreamsFailed; set => _StreamsFailed = value; }
+
+        // W-DEDUP (2026-10-01): GETs fisicos evitados porque o mesmo sfp1
+        // (ValidationKey) ja' estava Working neste run. StreamsTested passa a
+        // contar apenas validacoes fisicas.
+        internal int _StreamsSkippedAlreadyValidated;
+        public int StreamsSkippedAlreadyValidated { get => _StreamsSkippedAlreadyValidated; set => _StreamsSkippedAlreadyValidated = value; }
 
         // === Publicacao Discovery / Resolution (introduzido 2026-09-09) ===
 
@@ -221,5 +240,38 @@ namespace m3uCrawler.Models
         public int TraceEventsAttachmentDownloadFailed { get; set; }
         public int TraceEventsXtreamAccount { get; set; }
         public int TraceEventsCandidatePromoted { get; set; }
+
+        // === W2 (2026-09-19) — falhas de aquisição ===
+        // Classificação técnica (19-FAILURE-MODEL §6). Escritos por até
+        // `maxConcurrency` tasks; usam Interlocked.* (fields com wrappers).
+        internal int _AcquisitionFailures;
+        public int AcquisitionFailures { get => _AcquisitionFailures; set => _AcquisitionFailures = value; }
+        internal int _AcquisitionRetryableFailures;
+        public int AcquisitionRetryableFailures { get => _AcquisitionRetryableFailures; set => _AcquisitionRetryableFailures = value; }
+        internal int _AcquisitionTerminalFailures;
+        public int AcquisitionTerminalFailures { get => _AcquisitionTerminalFailures; set => _AcquisitionTerminalFailures = value; }
+
+        // === PHASE 13 (Wave 13-3) — Source Selection ===        // Diagnóstico agregado da aplicação da política de selecção de
+        // fontes ao pipeline Telegram. Só contagens; nunca URLs nem
+        // credenciais. Null quando o estágio não correu (ex.: pipeline
+        // sem catálogo).
+        public SourceSelectionReport? SourceSelection { get; set; }
+    }
+
+    /// <summary>
+    /// PHASE 13 (Wave 13-3) — Contagens agregadas da selecção de fontes.
+    /// Não contém URLs, usernames, passwords nem tokens.
+    /// </summary>
+    public class SourceSelectionReport
+    {
+        public bool Applied { get; set; }
+        public int MatchedChannelCount { get; set; }
+        public int AmbiguousCount { get; set; }
+        public int SelectedCount { get; set; }
+        public int RejectedCount { get; set; }
+        public int UnmatchedCount { get; set; }
+
+        /// <summary>Contagens por motivo de rejeição (ex.: "source-disabled", "limit-reached").</summary>
+        public Dictionary<string, int> RejectionCounts { get; set; } = new();
     }
 }

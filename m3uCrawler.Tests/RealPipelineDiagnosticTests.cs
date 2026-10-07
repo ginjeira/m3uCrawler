@@ -224,7 +224,7 @@ public class RealPipelineDiagnosticTests : IAsyncLifetime
         var matchedByAlias = ingestionResult.Entries.Count(e => e.MatchMethod == "canonical-alias");
         var autoCreated = ingestionResult.Entries.Count(e => e.AutoCreated);
         var avgConfidence = ingestionResult.Entries.Count > 0
-            ? ingestionResult.Entries.Average(e => e.MatchConfidence)
+            ? ingestionResult.Entries.Average(e => e.MatchConfidence ?? 0.0)
             : 0.0;
         _out.WriteLine($"[5] Matching:");
         _out.WriteLine($"    canonical-alias: {matchedByAlias}");
