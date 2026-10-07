@@ -141,7 +141,7 @@ public class WaveW5ReviewListAndCreateTests : IAsyncLifetime
 
     private Task<CanonicalChannelEntity> NewChannelAsync(string key, params string[] aliases)
         => _resolver.CreateCanonicalChannelAsync(
-            key, key, EditorialCategory.Live, CanonicalEditorialGroup.PortugalLive,
+            key, key, EditorialCategory.Live, CanonicalGroupKeys.PortugalGeneralistas,
             PublicationPolicy.CreateEligible, isEnabled: true, normalizedAliases: aliases.ToList());
 
     private static async Task<List<long>> ReadIdsAsync(HttpResponseMessage response)
@@ -264,7 +264,7 @@ public class WaveW5ReviewListAndCreateTests : IAsyncLifetime
                     name = "W5 Disabled",
                     country = "pt",
                     editorialCategory = "Live",
-                    editorialGroup = "PortugalLive",
+                    groupKey = "pt-generalistas",
                     publicationPolicy = "CreateEligible",
                     isEnabled = false,
                 },

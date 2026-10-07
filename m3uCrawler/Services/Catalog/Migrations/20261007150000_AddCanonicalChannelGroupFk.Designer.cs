@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using m3uCrawler.Services.Catalog;
 
@@ -10,9 +11,11 @@ using m3uCrawler.Services.Catalog;
 namespace m3uCrawler.Services.Catalog.Migrations
 {
     [DbContext(typeof(ChannelCatalogDbContext))]
-    partial class ChannelCatalogDbContextModelSnapshot : ModelSnapshot
+    [Migration("20261007150000_AddCanonicalChannelGroupFk")]
+    partial class AddCanonicalChannelGroupFk
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder.HasAnnotation("ProductVersion", "9.0.0");
@@ -253,6 +256,9 @@ namespace m3uCrawler.Services.Catalog.Migrations
                         .HasColumnType("TEXT");
 
                     b.Property<int>("EditorialCategory")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("EditorialGroup")
                         .HasColumnType("INTEGER");
 
                     b.Property<long?>("GroupId")
@@ -655,6 +661,42 @@ namespace m3uCrawler.Services.Catalog.Migrations
                         .IsUnique();
 
                     b.ToTable("external_identities", (string)null);
+                });
+
+            modelBuilder.Entity("m3uCrawler.Services.Catalog.GroupMappingEntity", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long>("CanonicalGroupId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime>("CreatedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<bool>("IsEnabled")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("SourceGroupTitle")
+                        .IsRequired()
+                        .HasMaxLength(400)
+                        .HasColumnType("TEXT");
+
+                    b.Property<int>("SourceKind")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime>("UpdatedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("CanonicalGroupId");
+
+                    b.HasIndex("SourceKind", "SourceGroupTitle")
+                        .IsUnique();
+
+                    b.ToTable("group_mappings", (string)null);
                 });
 
             modelBuilder.Entity("m3uCrawler.Services.Catalog.IdentityRuleEntity", b =>
@@ -1653,6 +1695,17 @@ namespace m3uCrawler.Services.Catalog.Migrations
                         .IsRequired();
 
                     b.Navigation("CanonicalChannel");
+                });
+
+            modelBuilder.Entity("m3uCrawler.Services.Catalog.GroupMappingEntity", b =>
+                {
+                    b.HasOne("m3uCrawler.Services.Catalog.CanonicalGroupEntity", "CanonicalGroup")
+                        .WithMany()
+                        .HasForeignKey("CanonicalGroupId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+
+                    b.Navigation("CanonicalGroup");
                 });
 
             modelBuilder.Entity("m3uCrawler.Services.Catalog.LiveRunStepEntity", b =>

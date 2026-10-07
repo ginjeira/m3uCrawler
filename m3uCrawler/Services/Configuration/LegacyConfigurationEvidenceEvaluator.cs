@@ -28,12 +28,13 @@ public sealed record LegacyEvidenceResult(bool HasEvidence, IReadOnlyList<string
 /// <list type="bullet">
 ///   <item>
 ///     Entidades de operação no catálogo SQLite: sources, channel-sources,
-///     observações, ordering lists/items, import policies, grupos
-///     canónicos e mappings, jobs agendados, sync-runs/steps, review items,
-///     matching audits, pending country approvals, affinity groups,
-///     ownership Dispatcharr e identity rules.
+///     observações, ordering lists/items, import policies, jobs agendados,
+///     sync-runs/steps, review items, matching audits, pending country
+///     approvals, affinity groups, ownership Dispatcharr e identity rules.
 ///     <b>Excluídos</b> <c>CanonicalChannels</c>, <c>ChannelAliases</c>
-///     (criados pelo seed/baseline), <c>SourcePriorityPolicies</c> e
+///     (criados pelo seed/baseline), <c>CanonicalGroups</c> (criados pela
+///     migration <c>AddCanonicalChannelGroupFk</c>/seed a partir da
+///     Wave A), <c>SourcePriorityPolicies</c> e
 ///     <c>SourceSelectionPolicies</c> (defaults globais criados
 ///     lazily e, por isso, sem valor probatório de adopção legacy).
 ///   </item>
@@ -96,8 +97,17 @@ public sealed class LegacyConfigurationEvidenceEvaluator
         if (await context.OrderingLists.AnyAsync(cancellationToken)) reasons.Add("ordering-lists");
         if (await context.OrderingItems.AnyAsync(cancellationToken)) reasons.Add("ordering-items");
         if (await context.ImportPolicies.AnyAsync(cancellationToken)) reasons.Add("import-policies");
-        if (await context.CanonicalGroups.AnyAsync(cancellationToken)) reasons.Add("canonical-groups");
-        if (await context.GroupMappings.AnyAsync(cancellationToken)) reasons.Add("group-mappings");
+        // NOTA (Wave A): CanonicalGroups deixou de ser evidência legacy —
+        // os 9 grupos por omissão são criados por migration/seed numa
+        // instalação nova (ver AddCanonicalChannelGroupFk e
+        // CanonicalGroupDefaults).
+        // NOTA (Wave D1, 2026-10-07): GroupMappings foi eliminado
+        // (entidade, tabela e endpoints); deixou de ser evidência legacy.
+        // Uma instalação cuja única evidência fosse `group_mappings` já não
+        // adopta READY automaticamente — passa a NOT_CONFIGURED e requer
+        // configuração explícita. Não era um requisito de READY, pelo que a
+        // remoção não altera o gate (que continua a ser apenas "evidência
+        // persistida").
         if (await context.ScheduledJobs.AnyAsync(cancellationToken)) reasons.Add("scheduled-jobs");
         if (await context.SyncRuns.AnyAsync(cancellationToken)) reasons.Add("sync-runs");
         if (await context.SyncRunSteps.AnyAsync(cancellationToken)) reasons.Add("sync-run-steps");

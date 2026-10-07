@@ -289,7 +289,7 @@ public class WaveV1V2SanitizedIdentityRemovalTests : IAsyncLifetime
     private async Task<(CanonicalChannelEntity Channel, SourceEntity Source)> NewChannelAndSourceAsync(string key)
     {
         var channel = await _resolver.CreateCanonicalChannelAsync(
-            key, key, EditorialCategory.Live, CanonicalEditorialGroup.PortugalLive,
+            key, key, EditorialCategory.Live, CanonicalGroupKeys.PortugalGeneralistas,
             PublicationPolicy.CreateEligible, true, new List<string>(), country: "pt");
         var source = await _resolver.EnsureSourceAsync(
             key, key, SourceKind.M3U, $"file:///{key}.m3u", 0);

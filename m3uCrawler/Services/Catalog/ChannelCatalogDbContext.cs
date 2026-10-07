@@ -35,7 +35,6 @@ public sealed class ChannelCatalogDbContext : DbContext
     public DbSet<RecognitionPolicySnapshotEntity> RecognitionPolicySnapshots => Set<RecognitionPolicySnapshotEntity>();
     public DbSet<ImportPolicyEntity> ImportPolicies => Set<ImportPolicyEntity>();
     public DbSet<CanonicalGroupEntity> CanonicalGroups => Set<CanonicalGroupEntity>();
-    public DbSet<GroupMappingEntity> GroupMappings => Set<GroupMappingEntity>();
     public DbSet<MatchingAuditEntity> MatchingAudits => Set<MatchingAuditEntity>();
     public DbSet<ChannelSourceObservationEntity> ChannelSourceObservations => Set<ChannelSourceObservationEntity>();
     public DbSet<SyncRunStepEntity> SyncRunSteps => Set<SyncRunStepEntity>();
@@ -59,7 +58,6 @@ public sealed class ChannelCatalogDbContext : DbContext
             e.Property(x => x.Country).HasMaxLength(10);
             e.Property(x => x.PublicationPolicy).HasConversion<int>();
             e.Property(x => x.EditorialCategory).HasConversion<int>();
-            e.Property(x => x.EditorialGroup).HasConversion<int>();
             e.Property(x => x.IsEnabled).IsRequired();
             e.Property(x => x.CreatedAtUtc).IsRequired();
             e.Property(x => x.UpdatedAtUtc).IsRequired();
@@ -68,6 +66,11 @@ public sealed class ChannelCatalogDbContext : DbContext
                 .WithOne(a => a.CanonicalChannel)
                 .HasForeignKey(a => a.CanonicalChannelId)
                 .OnDelete(DeleteBehavior.Cascade);
+            e.HasIndex(x => x.GroupId);
+            e.HasOne(x => x.Group)
+                .WithMany()
+                .HasForeignKey(x => x.GroupId)
+                .OnDelete(DeleteBehavior.Restrict);
         });
 
         // ChannelAlias
@@ -568,25 +571,6 @@ public sealed class ChannelCatalogDbContext : DbContext
             e.Property(x => x.CreatedAtUtc).IsRequired();
             e.Property(x => x.UpdatedAtUtc).IsRequired();
             e.HasIndex(x => x.Key).IsUnique();
-        });
-
-        // PHASE 8 — GroupMapping
-        modelBuilder.Entity<GroupMappingEntity>(e =>
-        {
-            e.ToTable("group_mappings");
-            e.HasKey(x => x.Id);
-            e.Property(x => x.Id).ValueGeneratedOnAdd();
-            e.Property(x => x.SourceKind).HasConversion<int>();
-            e.Property(x => x.SourceGroupTitle).IsRequired().HasMaxLength(400);
-            e.Property(x => x.CanonicalGroupId).IsRequired();
-            e.Property(x => x.IsEnabled).IsRequired();
-            e.Property(x => x.CreatedAtUtc).IsRequired();
-            e.Property(x => x.UpdatedAtUtc).IsRequired();
-            e.HasIndex(x => new { x.SourceKind, x.SourceGroupTitle }).IsUnique();
-            e.HasOne(x => x.CanonicalGroup)
-                .WithMany()
-                .HasForeignKey(x => x.CanonicalGroupId)
-                .OnDelete(DeleteBehavior.Restrict);
         });
 
         // PHASE 3 — MatchingAudit

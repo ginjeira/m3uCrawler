@@ -42,7 +42,7 @@ public class Phase93AffinityCatalogTests
     {
         var channel = await resolver.CreateCanonicalChannelAsync(
             key, displayName,
-            EditorialCategory.Live, CanonicalEditorialGroup.PortugalLive,
+            EditorialCategory.Live, CanonicalGroupKeys.PortugalGeneralistas,
             PublicationPolicy.CreateEligible, isEnabled: true,
             normalizedAliases: new List<string>(),
             country: country);
@@ -181,7 +181,7 @@ public class Phase93AffinityCatalogTests
         var channel = await resolver.GetCanonicalChannelAsync(before.CanonicalChannelId!.Value);
         await resolver.UpdateCanonicalChannelAsync(
             channel!.Id, "RTP 1 renomeado",
-            channel.EditorialCategory, channel.EditorialGroup, channel.PublicationPolicy,
+            channel.EditorialCategory, channel.Group?.Key, channel.PublicationPolicy,
             channel.IsEnabled, channel.Country);
 
         var after = await resolver.ResolveAsync("variante rtp");
@@ -237,13 +237,13 @@ public class Phase93AffinityCatalogTests
         var resolver = new CatalogResolver(new TestDbContextFactory(dbPath), dbPath);
 
         var withCountry = await resolver.CreateCanonicalChannelAsync(
-            "com-pais", "Com País", EditorialCategory.Live, CanonicalEditorialGroup.PortugalLive,
+            "com-pais", "Com País", EditorialCategory.Live, CanonicalGroupKeys.PortugalGeneralistas,
             PublicationPolicy.CreateEligible, true, new List<string>(), country: "pt");
         Assert.Equal("pt", withCountry.Country);
         Assert.Equal("com-pais", withCountry.Key);
 
         var without = await resolver.CreateCanonicalChannelAsync(
-            "sem-pais", "Sem País", EditorialCategory.Live, CanonicalEditorialGroup.PortugalLive,
+            "sem-pais", "Sem País", EditorialCategory.Live, CanonicalGroupKeys.PortugalGeneralistas,
             PublicationPolicy.CreateEligible, true, new List<string>());
         Assert.Null(without.Country);
     }

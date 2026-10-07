@@ -79,7 +79,7 @@ public class WaveW56MatchConfidenceTests : IAsyncLifetime
     private Task<CanonicalChannelEntity> Ch(
         string key, string displayName, params string[] aliases)
         => _resolver.CreateCanonicalChannelAsync(
-            key, displayName, EditorialCategory.Live, CanonicalEditorialGroup.PortugalLive,
+            key, displayName, EditorialCategory.Live, CanonicalGroupKeys.PortugalGeneralistas,
             PublicationPolicy.CreateEligible, true, aliases);
 
     private static RecognitionPolicy FuzzyPolicy(int threshold, int margin) =>

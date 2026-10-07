@@ -73,16 +73,20 @@ public class SchedulerEndToEndTests : IAsyncLifetime
     }
 
     private async Task<long> CreateCanonicalChannelAsync(string key, string displayName,
-        CanonicalEditorialGroup group = CanonicalEditorialGroup.PortugalLive,
+        string groupKey = CanonicalGroupKeys.PortugalGeneralistas,
         PublicationPolicy policy = PublicationPolicy.CreateEligible)
     {
         await using var ctx = _factory.CreateDbContext();
+        var groupId = await ctx.CanonicalGroups
+            .Where(g => g.Key == groupKey)
+            .Select(g => (long?)g.Id)
+            .FirstOrDefaultAsync();
         var ch = new CanonicalChannelEntity
         {
             Key = key,
             DisplayName = displayName,
             EditorialCategory = EditorialCategory.Live,
-            EditorialGroup = group,
+            GroupId = groupId,
             PublicationPolicy = policy,
             IsEnabled = true,
             CreatedAtUtc = DateTime.UtcNow,

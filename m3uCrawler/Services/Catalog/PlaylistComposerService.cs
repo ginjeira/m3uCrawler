@@ -60,6 +60,7 @@ public sealed class PlaylistComposerService
             .AsNoTracking()
             .Include(l => l.Items.OrderBy(i => i.Position))
                 .ThenInclude(i => i.CanonicalChannel)
+                    .ThenInclude(c => c!.Group)
             .FirstOrDefaultAsync(l => l.Id == orderingListId, cancellationToken);
 
         if (list == null) throw new InvalidOperationException($"OrderingList #{orderingListId} não encontrada.");
@@ -148,7 +149,7 @@ public sealed class PlaylistComposerService
                 channel.Id,
                 channel.Key,
                 channel.DisplayName,
-                channel.EditorialGroup.ToString(),
+                channel.Group?.DisplayName ?? "Other",
                 chosen.StreamUrl,
                 chosen.Id,
                 chosen.SourceId,

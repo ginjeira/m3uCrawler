@@ -62,7 +62,6 @@ Evidência baseada em entidades que uma instalação nova **não** cria
 - `sources`, `channel_sources`, `channel_source_observations`
 - `ordering_lists`, `ordering_items`
 - `import_policies`
-- `canonical_groups`, `group_mappings`
 - `scheduled_jobs`
 - `sync_runs`, `sync_run_steps`
 - `review_items`

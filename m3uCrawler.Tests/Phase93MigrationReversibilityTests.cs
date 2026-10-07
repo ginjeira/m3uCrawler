@@ -258,7 +258,7 @@ public class Phase93MigrationReversibilityTests
 
         var resolver = new CatalogResolver(new TestDbContextFactory(dbPath), dbPath);
         var channel = await resolver.CreateCanonicalChannelAsync(
-            "p93-coexist", "Coexist", EditorialCategory.Live, CanonicalEditorialGroup.PortugalLive,
+            "p93-coexist", "Coexist", EditorialCategory.Live, CanonicalGroupKeys.PortugalGeneralistas,
             PublicationPolicy.CreateEligible, true, new List<string>(), country: "pt");
         await resolver.CreateAffinityGroupAsync("Coexist", AffinityKind.Channel, channel.Key, null, new[] { "coexist" });
         await resolver.CreateAffinityGroupAsync("PT distinct", AffinityKind.Country, null, "pt", new[] { "pt distinct" });
@@ -291,7 +291,7 @@ public class Phase93MigrationReversibilityTests
 
         var resolver = new CatalogResolver(new TestDbContextFactory(dbPath), dbPath);
         var channel = await resolver.CreateCanonicalChannelAsync(
-            "p93-dup", "Dup", EditorialCategory.Live, CanonicalEditorialGroup.PortugalLive,
+            "p93-dup", "Dup", EditorialCategory.Live, CanonicalGroupKeys.PortugalGeneralistas,
             PublicationPolicy.CreateEligible, true, new List<string>(), country: "pt");
         // Mesma variante em Channel e Country (permitido pelo índice filtrado).
         await resolver.CreateAffinityGroupAsync("Dup", AffinityKind.Channel, channel.Key, null, new[] { "dup shared" });

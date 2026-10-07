@@ -38,9 +38,9 @@ public sealed record ReviewChannelSpec(
     string Name,
     string? Country = null,
     EditorialCategory? EditorialCategory = null,
-    CanonicalEditorialGroup? EditorialGroup = null,
     PublicationPolicy? PublicationPolicy = null,
-    bool? IsEnabled = null);
+    bool? IsEnabled = null,
+    string? GroupKey = null);
 
 /// <summary>
 /// Declaração explícita do efeito de uma aprovação/exclusão de Review.

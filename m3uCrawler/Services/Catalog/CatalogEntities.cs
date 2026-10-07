@@ -41,10 +41,18 @@ public sealed class CanonicalChannelEntity
     public EditorialCategory EditorialCategory { get; set; }
 
     /// <summary>
-    /// Grupo final de publicação. Mantido como enum estável
-    /// (CanonicalEditorialGroup) — ver <c>CatalogEnums.cs</c>.
+    /// FK para o grupo canónico configurável
+    /// (<see cref="CanonicalGroupEntity"/>). Identidade de grupo do
+    /// canal. <c>null</c> apenas em canais históricos ainda não
+    /// migrados.
     /// </summary>
-    public CanonicalEditorialGroup EditorialGroup { get; set; }
+    public long? GroupId { get; set; }
+
+    /// <summary>
+    /// Navegação para o grupo canónico configurável (ver
+    /// <see cref="GroupId"/>). Não é carregada por omissão.
+    /// </summary>
+    public CanonicalGroupEntity? Group { get; set; }
 
     /// <summary>
     /// Política de publicação. Só <see cref="PublicationPolicy.CreateEligible"/>
@@ -1192,9 +1200,10 @@ public enum VodPolicy
 }
 
 /// <summary>
-/// PHASE 8 — Grupo canónico persistente. Substitui o enum
-/// rígido <c>CanonicalEditorialGroup</c> por uma entidade
-/// configurável pelo operador.
+/// PHASE 8 — Grupo canónico persistente. Substitui o antigo enum
+/// rígido <c>CanonicalEditorialGroup</c> (removido na Wave D2) por
+/// uma entidade configurável pelo operador, identificada pela sua
+/// <see cref="Key"/>.
 /// </summary>
 public sealed class CanonicalGroupEntity
 {
@@ -1208,31 +1217,6 @@ public sealed class CanonicalGroupEntity
     public int Order { get; set; }
     public bool IsEnabled { get; set; } = true;
     public bool IsDefault { get; set; }
-
-    public DateTime CreatedAtUtc { get; set; }
-    public DateTime UpdatedAtUtc { get; set; }
-}
-
-/// <summary>
-/// PHASE 8 — Mapping entre um <c>group-title</c> da source e um
-/// <see cref="CanonicalGroupEntity"/>. Nunca transforma
-/// automaticamente qualquer group-title num grupo canónico — só
-/// através de mapping explícito.
-/// </summary>
-public sealed class GroupMappingEntity
-{
-    public long Id { get; set; }
-
-    /// <summary>Tipo de source à qual o mapping se aplica.</summary>
-    public SourceKind SourceKind { get; set; }
-
-    /// <summary>group-title original (case-sensitive, verbatim da source).</summary>
-    public string SourceGroupTitle { get; set; } = string.Empty;
-
-    public long CanonicalGroupId { get; set; }
-    public CanonicalGroupEntity? CanonicalGroup { get; set; }
-
-    public bool IsEnabled { get; set; } = true;
 
     public DateTime CreatedAtUtc { get; set; }
     public DateTime UpdatedAtUtc { get; set; }

@@ -587,6 +587,8 @@ O dashboard tem os seguintes separadores principais:
 - **Setup**: onboarding pós-bootstrap — banner `⚠️ SETUP REQUIRED`, prontidão por componente, config/autenticação Telegram e config/teste Dispatcharr (ver secção "Onboarding / Setup operacional").
 - **Diagnóstico**: inventário de ficheiros, RunReport completo e glossário de métricas.
 
+Os editores inline do dashboard (Canais, Reviews, Regras, Afinidade, Ordering, Scheduler, Source selection e Import policies) passam a abrir num modal centrado, com fecho por `Cancelar`, clique fora ou `Escape` e gestão de foco.
+
 ### Catálogo de Canais
 
 O catálogo (`ChannelCatalogDbContext`, SQLite em `/data/channel-catalog.db`) gere:
@@ -601,6 +603,27 @@ O catálogo (`ChannelCatalogDbContext`, SQLite em `/data/channel-catalog.db`) ge
 | **Sync Runs** | Histórico de sincronizações Dispatcharr com contadores de created/merged/protected/removed. |
 | **Pending** | Canais que geraram dúvida no country-level targeting e aguardam decisão manual (ver secção seguinte). |
 | **Scheduled Jobs** | Jobs agendados persistentes (tabela SQLite `scheduled_jobs`): cron de 5 campos, acção, activo, último/próximo tick e último resultado. Ver secção "Scheduler / Scheduled Jobs". |
+
+### Grupos canónicos e atribuição por canal
+
+O grupo de publicação é uma **propriedade do canal canónico** (`CanonicalChannel.GroupId`
+→ `canonical_groups`, FK), não da source. A identidade do grupo é a `Key` estável
+(ex.: `pt-desporto`); o `DisplayName` é apenas apresentação e pode ser renomeado sem
+quebrar referências. A playlist M3U (`group-title`) e o agrupamento no Dispatcharr usam
+o `DisplayName` do grupo do canal, **independentemente do `group-title` da source**; este
+último é apenas **sugestão** de pré-selecção.
+
+| Endpoint | Método | Descrição |
+|---|---|---|
+| `/api/catalog/canonical-groups` | `GET` | Lista os grupos canónicos (ordenados por `order`). |
+| `/api/catalog/canonical-groups` | `POST` | Upsert por `Key`: `key`, `displayName`, `country`, `order`, `isEnabled`, `isDefault`. |
+| `/api/catalog/canonical-groups/{id}` | `DELETE` | Elimina o grupo; **400** quando está em uso por canais (`GroupId`). |
+| `/api/catalog/group-suggestion` | `GET` | Sugere `{ groupKey, groupName }` a partir de `?group=<group-title>&title=<título>`; `null` quando não há sugestão. |
+
+O formulário de canal (criar/editar) e a API usam `groupKey`; o campo legacy
+`editorialGroup` e a feature *Group Mapping* (source→canónico) foram removidos
+(Waves D1/D2). A sugestão é apenas um default — o valor persistido é sempre a escolha
+explícita do operador. Ver invariante em `AGENTS.md` §2.
 
 ### Pending Country Approvals
 

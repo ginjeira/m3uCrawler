@@ -226,11 +226,13 @@ namespace m3uCrawler.Services.Matching
             // pair is homogeneous by construction (we don't mix streams
             // with different NewChannelEligibility in the same tier).
             var bucketNewChannelEligible = new Dictionary<(BucketTier, string), bool>();
-            // Canonical key → (DisplayName actual, CanonicalChannelId).
-            // Preenchido durante a resolução por stream; usado para
-            // publicar no Dispatcharr o DisplayName actual do catálogo
-            // (nunca o alias/variante da fonte).
-            var canonicalByKey = new Dictionary<string, (string? DisplayName, long? Id)>(StringComparer.Ordinal);
+            // Canonical key → (DisplayName actual, CanonicalChannelId,
+            // GroupName). Preenchido durante a resolução por stream;
+            // usado para publicar no Dispatcharr o DisplayName actual do
+            // catálogo (nunca o alias/variante da fonte) e, quando o
+            // canal canónico tem grupo, o DisplayName desse grupo
+            // canónico (source-independent).
+            var canonicalByKey = new Dictionary<string, (string? DisplayName, long? Id, string? GroupName)>(StringComparer.Ordinal);
 
             foreach (var s in discovered)
             {
@@ -357,7 +359,8 @@ namespace m3uCrawler.Services.Matching
                 {
                     canonicalByKey[resolvedKey] = (
                         catalogResolution.Value.DisplayName,
-                        catalogResolution.Value.CanonicalChannelId);
+                        catalogResolution.Value.CanonicalChannelId,
+                        catalogResolution.Value.GroupName);
                 }
 
                 var key = (tier, resolved);
@@ -423,6 +426,7 @@ namespace m3uCrawler.Services.Matching
                 string? bucketCanonicalKey = null;
                 long? bucketCanonicalId = null;
                 string? bucketCatalogDisplayName = null;
+                string? bucketCanonicalGroupName = null;
                 if (canonicalByKey.TryGetValue(identity, out var canonical))
                 {
                     bucketCanonicalKey = identity;
@@ -431,6 +435,10 @@ namespace m3uCrawler.Services.Matching
                     {
                         bucketCatalogDisplayName = canonical.DisplayName!;
                         canonicalName = canonical.DisplayName!;
+                    }
+                    if (!string.IsNullOrWhiteSpace(canonical.GroupName))
+                    {
+                        bucketCanonicalGroupName = canonical.GroupName;
                     }
                 }
 
@@ -574,6 +582,7 @@ namespace m3uCrawler.Services.Matching
                         bucket.Value, matched, isCurated, outputGroup,
                         matchReason!, matchScore, bucketCatalogDisplayName,
                         bucketCanonicalKey, bucketCanonicalId,
+                        bucketCanonicalGroupName,
                         ordering, existing.Streams,
                         existingStreamsById, streamsByChannel, ownershipByStreamId, counts) });
                     continue;
@@ -603,7 +612,13 @@ namespace m3uCrawler.Services.Matching
                 // (only path that promotes a curated identity).
                 dispositionCounts["newChannelsFromCuratedIdentity"] =
                     dispositionCounts["newChannelsFromCuratedIdentity"] + 1;
-                var newGroupName = ResolveGroupName(bucket.Value, groupIndex);
+                // O grupo publicado é o grupo canónico (DisplayName do
+                // grupo do canal canónico), quando existe e não vazio.
+                // Caso contrário mantém-se o comportamento histórico
+                // (grupo derivado da fonte via ResolveGroupName).
+                var newGroupName = !string.IsNullOrWhiteSpace(bucketCanonicalGroupName)
+                    ? bucketCanonicalGroupName
+                    : ResolveGroupName(bucket.Value, groupIndex);
                 var newStreamDecisions = bucket.Value
                     .Select(s => StreamDecisionForNewChannel(s, newChannelIdSeed--, ordering, defaultStreamId: null))
                     .ToList();
@@ -966,7 +981,7 @@ namespace m3uCrawler.Services.Matching
         {
             return BuildExistingDecision(
                 bucket, matched, isCurated, outputGroup, matchReason, matchScore,
-                null, null, null, ordering, allExistingStreams, existingStreamsById,
+                null, null, null, null, ordering, allExistingStreams, existingStreamsById,
                 streamsByChannel, ownershipByStreamId, counts);
         }
 
@@ -980,6 +995,7 @@ namespace m3uCrawler.Services.Matching
             string? catalogDisplayName,
             string? canonicalChannelKey,
             long? canonicalChannelId,
+            string? canonicalGroupName,
             IStreamOrderingPolicy ordering,
             IReadOnlyList<DispatcharrStream> allExistingStreams,
             IReadOnlyDictionary<long, DispatcharrStream> existingStreamsById,
@@ -1123,7 +1139,9 @@ namespace m3uCrawler.Services.Matching
                     ? SyncOutcome.ExistingReassigned
                     : SyncOutcome.ExistingUnchanged,
                 ExistingChannelId = matched.Id,
-                ChannelGroupName = matched.GroupName,
+                ChannelGroupName = string.IsNullOrWhiteSpace(canonicalGroupName)
+                    ? matched.GroupName
+                    : canonicalGroupName,
                 OutputGroup = outputGroup,
                 MatchReason = matchReason,
                 MatchScore = matchScore,

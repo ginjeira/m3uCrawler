@@ -52,9 +52,15 @@ public class WaveW4UiHtmlTests
         Assert.Contains("id='newChannelGroup'", html);
         Assert.Contains("id='newChannelPolicy'", html);
 
-        // As opções de categoria/grupo continuam presentes no formulário.
+        // As opções de categoria continuam estáticas no formulário.
         Assert.Contains("<option value='Desporto'>Desporto</option>", html);
-        Assert.Contains("<option value='PortugalDesporto'>PortugalDesporto</option>", html);
+
+        // Wave C1 — o select de grupo passa a ser populado dinamicamente a
+        // partir dos grupos canónicos configuráveis (não há opções estáticas).
+        Assert.Contains("async function loadChannelGroupOptions(", html);
+        Assert.Contains("'/api/catalog/canonical-groups'", html);
+        Assert.Contains("<option value='${escapeAttr(g.key)}'>${escapeHtml(g.displayName || g.key)}</option>", html);
+        Assert.DoesNotContain("<option value='PortugalDesporto'>PortugalDesporto</option>", html);
 
         // O mesmo formulário é reutilizado para edição.
         Assert.Contains("Editar Canal Canónico", html);
@@ -72,5 +78,18 @@ public class WaveW4UiHtmlTests
         Assert.Contains("window.editScheduledJob = editScheduledJob;", html);
         Assert.Contains("window.newScheduledJob = newScheduledJob;", html);
         Assert.Contains("onclick='newScheduledJob()'", html);
+    }
+
+    [Fact]
+    public void Ordering_detail_row_renders_one_based_number_key_and_display()
+    {
+        var html = BuildDashboardHtml();
+
+        // Coluna "#" 1-based (o position da DB/API continua 0-based).
+        Assert.Contains("<td>${i.position + 1}</td>", html);
+        // Coluna "Canal" a partir da key canónica, com fallback numérico.
+        Assert.Contains("i.canonicalChannelKey || ('#' + i.canonicalChannelId)", html);
+        // Coluna "Display" a partir do display name canónico.
+        Assert.Contains("escapeHtml(i.canonicalChannelDisplayName || '—')", html);
     }
 }

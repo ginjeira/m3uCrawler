@@ -75,40 +75,39 @@ public static class CatalogBaselineImporter
     }
 
     /// <summary>
-    /// Resolve o <see cref="CanonicalEditorialGroup"/> a partir do
-    /// prefixo do <c>group.id</c> do baseline. Mantido determinístico
-    /// — qualquer mapping novo deve ser adicionado aqui e coberto
-    /// por teste.
+    /// Resolve a <c>Key</c> do grupo canónico a partir do prefixo do
+    /// <c>group.id</c> do baseline. Mantido determinístico — qualquer
+    /// mapping novo deve ser adicionado aqui e coberto por teste.
     /// </summary>
-    public static CanonicalEditorialGroup ResolveEditorialGroup(string? groupId)
+    public static string ResolveGroupKey(string? groupId)
     {
-        if (string.IsNullOrWhiteSpace(groupId)) return CanonicalEditorialGroup.Other;
+        if (string.IsNullOrWhiteSpace(groupId)) return CanonicalGroupKeys.Other;
         var g = groupId.ToLowerInvariant();
         if (g == "pt-generalistas" || g.StartsWith("pt-generalistas"))
-            return CanonicalEditorialGroup.PortugalLive;
+            return CanonicalGroupKeys.PortugalGeneralistas;
         if (g == "pt-desporto" || g.StartsWith("pt-desporto"))
-            return CanonicalEditorialGroup.PortugalDesporto;
+            return CanonicalGroupKeys.PortugalDesporto;
         if (g == "pt-infantil" || g.StartsWith("pt-infantil"))
-            return CanonicalEditorialGroup.PortugalInfantil;
+            return CanonicalGroupKeys.PortugalInfantil;
         if (g == "pt-filmes-series" || g.StartsWith("pt-filmes-series"))
-            return CanonicalEditorialGroup.PortugalFilmes24_7;
+            return CanonicalGroupKeys.PortugalFilmesSeries;
         if (g == "pt-documentarios" || g.StartsWith("pt-documentarios"))
-            return CanonicalEditorialGroup.PortugalDocumentarios;
+            return CanonicalGroupKeys.PortugalDocumentarios;
         if (g == "pt-entretenimento" || g.StartsWith("pt-entretenimento"))
-            return CanonicalEditorialGroup.PortugalEntretenimento;
+            return CanonicalGroupKeys.PortugalEntretenimento;
         if (g == "pt-tematicos" || g.StartsWith("pt-tematicos"))
-            return CanonicalEditorialGroup.PortugalEntretenimento;
+            return CanonicalGroupKeys.PortugalEntretenimento;
         if (g == "pt-musica" || g.StartsWith("pt-musica"))
-            return CanonicalEditorialGroup.PortugalEntretenimento;
+            return CanonicalGroupKeys.PortugalEntretenimento;
         if (g.StartsWith("pt-") || g.StartsWith("radio-pt"))
-            return CanonicalEditorialGroup.PortugalLive;
+            return CanonicalGroupKeys.PortugalGeneralistas;
         if (g.StartsWith("international"))
-            return CanonicalEditorialGroup.Foreign;
+            return CanonicalGroupKeys.International;
         if (g == "adultos" || g.StartsWith("adultos"))
-            return CanonicalEditorialGroup.PortugalPPV;
+            return CanonicalGroupKeys.PortugalPPV;
         if (g.StartsWith("vod-"))
-            return CanonicalEditorialGroup.PortugalFilmes24_7;
-        return CanonicalEditorialGroup.Other;
+            return CanonicalGroupKeys.PortugalFilmesSeries;
+        return CanonicalGroupKeys.Other;
     }
 
     /// <summary>
@@ -155,7 +154,7 @@ public static class CatalogBaselineImporter
     /// casa pelo número de position no <see cref="CatalogBaseline.Numbering"/>
     /// com os <see cref="GroupBaseline.Range"/>s declarados.
     /// </summary>
-    public static (CanonicalEditorialGroup Group, EditorialCategory Category) ResolveEditorialFromBaseline(
+    public static (string GroupKey, EditorialCategory Category) ResolveEditorialFromBaseline(
         CatalogBaseline baseline,
         ChannelBaseline channelBaseline)
     {
@@ -168,18 +167,18 @@ public static class CatalogBaselineImporter
         foreach (var alias in channelBaseline.Aliases)
         {
             var a = alias.ToLowerInvariant();
-            if (a.Contains("noticias") || a.Contains("generalistas")) return (CanonicalEditorialGroup.PortugalLive, EditorialCategory.Live);
-            if (a.Contains("desporto") || a.Contains("sport")) return (CanonicalEditorialGroup.PortugalDesporto, EditorialCategory.Desporto);
-            if (a.Contains("infantil") || a.Contains("kids")) return (CanonicalEditorialGroup.PortugalInfantil, EditorialCategory.Infantil);
-            if (a.Contains("documentario") || a.Contains("history")) return (CanonicalEditorialGroup.PortugalDocumentarios, EditorialCategory.Documentarios);
+            if (a.Contains("noticias") || a.Contains("generalistas")) return (CanonicalGroupKeys.PortugalGeneralistas, EditorialCategory.Live);
+            if (a.Contains("desporto") || a.Contains("sport")) return (CanonicalGroupKeys.PortugalDesporto, EditorialCategory.Desporto);
+            if (a.Contains("infantil") || a.Contains("kids")) return (CanonicalGroupKeys.PortugalInfantil, EditorialCategory.Infantil);
+            if (a.Contains("documentario") || a.Contains("history")) return (CanonicalGroupKeys.PortugalDocumentarios, EditorialCategory.Documentarios);
         }
-        if (nameLower.Contains("noticias") || nameLower.Contains("news")) return (CanonicalEditorialGroup.PortugalLive, EditorialCategory.Live);
-        if (nameLower.Contains("sport")) return (CanonicalEditorialGroup.PortugalDesporto, EditorialCategory.Desporto);
-        if (nameLower.Contains("infantil") || nameLower.Contains("kids")) return (CanonicalEditorialGroup.PortugalInfantil, EditorialCategory.Infantil);
-        if (nameLower.Contains("documentario")) return (CanonicalEditorialGroup.PortugalDocumentarios, EditorialCategory.Documentarios);
+        if (nameLower.Contains("noticias") || nameLower.Contains("news")) return (CanonicalGroupKeys.PortugalGeneralistas, EditorialCategory.Live);
+        if (nameLower.Contains("sport")) return (CanonicalGroupKeys.PortugalDesporto, EditorialCategory.Desporto);
+        if (nameLower.Contains("infantil") || nameLower.Contains("kids")) return (CanonicalGroupKeys.PortugalInfantil, EditorialCategory.Infantil);
+        if (nameLower.Contains("documentario")) return (CanonicalGroupKeys.PortugalDocumentarios, EditorialCategory.Documentarios);
         // Fallback: canais sem keyword de categoria entram no
         // bucket "Entretenimento" (PT default).
-        return (CanonicalEditorialGroup.PortugalEntretenimento, EditorialCategory.Entretenimento);
+        return (CanonicalGroupKeys.PortugalEntretenimento, EditorialCategory.Entretenimento);
     }
 
     /// <summary>
@@ -296,6 +295,12 @@ public static class CatalogBaselineImporter
 
         var now = DateTime.UtcNow;
 
+        // Wave A — garantir os grupos canónicos por omissão e obter o
+        // mapa Key → Id para que os canais criados pelo baseline fiquem
+        // já com GroupId. Aditivo: não altera qualquer comportamento
+        // observável (o campo não é lido nesta wave).
+        var groupIds = await ChannelCatalogBootstrapper.EnsureCanonicalGroupsAsync(context, now, ct);
+
         // Indexar canais existentes por Key.
         var existingChannels = await context.CanonicalChannels
             .Include(c => c.Aliases)
@@ -335,7 +340,7 @@ public static class CatalogBaselineImporter
                 continue;
             }
 
-            var (group, category) = ResolveEditorialFromBaseline(baseline, channelBaseline);
+            var (groupKey, category) = ResolveEditorialFromBaseline(baseline, channelBaseline);
 
             if (!channelsByKey.TryGetValue(key, out var channel))
             {
@@ -345,7 +350,9 @@ public static class CatalogBaselineImporter
                     DisplayName = channelBaseline.Name,
                     Country = NormalizeBaselineCountry(baseline.Country),
                     EditorialCategory = category,
-                    EditorialGroup = group,
+                    GroupId = groupIds.TryGetValue(groupKey, out var channelGroupId)
+                            ? channelGroupId
+                            : null,
                     PublicationPolicy = PublicationPolicy.CreateEligible,
                     IsEnabled = true,
                     CreatedAtUtc = now,

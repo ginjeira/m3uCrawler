@@ -145,7 +145,7 @@ public class WaveW6cScheduledDispatcharrSelectionTests : IAsyncLifetime
             key,
             displayName,
             EditorialCategory.Live,
-            CanonicalEditorialGroup.PortugalLive,
+            CanonicalGroupKeys.PortugalGeneralistas,
             PublicationPolicy.CreateEligible,
             isEnabled: true,
             normalizedAliases: aliases);

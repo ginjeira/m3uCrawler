@@ -338,6 +338,13 @@ public sealed class ChannelCatalogBootstrapper
             existingChannelKeys, System.StringComparer.Ordinal);
 
         var now = DateTime.UtcNow;
+
+        // Wave A — grupos canónicos configuráveis. Garantir os 9 grupos
+        // por omissão (idempotente, por Key) ANTES de qualquer canal, para
+        // que os canais possam ser criados já com GroupId. O mapeamento
+        // vive em CanonicalGroupDefaults (única fonte C#).
+        var groupIds = await EnsureCanonicalGroupsAsync(context, now, cancellationToken);
+
         foreach (var ch in CatalogSeed.Channels)
         {
             // Forma única matchable, deduplicada por canal.
@@ -365,7 +372,9 @@ public sealed class ChannelCatalogBootstrapper
                     Key = ch.Key,
                     DisplayName = ch.DisplayName,
                     EditorialCategory = ch.Category,
-                    EditorialGroup = ch.Group,
+                    GroupId = groupIds.TryGetValue(ch.GroupKey, out var groupId)
+                            ? groupId
+                            : null,
                     PublicationPolicy = ch.Policy,
                     IsEnabled = true,
                     CreatedAtUtc = now,
@@ -418,6 +427,63 @@ public sealed class ChannelCatalogBootstrapper
         }
 
         await context.SaveChangesAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Garante que os 9 grupos canónicos por omissão existem
+    /// (idempotente, por <see cref="CanonicalGroupEntity.Key"/>) e
+    /// devolve o mapa <c>Key → Id</c>. É a única implementação C# de
+    /// garantia de grupos; o mapeamento em si vive em
+    /// <see cref="CanonicalGroupDefaults"/>.
+    /// </summary>
+    internal static async Task<System.Collections.Generic.Dictionary<string, long>> EnsureCanonicalGroupsAsync(
+        ChannelCatalogDbContext context,
+        DateTime now,
+        CancellationToken cancellationToken = default)
+    {
+        var existing = await context.CanonicalGroups
+            .AsNoTracking()
+            .Select(g => new { g.Id, g.Key })
+            .ToListAsync(cancellationToken);
+        var idsByKey = new System.Collections.Generic.Dictionary<string, long>(
+            System.StringComparer.Ordinal);
+        foreach (var g in existing)
+        {
+            idsByKey[g.Key] = g.Id;
+        }
+
+        var added = false;
+        foreach (var def in CanonicalGroupDefaults.All)
+        {
+            if (idsByKey.ContainsKey(def.Key)) continue;
+            context.CanonicalGroups.Add(new CanonicalGroupEntity
+            {
+                Key = def.Key,
+                DisplayName = def.DisplayName,
+                Order = def.Order,
+                IsEnabled = true,
+                IsDefault = def.IsDefault,
+                CreatedAtUtc = now,
+                UpdatedAtUtc = now,
+            });
+            added = true;
+        }
+
+        if (added)
+        {
+            await context.SaveChangesAsync(cancellationToken);
+            idsByKey.Clear();
+            var refreshed = await context.CanonicalGroups
+                .AsNoTracking()
+                .Select(g => new { g.Id, g.Key })
+                .ToListAsync(cancellationToken);
+            foreach (var g in refreshed)
+            {
+                idsByKey[g.Key] = g.Id;
+            }
+        }
+
+        return idsByKey;
     }
 
     /// <summary>

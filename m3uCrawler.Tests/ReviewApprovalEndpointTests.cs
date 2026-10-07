@@ -145,7 +145,7 @@ public class ReviewApprovalEndpointTests : IAsyncLifetime
 
     private async Task<CanonicalChannelEntity> NewChannelAsync(string key, params string[] aliases)
         => await _resolver.CreateCanonicalChannelAsync(
-            key, key, EditorialCategory.Live, CanonicalEditorialGroup.PortugalLive,
+            key, key, EditorialCategory.Live, CanonicalGroupKeys.PortugalGeneralistas,
             PublicationPolicy.CreateEligible, isEnabled: true,
             normalizedAliases: aliases.ToList());
 

@@ -115,7 +115,7 @@ public class Phase94DL130PublicationStatusTests
             DisplayName = "Test Channel",
             Country = "pt",
             EditorialCategory = EditorialCategory.Live,
-            EditorialGroup = CanonicalEditorialGroup.PortugalLive,
+            GroupId = null,
             PublicationPolicy = PublicationPolicy.CreateEligible,
             IsEnabled = true,
             CreatedAtUtc = updatedAt,

@@ -56,7 +56,7 @@ public class WaveW52RecognitionOrderTests : IAsyncLifetime
     private Task<CanonicalChannelEntity> Ch(
         string key, string displayName, bool enabled = true, params string[] aliases)
         => _catalog.CreateCanonicalChannelAsync(
-            key, displayName, EditorialCategory.Live, CanonicalEditorialGroup.PortugalLive,
+            key, displayName, EditorialCategory.Live, CanonicalGroupKeys.PortugalGeneralistas,
             PublicationPolicy.CreateEligible, enabled, aliases);
 
     private async Task<int> CountChannelsAsync()

@@ -175,7 +175,7 @@ public class ReviewApprovalIntegrityTests : IAsyncLifetime
         // dedup lookup to prove the schema-level constraint is engaged.
         var channel = await _resolver.CreateCanonicalChannelAsync(
             "wreview02b-1", "W-Review-02B 1",
-            EditorialCategory.Live, CanonicalEditorialGroup.PortugalLive,
+            EditorialCategory.Live, CanonicalGroupKeys.PortugalGeneralistas,
             PublicationPolicy.CreateEligible, isEnabled: true,
             normalizedAliases: new List<string>(),
             country: "pt");
@@ -251,7 +251,7 @@ public class ReviewApprovalIntegrityTests : IAsyncLifetime
         // Fingerprint IS NOT NULL.
         var channel = await _resolver.CreateCanonicalChannelAsync(
             "wreview02b-2", "W-Review-02B 2",
-            EditorialCategory.Live, CanonicalEditorialGroup.PortugalLive,
+            EditorialCategory.Live, CanonicalGroupKeys.PortugalGeneralistas,
             PublicationPolicy.CreateEligible, isEnabled: true,
             normalizedAliases: new List<string>(),
             country: "pt");
@@ -367,7 +367,7 @@ public class ReviewApprovalIntegrityTests : IAsyncLifetime
 
         await _resolver.CreateCanonicalChannelAsync(
             key, "Pre-existing",
-            EditorialCategory.Live, CanonicalEditorialGroup.PortugalLive,
+            EditorialCategory.Live, CanonicalGroupKeys.PortugalGeneralistas,
             PublicationPolicy.CreateEligible, isEnabled: true,
             normalizedAliases: new List<string>(),
             country: "pt");
@@ -462,7 +462,7 @@ public class ReviewApprovalIntegrityTests : IAsyncLifetime
                     DisplayName = "W-Review-02B 5",
                     Country = "pt",
                     EditorialCategory = EditorialCategory.Live,
-                    EditorialGroup = CanonicalEditorialGroup.PortugalLive,
+                    GroupId = null,
                     PublicationPolicy = PublicationPolicy.CreateEligible,
                     IsEnabled = true,
                     CreatedAtUtc = DateTime.UtcNow,
@@ -591,7 +591,7 @@ public class ReviewApprovalIntegrityTests : IAsyncLifetime
         // caller. The atomic assertion: exactly one row in the DB.
         var channel = await _resolver.CreateCanonicalChannelAsync(
             "wreview02b-7", "W-Review-02B 7",
-            EditorialCategory.Live, CanonicalEditorialGroup.PortugalLive,
+            EditorialCategory.Live, CanonicalGroupKeys.PortugalGeneralistas,
             PublicationPolicy.CreateEligible, isEnabled: true,
             normalizedAliases: new List<string>(),
             country: "pt");
@@ -653,7 +653,7 @@ public class ReviewApprovalIntegrityTests : IAsyncLifetime
 
         await _resolver.CreateCanonicalChannelAsync(
             key, "W-Review-02B 8",
-            EditorialCategory.Live, CanonicalEditorialGroup.PortugalLive,
+            EditorialCategory.Live, CanonicalGroupKeys.PortugalGeneralistas,
             PublicationPolicy.CreateEligible, isEnabled: true,
             normalizedAliases: new List<string>(),
             country: "pt");
@@ -716,7 +716,7 @@ public class ReviewApprovalIntegrityTests : IAsyncLifetime
         // directly.
         var channel = await _resolver.CreateCanonicalChannelAsync(
             "wreview02b-10", "W-Review-02B 10",
-            EditorialCategory.Live, CanonicalEditorialGroup.PortugalLive,
+            EditorialCategory.Live, CanonicalGroupKeys.PortugalGeneralistas,
             PublicationPolicy.CreateEligible, isEnabled: true,
             normalizedAliases: new List<string>(),
             country: "pt");

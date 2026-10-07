@@ -65,7 +65,7 @@ Key             text  UK (ex.: "benfica-tv")
 DisplayName     text
 Country         text  NULL (ex.: "pt"; NULL = global/agnóstico)
 EditorialCategory    int (Live/Entretenimento/Desporto/Infantil/Documentarios)
-EditorialGroup  int (PortugalLive/PortugalFilmes24_7/...)
+GroupId         long  FK → CanonicalGroup (grupo de publicação do canal)
 PublicationPolicy    int (CreateEligible/MergeOnly/ReviewOnly/Excluded)
 IsEnabled       bool
 CreatedAtUtc    datetime
@@ -75,9 +75,37 @@ UpdatedAtUtc    datetime
 `Key` é o identificador estável; `DisplayName` é o nome editorial
 (mutável, sem impacto na `Key` nem nas afinidades); `Country` é o
 país do catálogo canónico (opcional, não faz parte da identidade);
-`EditorialCategory` é a categoria; `EditorialGroup` é o grupo final
-de publicação; `PublicationPolicy` é a autorização; `IsEnabled`
+`EditorialCategory` é a categoria; `GroupId` é o **grupo de publicação
+do canal** (FK → `CanonicalGroup`; a identidade do grupo é a `Key`,
+nunca o `DisplayName`); `PublicationPolicy` é a autorização; `IsEnabled`
 desactiva temporariamente sem apagar.
+
+O grupo de publicação é uma propriedade do **canal canónico**, não da
+source. A playlist M3U (`group-title`) e o agrupamento no Dispatcharr
+usam o `DisplayName` do grupo do canal, **independentemente do
+`group-title` da source**; este último é apenas sugestão
+(`GET /api/catalog/group-suggestion`, pré-selecção). O enum legado
+`CanonicalEditorialGroup`, a coluna `canonical_channels.EditorialGroup`
+e a tabela `group_mappings` foram removidos (Waves D1/D2, 2026-10-07).
+
+### `CanonicalGroup`
+
+```
+Id              long  PK
+Key             text  UK (ex.: "pt-desporto")  ← identidade estável
+DisplayName     text   (apresentação: group-title / Dispatcharr)
+Country         text  NULL
+Order           int
+IsEnabled       bool
+IsDefault       bool
+CreatedAtUtc    datetime
+UpdatedAtUtc    datetime
+```
+
+A identidade do grupo é a `Key`; o `DisplayName` é mutável. Um
+`CanonicalGroup` é referenciado por `CanonicalChannel.GroupId` e
+**não pode ser eliminado** enquanto estiver em uso por canais
+(`DELETE /api/catalog/canonical-groups/{id}` devolve **400**).
 
 ### `ChannelAlias`
 

@@ -183,7 +183,7 @@ public class ChannelCatalogIntegrationTests : IAsyncLifetime
                 Key = "user-custom",
                 DisplayName = "User Custom Channel",
                 EditorialCategory = EditorialCategory.Live,
-                EditorialGroup = CanonicalEditorialGroup.PortugalLive,
+                GroupId = null,
                 PublicationPolicy = PublicationPolicy.CreateEligible,
                 IsEnabled = true,
                 CreatedAtUtc = DateTime.UtcNow,

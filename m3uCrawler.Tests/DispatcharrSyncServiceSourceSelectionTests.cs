@@ -1035,7 +1035,7 @@ public class DispatcharrSyncServiceSourceSelectionTests : IAsyncLifetime
             key,
             displayName ?? key,
             EditorialCategory.Live,
-            CanonicalEditorialGroup.PortugalLive,
+            CanonicalGroupKeys.PortugalGeneralistas,
             PublicationPolicy.CreateEligible,
             isEnabled: true,
             normalizedAliases: aliases ?? Array.Empty<string>());

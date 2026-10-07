@@ -76,7 +76,7 @@ public class WaveW54ReviewLifecycleTests : IAsyncLifetime
 
     private Task<CanonicalChannelEntity> Ch(string key, string displayName, bool enabled = true, params string[] aliases)
         => _catalog.CreateCanonicalChannelAsync(
-            key, displayName, EditorialCategory.Live, CanonicalEditorialGroup.PortugalLive,
+            key, displayName, EditorialCategory.Live, CanonicalGroupKeys.PortugalGeneralistas,
             PublicationPolicy.CreateEligible, enabled, aliases);
 
     private static RecognitionPolicy FuzzyPolicy(int threshold, int margin)

@@ -84,7 +84,7 @@ public class SourceSelectionPolicyRuntimeIntegrationTests : IAsyncLifetime
             $"{prefix}-{Guid.NewGuid():N}",
             prefix,
             EditorialCategory.Live,
-            CanonicalEditorialGroup.PortugalLive,
+            CanonicalGroupKeys.PortugalGeneralistas,
             PublicationPolicy.CreateEligible,
             isEnabled: true,
             normalizedAliases: Array.Empty<string>());

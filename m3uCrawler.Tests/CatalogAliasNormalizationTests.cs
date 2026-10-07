@@ -45,7 +45,7 @@ public class CatalogAliasNormalizationTests : IAsyncLifetime
 
     private Task<CanonicalChannelEntity> NewChannelAsync(string key, params string[] aliases) =>
         _resolver.CreateCanonicalChannelAsync(
-            key, key, EditorialCategory.Live, CanonicalEditorialGroup.PortugalLive,
+            key, key, EditorialCategory.Live, CanonicalGroupKeys.PortugalGeneralistas,
             PublicationPolicy.CreateEligible, isEnabled: true,
             normalizedAliases: aliases.ToList());
 
@@ -186,7 +186,7 @@ public class CatalogAliasNormalizationTests : IAsyncLifetime
                 Key = "legacy-raw",
                 DisplayName = "Legacy Raw",
                 EditorialCategory = EditorialCategory.Live,
-                EditorialGroup = CanonicalEditorialGroup.PortugalLive,
+                GroupId = null,
                 PublicationPolicy = PublicationPolicy.CreateEligible,
                 IsEnabled = true,
                 CreatedAtUtc = now,
@@ -244,7 +244,7 @@ public class CatalogAliasNormalizationTests : IAsyncLifetime
                 Key = "norm-collision-a",
                 DisplayName = "Norm Collision A",
                 EditorialCategory = EditorialCategory.Live,
-                EditorialGroup = CanonicalEditorialGroup.PortugalLive,
+                GroupId = null,
                 PublicationPolicy = PublicationPolicy.CreateEligible,
                 IsEnabled = true,
                 CreatedAtUtc = now,
@@ -255,7 +255,7 @@ public class CatalogAliasNormalizationTests : IAsyncLifetime
                 Key = "norm-collision-b",
                 DisplayName = "Norm Collision B",
                 EditorialCategory = EditorialCategory.Live,
-                EditorialGroup = CanonicalEditorialGroup.PortugalLive,
+                GroupId = null,
                 PublicationPolicy = PublicationPolicy.CreateEligible,
                 IsEnabled = true,
                 CreatedAtUtc = now,

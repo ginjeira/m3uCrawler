@@ -159,7 +159,7 @@ public class AuditRecordEndpointTests : IAsyncLifetime
             displayName = "Audit Create",
             country = "PT",
             editorialCategory = "Live",
-            editorialGroup = "PortugalLive",
+            groupKey = "pt-generalistas",
             publicationPolicy = "CreateEligible",
             isEnabled = true,
             aliases = new[] { "audit create hd" },
@@ -210,7 +210,7 @@ public class AuditRecordEndpointTests : IAsyncLifetime
             key,
             displayName = "Audit Secret",
             editorialCategory = "Live",
-            editorialGroup = "PortugalLive",
+            groupKey = "pt-generalistas",
             publicationPolicy = "CreateEligible",
             isEnabled = true,
         });
@@ -392,20 +392,13 @@ public class AuditMigrationTests
                 Assert.DoesNotContain("AddAuditRecords", applied.Select(m => m.Split('_').Last()));
 
                 // Dados pré-existentes (instalação antiga) que a migration
-                // aditiva não pode perder.
+                // aditiva não pode perder. Inserção por SQL bruto: o modelo
+                // EF actual inclui a coluna GroupId (Wave A), que ainda não
+                // existe neste ponto do schema; o objectivo aqui é apenas
+                // ter uma linha pré-existente sobrevivente.
                 var now = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
-                context.CanonicalChannels.Add(new CanonicalChannelEntity
-                {
-                    Key = sentinelKey,
-                    DisplayName = "Audit Sentinel",
-                    EditorialCategory = EditorialCategory.Live,
-                    EditorialGroup = CanonicalEditorialGroup.PortugalLive,
-                    PublicationPolicy = PublicationPolicy.CreateEligible,
-                    IsEnabled = true,
-                    CreatedAtUtc = now,
-                    UpdatedAtUtc = now,
-                });
-                await context.SaveChangesAsync();
+                await context.Database.ExecuteSqlInterpolatedAsync(
+                    $"INSERT INTO canonical_channels (Key, DisplayName, EditorialCategory, EditorialGroup, PublicationPolicy, IsEnabled, CreatedAtUtc, UpdatedAtUtc) VALUES ({sentinelKey}, 'Audit Sentinel', 0, 0, 0, 1, {now}, {now});");
             }
 
             var bootstrapper = new ChannelCatalogBootstrapper(dbPath);

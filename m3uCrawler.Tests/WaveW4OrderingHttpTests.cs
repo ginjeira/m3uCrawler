@@ -151,4 +151,53 @@ public sealed class WaveW4OrderingHttpTests : IAsyncLifetime
         using var errDoc = JsonDocument.Parse(await update.Content.ReadAsStringAsync());
         Assert.False(string.IsNullOrWhiteSpace(errDoc.RootElement.GetProperty("error").GetString()));
     }
+
+    [Fact]
+    public async Task Ordering_list_detail_exposes_canonical_channel_key_and_display_name()
+    {
+        var suffix = Guid.NewGuid().ToString("N");
+        var channelKey = $"w4-ch-{suffix}";
+        var channelDisplayName = $"W4 Canal {suffix}";
+
+        var createChannel = await Client.PostAsync(
+            "/api/catalog/channels",
+            Json($"{{\"key\":\"{channelKey}\",\"displayName\":\"{channelDisplayName}\",\"editorialCategory\":\"Desporto\",\"groupKey\":\"pt-desporto\",\"publicationPolicy\":\"CreateEligible\",\"isEnabled\":true,\"aliases\":[]}}"),
+            ShortToken());
+        Assert.Equal(HttpStatusCode.Created, createChannel.StatusCode);
+
+        long channelId;
+        using (var doc = JsonDocument.Parse(await createChannel.Content.ReadAsStringAsync()))
+        {
+            channelId = doc.RootElement.GetProperty("id").GetInt64();
+            Assert.True(channelId > 0);
+        }
+
+        var listKey = $"w4-ord-{suffix}";
+        var createList = await Client.PostAsync(
+            "/api/catalog/ordering-lists",
+            Json($"{{\"key\":\"{listKey}\",\"name\":\"W4 Detalhe\",\"isEnabled\":true}}"),
+            ShortToken());
+        Assert.Equal(HttpStatusCode.Created, createList.StatusCode);
+
+        long listId;
+        using (var doc = JsonDocument.Parse(await createList.Content.ReadAsStringAsync()))
+        {
+            listId = doc.RootElement.GetProperty("id").GetInt64();
+            Assert.True(listId > 0);
+        }
+
+        var addItem = await Client.PostAsync(
+            $"/api/catalog/ordering-lists/{listId}/items",
+            Json($"{{\"canonicalChannelId\":{channelId},\"isEnabled\":true}}"),
+            ShortToken());
+        Assert.Equal(HttpStatusCode.Created, addItem.StatusCode);
+
+        var detail = await Client.GetAsync($"/api/catalog/ordering-lists/{listId}", ShortToken());
+        Assert.Equal(HttpStatusCode.OK, detail.StatusCode);
+        using var detailDoc = JsonDocument.Parse(await detail.Content.ReadAsStringAsync());
+        var item = detailDoc.RootElement.GetProperty("items").EnumerateArray()
+            .Single(i => i.GetProperty("canonicalChannelId").GetInt64() == channelId);
+        Assert.Equal(channelKey, item.GetProperty("canonicalChannelKey").GetString());
+        Assert.Equal(channelDisplayName, item.GetProperty("canonicalChannelDisplayName").GetString());
+    }
 }

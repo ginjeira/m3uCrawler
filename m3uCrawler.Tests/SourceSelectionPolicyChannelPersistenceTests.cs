@@ -45,7 +45,7 @@ public class SourceSelectionPolicyChannelPersistenceTests : IAsyncLifetime
             key,
             $"Channel {key}",
             EditorialCategory.Live,
-            CanonicalEditorialGroup.PortugalLive,
+            CanonicalGroupKeys.PortugalGeneralistas,
             PublicationPolicy.CreateEligible,
             isEnabled: true,
             normalizedAliases: Array.Empty<string>());

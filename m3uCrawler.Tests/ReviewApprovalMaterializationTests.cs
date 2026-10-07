@@ -510,7 +510,7 @@ public class ReviewApprovalMaterializationTests : IAsyncLifetime
         // pré-materialização) que prova que nenhum side-effect fica.
         var otherChannel = await _resolver.CreateCanonicalChannelAsync(
             "wreview02-i-other", "Other", EditorialCategory.Live,
-            CanonicalEditorialGroup.PortugalLive,
+            CanonicalGroupKeys.PortugalGeneralistas,
             PublicationPolicy.CreateEligible, isEnabled: true,
             normalizedAliases: new List<string> { ChannelNormalizer.Normalize(title) });
 

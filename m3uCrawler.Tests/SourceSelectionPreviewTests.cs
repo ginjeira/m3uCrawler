@@ -1040,7 +1040,7 @@ public class SourceSelectionPreviewTests : IAsyncLifetime
             "preview-case-sensitive",
             "Preview Case Sensitive",
             EditorialCategory.Live,
-            CanonicalEditorialGroup.PortugalLive,
+            CanonicalGroupKeys.PortugalGeneralistas,
             PublicationPolicy.CreateEligible,
             isEnabled: true,
             normalizedAliases: Array.Empty<string>());

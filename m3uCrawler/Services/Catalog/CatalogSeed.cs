@@ -54,7 +54,7 @@ public static class CatalogSeed
             Key: "btv",
             DisplayName: "BTV",
             Category: EditorialCategory.Desporto,
-            Group: CanonicalEditorialGroup.PortugalDesporto,
+            GroupKey: CanonicalGroupKeys.PortugalDesporto,
             Policy: PublicationPolicy.CreateEligible,
             Aliases: new[]
             {
@@ -72,7 +72,7 @@ public static class CatalogSeed
             Key: "sport-tv-nba",
             DisplayName: "Sport TV NBA",
             Category: EditorialCategory.Desporto,
-            Group: CanonicalEditorialGroup.PortugalDesporto,
+            GroupKey: CanonicalGroupKeys.PortugalDesporto,
             Policy: PublicationPolicy.CreateEligible,
             Aliases: new[]
             {
@@ -88,7 +88,7 @@ public static class CatalogSeed
             Key: "sport-tv-2",
             DisplayName: "Sport TV 2",
             Category: EditorialCategory.Desporto,
-            Group: CanonicalEditorialGroup.PortugalDesporto,
+            GroupKey: CanonicalGroupKeys.PortugalDesporto,
             Policy: PublicationPolicy.CreateEligible,
             Aliases: new[]
             {
@@ -100,7 +100,7 @@ public static class CatalogSeed
             Key: "sport-tv-3",
             DisplayName: "Sport TV 3",
             Category: EditorialCategory.Desporto,
-            Group: CanonicalEditorialGroup.PortugalDesporto,
+            GroupKey: CanonicalGroupKeys.PortugalDesporto,
             Policy: PublicationPolicy.CreateEligible,
             Aliases: new[]
             {
@@ -111,7 +111,7 @@ public static class CatalogSeed
             Key: "sport-tv-4",
             DisplayName: "Sport TV 4",
             Category: EditorialCategory.Desporto,
-            Group: CanonicalEditorialGroup.PortugalDesporto,
+            GroupKey: CanonicalGroupKeys.PortugalDesporto,
             Policy: PublicationPolicy.CreateEligible,
             Aliases: new[]
             {
@@ -122,7 +122,7 @@ public static class CatalogSeed
             Key: "sport-tv-5",
             DisplayName: "Sport TV 5",
             Category: EditorialCategory.Desporto,
-            Group: CanonicalEditorialGroup.PortugalDesporto,
+            GroupKey: CanonicalGroupKeys.PortugalDesporto,
             Policy: PublicationPolicy.CreateEligible,
             Aliases: new[]
             {
@@ -133,7 +133,7 @@ public static class CatalogSeed
             Key: "sport-tv-6",
             DisplayName: "Sport TV 6",
             Category: EditorialCategory.Desporto,
-            Group: CanonicalEditorialGroup.PortugalDesporto,
+            GroupKey: CanonicalGroupKeys.PortugalDesporto,
             Policy: PublicationPolicy.CreateEligible,
             Aliases: new[]
             {
@@ -145,7 +145,7 @@ public static class CatalogSeed
             Key: "sport-tv-7",
             DisplayName: "Sport TV 7",
             Category: EditorialCategory.Desporto,
-            Group: CanonicalEditorialGroup.PortugalDesporto,
+            GroupKey: CanonicalGroupKeys.PortugalDesporto,
             Policy: PublicationPolicy.CreateEligible,
             Aliases: new[]
             {
@@ -156,7 +156,7 @@ public static class CatalogSeed
             Key: "sport-tv-news",
             DisplayName: "Sport TV News",
             Category: EditorialCategory.Desporto,
-            Group: CanonicalEditorialGroup.PortugalDesporto,
+            GroupKey: CanonicalGroupKeys.PortugalDesporto,
             Policy: PublicationPolicy.CreateEligible,
             Aliases: new[]
             {
@@ -170,7 +170,7 @@ public static class CatalogSeed
             Key: "tvi-24",
             DisplayName: "TVI 24",
             Category: EditorialCategory.Live,
-            Group: CanonicalEditorialGroup.PortugalLive,
+            GroupKey: CanonicalGroupKeys.PortugalGeneralistas,
             Policy: PublicationPolicy.CreateEligible,
             Aliases: new[]
             {
@@ -181,7 +181,7 @@ public static class CatalogSeed
             Key: "euronews",
             DisplayName: "Euronews",
             Category: EditorialCategory.Live,
-            Group: CanonicalEditorialGroup.PortugalLive,
+            GroupKey: CanonicalGroupKeys.PortugalGeneralistas,
             Policy: PublicationPolicy.CreateEligible,
             Aliases: new[]
             {
@@ -194,28 +194,28 @@ public static class CatalogSeed
             Key: "axn-white",
             DisplayName: "AXN White",
             Category: EditorialCategory.Entretenimento,
-            Group: CanonicalEditorialGroup.PortugalEntretenimento,
+            GroupKey: CanonicalGroupKeys.PortugalEntretenimento,
             Policy: PublicationPolicy.CreateEligible,
             Aliases: new[] { "axn white", "axn white hd" }),
         new CanonicalChannelSeed(
             Key: "amc",
             DisplayName: "AMC",
             Category: EditorialCategory.Entretenimento,
-            Group: CanonicalEditorialGroup.PortugalEntretenimento,
+            GroupKey: CanonicalGroupKeys.PortugalEntretenimento,
             Policy: PublicationPolicy.CreateEligible,
             Aliases: new[] { "amc", "amc hd" }),
         new CanonicalChannelSeed(
             Key: "fox",
             DisplayName: "FOX",
             Category: EditorialCategory.Entretenimento,
-            Group: CanonicalEditorialGroup.PortugalEntretenimento,
+            GroupKey: CanonicalGroupKeys.PortugalEntretenimento,
             Policy: PublicationPolicy.CreateEligible,
             Aliases: new[] { "fox", "fox hd", "fox life", "fox crime" }),
         new CanonicalChannelSeed(
             Key: "tv-cine",
             DisplayName: "TV Cine",
             Category: EditorialCategory.Entretenimento,
-            Group: CanonicalEditorialGroup.PortugalEntretenimento,
+            GroupKey: CanonicalGroupKeys.PortugalEntretenimento,
             Policy: PublicationPolicy.CreateEligible,
             Aliases: new[]
             {
@@ -235,14 +235,14 @@ public static class CatalogSeed
             Key: "travel-channel",
             DisplayName: "Travel Channel",
             Category: EditorialCategory.Entretenimento,
-            Group: CanonicalEditorialGroup.PortugalEntretenimento,
+            GroupKey: CanonicalGroupKeys.PortugalEntretenimento,
             Policy: PublicationPolicy.CreateEligible,
             Aliases: new[] { "travel channel", "travel channel hd" }),
         new CanonicalChannelSeed(
             Key: "tvi-internacional",
             DisplayName: "TVI Internacional",
             Category: EditorialCategory.Entretenimento,
-            Group: CanonicalEditorialGroup.PortugalEntretenimento,
+            GroupKey: CanonicalGroupKeys.PortugalEntretenimento,
             Policy: PublicationPolicy.CreateEligible,
             Aliases: new[]
             {
@@ -253,14 +253,14 @@ public static class CatalogSeed
             Key: "sic-mulher",
             DisplayName: "SIC Mulher",
             Category: EditorialCategory.Entretenimento,
-            Group: CanonicalEditorialGroup.PortugalEntretenimento,
+            GroupKey: CanonicalGroupKeys.PortugalEntretenimento,
             Policy: PublicationPolicy.CreateEligible,
             Aliases: new[] { "sic mulher", "sic mulher hd" }),
         new CanonicalChannelSeed(
             Key: "sic-radical",
             DisplayName: "SIC Radical",
             Category: EditorialCategory.Entretenimento,
-            Group: CanonicalEditorialGroup.PortugalEntretenimento,
+            GroupKey: CanonicalGroupKeys.PortugalEntretenimento,
             Policy: PublicationPolicy.CreateEligible,
             Aliases: new[] { "sic radical", "sic radical hd" }),
 
@@ -272,7 +272,7 @@ public static class CatalogSeed
             Key: "canal-panda",
             DisplayName: "Canal Panda",
             Category: EditorialCategory.Infantil,
-            Group: CanonicalEditorialGroup.PortugalInfantil,
+            GroupKey: CanonicalGroupKeys.PortugalInfantil,
             Policy: PublicationPolicy.CreateEligible,
             Aliases: new[]
             {
@@ -284,7 +284,7 @@ public static class CatalogSeed
             Key: "baby-tv",
             DisplayName: "Baby TV",
             Category: EditorialCategory.Infantil,
-            Group: CanonicalEditorialGroup.PortugalInfantil,
+            GroupKey: CanonicalGroupKeys.PortugalInfantil,
             Policy: PublicationPolicy.CreateEligible,
             Aliases: new[] { "baby tv", "babytv" }),
 
@@ -293,7 +293,7 @@ public static class CatalogSeed
             Key: "odisseia",
             DisplayName: "Odisseia",
             Category: EditorialCategory.Documentarios,
-            Group: CanonicalEditorialGroup.PortugalDocumentarios,
+            GroupKey: CanonicalGroupKeys.PortugalDocumentarios,
             Policy: PublicationPolicy.CreateEligible,
             Aliases: new[] { "odisseia", "canal odisseia" }),
     };
@@ -339,7 +339,7 @@ public sealed record CanonicalChannelSeed(
     string Key,
     string DisplayName,
     EditorialCategory Category,
-    CanonicalEditorialGroup Group,
+    string GroupKey,
     PublicationPolicy Policy,
     IReadOnlyList<string> Aliases);
 

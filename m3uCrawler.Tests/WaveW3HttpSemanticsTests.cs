@@ -185,7 +185,7 @@ public sealed class WaveW3HttpSemanticsTests : IAsyncLifetime
         var key = $"w3-test-{Guid.NewGuid():N}";
         var payload =
             $"{{\"key\":\"{key}\",\"displayName\":\"W3 Test\",\"country\":null," +
-            "\"editorialCategory\":\"Live\",\"editorialGroup\":\"PortugalLive\"," +
+            "\"editorialCategory\":\"Live\",\"groupKey\":\"pt-generalistas\"," +
             "\"publicationPolicy\":\"CreateEligible\",\"isEnabled\":true,\"aliases\":[]}";
 
         var created = await Client.PostAsync("/api/catalog/channels", Json(payload), ShortToken());

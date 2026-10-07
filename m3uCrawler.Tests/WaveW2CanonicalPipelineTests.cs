@@ -272,7 +272,7 @@ public class WaveW2CanonicalPipelineTests : IAsyncLifetime
             key,
             displayName,
             EditorialCategory.Live,
-            CanonicalEditorialGroup.PortugalLive,
+            CanonicalGroupKeys.PortugalGeneralistas,
             PublicationPolicy.CreateEligible,
             isEnabled: true,
             normalizedAliases: aliases);

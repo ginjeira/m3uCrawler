@@ -56,7 +56,7 @@ public sealed class CatalogResolver
     /// <summary>
     /// Resolve uma identidade normalizada para uma decisão
     /// completa: <c>(CanonicalKey, DisplayName, EditorialCategory,
-    /// EditorialGroup, PublicationPolicy, CanonicalChannelId)</c>.
+    /// GroupKey, PublicationPolicy, CanonicalChannelId)</c>.
     ///
     /// <para>
     /// Ordem de precedência:
@@ -185,6 +185,7 @@ public sealed class CatalogResolver
                     .Namespace;
                 var canonical = await context.CanonicalChannels
                     .AsNoTracking()
+                    .Include(c => c.Group)
                     .FirstOrDefaultAsync(c => c.Id == distinctChannelIds[0], cancellationToken);
                 if (canonical != null && canonical.IsEnabled)
                 {
@@ -230,6 +231,7 @@ public sealed class CatalogResolver
         {
             var canonical = await context.CanonicalChannels
                 .AsNoTracking()
+                .Include(c => c.Group)
                 .FirstOrDefaultAsync(c => c.Id == canonicalMatches[0], cancellationToken);
             if (canonical != null)
             {
@@ -254,6 +256,7 @@ public sealed class CatalogResolver
         {
             var canonical = await context.CanonicalChannels
                 .AsNoTracking()
+                .Include(c => c.Group)
                 .FirstOrDefaultAsync(c => c.Id == nameMatches[0], cancellationToken);
             if (canonical != null)
             {
@@ -266,6 +269,7 @@ public sealed class CatalogResolver
         var alias = await context.ChannelAliases
             .AsNoTracking()
             .Include(a => a.CanonicalChannel)
+                .ThenInclude(c => c!.Group)
             .FirstOrDefaultAsync(a => a.NormalizedAlias == normalizedIdentity, cancellationToken);
         if (alias?.CanonicalChannel != null && alias.CanonicalChannel.IsEnabled)
         {
@@ -282,6 +286,7 @@ public sealed class CatalogResolver
             .AsNoTracking()
             .Include(m => m.AffinityGroup)
                 .ThenInclude(g => g!.CanonicalChannel)
+                    .ThenInclude(c => c!.Group)
             .FirstOrDefaultAsync(
                 m => m.NormalizedMember == normalizedIdentity && m.Kind == AffinityKind.Channel,
                 cancellationToken);
@@ -292,6 +297,7 @@ public sealed class CatalogResolver
             {
                 var canonicalByKey = await context.CanonicalChannels
                     .AsNoTracking()
+                    .Include(c => c.Group)
                     .FirstOrDefaultAsync(c => c.Key == affinityKey, cancellationToken);
                 if (canonicalByKey != null && canonicalByKey.IsEnabled)
                 {
@@ -351,6 +357,7 @@ public sealed class CatalogResolver
                 {
                     var fuzzyChannel = await context.CanonicalChannels
                         .AsNoTracking()
+                        .Include(c => c.Group)
                         .FirstOrDefaultAsync(c => c.Id == fuzzyId, cancellationToken);
                     if (fuzzyChannel != null)
                     {
@@ -750,6 +757,7 @@ public sealed class CatalogResolver
         return await context.CanonicalChannels
             .AsNoTracking()
             .Include(c => c.Aliases)
+            .Include(c => c.Group)
             .OrderBy(c => c.DisplayName)
             .ToListAsync(cancellationToken);
     }
@@ -1752,13 +1760,17 @@ public sealed class CatalogResolver
                 }
 
                 var createdNow = DateTime.UtcNow;
+                // Wave D2 — o grupo é identificado apenas pela Key/FK.
+                // A key ausente ou desconhecida cai no grupo "other".
+                var reviewGroupId = await ResolveGroupIdOrDefaultAsync(
+                    context, spec.GroupKey, cancellationToken);
                 channel = new CanonicalChannelEntity
                 {
                     Key = key,
                     DisplayName = spec.Name.Trim(),
                     Country = NormalizeCountry(spec.Country),
                     EditorialCategory = spec.EditorialCategory ?? EditorialCategory.Live,
-                    EditorialGroup = spec.EditorialGroup ?? CanonicalEditorialGroup.Other,
+                    GroupId = reviewGroupId,
                     PublicationPolicy = spec.PublicationPolicy ?? PublicationPolicy.CreateEligible,
                     IsEnabled = spec.IsEnabled ?? true,
                     CreatedAtUtc = createdNow,
@@ -2267,14 +2279,64 @@ public sealed class CatalogResolver
         return await context.CanonicalChannels
             .AsNoTracking()
             .Include(c => c.Aliases)
+            .Include(c => c.Group)
             .FirstOrDefaultAsync(c => c.Id == id, cancellationToken);
+    }
+
+    /// <summary>
+    /// Wave D2 — resolve o <c>Id</c> do grupo canónico pela <c>Key</c>
+    /// estável. Quando a key é nula/branca ou não existe em
+    /// <c>canonical_groups</c>, cai no grupo por omissão
+    /// <see cref="CanonicalGroupKeys.Other"/>. Devolve <c>null</c>
+    /// apenas se nem o grupo "other" existir (BD não inicializada).
+    /// </summary>
+    private static async Task<long?> ResolveGroupIdOrDefaultAsync(
+        DbContext context,
+        string? key,
+        CancellationToken cancellationToken = default)
+    {
+        if (!string.IsNullOrWhiteSpace(key))
+        {
+            var byKey = await ResolveGroupIdByKeyAsync(context, key!, cancellationToken);
+            if (byKey.HasValue)
+            {
+                return byKey;
+            }
+        }
+
+        return await ResolveGroupIdByKeyAsync(context, CanonicalGroupKeys.Other, cancellationToken);
+    }
+
+    /// <summary>
+    /// Wave C1 — resolve o <c>Id</c> do grupo canónico configurável
+    /// correspondente a uma <c>Key</c> estável, consultando
+    /// <c>canonical_groups</c> no mesmo DbContext. Devolve <c>null</c>
+    /// se a linha não existir (a validação de existência é feita na
+    /// camada HTTP via <see cref="GetCanonicalGroupByKeyAsync"/>). A
+    /// key é normalizada por <c>Trim</c>.
+    /// </summary>
+    private static async Task<long?> ResolveGroupIdByKeyAsync(
+        DbContext context,
+        string key,
+        CancellationToken cancellationToken = default)
+    {
+        var normalized = key.Trim();
+        if (normalized.Length == 0)
+        {
+            return null;
+        }
+
+        return await context.Set<CanonicalGroupEntity>()
+            .Where(g => g.Key == normalized)
+            .Select(g => (long?)g.Id)
+            .FirstOrDefaultAsync(cancellationToken);
     }
 
     public async Task<CanonicalChannelEntity> CreateCanonicalChannelAsync(
         string key,
         string displayName,
         EditorialCategory editorialCategory,
-        CanonicalEditorialGroup editorialGroup,
+        string? groupKey,
         PublicationPolicy publicationPolicy,
         bool isEnabled,
         IReadOnlyList<string> normalizedAliases,
@@ -2322,13 +2384,17 @@ public sealed class CatalogResolver
         }
 
         var now = DateTime.UtcNow;
+        // Wave D2 — o grupo é identificado apenas pela Key/FK. A key
+        // ausente ou desconhecida cai no grupo "other".
+        var groupId = await ResolveGroupIdOrDefaultAsync(context, groupKey, cancellationToken);
+
         var channel = new CanonicalChannelEntity
         {
             Key = normalizedKey,
             DisplayName = displayName.Trim(),
             Country = NormalizeCountry(country),
             EditorialCategory = editorialCategory,
-            EditorialGroup = editorialGroup,
+            GroupId = groupId,
             PublicationPolicy = publicationPolicy,
             IsEnabled = isEnabled,
             CreatedAtUtc = now,
@@ -2352,7 +2418,7 @@ public sealed class CatalogResolver
         long id,
         string displayName,
         EditorialCategory editorialCategory,
-        CanonicalEditorialGroup editorialGroup,
+        string? groupKey,
         PublicationPolicy publicationPolicy,
         bool isEnabled,
         string? country = null,
@@ -2368,7 +2434,9 @@ public sealed class CatalogResolver
         channel.DisplayName = displayName.Trim();
         channel.Country = NormalizeCountry(country);
         channel.EditorialCategory = editorialCategory;
-        channel.EditorialGroup = editorialGroup;
+        // Wave D2 — o grupo é identificado apenas pela Key/FK. A key
+        // ausente ou desconhecida cai no grupo "other".
+        channel.GroupId = await ResolveGroupIdOrDefaultAsync(context, groupKey, cancellationToken);
         channel.PublicationPolicy = publicationPolicy;
         channel.IsEnabled = isEnabled;
         channel.UpdatedAtUtc = DateTime.UtcNow;
@@ -2421,7 +2489,7 @@ public sealed class CatalogResolver
         string key,
         string displayName,
         EditorialCategory editorialCategory,
-        CanonicalEditorialGroup editorialGroup,
+        string? groupKey,
         PublicationPolicy publicationPolicy,
         bool isEnabled,
         string? normalizedAlias,
@@ -2445,12 +2513,16 @@ public sealed class CatalogResolver
         // (o alias será mantido no canal existente; este canal
         // desconhecido fica sem o alias, mas é criado).
         var now = DateTime.UtcNow;
+        // Wave D2 — o grupo é identificado apenas pela Key/FK. A key
+        // ausente ou desconhecida cai no grupo "other".
+        var groupId = await ResolveGroupIdOrDefaultAsync(context, groupKey, cancellationToken);
+
         var channel = new CanonicalChannelEntity
         {
             Key = normalizedKey,
             DisplayName = displayName.Trim(),
             EditorialCategory = editorialCategory,
-            EditorialGroup = editorialGroup,
+            GroupId = groupId,
             PublicationPolicy = publicationPolicy,
             IsEnabled = isEnabled,
             CreatedAtUtc = now,
@@ -2689,7 +2761,6 @@ public sealed class CatalogResolver
             SourcePriorityPolicies = await context.SourcePriorityPolicies.AsNoTracking().CountAsync(cancellationToken),
             ImportPolicies = await context.ImportPolicies.AsNoTracking().CountAsync(cancellationToken),
             CanonicalGroups = await context.CanonicalGroups.AsNoTracking().CountAsync(cancellationToken),
-            GroupMappings = await context.GroupMappings.AsNoTracking().CountAsync(cancellationToken),
             MatchingAudits = await context.MatchingAudits.AsNoTracking().CountAsync(cancellationToken),
             ChannelSourceObservations = await context.ChannelSourceObservations.AsNoTracking().CountAsync(cancellationToken),
             SyncRunSteps = await context.SyncRunSteps.AsNoTracking().CountAsync(cancellationToken),
@@ -3388,7 +3459,9 @@ public sealed class CatalogResolver
         var query = context.OrderingLists.AsNoTracking().AsQueryable();
         if (includeItems)
         {
-            query = query.Include(l => l.Items.OrderBy(i => i.Position));
+            query = query
+                .Include(l => l.Items.OrderBy(i => i.Position))
+                .ThenInclude(i => i.CanonicalChannel);
         }
         return await query.FirstOrDefaultAsync(l => l.Id == id, cancellationToken);
     }
@@ -4278,6 +4351,27 @@ public sealed class CatalogResolver
             .ToListAsync(cancellationToken);
     }
 
+    /// <summary>
+    /// Wave C1 — devolve o <see cref="CanonicalGroupEntity"/> pela sua
+    /// <c>Key</c> estável, ou <c>null</c> quando não existe. Usado pela
+    /// camada HTTP para validar um <c>groupKey</c> antes de persistir.
+    /// Read-only (<c>AsNoTracking</c>) e mínimo.
+    /// </summary>
+    public async Task<CanonicalGroupEntity?> GetCanonicalGroupByKeyAsync(
+        string key, CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(key))
+        {
+            return null;
+        }
+
+        var normalized = key.Trim();
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.CanonicalGroups
+            .AsNoTracking()
+            .FirstOrDefaultAsync(g => g.Key == normalized, cancellationToken);
+    }
+
     public async Task<CanonicalGroupEntity> UpsertCanonicalGroupAsync(
         string key, string displayName, string? country, int order,
         bool isEnabled, bool isDefault,
@@ -4325,68 +4419,16 @@ public sealed class CatalogResolver
         await using var context = await _factory.CreateDbContextAsync(cancellationToken);
         var entity = await context.CanonicalGroups.FirstOrDefaultAsync(g => g.Id == id, cancellationToken);
         if (entity == null) return false;
+
+        var channelCount = await context.CanonicalChannels
+            .CountAsync(c => c.GroupId == id, cancellationToken);
+        if (channelCount > 0)
+        {
+            throw new InvalidOperationException(
+                $"Grupo #{id} em uso por {channelCount} canal(is); reatribui-os antes de eliminar.");
+        }
+
         context.CanonicalGroups.Remove(entity);
-        await context.SaveChangesAsync(cancellationToken);
-        return true;
-    }
-
-    public async Task<IReadOnlyList<GroupMappingEntity>> ListGroupMappingsAsync(
-        CancellationToken cancellationToken = default)
-    {
-        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
-        return await context.GroupMappings
-            .AsNoTracking()
-            .Include(m => m.CanonicalGroup)
-            .OrderBy(m => m.SourceKind).ThenBy(m => m.SourceGroupTitle)
-            .ToListAsync(cancellationToken);
-    }
-
-    public async Task<GroupMappingEntity> UpsertGroupMappingAsync(
-        SourceKind sourceKind, string sourceGroupTitle, long canonicalGroupId,
-        bool isEnabled = true,
-        CancellationToken cancellationToken = default)
-    {
-        if (string.IsNullOrWhiteSpace(sourceGroupTitle)) throw new ArgumentException("SourceGroupTitle é obrigatório.", nameof(sourceGroupTitle));
-        if (sourceGroupTitle.Length > 400) throw new ArgumentException("SourceGroupTitle excede 400 caracteres.", nameof(sourceGroupTitle));
-
-        var normalizedTitle = sourceGroupTitle.Trim();
-        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
-        if (!await context.CanonicalGroups.AnyAsync(g => g.Id == canonicalGroupId, cancellationToken))
-        {
-            throw new InvalidOperationException($"CanonicalGroup #{canonicalGroupId} não encontrada.");
-        }
-        var now = DateTime.UtcNow;
-        var existing = await context.GroupMappings
-            .FirstOrDefaultAsync(m => m.SourceKind == sourceKind && m.SourceGroupTitle == normalizedTitle,
-                cancellationToken);
-        if (existing != null)
-        {
-            existing.CanonicalGroupId = canonicalGroupId;
-            existing.IsEnabled = isEnabled;
-            existing.UpdatedAtUtc = now;
-            await context.SaveChangesAsync(cancellationToken);
-            return existing;
-        }
-        existing = new GroupMappingEntity
-        {
-            SourceKind = sourceKind,
-            SourceGroupTitle = normalizedTitle,
-            CanonicalGroupId = canonicalGroupId,
-            IsEnabled = isEnabled,
-            CreatedAtUtc = now,
-            UpdatedAtUtc = now,
-        };
-        context.GroupMappings.Add(existing);
-        await context.SaveChangesAsync(cancellationToken);
-        return existing;
-    }
-
-    public async Task<bool> DeleteGroupMappingAsync(long id, CancellationToken cancellationToken = default)
-    {
-        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
-        var entity = await context.GroupMappings.FirstOrDefaultAsync(m => m.Id == id, cancellationToken);
-        if (entity == null) return false;
-        context.GroupMappings.Remove(entity);
         await context.SaveChangesAsync(cancellationToken);
         return true;
     }
@@ -4883,7 +4925,6 @@ public sealed class CatalogStats
     public int SourcePriorityPolicies { get; set; }
     public int ImportPolicies { get; set; }
     public int CanonicalGroups { get; set; }
-    public int GroupMappings { get; set; }
     public int MatchingAudits { get; set; }
     public int ChannelSourceObservations { get; set; }
     public int SyncRunSteps { get; set; }
@@ -4903,7 +4944,9 @@ public readonly record struct CatalogResolution(
     string? CanonicalKey,
     string? DisplayName,
     EditorialCategory? EditorialCategory,
-    CanonicalEditorialGroup? EditorialGroup,
+    long? GroupId,
+    string? GroupKey,
+    string? GroupName,
     PublicationPolicy PublicationPolicy,
     RuleDisposition? RuleDisposition,
     string? RuleReason)
@@ -4959,13 +5002,14 @@ public readonly record struct CatalogResolution(
 
     public static CatalogResolution Unknown() => new(
         CatalogResolutionKind.Unknown,
-        null, null, null, null, null,
+        null, null, null, null, null, null, null,
         PublicationPolicy.Excluded, null, null);
 
     public static CatalogResolution FromCanonical(CanonicalChannelEntity ch, string? matchMethod = null) => new(
         CatalogResolutionKind.Canonical,
         ch.Id, ch.Key, ch.DisplayName,
-        ch.EditorialCategory, ch.EditorialGroup,
+        ch.EditorialCategory,
+        ch.GroupId, ch.Group?.Key, ch.Group?.DisplayName,
         ch.PublicationPolicy, null, null)
     {
         MatchMethod = matchMethod,
@@ -4976,7 +5020,7 @@ public readonly record struct CatalogResolution(
 
     public static CatalogResolution FromRule(IdentityRuleEntity rule) => new(
         CatalogResolutionKind.Rule,
-        null, null, null, null, null,
+        null, null, null, null, null, null, null,
         rule.Disposition == global::m3uCrawler.Services.Catalog.RuleDisposition.Excluded
             ? PublicationPolicy.Excluded
             : PublicationPolicy.ReviewOnly,
@@ -4994,7 +5038,7 @@ public readonly record struct CatalogResolution(
     /// </summary>
     public static CatalogResolution Ambiguous(string reason) => new(
         CatalogResolutionKind.Ambiguous,
-        null, null, null, null, null,
+        null, null, null, null, null, null, null,
         PublicationPolicy.ReviewOnly, null, reason);
 
     /// <summary>

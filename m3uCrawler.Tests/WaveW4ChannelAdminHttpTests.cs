@@ -16,7 +16,7 @@ namespace m3uCrawler.Tests;
 /// <summary>
 /// W4 — Canonical Channels: o formulário de edição do Dashboard expõe todos
 /// os campos suportados por <c>PUT /api/catalog/channels/{id}</c>
-/// (DisplayName, Country, EditorialCategory, EditorialGroup,
+/// (DisplayName, Country, EditorialCategory, GroupKey,
 /// PublicationPolicy, IsEnabled). Este teste prova o contrato HTTP real
 /// no harness standalone: actualização, validação de enum, duplicado e delete.
 /// </summary>
@@ -67,7 +67,7 @@ public sealed class WaveW4ChannelAdminHttpTests : IAsyncLifetime
     {
         var body =
             $"{{\"key\":\"{key}\",\"displayName\":\"W4 Canal\",\"country\":\"pt\"," +
-            "\"editorialCategory\":\"Live\",\"editorialGroup\":\"PortugalLive\"," +
+            "\"editorialCategory\":\"Live\",\"groupKey\":\"pt-generalistas\"," +
             "\"publicationPolicy\":\"CreateEligible\",\"isEnabled\":true,\"aliases\":[]}";
         var created = await client.PostAsync("/api/catalog/channels", Json(body), ShortToken());
         Assert.Equal(HttpStatusCode.Created, created.StatusCode);
@@ -84,7 +84,7 @@ public sealed class WaveW4ChannelAdminHttpTests : IAsyncLifetime
         var update = await Client.PutAsync(
             $"/api/catalog/channels/{id}",
             Json("{\"displayName\":\"W4 Editado\",\"country\":\"es\"," +
-                 "\"editorialCategory\":\"Desporto\",\"editorialGroup\":\"PortugalDesporto\"," +
+                 "\"editorialCategory\":\"Desporto\",\"groupKey\":\"pt-desporto\"," +
                  "\"publicationPolicy\":\"ReviewOnly\",\"isEnabled\":false}"),
             ShortToken());
         Assert.Equal(HttpStatusCode.OK, update.StatusCode);
@@ -97,7 +97,7 @@ public sealed class WaveW4ChannelAdminHttpTests : IAsyncLifetime
         Assert.Equal("W4 Editado", entry.GetProperty("displayName").GetString());
         Assert.Equal("es", entry.GetProperty("country").GetString());
         Assert.Equal("Desporto", entry.GetProperty("editorialCategory").GetString());
-        Assert.Equal("PortugalDesporto", entry.GetProperty("editorialGroup").GetString());
+        Assert.Equal("pt-desporto", entry.GetProperty("groupKey").GetString());
         Assert.Equal("ReviewOnly", entry.GetProperty("publicationPolicy").GetString());
         Assert.False(entry.GetProperty("isEnabled").GetBoolean());
         Assert.Equal(key, entry.GetProperty("key").GetString());
@@ -112,7 +112,7 @@ public sealed class WaveW4ChannelAdminHttpTests : IAsyncLifetime
         var update = await Client.PutAsync(
             $"/api/catalog/channels/{id}",
             Json("{\"displayName\":\"W4\",\"country\":null," +
-                 "\"editorialCategory\":\"NaoExiste\",\"editorialGroup\":\"PortugalLive\"," +
+                 "\"editorialCategory\":\"NaoExiste\",\"groupKey\":\"pt-generalistas\"," +
                  "\"publicationPolicy\":\"CreateEligible\",\"isEnabled\":true}"),
             ShortToken());
 
@@ -131,7 +131,7 @@ public sealed class WaveW4ChannelAdminHttpTests : IAsyncLifetime
             displayName = "Outro",
             country = (string?)null,
             editorialCategory = "Live",
-            editorialGroup = "PortugalLive",
+            groupKey = "pt-generalistas",
             publicationPolicy = "CreateEligible",
             isEnabled = true,
             aliases = Array.Empty<string>(),

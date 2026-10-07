@@ -54,6 +54,7 @@ Para tarefas triviais (typo numa doc, mudança de uma flag) o plano pode ser dis
 - O fallback por `group-title` em `ValidateStreams` aceita apenas tokens de categoria explícitos do país (`pt` → `portugal`, `pt`, `🇵🇹`, etc.). Não transforma qualquer `group-title` em aprovação.
 - `CredentialSanitizer.SanitizeUrl` e `SanitizeM3uContent` aplicam-se a **todos** os pontos de saída: consola, `RunReport`, JSONs de relatório, preview do dashboard, mensagens de erro. **Nunca** passar uma URL Xtream com credenciais a `Console.WriteLine`, `JsonSerializer.Serialize`, `SaveToJsonReport` ou ao endpoint de preview sem sanitizar.
 - **Representações sanitizadas são apenas de apresentação** (logs, relatórios, observabilidade, mensagens, outputs destinados a leitura humana) e **nunca** devem ser usadas como identidade interna primária — nem para deduplicação, fingerprint, account identity, matching, cache key, dictionary key, agrupamento por conta ou fallback de identidade. Identidade interna usa `AccountKey` (`Services/Validation/AccountIdentity.cs`), o fingerprint `sfp1` (`Services/Matching/StreamFingerprint.cs`) ou `ExistingStreamId`, conforme aplicável. Se um componente precisar de identificar uma entidade mas só dispuser da representação sanitizada, isso é uma **lacuna arquitectural** a registar — nunca resolver usando a string sanitizada como chave. Ver `docs/Reestructure/04-PLAYLIST-STREAM.md` §4.1, `docs/Reestructure/23-DATA-CONTRACTS.md` §7 e `docs/Reestructure/46-REQUIREMENT-TRACEABILITY.md` (W4.1); divergência pendente relacionada: D-F3 em `docs/PROJECT_STATUS.md`.
+- **O grupo de publicação é uma propriedade do canal canónico (Wave D3, 2026-10-07).** O grupo de publicação é uma propriedade do **canal canónico** (`CanonicalChannel.GroupId` → `canonical_groups`; identidade pela `Key`, nunca pelo `DisplayName`). A playlist M3U (`group-title`) e o agrupamento no Dispatcharr usam o `DisplayName` do grupo do canal, **independentemente da source**. O `group-title` da source é apenas **sugestão** (pré-selecção em `GET /api/catalog/group-suggestion`), nunca autoridade. O enum `CanonicalEditorialGroup`, a coluna `canonical_channels.EditorialGroup` e a tabela/`group_mappings` foram **removidos** (2026-10-07). Ver `m3uCrawler/README.md` § grupos.
 - **Validação física deduplicada por run (W-DEDUP, 2026-10-01).** No caminho de descoberta Telegram, o GET físico é deduplicado pela **ValidationKey = `sfp1`** (`StreamFingerprint.TryComputeFingerprint`); uma chave já `Working` neste run **não** é re-testada por outra conta. **Falhas nunca são reutilizáveis entre `AccountKey`s** (podem ser específicas das credenciais) e cada conta elegível executa **sempre ≥1 probe físico** com as suas próprias credenciais. A chave é o fingerprint canónico — **nunca** uma URL sanitizada (bullet acima). `RunReport.StreamsTested` conta **apenas** validações físicas; os GETs evitados vão para o novo `StreamsSkippedAlreadyValidated`. O registo é por run, em memória, não persistido. Ver `docs/Reestructure/08-VALIDATION.md` §6.
 - **Janela de histórico Min/Max (W-HISTWIN, 2026-10-02).** A pesquisa Telegram processa apenas mensagens com `MinHistoryHours <= idade <= HistoryHours`, com os **dois limites inclusivos**. Os cutoffs Min/Max derivam do **mesmo instante UTC** por ciclo (invariante R1); a paginação `Messages_GetHistory` é interrompida pelo cutoff Max e mensagens mais recentes que Min são saltadas sem interromper a paginação. `MinHistoryHours` default `0` (= comportamento legacy); validação `Min >= 0`, `Min <= Max`, `Max` em `[1, 1440]`h (tecto 60 dias); inversão `Min > Max` é normalizada para `Min = 0`. O endpoint `/api/discovery/settings` aceita `minHistoryHours`, mas a **UI do dashboard ainda não expõe estes campos** (wave futura), tal como o Schedule Min/Max. Ver `m3uCrawler/README.md` § "Janela de histórico da pesquisa Telegram (Min/Max)".
 - **Proveniência da mensagem de origem (2026-10-02).** `CandidatePlaylist.SourceMessageId`/`SourceMessageDateUtc` são propagados para `DiscoveredPlaylist.MessageId`/`MessageDateUtc` (com `CandidateId`), visíveis em `output/telegram_run_report.json` (`discoveredPlaylists`) e em `GET /api/discovered-playlists`. Promoções `t.me/c` resolvidas pós-enumeração ficam com `messageId` mas `messageDateUtc` nulo; candidatos fora do caminho de mensagens enumeradas (ex.: `--scan-domain`) têm proveniência nula. `telegram_run_report.json` é sobrescrito a cada run.
@@ -175,9 +176,9 @@ Esta regra evita simultaneamente:
 
 ---
 
-## 9. Setup local para testes (Windows + Docker Desktop)
+## 9. Setup local para testes (Windows + Docker Desktop · Linux)
 
-> Esta secção documenta como **qualquer agente AI** (Kilo, Roo, etc.) deve configurar e usar um ambiente local equivalente à produção, **sem nunca tocar no servidor**. O setup foi estabelecido em 2026-09-14 e é estável; detalhes interactivos (autenticação Telegram) vivem em `.kilo/LOCAL_DEV.md`.
+> Esta secção documenta como **qualquer agente AI** (Kilo, Roo, etc.) deve configurar e usar um ambiente local equivalente à produção, **sem nunca tocar no servidor**. O setup foi estabelecido em 2026-09-14 e é estável; detalhes interactivos (autenticação Telegram) vivem em `.kilo/LOCAL_DEV.md`. Os **comandos são específicos do sistema operativo**: usar o bloco Windows (PowerShell + Docker Desktop) ou o bloco Linux (bash) em §9.4. O setup Windows foi estabelecido em 2026-09-14; o Linux foi validado em 2026-10-07.
 
 ### 9.1 Quando usar este setup
 
@@ -195,6 +196,8 @@ Estas restrições aplicam-se a qualquer sessão AI que vá interagir com o setu
 3. **NUNCA** correr `docker compose up -d` sem `-f docker-compose.local.yml`. O `docker-compose.yml` da raiz aponta para paths Linux e nome de container `m3ucrawler` (produção).
 4. **NUNCA** correr `docker pull ghcr.io/ginjeira/m3ucrawler:latest` — o package é **privado** (owner `ginjeira` reporta 0 packages públicos; todos os endpoints `/v2/` GHCR devolvem 401). Esta é uma propriedade da conta, não falta de credenciais locais.
 5. **NUNCA** apagar `C:\Users\ULSSJOSE\m3ucrawler\runtime-data\wtelegram.config` — é uma cópia byte-exact (320 B) do servidor. Para regenerar é preciso aceder ao servidor.
+6. **NUNCA** correr o dashboard local contra a BD de produção viva (`/data/channel-catalog.db`) — correr sempre contra uma **cópia** (ex.: `/tmp/m3udash/`). A BD SQLite contém `ReviewItem.StreamUrl` RAW (DL-129); nunca a colar em logs, commits, screenshots ou mensagens.
+7. **NUNCA** usar `docker-compose.local.yml` num host Linux: os seus `volumes:` usam caminhos Windows absolutos (`C:\Users\...`). Em Linux, usar `dotnet run` a partir do source ou `docker run` com bind mounts Linux (§9.4.2).
 
 ### 9.3 Componentes do setup
 
@@ -204,8 +207,14 @@ Estas restrições aplicam-se a qualquer sessão AI que vá interagir com o setu
 | Imagem local | `m3ucrawler:local` | Construída a partir do Dockerfile do repo, **não** puxada de GHCR |
 | Compose local | `docker-compose.local.yml` (raiz do repo, **.gitignored**) | Duas configurações via profiles: `default` (só dashboard) e `full` (com Telegram) |
 | `.gitignore` adicional | entrada `docker-compose.local.yml` linha 30 | Impede versionamento acidental |
+| Runtime data (Linux) | `/data/` (BD `channel-catalog.db` + `configuration_lifecycle.json`) | Equivalente Linux do bind mount; usar cópia em `/tmp` |
+| Compose local (Linux) | n/a — `docker-compose.local.yml` tem paths Windows | Em Linux preferir `dotnet run` ou `docker run` (§9.4.2) |
 
 ### 9.4 Comandos essenciais
+
+Os comandos são **específicos do sistema operativo**. Usar o bloco do OS onde se está.
+
+#### 9.4.1 Windows (PowerShell + Docker Desktop)
 
 **Validar que o setup está operacional** (sem afectar nada):
 
@@ -245,6 +254,62 @@ docker compose -f C:\Users\ULSSJOSE\Repos\m3uCrawler\docker-compose.local.yml --
 # Após autenticação: Ctrl+P Ctrl+Q para detach sem matar.
 ```
 
+#### 9.4.2 Linux (bash)
+
+> Validado em 2026-10-07 num dev-container Linux. O `docker-compose.local.yml` **não** é usado aqui (tem `volumes:` com caminhos Windows): em Linux correr a partir do source ou com `docker run`.
+
+**Validar o ambiente:**
+
+```bash
+command -v dotnet && dotnet --version          # tem de ser SDK 9.0.x (o projecto é net9.0)
+docker ps --filter name=m3ucrawler --format '{{.Names}} {{.Status}} {{.Ports}}'
+ls -l /data/channel-catalog.db /data/configuration_lifecycle.json
+```
+
+**Correr o dashboard a partir do código** (mais rápido; sem Docker nem imagem):
+
+```bash
+# 1) cópia da BD para /tmp — NÃO apontar para /data (BD viva; contém StreamUrl RAW, DL-129)
+mkdir -p /tmp/m3udash/output
+cp /data/channel-catalog.db            /tmp/m3udash/channel-catalog.db
+cp /data/configuration_lifecycle.json  /tmp/m3udash/configuration_lifecycle.json 2>/dev/null || true
+
+# 2) arrancar o dashboard (standalone, sem --telegram)
+cd <raiz-do-repo>/m3uCrawler
+dotnet run -c Release -- --web --web-port 5000 \
+  --catalog-db /tmp/m3udash/channel-catalog.db \
+  --output-dir /tmp/m3udash/output
+# Dashboard em http://localhost:5000/
+```
+
+- Usar o **SDK 9**; se o `dotnet` do PATH for outro, invocar o caminho absoluto (no dev-container: `/root/.dotnet/dotnet`).
+- O default de `--catalog-db` é `/data/channel-catalog.db`; passar sempre `--catalog-db` para a cópia em `/tmp`.
+- `runtime-data/` é resolvido a partir da pasta actual: correr a partir de `<raiz>/m3uCrawler`.
+- BD **sem administrador** (mesmo com lifecycle `READY` adoptado de legacy) → `GET /` responde **302 → `/bootstrap`** e as APIs `403 bootstrap-required`; concluir o *Configuração inicial* (criar admin) uma vez e depois entrar no dashboard.
+
+**Correr em Docker** (equivalente Linux ao compose Windows):
+
+```bash
+cd <raiz-do-repo>
+docker build -t m3ucrawler:local -f m3uCrawler/Dockerfile \
+  --build-arg M3uCrawlerVersion=refs/heads/main \
+  --build-arg M3uCrawlerCommitSha="$(git rev-parse HEAD)" \
+  --build-arg M3uCrawlerBuildNumber=0 \
+  --build-arg M3uCrawlerBuildDate="$(date -u +%Y-%m-%dT%H:%M:%SZ)" .
+
+mkdir -p /tmp/m3udash/data /tmp/m3udash/playlists
+cp /data/channel-catalog.db           /tmp/m3udash/data/
+cp /data/configuration_lifecycle.json /tmp/m3udash/data/ 2>/dev/null || true
+
+docker run --rm -p 5000:5000 \
+  -v /tmp/m3udash/data:/data \
+  -v /tmp/m3udash/playlists:/opt/playlists \
+  m3ucrawler:local --web --web-port 5000 --output-dir /opt/playlists
+# Dashboard em http://localhost:5000/
+```
+
+- O `WORKDIR` da imagem é `/data` e o default `--catalog-db` é `/data/channel-catalog.db`, coincidindo com o bind mount.
+
 ### 9.5 Procedimento para primeira autenticação Telegram (após setup inicial)
 
 Ver runbook completo em **`.kilo/LOCAL_DEV.md`** § "Primeira autenticação Telegram". Em resumo:
@@ -256,6 +321,8 @@ Ver runbook completo em **`.kilo/LOCAL_DEV.md`** § "Primeira autenticação Tel
 5. Se pedir `password:`, digitar a password 2FA.
 6. `Ctrl+P Ctrl+Q` para detach após ver `Autenticado como: <user>`.
 
+> O procedimento interactivo do Telegram foi estabelecido e validado no setup **Windows** (Docker Desktop). Em Linux **não** foi re-validado nesta data; o equivalente seria `docker run -it` com stdin ligado, não o compose Windows.
+
 ### 9.6 Diagnóstico rápido
 
 | Sintoma | Causa provável | Resolução |
@@ -265,6 +332,9 @@ Ver runbook completo em **`.kilo/LOCAL_DEV.md`** § "Primeira autenticação Tel
 | `PHONE_CODE_INVALID` em loop sem attach | `session.dat` local corrompido, **ou** stdin a receber input externo | Apagar `session.dat`, esperar 60s, foreground com `-it` |
 | `docker compose ... up -d` falha com "no service selected" | Profiles mal seleccionados | Usar `docker compose --profile full` explicitamente |
 | `/api/version` mostra versão diferente do `git rev-parse HEAD` | Imagem `m3ucrawler:local` desactualizada | Re-`docker build` com o SHA actual |
+| Linux: `dotnet build` falha com `NETSDK1045` (net9.0) | `dotnet` do PATH é um SDK antigo (8.x) | Usar o SDK 9 por caminho absoluto (ex.: `/root/.dotnet/dotnet`) |
+| Linux: `docker compose -f docker-compose.local.yml up` falha / volumes errados | `volumes:` com caminhos Windows | Usar `docker run` com bind mounts Linux (§9.4.2) |
+| `GET /` redirecciona para `/bootstrap` ou APIs devolvem `403 bootstrap-required` | BD sem administrador | Concluir o Setup inicial (criar admin) uma vez |
 
 ### 9.7 Não duplicar este setup noutro local do repo
 

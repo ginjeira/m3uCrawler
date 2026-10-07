@@ -17,25 +17,6 @@ public enum EditorialCategory
 }
 
 /// <summary>
-/// Editorial group final de publicação do canal. Por exemplo,
-/// "PORTUGAL", "EU | PT | GENERAL", "Sport TV Channels". Não confundir
-/// com <c>OutputGroupKind</c> (que é derivado em runtime a partir do
-/// source group pelo ResolutionPolicy).
-/// </summary>
-public enum CanonicalEditorialGroup
-{
-    PortugalLive = 0,
-    PortugalFilmes24_7,
-    PortugalEntretenimento,
-    PortugalDesporto,
-    PortugalInfantil,
-    PortugalDocumentarios,
-    PortugalPPV,
-    Foreign,
-    Other,
-}
-
-/// <summary>
 /// Política de publicação do canal canónico. Determina se o matcher
 /// pode criar o canal automaticamente no Dispatcharr, se só pode
 /// anexar streams em modo merge-only, se deve ficar bloqueado para

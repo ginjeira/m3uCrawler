@@ -62,7 +62,7 @@ public class Phase9C6CanonicalIdentityTests : IAsyncLifetime
             key,
             $"Phase 9C6 {key}",
             EditorialCategory.Live,
-            CanonicalEditorialGroup.PortugalLive,
+            CanonicalGroupKeys.PortugalGeneralistas,
             PublicationPolicy.CreateEligible,
             isEnabled: true,
             normalizedAliases: Array.Empty<string>());

@@ -165,7 +165,7 @@ public class CatalogChannelEndpointTests : IAsyncLifetime
             displayName = "Wave A Create",
             country = "PT",
             editorialCategory = "Live",
-            editorialGroup = "PortugalLive",
+            groupKey = "pt-generalistas",
             publicationPolicy = "CreateEligible",
             isEnabled = true,
             aliases = new[] { "wave a create hd" },
@@ -202,8 +202,91 @@ public class CatalogChannelEndpointTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task Unsupported_method_on_channels_collection_returns_405()
+    public async Task Post_with_groupKey_returns_group_fields()
     {
+        var harness = StartHarness();
+        await ReachReadyAsync(harness);
+        var csrf = await LoginAsync(harness);
+
+        var key = "wave-c-groupkey-" + Guid.NewGuid().ToString("N")[..8];
+        var body = JsonSerializer.Serialize(new
+        {
+            key,
+            displayName = "Wave C GroupKey",
+            country = "PT",
+            editorialCategory = "Live",
+            groupKey = "pt-desporto",
+            publicationPolicy = "CreateEligible",
+            isEnabled = true,
+            aliases = new[] { "wave c groupkey hd" },
+        });
+
+        var created = await harness.Client.SendAsync(
+            WithCsrf(HttpMethod.Post, ChannelsEndpoint, body, csrf));
+
+        Assert.Equal(HttpStatusCode.Created, created.StatusCode);
+        using var doc = JsonDocument.Parse(await created.Content.ReadAsStringAsync());
+        Assert.True(doc.RootElement.GetProperty("groupId").GetInt64() > 0);
+        Assert.Equal("pt-desporto", doc.RootElement.GetProperty("groupKey").GetString());
+        Assert.Equal("PortugalDesporto", doc.RootElement.GetProperty("groupName").GetString());
+    }
+
+    [Fact]
+    public async Task Post_with_unknown_groupKey_returns_400()
+    {
+        var harness = StartHarness();
+        await ReachReadyAsync(harness);
+        var csrf = await LoginAsync(harness);
+
+        var body = JsonSerializer.Serialize(new
+        {
+            key = "wave-c-bad-groupkey-" + Guid.NewGuid().ToString("N")[..8],
+            displayName = "Wave C Bad GroupKey",
+            editorialCategory = "Live",
+            groupKey = "does-not-exist",
+            publicationPolicy = "CreateEligible",
+            isEnabled = true,
+            aliases = Array.Empty<string>(),
+        });
+
+        var response = await harness.Client.SendAsync(
+            WithCsrf(HttpMethod.Post, ChannelsEndpoint, body, csrf));
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        Assert.Contains("GroupKey inválido", doc.RootElement.GetProperty("error").GetString());
+    }
+
+    [Fact]
+    public async Task Post_without_groupKey_defaults_to_Other()
+    {
+        var harness = StartHarness();
+        await ReachReadyAsync(harness);
+        var csrf = await LoginAsync(harness);
+
+        var key = "wave-c-default-group-" + Guid.NewGuid().ToString("N")[..8];
+        var body = JsonSerializer.Serialize(new
+        {
+            key,
+            displayName = "Wave C Default Group",
+            editorialCategory = "Live",
+            publicationPolicy = "CreateEligible",
+            isEnabled = true,
+            aliases = Array.Empty<string>(),
+        });
+
+        var created = await harness.Client.SendAsync(
+            WithCsrf(HttpMethod.Post, ChannelsEndpoint, body, csrf));
+
+        Assert.Equal(HttpStatusCode.Created, created.StatusCode);
+        using var doc = JsonDocument.Parse(await created.Content.ReadAsStringAsync());
+        // Sem groupKey → grupo por omissão "other".
+        Assert.True(doc.RootElement.GetProperty("groupId").GetInt64() > 0);
+        Assert.Equal("other", doc.RootElement.GetProperty("groupKey").GetString());
+    }
+
+    [Fact]
+    public async Task Unsupported_method_on_channels_collection_returns_405()    {
         var harness = StartHarness();
         await ReachReadyAsync(harness);
         var csrf = await LoginAsync(harness);

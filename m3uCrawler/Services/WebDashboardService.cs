@@ -1716,15 +1716,22 @@ namespace m3uCrawler.Services
                         return;
                     }
                     if (!TryParseOptionalEnum(ch.EditorialCategory, out EditorialCategory? editorialCategory)
-                        || !TryParseOptionalEnum(ch.EditorialGroup, out CanonicalEditorialGroup? editorialGroup)
                         || !TryParseOptionalEnum(ch.PublicationPolicy, out PublicationPolicy? publicationPolicy))
                     {
                         await WriteJsonAsync(context.Response, new { error = "Valor editorial inválido em channel." },
                             HttpStatusCode.BadRequest);
                         return;
                     }
+                    var reviewGroupKey = await ResolveValidatedGroupKeyAsync(ch.GroupKey);
+                    if (reviewGroupKey is null)
+                    {
+                        await WriteJsonAsync(context.Response, new { error = $"GroupKey inválido: '{ch.GroupKey}'." },
+                            HttpStatusCode.BadRequest);
+                        return;
+                    }
                     channelSpec = new ReviewChannelSpec(
-                        ch.Key!, ch.Name!, ch.Country, editorialCategory, editorialGroup, publicationPolicy, ch.IsEnabled);
+                        ch.Key!, ch.Name!, ch.Country, editorialCategory, publicationPolicy, ch.IsEnabled,
+                        reviewGroupKey);
                 }
                 else if (action == ReviewApprovalAction.AddAlias
                     && string.IsNullOrWhiteSpace(payload?.CanonicalChannelKey))
@@ -2776,15 +2783,12 @@ namespace m3uCrawler.Services
                 return;
             }
 
-            // === PHASE 8 — Import Policies + Canonical Groups + Group Mappings ===
+            // === PHASE 8 — Import Policies + Canonical Groups ===
             // GET    /api/catalog/import-policies
             // POST   /api/catalog/import-policies
             // GET    /api/catalog/canonical-groups
             // POST   /api/catalog/canonical-groups
             // DELETE /api/catalog/canonical-groups/{id}
-            // GET    /api/catalog/group-mappings
-            // POST   /api/catalog/group-mappings
-            // DELETE /api/catalog/group-mappings/{id}
             if (requestPath.Equals("/api/catalog/import-policies", StringComparison.OrdinalIgnoreCase))
             {
                 if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
@@ -2874,78 +2878,49 @@ namespace m3uCrawler.Services
                 }
                 if (context.Request.HttpMethod.Equals("DELETE", StringComparison.OrdinalIgnoreCase))
                 {
-                    var ok = await _catalogResolver.DeleteCanonicalGroupAsync(gid);
-                    if (!ok)
-                    {
-                        context.Response.StatusCode = (int)HttpStatusCode.NotFound;
-                        await WriteJsonAsync(context.Response, new { error = $"CanonicalGroup #{gid} não encontrada." });
-                        return;
-                    }
-                    await WriteJsonAsync(context.Response, new { deleted = true, id = gid });
-                    return;
-                }
-            }
-
-            if (requestPath.Equals("/api/catalog/group-mappings", StringComparison.OrdinalIgnoreCase))
-            {
-                if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
-                {
-                    await WriteJsonAsync(context.Response, (await _catalogResolver.ListGroupMappingsAsync()).Select(GroupMappingToJson));
-                    return;
-                }
-                if (context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
-                {
                     try
                     {
-                        using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
-                        var body = await reader.ReadToEndAsync();
-                        var payload = JsonSerializer.Deserialize<GroupMappingPayload>(body, JsonOptions);
-                        if (payload == null
-                            || !Enum.TryParse<SourceKind>(payload.SourceKind, true, out var sk)
-                            || string.IsNullOrWhiteSpace(payload.SourceGroupTitle)
-                            || payload.CanonicalGroupId <= 0)
+                        var ok = await _catalogResolver.DeleteCanonicalGroupAsync(gid);
+                        if (!ok)
                         {
-                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
-                            await WriteJsonAsync(context.Response, new { error = "Payload inválido." });
+                            context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                            await WriteJsonAsync(context.Response, new { error = $"CanonicalGroup #{gid} não encontrada." });
                             return;
                         }
-                        var saved = await _catalogResolver.UpsertGroupMappingAsync(
-                            sk, payload.SourceGroupTitle, payload.CanonicalGroupId, payload.IsEnabled);
-                        await WriteJsonAsync(context.Response, GroupMappingToJson(saved));
+                        await WriteJsonAsync(context.Response, new { deleted = true, id = gid });
                         return;
                     }
-                    catch (Exception ex)
+                    catch (InvalidOperationException ex)
                     {
                         context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
                         await WriteJsonAsync(context.Response, new { error = ex.Message });
                         return;
                     }
                 }
-                context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
-                return;
             }
 
-            if (requestPath.StartsWith("/api/catalog/group-mappings/", StringComparison.OrdinalIgnoreCase))
+            // === Wave D3 — sugestão de grupo canónico (pré-selecção apenas) ===
+            // GET /api/catalog/group-suggestion?group=<...>&title=<...>
+            // O group-title da source é apenas sugestão; o valor persistido é
+            // sempre a escolha explícita do operador no formulário de canal.
+            if (requestPath.Equals("/api/catalog/group-suggestion", StringComparison.OrdinalIgnoreCase))
             {
-                var idStr = requestPath.Substring("/api/catalog/group-mappings/".Length);
-                if (!long.TryParse(idStr, out var mid))
+                if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
                 {
-                    context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
-                    await WriteJsonAsync(context.Response, new { error = "ID inválido." });
-                    return;
-                }
-                if (context.Request.HttpMethod.Equals("DELETE", StringComparison.OrdinalIgnoreCase))
-                {
-                    var ok = await _catalogResolver.DeleteGroupMappingAsync(mid);
-                    if (!ok)
+                    var suggestionGroup = context.Request.QueryString["group"];
+                    var suggestionTitle = context.Request.QueryString["title"];
+                    var suggestedKey = GroupSuggester.SuggestGroupKey(suggestionGroup, suggestionTitle);
+                    string? suggestedName = null;
+                    if (!string.IsNullOrWhiteSpace(suggestedKey))
                     {
-                        context.Response.StatusCode = (int)HttpStatusCode.NotFound;
-                        await WriteJsonAsync(context.Response, new { error = $"GroupMapping #{mid} não encontrado." });
-                        return;
+                        var suggested = await _catalogResolver!.GetCanonicalGroupByKeyAsync(suggestedKey);
+                        suggestedName = suggested?.DisplayName;
                     }
-                    await WriteJsonAsync(context.Response, new { deleted = true, id = mid });
+                    await WriteJsonAsync(context.Response, new { groupKey = suggestedKey, groupName = suggestedName });
                     return;
                 }
+                context.Response.StatusCode = (int)HttpStatusCode.MethodNotAllowed;
+                return;
             }
 
             // === PHASE 9 b — ChannelSource observation history ===
@@ -3354,10 +3329,14 @@ namespace m3uCrawler.Services
                                 await WriteJsonAsync(context.Response, new { error = $"EditorialCategory inválido: '{payload.EditorialCategory}'." });
                                 return;
                             }
-                            if (!Enum.TryParse<CanonicalEditorialGroup>(payload.EditorialGroup, true, out var editorialGroup))
+                            // Wave D2 — o grupo é identificado apenas pela
+                            // Key/FK. A key ausente cai em "other"; uma key
+                            // desconhecida é rejeitada com 400.
+                            var groupKey = await ResolveValidatedGroupKeyAsync(payload.GroupKey);
+                            if (groupKey is null)
                             {
                                 context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
-                                await WriteJsonAsync(context.Response, new { error = $"EditorialGroup inválido: '{payload.EditorialGroup}'." });
+                                await WriteJsonAsync(context.Response, new { error = $"GroupKey inválido: '{payload.GroupKey}'." });
                                 return;
                             }
                             if (!Enum.TryParse<PublicationPolicy>(payload.PublicationPolicy, true, out var publicationPolicy))
@@ -3370,7 +3349,7 @@ namespace m3uCrawler.Services
                             var beforeChannel = await _catalogResolver.GetCanonicalChannelAsync(channelId);
                             var updated = await _catalogResolver.UpdateCanonicalChannelAsync(
                                 channelId, payload.DisplayName, editorialCategory,
-                                editorialGroup, publicationPolicy, isEnabled, payload.Country);
+                                groupKey, publicationPolicy, isEnabled, payload.Country);
                             if (updated == null)
                             {
                                 context.Response.StatusCode = (int)HttpStatusCode.NotFound;
@@ -3517,10 +3496,14 @@ namespace m3uCrawler.Services
                         await WriteJsonAsync(context.Response, new { error = $"EditorialCategory inválido: '{payload.EditorialCategory}'." });
                         return;
                     }
-                    if (!Enum.TryParse<CanonicalEditorialGroup>(payload.EditorialGroup, true, out var editorialGroup))
+                    // Wave D2 — o grupo é identificado apenas pela
+                    // Key/FK. A key ausente cai em "other"; uma key
+                    // desconhecida é rejeitada com 400.
+                    var groupKey = await ResolveValidatedGroupKeyAsync(payload.GroupKey);
+                    if (groupKey is null)
                     {
                         context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
-                        await WriteJsonAsync(context.Response, new { error = $"EditorialGroup inválido: '{payload.EditorialGroup}'." });
+                        await WriteJsonAsync(context.Response, new { error = $"GroupKey inválido: '{payload.GroupKey}'." });
                         return;
                     }
                     if (!Enum.TryParse<PublicationPolicy>(payload.PublicationPolicy, true, out var publicationPolicy))
@@ -3535,7 +3518,7 @@ namespace m3uCrawler.Services
                         .ToList();
                     var created = await _catalogResolver.CreateCanonicalChannelAsync(
                         payload.Key.Trim(), payload.DisplayName,
-                        editorialCategory, editorialGroup, publicationPolicy,
+                        editorialCategory, groupKey, publicationPolicy,
                         payload.IsEnabled, aliases, payload.Country);
                     var reloaded = await _catalogResolver.GetCanonicalChannelAsync(created.Id);
                     await RecordAuditAsync(auditActor, "catalog.channel.create", "canonical-channel",
@@ -4165,15 +4148,22 @@ namespace m3uCrawler.Services
                         return;
                     }
                     if (!TryParseOptionalEnum(ch.EditorialCategory, out EditorialCategory? editorialCategory)
-                        || !TryParseOptionalEnum(ch.EditorialGroup, out CanonicalEditorialGroup? editorialGroup)
                         || !TryParseOptionalEnum(ch.PublicationPolicy, out PublicationPolicy? publicationPolicy))
                     {
                         await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.UnprocessableEntity,
                             "declared-change-invalid", "Valor editorial inválido em channel.", correlationId);
                         return;
                     }
+                    var reviewGroupKey = await ResolveValidatedGroupKeyAsync(ch.GroupKey);
+                    if (reviewGroupKey is null)
+                    {
+                        await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.UnprocessableEntity,
+                            "declared-change-invalid", $"GroupKey inválido: '{ch.GroupKey}'.", correlationId);
+                        return;
+                    }
                     channelSpec = new ReviewChannelSpec(
-                        ch.Key!, ch.Name!, ch.Country, editorialCategory, editorialGroup, publicationPolicy, ch.IsEnabled);
+                        ch.Key!, ch.Name!, ch.Country, editorialCategory, publicationPolicy, ch.IsEnabled,
+                        reviewGroupKey);
                     break;
 
                 default:
@@ -4708,8 +4698,8 @@ namespace m3uCrawler.Services
         [JsonPropertyName("editorialCategory")]
         public string? EditorialCategory { get; set; }
 
-        [JsonPropertyName("editorialGroup")]
-        public string? EditorialGroup { get; set; }
+        [JsonPropertyName("groupKey")]
+        public string? GroupKey { get; set; }
 
         [JsonPropertyName("publicationPolicy")]
         public string? PublicationPolicy { get; set; }
@@ -4735,6 +4725,25 @@ namespace m3uCrawler.Services
         return false;
     }
 
+    /// <summary>
+    /// Wave D2 — resolve e valida a <c>Key</c> do grupo canónico de um
+    /// payload HTTP. Devolve <see cref="CanonicalGroupKeys.Other"/>
+    /// quando a key está ausente, a própria key quando existe em
+    /// <c>canonical_groups</c>, ou <c>null</c> quando a key é
+    /// desconhecida (o caller responde 400/422).
+    /// </summary>
+    private static async Task<string?> ResolveValidatedGroupKeyAsync(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return CanonicalGroupKeys.Other;
+        }
+
+        var trimmed = raw.Trim();
+        var group = await _catalogResolver!.GetCanonicalGroupByKeyAsync(trimmed);
+        return group is null ? null : trimmed;
+    }
+
     private sealed class CreateChannelPayload
     {
         [JsonPropertyName("key")]
@@ -4745,8 +4754,8 @@ namespace m3uCrawler.Services
         public string? Country { get; set; }
         [JsonPropertyName("editorialCategory")]
         public string? EditorialCategory { get; set; }
-        [JsonPropertyName("editorialGroup")]
-        public string? EditorialGroup { get; set; }
+        [JsonPropertyName("groupKey")]
+        public string? GroupKey { get; set; }
         [JsonPropertyName("publicationPolicy")]
         public string? PublicationPolicy { get; set; }
         [JsonPropertyName("isEnabled")]
@@ -4763,8 +4772,8 @@ namespace m3uCrawler.Services
         public string? Country { get; set; }
         [JsonPropertyName("editorialCategory")]
         public string? EditorialCategory { get; set; }
-        [JsonPropertyName("editorialGroup")]
-        public string? EditorialGroup { get; set; }
+        [JsonPropertyName("groupKey")]
+        public string? GroupKey { get; set; }
         [JsonPropertyName("publicationPolicy")]
         public string? PublicationPolicy { get; set; }
         [JsonPropertyName("isEnabled")]
@@ -4786,7 +4795,9 @@ namespace m3uCrawler.Services
             displayName = c.DisplayName,
             country = c.Country,
             editorialCategory = c.EditorialCategory.ToString(),
-            editorialGroup = c.EditorialGroup.ToString(),
+            groupId = c.GroupId,
+            groupKey = c.Group?.Key,
+            groupName = c.Group?.DisplayName,
             publicationPolicy = c.PublicationPolicy.ToString(),
             isEnabled = c.IsEnabled,
             aliases = c.Aliases.OrderBy(a => a.NormalizedAlias, StringComparer.Ordinal)
@@ -4990,14 +5001,6 @@ namespace m3uCrawler.Services
         [JsonPropertyName("isDefault")] public bool IsDefault { get; set; }
     }
 
-    private sealed class GroupMappingPayload
-    {
-        [JsonPropertyName("sourceKind")] public string? SourceKind { get; set; }
-        [JsonPropertyName("sourceGroupTitle")] public string? SourceGroupTitle { get; set; }
-        [JsonPropertyName("canonicalGroupId")] public long CanonicalGroupId { get; set; }
-        [JsonPropertyName("isEnabled")] public bool IsEnabled { get; set; } = true;
-    }
-
     private static object ImportPolicyToJson(ImportPolicyEntity p)
     {
         return new
@@ -5026,22 +5029,6 @@ namespace m3uCrawler.Services
             isDefault = g.IsDefault,
             createdAtUtc = g.CreatedAtUtc.ToString("o"),
             updatedAtUtc = g.UpdatedAtUtc.ToString("o"),
-        };
-    }
-
-    private static object GroupMappingToJson(GroupMappingEntity m)
-    {
-        return new
-        {
-            id = m.Id,
-            sourceKind = m.SourceKind.ToString(),
-            sourceGroupTitle = m.SourceGroupTitle,
-            canonicalGroupId = m.CanonicalGroupId,
-            canonicalGroupKey = m.CanonicalGroup?.Key,
-            canonicalGroupDisplayName = m.CanonicalGroup?.DisplayName,
-            isEnabled = m.IsEnabled,
-            createdAtUtc = m.CreatedAtUtc.ToString("o"),
-            updatedAtUtc = m.UpdatedAtUtc.ToString("o"),
         };
     }
 
@@ -5440,6 +5427,12 @@ namespace m3uCrawler.Services
     .setup-item .k { color: var(--muted); }
     .setup-item button { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 2px 8px; font: inherit; font-size: 12px; cursor: pointer; }
     .setup-status { margin-top: 8px; font-size: 13px; }
+    #modalRoot{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:2000;display:none;overflow:auto;padding:32px 12px}
+    #modalRoot.open{display:block}
+    .modal-panel{position:relative;margin:0 auto;width:min(760px,94vw);max-height:88vh;overflow:auto;background:var(--panel);border:1px solid var(--border);border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.5);padding:20px}
+    .modal-panel .card{border:none;background:transparent;padding:0;margin:0}
+    .modal-close{position:absolute;top:10px;right:12px;background:transparent;border:none;color:var(--muted);font-size:20px;cursor:pointer;line-height:1}
+    body.modal-open{overflow:hidden}
   </style>
 </head>
 <body>
@@ -5603,7 +5596,8 @@ namespace m3uCrawler.Services
         <button data-ctab='matching' style='padding:8px 14px;'>Matching</button>
         <button data-ctab='degradation' style='padding:8px 14px;'>Degradação</button>
         <button data-ctab='scheduled' style='padding:8px 14px;'>Scheduled Jobs</button>
-        <button data-ctab='policies' style='padding:8px 14px;'>Import Policies</button>
+        <!-- Import Policies oculto até decisão W6b-3 (funcionalidade inerte, sem consumidor). Endpoints/entidade mantidos. -->
+        <button data-ctab='policies' hidden style='padding:8px 14px;'>Import Policies</button>
         <button data-ctab='groups' style='padding:8px 14px;'>Grupos</button>
         <button data-ctab='reviews' style='padding:8px 14px;'>Reviews</button>
         <button data-ctab='syncruns' style='padding:8px 14px;'>Sync Runs</button>
@@ -5677,17 +5671,7 @@ namespace m3uCrawler.Services
                 </div>
                 <div>
                   <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Grupo Editorial</label>
-                  <select id='newChannelGroup' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
-                    <option value='PortugalLive'>PortugalLive</option>
-                    <option value='PortugalFilmes24_7'>PortugalFilmes24_7</option>
-                    <option value='PortugalEntretenimento'>PortugalEntretenimento</option>
-                    <option value='PortugalDesporto'>PortugalDesporto</option>
-                    <option value='PortugalInfantil'>PortugalInfantil</option>
-                    <option value='PortugalDocumentarios'>PortugalDocumentarios</option>
-                    <option value='PortugalPPV'>PortugalPPV</option>
-                    <option value='Foreign'>Foreign</option>
-                    <option value='Other'>Other</option>
-                  </select>
+                  <select id='newChannelGroup' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'></select>
                 </div>
                 <div>
                   <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Política de Publicação</label>
@@ -5717,7 +5701,7 @@ namespace m3uCrawler.Services
             </div>
           </div>
           <div id='catalogChannelsTable'></div>
-          <div id='channelDetailPanel' style='margin-top:24px;'></div>
+          <div id='channelDetailPanel' hidden style='margin-top:24px;'></div>
         </div>
       </div>
 
@@ -5939,7 +5923,10 @@ namespace m3uCrawler.Services
           <h3>Ordering Lists</h3>
           <p class='muted'>Listas que determinam a ordem dos canais na playlist gerada. Cada lista pode ser duplicada, editada e usada como entrada para a composição.</p>
           <div id='orderingListsTable'></div>
-          <div style='margin-top:16px;'>
+          <div style='margin-top:10px;'>
+            <button onclick='showCreateOrderingForm()'>+ Nova lista</button>
+          </div>
+          <div id='orderingCreateForm' hidden style='margin-top:16px;'>
             <h4 style='margin:0 0 8px 0;'>Nova lista</h4>
             <div style='display:grid;gap:8px;grid-template-columns:1fr 1fr 1fr;'>
               <div>
@@ -5957,6 +5944,7 @@ namespace m3uCrawler.Services
             </div>
             <div style='margin-top:10px;display:flex;gap:8px;'>
               <button onclick='submitCreateOrderingList()'>Guardar</button>
+              <button class='secondary' onclick='closeModalPanel()'>Cancelar</button>
             </div>
           </div>
           <div id='orderingEditForm' hidden style='margin-top:16px;'>
@@ -6038,6 +6026,16 @@ namespace m3uCrawler.Services
         </div>
 
         <div class='card' style='margin-top:16px;'>
+          <h3>Overrides por canal</h3>
+          <p class='muted'>Cada linha representa um override por canal. Um override substitui por completo a política global para esse canal.</p>
+          <div style='margin-top:10px;display:flex;gap:8px;'>
+            <button onclick='newChannelSourceSelectionPolicy()'>+ Novo override</button>
+            <button class='secondary' onclick='loadChannelSourceSelectionPolicies()'>Recarregar</button>
+          </div>
+          <div id='channelSourceSelectionPoliciesTable' style='margin-top:12px;'></div>
+        </div>
+
+        <div class='card' id='channelSourceSelectionPolicyForm' hidden style='margin-top:16px;'>
           <h3>Override por canal</h3>
           <p class='muted'>Um override por canal <strong>substitui por completo a política global</strong> para esse canal. <strong>MaxSourcesPerChannel = 0</strong> é válido e significa que nenhuma fonte seleccionada é publicada para esse canal. Valores negativos são rejeitados. MaxSourcesPerProvider em branco significa sem limite. A identidade usada é a chave canónica do canal.</p>
           <div style='display:grid;gap:8px;grid-template-columns:1fr 1fr;'>
@@ -6065,10 +6063,9 @@ namespace m3uCrawler.Services
           </div>
           <div style='margin-top:10px;display:flex;gap:8px;'>
             <button onclick='saveChannelSourceSelectionPolicy()'>Guardar override</button>
-            <button class='secondary' onclick='loadChannelSourceSelectionPolicies()'>Recarregar</button>
+            <button class='secondary' onclick='closeModalPanel()'>Cancelar</button>
           </div>
           <div id='channelSourceSelectionPolicyStatus' class='muted' style='margin-top:8px;'></div>
-          <div id='channelSourceSelectionPoliciesTable' style='margin-top:12px;'></div>
         </div>
 
         <!-- PHASE 13 (Wave 13-5) — Preview / Dry-Run -->
@@ -6131,7 +6128,10 @@ namespace m3uCrawler.Services
           <h3>Scheduled Jobs</h3>
           <p class='muted'>Jobs persistidos em SQLite. O scheduler calcula o próximo tick a partir da expressão cron (5 campos) e persiste <code>lastRunAtUtc</code> + <code>nextRunAtUtc</code>.</p>
           <div id='scheduledJobsTable'></div>
-          <div style='margin-top:16px;'>
+          <div style='margin-top:10px;'>
+            <button onclick='newScheduledJob()'>+ Novo job</button>
+          </div>
+          <div id='scheduledJobForm' hidden style='margin-top:16px;'>
             <h4 style='margin:0 0 8px 0;'>Novo / actualizar job</h4>
             <p class='muted' style='margin:0 0 8px 0;font-size:12px;'>Upsert por <strong>Name</strong>: o mesmo nome actualiza o job existente; um nome diferente cria um novo job.</p>
             <div style='display:grid;gap:8px;grid-template-columns:1fr 1fr 1fr 1fr;'>
@@ -6205,6 +6205,7 @@ namespace m3uCrawler.Services
             <div style='margin-top:10px;display:flex;gap:8px;align-items:center;'>
               <button onclick='submitCreateScheduledJob()'>Guardar</button>
               <button class='secondary' onclick='newScheduledJob()'>Limpar / Novo</button>
+              <button class='secondary' onclick='closeModalPanel()'>Cancelar</button>
               <span id='schedFormStatus' style='font-size:12px;'></span>
             </div>
           </div>
@@ -6218,68 +6219,80 @@ namespace m3uCrawler.Services
           <p class='muted'>Define, por tipo de media, quais os grupos alvo e quais os excluídos. VOD tem ainda a política <i>Import / Keep / Exclude</i> separada de Linear TV.</p>
           <div id='importPoliciesTable'></div>
         </div>
+        <div class='card' id='importPolicyEditForm' hidden style='margin-top:16px;'>
+          <h3>Editar política de importação</h3>
+          <p class='muted'>MediaKind: <strong id='importPolicyEditMediaKindLabel'></strong> (não editável).</p>
+          <div style='display:grid;gap:8px;grid-template-columns:1fr 1fr;'>
+            <div>
+              <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>VOD Policy</label>
+              <select id='importPolicyEditVod' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                <option value='ImportVod'>ImportVod</option>
+                <option value='KeepVod'>KeepVod</option>
+                <option value='ExcludeVod'>ExcludeVod</option>
+              </select>
+            </div>
+            <div>
+              <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Targets (CSV)</label>
+              <input id='importPolicyEditTargets' placeholder='ex: Desporto,Notícias' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+            </div>
+            <div>
+              <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Excluded (CSV)</label>
+              <input id='importPolicyEditExcluded' placeholder='ex: Adultos' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+            </div>
+          </div>
+          <div style='margin-top:10px;display:flex;gap:8px;'>
+            <button onclick='submitImportPolicyEdit()'>Guardar</button>
+            <button class='secondary' onclick='closeModalPanel()'>Cancelar</button>
+          </div>
+        </div>
       </div>
 
       <!-- TAB: Groups (PHASE 8) -->
       <div id='ctab-groups' hidden>
         <div class='card' style='margin-top:16px;'>
           <h3>Grupos canónicos</h3>
-          <p class='muted'>Os grupos canónicos deixam de ser apenas enums rígidos. São entidades persistentes, configuráveis e associáveis a group-titles de cada source via mapping explícito.</p>
+          <p class='muted'>Cada grupo pertence ao canal canónico e é o grupo de publicação usado na playlist e no Dispatcharr. O <i>group-title</i> da source é apenas uma sugestão — não define o grupo do canal.</p>
           <div id='canonicalGroupsTable'></div>
           <div style='margin-top:16px;'>
-            <h4 style='margin:0 0 8px 0;'>Novo grupo</h4>
-            <div style='display:grid;gap:8px;grid-template-columns:1fr 1fr 1fr 1fr;'>
+            <button onclick='showCreateCanonicalGroup()'>+ Novo grupo</button>
+          </div>
+          <div class='card' id='canonicalGroupEditForm' hidden style='margin-top:16px;'>
+            <h4 id='canonicalGroupEditTitle' style='margin:0 0 8px 0;'>Novo grupo</h4>
+            <div style='display:grid;gap:8px;grid-template-columns:1fr 1fr;'>
               <div>
                 <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Key</label>
-                <input data-group-create='key' placeholder='ex: portugal-live' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                <input id='cgKey' placeholder='ex: portugal-live' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
               </div>
               <div>
                 <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Display Name</label>
-                <input data-group-create='name' placeholder='ex: Portugal Live' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                <input id='cgName' placeholder='ex: Portugal Live' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
               </div>
               <div>
                 <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>País (ISO)</label>
-                <input data-group-create='country' placeholder='pt' maxlength='10' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                <input id='cgCountry' placeholder='pt' maxlength='10' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
               </div>
               <div>
                 <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Ordem</label>
-                <input data-group-create='order' type='number' value='100' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                <input id='cgOrder' type='number' value='100' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
               </div>
-            </div>
-            <div style='margin-top:10px;display:flex;gap:8px;'>
-              <button onclick='submitCreateGroup()'>Guardar</button>
-            </div>
-          </div>
-        </div>
-        <div class='card' style='margin-top:16px;'>
-          <h3>Group Mappings</h3>
-          <p class='muted'>Associa <i>group-titles</i> de uma source a um grupo canónico. Nunca é automático — exige mapping explícito.</p>
-          <div id='groupMappingsTable'></div>
-          <div style='margin-top:16px;'>
-            <h4 style='margin:0 0 8px 0;'>Novo mapping</h4>
-            <div style='display:grid;gap:8px;grid-template-columns:1fr 1fr 1fr;'>
               <div>
-                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Source Kind</label>
-                <select data-mapping-create='kind'>
-                  <option value='M3U'>M3U</option>
-                  <option value='Xtream'>Xtream</option>
-                  <option value='Telegram'>Telegram</option>
-                  <option value='Http'>Http</option>
-                  <option value='File'>File</option>
-                  <option value='Manual'>Manual</option>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Default</label>
+                <select id='cgDefault' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                  <option value='false'>Não</option>
+                  <option value='true'>Sim</option>
                 </select>
               </div>
               <div>
-                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Source Group Title</label>
-                <input data-mapping-create='title' placeholder='ex: PORTUGAL SPORTS' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
-              </div>
-              <div>
-                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Canonical Group ID</label>
-                <input data-mapping-create='groupId' type='number' placeholder='id' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Activo</label>
+                <select id='cgEnabled' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                  <option value='true'>Sim</option>
+                  <option value='false'>Não</option>
+                </select>
               </div>
             </div>
             <div style='margin-top:10px;display:flex;gap:8px;'>
-              <button onclick='submitCreateGroupMapping()'>Guardar</button>
+              <button onclick='submitCanonicalGroupEdit()'>Guardar</button>
+              <button class='secondary' onclick='closeModalPanel()'>Cancelar</button>
             </div>
           </div>
         </div>
@@ -6466,6 +6479,8 @@ namespace m3uCrawler.Services
       </div>
     </section>
   </main>
+
+  <div id='modalRoot' hidden></div>
 
   <script>
   (function(){
@@ -7092,8 +7107,8 @@ const rows = Object.entries(inv).map(([k, v]) => {
       cards.push(metricCard('Channel Sources', nfmt(stats.channelSources || 0), '', 'Associações canal-canónico ↔ stream ↔ source.'));
       cards.push(metricCard('Ordering Lists', nfmt(stats.orderingLists || 0) + ' · ' + nfmt(stats.orderingItems || 0) + ' items', '', 'Listas de ordenação e respectivos items.'));
       cards.push(metricCard('Priority Policies', nfmt(stats.sourcePriorityPolicies || 0), '', 'Políticas de Source Priority persistidas (global + overrides).'));
-      cards.push(metricCard('Import Policies', nfmt(stats.importPolicies || 0), '', 'Live/Radio/VOD policies configuráveis.'));
-      cards.push(metricCard('Canonical Groups', nfmt(stats.canonicalGroups || 0) + ' · ' + nfmt(stats.groupMappings || 0) + ' mappings', '', 'Grupos canónicos persistentes e mappings source→canónico.'));
+      // Import Policies (card) oculto até W6b-3.
+      cards.push(metricCard('Canonical Groups', nfmt(stats.canonicalGroups || 0), '', 'Grupos canónicos persistentes (grupo de publicação do canal).'));
       cards.push(metricCard('Matching Audits', nfmt(stats.matchingAudits || 0), '', 'Auditoria de cada resolução do CatalogResolver (PHASE 3).'));
       cards.push(metricCard('ChannelSource Observations', nfmt(stats.channelSourceObservations || 0), '', 'Histórico Quality/EPG/Availability por ChannelSource (PHASE 9 b).'));
       cards.push(metricCard('Sync Run Steps', nfmt(stats.syncRunSteps || 0), '', 'Passos detalhados por SyncRun (PHASE 11).'));
@@ -7128,28 +7143,96 @@ const rows = Object.entries(inv).map(([k, v]) => {
       else if (tab === 'degradation') loadDegradation();
       else if (tab === 'scheduled') { loadScheduledActions(); loadScheduledJobs(); }
       else if (tab === 'policies') loadImportPolicies();
-      else if (tab === 'groups') { loadCanonicalGroups(); loadGroupMappings(); }
+      else if (tab === 'groups') loadCanonicalGroups();
       else if (tab === 'reviews') loadCatalogReviews();
       else if (tab === 'syncruns') loadCatalogSyncRuns();
       else if (tab === 'pending') loadPendingCountryApprovals();
     }
 
     let _channelsCache = [];
+    // Wave C1 — grupos canónicos configuráveis (Key estável → DisplayName).
+    let _canonicalGroupsCache = [];
     let _selectedChannelId = null;
     let _editingChannelId = null;
     // W5 — estado do fluxo de aprovação de Review e do formulário de
     // criação em modo Review.
     let _pendingReviewFingerprint = null;
     let _pendingReviewIdentity = '';
+    let _pendingReviewGroup = '';
     let _reviewChannelFingerprint = null;
 
     async function loadCatalogChannels() {
+      await loadChannelGroupOptions();
       const channels = await safeFetchJson('/api/catalog/channels', []);
       if (!Array.isArray(channels)) { document.getElementById('catalogChannelsTable').innerHTML = '<p class="muted">Erro ao carregar canais.</p>'; return; }
       _channelsCache = channels;
       document.getElementById('channelsCount').textContent = `${channels.length} canal(is).`;
       renderChannelsTable();
       renderChannelDetail();
+    }
+
+    // Wave C1 — carrega os grupos canónicos configuráveis e popula o
+    // select do formulário de canal. Robusto a falhas: em erro mantém as
+    // opções actuais (o select existe no HTML sem opções estáticas).
+    async function loadChannelGroupOptions() {
+      const groups = await safeFetchJson('/api/catalog/canonical-groups', null);
+      if (!Array.isArray(groups)) return;
+      _canonicalGroupsCache = groups;
+      const sel = document.getElementById('newChannelGroup');
+      if (!sel) return;
+      const current = sel.value;
+      const ordered = groups
+        .filter(g => g && g.key)
+        .slice()
+        .sort((a, b) => (a.order || 0) - (b.order || 0));
+      sel.innerHTML = ordered
+        .map(g => `<option value='${escapeAttr(g.key)}'>${escapeHtml(g.displayName || g.key)}</option>`)
+        .join('');
+      if (current) sel.value = current;
+    }
+
+    // Wave C1 — default do formulário: grupo com isDefault=true ou o primeiro.
+    function defaultChannelGroupKey() {
+      if (Array.isArray(_canonicalGroupsCache) && _canonicalGroupsCache.length) {
+        const def = _canonicalGroupsCache.find(g => g && g.isDefault);
+        if (def && def.key) return def.key;
+        const first = _canonicalGroupsCache.find(g => g && g.key);
+        if (first) return first.key;
+      }
+      return '';
+    }
+
+    // Wave C1 — garante que uma key está presente no select (opções
+    // carregadas assincronamente podem ainda não incluir o valor do canal).
+    function ensureChannelGroupOption(key) {
+      const sel = document.getElementById('newChannelGroup');
+      if (!sel || !key) return;
+      if (Array.from(sel.options).some(o => o.value === key)) return;
+      const known = Array.isArray(_canonicalGroupsCache)
+        ? _canonicalGroupsCache.find(g => g && g.key === key)
+        : null;
+      const opt = document.createElement('option');
+      opt.value = key;
+      opt.textContent = (known && known.displayName) ? known.displayName : key;
+      sel.appendChild(opt);
+    }
+
+    // Wave D3 — pré-selecção do grupo a partir do group-title da Review.
+    // A sugestão é apenas um default: o submit continua a enviar a escolha
+    // explícita do operador. Falhas são ignoradas (mantém o default).
+    async function applyGroupSuggestion(sourceGroup, title) {
+      const sel = document.getElementById('newChannelGroup');
+      if (!sel) return;
+      try {
+        const url = '/api/catalog/group-suggestion?group=' + encodeURIComponent(sourceGroup || '')
+          + '&title=' + encodeURIComponent(title || '');
+        const suggestion = await safeFetchJson(url, null);
+        const key = suggestion && suggestion.groupKey;
+        if (!key) return;
+        if (Array.from(sel.options).some(o => o.value === key)) {
+          sel.value = key;
+        }
+      } catch (e) { /* sugestão é apenas pré-selecção */ }
     }
 
     function renderChannelsTable() {
@@ -7182,7 +7265,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
           <td><code>${c.key || '—'}</code></td>
           <td>${c.country ? `<span class='badge' style='background:var(--accent);color:#fff;'>${escapeHtml(c.country)}</span>` : '—'}</td>
           <td>${c.editorialCategory || '—'}</td>
-          <td>${c.editorialGroup || '—'}</td>
+          <td>${escapeHtml(c.groupName || '—')}</td>
           <td>${policyBadge}</td>
           <td>${c.isEnabled ? '<span class="badge ok">sim</span>' : '<span class="badge err">não</span>'}</td>
           <td><span class='muted'>${aliases}</span></td>
@@ -7196,6 +7279,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
       _selectedChannelId = id;
       renderChannelsTable();
       renderChannelDetail();
+      openModalPanel('channelDetailPanel');
     }
 
     function renderChannelDetail() {
@@ -7222,7 +7306,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
             <div><strong>País:</strong> ${c.country ? `<span class='badge' style='background:var(--accent);color:#fff;'>${escapeHtml(c.country)}</span>` : '<span class="muted">global</span>'}</div>
             <div><strong>Política:</strong> <span id='detailPolicyBadge'>${policyBadge}</span> <code>${c.publicationPolicy}</code></div>
             <div><strong>Categoria:</strong> ${c.editorialCategory}</div>
-            <div><strong>Grupo Editorial:</strong> ${c.editorialGroup}</div>
+            <div><strong>Grupo Editorial:</strong> ${escapeHtml(c.groupName || '—')}</div>
             <div><strong>Criado:</strong> <span class="muted">${tsLocal(c.createdAtUtc)}</span></div>
             <div><strong>Actualizado:</strong> <span class="muted">${tsLocal(c.updatedAtUtc)}</span></div>
           </div>
@@ -7292,7 +7376,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
         displayName: c.displayName,
         country: c.country,
         editorialCategory: c.editorialCategory,
-        editorialGroup: c.editorialGroup,
+        groupKey: c.groupKey,
         publicationPolicy: c.publicationPolicy,
         isEnabled: nextValue
       };
@@ -7321,7 +7405,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
         displayName: c.displayName,
         country: c.country,
         editorialCategory: c.editorialCategory,
-        editorialGroup: c.editorialGroup,
+        groupKey: c.groupKey,
         publicationPolicy: choice.trim(),
         isEnabled: c.isEnabled
       };
@@ -7346,7 +7430,10 @@ const rows = Object.entries(inv).map(([k, v]) => {
       document.getElementById('newChannelDisplayName').value = c.displayName || '';
       document.getElementById('newChannelCountry').value = c.country || '';
       document.getElementById('newChannelCategory').value = c.editorialCategory || 'Live';
-      document.getElementById('newChannelGroup').value = c.editorialGroup || 'PortugalLive';
+      await loadChannelGroupOptions();
+      const channelGroupKey = c.groupKey || '';
+      ensureChannelGroupOption(channelGroupKey);
+      document.getElementById('newChannelGroup').value = channelGroupKey;
       document.getElementById('newChannelPolicy').value = c.publicationPolicy || 'CreateEligible';
       document.getElementById('newChannelEnabled').value = String(!!c.isEnabled);
       const keyEl = document.getElementById('newChannelKey');
@@ -7355,9 +7442,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
       document.getElementById('newChannelAliasesBlock').hidden = true;
       document.getElementById('createChannelTitle').textContent = 'Editar Canal Canónico';
       document.getElementById('createChannelSubmitBtn').textContent = 'Guardar alterações';
-      const form = document.getElementById('createChannelForm');
-      form.hidden = false;
-      form.scrollIntoView({ behavior: 'smooth' });
+      openModalPanel('createChannelForm');
     }
 
     async function deleteChannel(channelId) {
@@ -7375,29 +7460,29 @@ const rows = Object.entries(inv).map(([k, v]) => {
       }
     }
 
-    function showCreateChannelForm() {
+    async function showCreateChannelForm() {
       _editingChannelId = null;
       _reviewChannelFingerprint = null;
+      await loadChannelGroupOptions();
       const keyEl = document.getElementById('newChannelKey');
       keyEl.value = '';
       keyEl.readOnly = false;
       document.getElementById('newChannelDisplayName').value = '';
       document.getElementById('newChannelCountry').value = '';
       document.getElementById('newChannelCategory').value = 'Live';
-      document.getElementById('newChannelGroup').value = 'PortugalLive';
+      document.getElementById('newChannelGroup').value = defaultChannelGroupKey();
       document.getElementById('newChannelPolicy').value = 'CreateEligible';
       document.getElementById('newChannelEnabled').value = 'true';
       document.getElementById('newChannelAliases').value = '';
       document.getElementById('newChannelAliasesBlock').hidden = false;
       document.getElementById('createChannelTitle').textContent = 'Novo Canal Canónico';
       document.getElementById('createChannelSubmitBtn').textContent = 'Guardar';
-      document.getElementById('createChannelForm').hidden = false;
-      document.getElementById('createChannelForm').scrollIntoView({ behavior: 'smooth' });
+      openModalPanel('createChannelForm');
     }
     function hideCreateChannelForm() {
-      document.getElementById('createChannelForm').hidden = true;
       _editingChannelId = null;
       _reviewChannelFingerprint = null;
+      closeModalPanel();
     }
 
     async function submitCreateChannel() {
@@ -7405,13 +7490,13 @@ const rows = Object.entries(inv).map(([k, v]) => {
       const displayName = document.getElementById('newChannelDisplayName').value.trim();
       const country = (document.getElementById('newChannelCountry').value || '').trim() || null;
       const editorialCategory = document.getElementById('newChannelCategory').value;
-      const editorialGroup = document.getElementById('newChannelGroup').value;
+      const groupKey = document.getElementById('newChannelGroup').value;
       const publicationPolicy = document.getElementById('newChannelPolicy').value;
       const isEnabled = document.getElementById('newChannelEnabled').value === 'true';
 
       if (editingId != null) {
         if (!displayName) { alert('Display Name é obrigatório.'); return; }
-        const updatePayload = { displayName, country, editorialCategory, editorialGroup, publicationPolicy, isEnabled };
+        const updatePayload = { displayName, country, editorialCategory, groupKey, publicationPolicy, isEnabled };
         const r = await fetch('/api/catalog/channels/' + editingId, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
@@ -7446,7 +7531,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
             name: displayName,
             country,
             editorialCategory,
-            editorialGroup,
+            groupKey,
             publicationPolicy,
             isEnabled,
           },
@@ -7475,7 +7560,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
         displayName,
         country,
         editorialCategory,
-        editorialGroup,
+        groupKey,
         publicationPolicy,
         isEnabled,
         aliases: document.getElementById('newChannelAliases').value.split(/\r?\n/).map(a => a.trim()).filter(Boolean),
@@ -7626,7 +7711,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
         const stateBadge = r.state === 'Open' ? '<span class="badge warn">Open</span>'
           : '<span class="badge warn">InReview</span>';
         const actions = (r.state === 'Open' || r.state === 'InReview')
-          ? `<button style='padding:4px 8px;' onclick='approveReview("${r.fingerprint.replace(/"/g, '\\"')}","${(r.normalizedIdentity || '').replace(/"/g, '\\"')}")'>Approve</button>
+          ? `<button style='padding:4px 8px;' onclick='approveReview("${r.fingerprint.replace(/"/g, '\\"')}","${(r.normalizedIdentity || '').replace(/"/g, '\\"')}","${(r.sourceGroup || '').replace(/"/g, '\\"')}")'>Approve</button>
              <button class='secondary' style='padding:4px 8px;' onclick='excludeReview("${r.fingerprint.replace(/"/g, '\\"')}")'>Exclude</button>`
           : '—';
         return `<tr>
@@ -7802,15 +7887,12 @@ const rows = Object.entries(inv).map(([k, v]) => {
       document.querySelector("[data-ordering-edit='description']").value = l.description || '';
       document.querySelector("[data-ordering-edit='enabled']").value = String(!!l.isEnabled);
       _orderingEditingId = id;
-      const form = document.getElementById('orderingEditForm');
-      form.hidden = false;
-      form.scrollIntoView({ behavior: 'smooth' });
+      openModalPanel('orderingEditForm');
     }
 
     function cancelOrderingListEdit() {
-      const form = document.getElementById('orderingEditForm');
-      if (form) form.hidden = true;
       _orderingEditingId = null;
+      closeModalPanel();
     }
 
     async function saveOrderingListEdit() {
@@ -7838,6 +7920,13 @@ const rows = Object.entries(inv).map(([k, v]) => {
       }
     }
 
+    function showCreateOrderingForm() {
+      document.querySelector("[data-ordering-create='key']").value = '';
+      document.querySelector("[data-ordering-create='name']").value = '';
+      document.querySelector("[data-ordering-create='country']").value = '';
+      openModalPanel('orderingCreateForm');
+    }
+
     async function submitCreateOrderingList() {
       const payload = {
         key: document.querySelector("[data-ordering-create='key']").value.trim(),
@@ -7856,6 +7945,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
         document.querySelector("[data-ordering-create='key']").value = '';
         document.querySelector("[data-ordering-create='name']").value = '';
         document.querySelector("[data-ordering-create='country']").value = '';
+        closeModalPanel();
         await loadOrderingLists();
       } else {
         const err = await r.json();
@@ -7875,9 +7965,9 @@ const rows = Object.entries(inv).map(([k, v]) => {
       const detailDiv = document.getElementById('orderingDetail');
       const items = (detail.items || []).slice().sort((a, b) => a.position - b.position);
       const itemRows = items.map(i => `<tr>
-        <td>${i.position}</td>
-        <td><code>${i.canonicalChannelId}</code></td>
-        <td>${escapeHtml((i.canonicalChannelDisplayName || '') + (i.canonicalChannelKey ? ' (' + i.canonicalChannelKey + ')' : ''))}</td>
+        <td>${i.position + 1}</td>
+        <td><code>${escapeHtml(i.canonicalChannelKey || ('#' + i.canonicalChannelId))}</code></td>
+        <td>${escapeHtml(i.canonicalChannelDisplayName || '—')}</td>
         <td>${i.isEnabled ? '<span class="badge ok">sim</span>' : '<span class="badge err">não</span>'}</td>
         <td>
           <button class='secondary' onclick='moveOrderingItem(${i.id}, ${i.position - 1})' ${i.position === 0 ? 'disabled' : ''}>↑</button>
@@ -8135,6 +8225,18 @@ const rows = Object.entries(inv).map(([k, v]) => {
       document.getElementById('cssp_preferDistinctProviders').value = p.preferDistinctProviders ? 'true' : 'false';
       document.getElementById('cssp_allowFallbackToSameProvider').value = p.allowFallbackToSameProvider ? 'true' : 'false';
       document.getElementById('channelSourceSelectionPolicyStatus').textContent = 'Override carregado para edição.';
+      openModalPanel('channelSourceSelectionPolicyForm');
+    }
+
+    function newChannelSourceSelectionPolicy() {
+      document.getElementById('cssp_channelKey').value = '';
+      document.getElementById('cssp_maxSourcesPerChannel').value = '3';
+      document.getElementById('cssp_maxSourcesPerProvider').value = '';
+      document.getElementById('cssp_preferDistinctProviders').value = 'true';
+      document.getElementById('cssp_allowFallbackToSameProvider').value = 'false';
+      const status = document.getElementById('channelSourceSelectionPolicyStatus');
+      if (status) status.textContent = '';
+      openModalPanel('channelSourceSelectionPolicyForm');
     }
 
     async function saveChannelSourceSelectionPolicy() {
@@ -8157,6 +8259,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
       });
       if (r.ok) {
         status.textContent = 'Override guardado.';
+        closeModalPanel();
         await loadChannelSourceSelectionPolicies();
       } else {
         const err = await r.json();
@@ -8278,9 +8381,14 @@ const rows = Object.entries(inv).map(([k, v]) => {
         + unmatchedBlock;
     }
 
+    let _importPoliciesCache = [];
+    let _importPolicyEditingId = null;
+    let _importPolicyEditingMediaKind = null;
+
     async function loadImportPolicies() {
       const list = await safeFetchJson('/api/catalog/import-policies', []);
       if (!Array.isArray(list)) { document.getElementById('importPoliciesTable').innerHTML = '<p class="muted">Erro.</p>'; return; }
+      _importPoliciesCache = list;
       if (!list.length) { document.getElementById('importPoliciesTable').innerHTML = '<p class="muted">Nenhuma política. Cria abaixo (Live, Radio, VOD).</p>'; return; }
       const rows = list.map(p => `<tr>
         <td><code>${p.id}</code></td>
@@ -8289,38 +8397,46 @@ const rows = Object.entries(inv).map(([k, v]) => {
         <td><code>${escapeHtml(p.targetGroupsCsv || '')}</code></td>
         <td><code>${escapeHtml(p.excludedGroupsCsv || '')}</code></td>
         <td>${p.isEnabled ? '<span class="badge ok">sim</span>' : '<span class="badge err">não</span>'}</td>
-        <td>
-          <select data-import-edit-vod data-row-key='${p.id}'>
-            <option value='ImportVod' ${p.vodPolicy==='ImportVod'?'selected':''}>ImportVod</option>
-            <option value='KeepVod' ${p.vodPolicy==='KeepVod'?'selected':''}>KeepVod</option>
-            <option value='ExcludeVod' ${p.vodPolicy==='ExcludeVod'?'selected':''}>ExcludeVod</option>
-          </select>
-          <input data-import-edit-target data-row-key='${p.id}' value='${escapeHtml(p.targetGroupsCsv||"")}' placeholder='targets' style='margin-left:4px;width:140px;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:4px 6px;border-radius:6px;font:inherit;'>
-          <input data-import-edit-excluded data-row-key='${p.id}' value='${escapeHtml(p.excludedGroupsCsv||"")}' placeholder='excluded' style='margin-left:4px;width:140px;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:4px 6px;border-radius:6px;font:inherit;'>
-          <button class='secondary' onclick='saveImportPolicy(` + p.id + `, "` + p.mediaKind + `")'>Guardar</button>
-        </td>
+        <td><button class='secondary' onclick='editImportPolicy(${p.id}, "${p.mediaKind}")'>Editar</button></td>
       </tr>`).join('');
       document.getElementById('importPoliciesTable').innerHTML = `<table><thead><tr><th>#</th><th>MediaKind</th><th>VodPolicy</th><th>Targets (CSV)</th><th>Excluded (CSV)</th><th>Activo</th><th>Editar</th></tr></thead><tbody>${rows}</tbody></table>`;
     }
 
-    async function saveImportPolicy(policyId, mediaKind) {
-      const sel = "[data-import-edit-vod][data-row-key='" + policyId + "']";
-      const vod = document.querySelector(sel).value;
-      const target = document.querySelector("[data-import-edit-target][data-row-key='" + policyId + "']").value;
-      const excluded = document.querySelector("[data-import-edit-excluded][data-row-key='" + policyId + "']").value;
+    function editImportPolicy(id, mediaKind) {
+      const p = _importPoliciesCache.find(x => x.id === id);
+      if (!p) return;
+      _importPolicyEditingId = id;
+      _importPolicyEditingMediaKind = mediaKind;
+      const label = document.getElementById('importPolicyEditMediaKindLabel');
+      if (label) label.textContent = mediaKind || '';
+      const vod = document.getElementById('importPolicyEditVod');
+      if (vod) vod.value = p.vodPolicy || 'ImportVod';
+      const target = document.getElementById('importPolicyEditTargets');
+      if (target) target.value = p.targetGroupsCsv || '';
+      const excluded = document.getElementById('importPolicyEditExcluded');
+      if (excluded) excluded.value = p.excludedGroupsCsv || '';
+      openModalPanel('importPolicyEditForm');
+    }
+
+    async function submitImportPolicyEdit() {
+      if (_importPolicyEditingId == null) return;
+      const vod = document.getElementById('importPolicyEditVod').value;
+      const target = document.getElementById('importPolicyEditTargets').value;
+      const excluded = document.getElementById('importPolicyEditExcluded').value;
       const r = await fetch('/api/catalog/import-policies', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mediaKind, vodPolicy: vod, targetGroupsCsv: target, excludedGroupsCsv: excluded, isEnabled: true }),
+        body: JSON.stringify({ mediaKind: _importPolicyEditingMediaKind, vodPolicy: vod, targetGroupsCsv: target, excludedGroupsCsv: excluded, isEnabled: true }),
       });
-      if (r.ok) { alert('Política guardada.'); await loadImportPolicies(); }
+      if (r.ok) { closeModalPanel(); await loadImportPolicies(); }
       else { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
     }
 
     async function loadCanonicalGroups() {
       const groups = await safeFetchJson('/api/catalog/canonical-groups', []);
       if (!Array.isArray(groups)) { document.getElementById('canonicalGroupsTable').innerHTML = '<p class="muted">Erro.</p>'; return; }
-      if (!groups.length) { document.getElementById('canonicalGroupsTable').innerHTML = '<p class="muted">Nenhum grupo canónico. Cria abaixo.</p>'; return; }
+      _canonicalGroupsCache = groups;
+      if (!groups.length) { document.getElementById('canonicalGroupsTable').innerHTML = '<p class="muted">Nenhum grupo canónico. Cria um novo.</p>'; return; }
       const rows = groups.map(g => `<tr>
         <td><code>${g.id}</code></td>
         <td><code>${escapeHtml(g.key)}</code></td>
@@ -8329,19 +8445,55 @@ const rows = Object.entries(inv).map(([k, v]) => {
         <td>${g.order}</td>
         <td>${g.isDefault ? '<span class="badge ok">default</span>' : '—'}</td>
         <td>${g.isEnabled ? '<span class="badge ok">sim</span>' : '<span class="badge err">não</span>'}</td>
-        <td><button class='secondary' style='color:var(--err);' onclick='deleteCanonicalGroup(${g.id})'>Eliminar</button></td>
+        <td>
+          <button class='secondary' onclick='editCanonicalGroup(${g.id})'>Editar</button>
+          <button class='secondary' style='color:var(--err);' onclick='deleteCanonicalGroup(${g.id})'>Eliminar</button>
+        </td>
       </tr>`).join('');
       document.getElementById('canonicalGroupsTable').innerHTML = `<table><thead><tr><th>#</th><th>Key</th><th>Display</th><th>País</th><th>Ordem</th><th>Default</th><th>Activo</th><th>Acções</th></tr></thead><tbody>${rows}</tbody></table>`;
     }
 
-    async function submitCreateGroup() {
+    let _editingCanonicalGroupId = null;
+
+    function showCreateCanonicalGroup() {
+      _editingCanonicalGroupId = null;
+      const key = document.getElementById('cgKey');
+      key.value = '';
+      key.readOnly = false;
+      document.getElementById('cgName').value = '';
+      document.getElementById('cgCountry').value = '';
+      document.getElementById('cgOrder').value = '100';
+      document.getElementById('cgDefault').value = 'false';
+      document.getElementById('cgEnabled').value = 'true';
+      document.getElementById('canonicalGroupEditTitle').textContent = 'Novo grupo';
+      openModalPanel('canonicalGroupEditForm');
+    }
+
+    function editCanonicalGroup(id) {
+      const list = Array.isArray(_canonicalGroupsCache) ? _canonicalGroupsCache : [];
+      const g = list.find(x => x && x.id === id);
+      if (!g) { alert('Grupo não encontrado. Recarrega a lista.'); return; }
+      _editingCanonicalGroupId = id;
+      const key = document.getElementById('cgKey');
+      key.value = g.key || '';
+      key.readOnly = true;
+      document.getElementById('cgName').value = g.displayName || '';
+      document.getElementById('cgCountry').value = g.country || '';
+      document.getElementById('cgOrder').value = String(g.order == null ? 100 : g.order);
+      document.getElementById('cgDefault').value = g.isDefault ? 'true' : 'false';
+      document.getElementById('cgEnabled').value = g.isEnabled ? 'true' : 'false';
+      document.getElementById('canonicalGroupEditTitle').textContent = 'Editar grupo';
+      openModalPanel('canonicalGroupEditForm');
+    }
+
+    async function submitCanonicalGroupEdit() {
       const payload = {
-        key: document.querySelector("[data-group-create='key']").value.trim(),
-        displayName: document.querySelector("[data-group-create='name']").value.trim(),
-        country: document.querySelector("[data-group-create='country']").value.trim() || null,
-        order: parseInt(document.querySelector("[data-group-create='order']").value, 10) || 0,
-        isEnabled: true,
-        isDefault: false,
+        key: document.getElementById('cgKey').value.trim(),
+        displayName: document.getElementById('cgName').value.trim(),
+        country: document.getElementById('cgCountry').value.trim() || null,
+        order: parseInt(document.getElementById('cgOrder').value, 10) || 0,
+        isEnabled: document.getElementById('cgEnabled').value === 'true',
+        isDefault: document.getElementById('cgDefault').value === 'true',
       };
       if (!payload.key || !payload.displayName) { alert('Key e Display Name obrigatórios.'); return; }
       const r = await fetch('/api/catalog/canonical-groups', {
@@ -8350,10 +8502,10 @@ const rows = Object.entries(inv).map(([k, v]) => {
         body: JSON.stringify(payload),
       });
       if (r.ok) {
-        document.querySelector("[data-group-create='key']").value = '';
-        document.querySelector("[data-group-create='name']").value = '';
-        document.querySelector("[data-group-create='country']").value = '';
+        _editingCanonicalGroupId = null;
+        closeModalPanel();
         await loadCanonicalGroups();
+        await loadChannelGroupOptions();
       } else {
         const err = await r.json();
         alert('Erro: ' + (err.error || r.status));
@@ -8364,52 +8516,6 @@ const rows = Object.entries(inv).map(([k, v]) => {
       if (!confirm('Eliminar o grupo #' + id + '?')) return;
       const r = await fetch('/api/catalog/canonical-groups/' + id, { method: 'DELETE' });
       if (r.ok) await loadCanonicalGroups();
-      else { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
-    }
-
-    async function loadGroupMappings() {
-      const list = await safeFetchJson('/api/catalog/group-mappings', []);
-      if (!Array.isArray(list)) { document.getElementById('groupMappingsTable').innerHTML = '<p class="muted">Erro.</p>'; return; }
-      if (!list.length) { document.getElementById('groupMappingsTable').innerHTML = '<p class="muted">Nenhum mapping. Cria abaixo.</p>'; return; }
-      const rows = list.map(m => `<tr>
-        <td><code>${m.id}</code></td>
-        <td>${m.sourceKind}</td>
-        <td><code>${escapeHtml(m.sourceGroupTitle)}</code></td>
-        <td>${m.canonicalGroupKey ? `<code>${escapeHtml(m.canonicalGroupKey)}</code>` : m.canonicalGroupId}</td>
-        <td>${escapeHtml(m.canonicalGroupDisplayName || '')}</td>
-        <td>${m.isEnabled ? '<span class="badge ok">sim</span>' : '<span class="badge err">não</span>'}</td>
-        <td><button class='secondary' style='color:var(--err);' onclick='deleteGroupMapping(${m.id})'>Eliminar</button></td>
-      </tr>`).join('');
-      document.getElementById('groupMappingsTable').innerHTML = `<table><thead><tr><th>#</th><th>Source</th><th>Group Title</th><th>Canonical Key</th><th>Display</th><th>Activo</th><th>Acções</th></tr></thead><tbody>${rows}</tbody></table>`;
-    }
-
-    async function submitCreateGroupMapping() {
-      const payload = {
-        sourceKind: document.querySelector("[data-mapping-create='kind']").value,
-        sourceGroupTitle: document.querySelector("[data-mapping-create='title']").value.trim(),
-        canonicalGroupId: parseInt(document.querySelector("[data-mapping-create='groupId']").value, 10),
-        isEnabled: true,
-      };
-      if (!payload.sourceGroupTitle || !payload.canonicalGroupId) { alert('Group title e groupId obrigatórios.'); return; }
-      const r = await fetch('/api/catalog/group-mappings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-      if (r.ok) {
-        document.querySelector("[data-mapping-create='title']").value = '';
-        document.querySelector("[data-mapping-create='groupId']").value = '';
-        await loadGroupMappings();
-      } else {
-        const err = await r.json();
-        alert('Erro: ' + (err.error || r.status));
-      }
-    }
-
-    async function deleteGroupMapping(id) {
-      if (!confirm('Eliminar o mapping #' + id + '?')) return;
-      const r = await fetch('/api/catalog/group-mappings/' + id, { method: 'DELETE' });
-      if (r.ok) await loadGroupMappings();
       else { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
     }
 
@@ -8532,9 +8638,8 @@ const rows = Object.entries(inv).map(([k, v]) => {
       if (enabledEl) enabledEl.value = String(!!job.isEnabled);
       _schedEditingId = id;
       updateSchedCronStatus();
-      const form = document.querySelector("[data-sched-create=name]");
-      if (form && form.scrollIntoView) form.scrollIntoView({ behavior: 'smooth' });
       setSchedFormStatus('A editar job #' + id + ' (Name bloqueado). Guardar actualiza este job.', true);
+      openModalPanel('scheduledJobForm');
     }
 
     function newScheduledJob() {
@@ -8546,6 +8651,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
       if (cronEl) cronEl.value = '';
       if (enabledEl) enabledEl.value = 'true';
       updateSchedCronStatus();
+      openModalPanel('scheduledJobForm');
     }
 
     async function submitCreateScheduledJob() {
@@ -8570,6 +8676,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
         body: JSON.stringify(payload),
       });
       if (r.ok) {
+        closeModalPanel();
         _schedEditingId = null;
         if (nameEl) { nameEl.value = ''; nameEl.readOnly = false; }
         if (cronEl) cronEl.value = '';
@@ -8856,8 +8963,8 @@ const rows = Object.entries(inv).map(([k, v]) => {
       else { alert('Erro: ' + r.status); }
     }
 
-    function showAddRuleForm() { document.getElementById('addRuleForm').hidden = false; }
-    function hideAddRuleForm() { document.getElementById('addRuleForm').hidden = true; }
+    function showAddRuleForm() { openModalPanel('addRuleForm'); }
+    function hideAddRuleForm() { closeModalPanel(); }
 
     async function submitAddRule() {
       const identity = document.getElementById('ruleIdentity').value.trim();
@@ -8996,17 +9103,17 @@ const rows = Object.entries(inv).map(([k, v]) => {
       document.getElementById('affinityCountryCode').value = '';
       document.getElementById('affinityChannelKey').disabled = false;
       document.getElementById('affinityMembers').value = '';
-      document.getElementById('addAffinityForm').hidden = false;
+      openModalPanel('addAffinityForm');
       loadAffinityFormOptions().then(onAffinityKindChange);
     }
 
     function hideAddAffinityForm() {
-      document.getElementById('addAffinityForm').hidden = true;
       _affinityEditId = null;
       _affinityEditKey = null;
       document.getElementById('affinityFormTitle').textContent = 'Nova Afinidade';
       document.getElementById('affinitySubmitBtn').textContent = 'Guardar';
       document.getElementById('affinityEditCancelBtn').hidden = true;
+      closeModalPanel();
     }
 
     async function editAffinityGroup(id) {
@@ -9025,14 +9132,13 @@ const rows = Object.entries(inv).map(([k, v]) => {
       document.getElementById('affinityName').value = g.name || '';
       document.getElementById('affinityCountryCode').value = g.countryCode || '';
       document.getElementById('affinityMembers').value = (g.members || []).join(_affinityDelimiter + ' ');
-      document.getElementById('addAffinityForm').hidden = false;
+      openModalPanel('addAffinityForm');
       await loadAffinityFormOptions();
       if (g.kind === 'Channel') {
         document.getElementById('affinityChannelKey').value = g.canonicalChannelKey || '';
         document.getElementById('affinityChannelKey').disabled = true;
       }
       onAffinityKindChange();
-      document.getElementById('addAffinityForm').scrollIntoView({ behavior: 'smooth' });
     }
 
     function cancelAffinityEdit() {
@@ -9045,6 +9151,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
       document.getElementById('affinityCountryCode').value = '';
       document.getElementById('affinityChannelKey').value = '';
       document.getElementById('affinityMembers').value = '';
+      closeModalPanel();
     }
 
     async function submitAddAffinityGroup() {
@@ -9089,18 +9196,18 @@ const rows = Object.entries(inv).map(([k, v]) => {
 
     // W5 — Aprovação estruturada: sem prompt, com escolha explícita
     // Add Alias / Create Channel / Excluir e dropdown de canais existentes.
-    function approveReview(fingerprint, normalizedIdentity) {
+    function approveReview(fingerprint, normalizedIdentity, sourceGroup) {
       _pendingReviewFingerprint = fingerprint;
       _pendingReviewIdentity = normalizedIdentity || '';
+      _pendingReviewGroup = sourceGroup || '';
       document.getElementById('reviewApproveTitle').textContent = 'Aprovar Review';
       document.getElementById('reviewApproveSubject').textContent = normalizedIdentity || fingerprint;
       document.getElementById('reviewApproveStatus').textContent = '';
       document.getElementById('reviewApproveActions').hidden = false;
       document.getElementById('reviewApproveAddAlias').hidden = true;
       document.getElementById('reviewApproveExclude').hidden = true;
-      document.getElementById('reviewApproveModal').hidden = false;
+      openModalPanel('reviewApproveModal');
       loadReviewAliasChannels();
-      document.getElementById('reviewApproveModal').scrollIntoView({ behavior: 'smooth' });
     }
 
     async function loadReviewAliasChannels() {
@@ -9184,37 +9291,37 @@ const rows = Object.entries(inv).map(([k, v]) => {
       }
     }
 
-    function showCreateChannelFormForReview() {
+    async function showCreateChannelFormForReview() {
       _reviewChannelFingerprint = _pendingReviewFingerprint;
       _editingChannelId = null;
+      await loadChannelGroupOptions();
       const keyEl = document.getElementById('newChannelKey');
       keyEl.value = '';
       keyEl.readOnly = false;
       document.getElementById('newChannelDisplayName').value = _pendingReviewIdentity || '';
       document.getElementById('newChannelCountry').value = '';
       document.getElementById('newChannelCategory').value = 'Live';
-      document.getElementById('newChannelGroup').value = 'PortugalLive';
+      document.getElementById('newChannelGroup').value = defaultChannelGroupKey();
+      await applyGroupSuggestion(_pendingReviewGroup, _pendingReviewIdentity);
       document.getElementById('newChannelPolicy').value = 'CreateEligible';
       document.getElementById('newChannelEnabled').value = 'true';
       document.getElementById('newChannelAliases').value = _pendingReviewIdentity || '';
       document.getElementById('newChannelAliasesBlock').hidden = false;
       document.getElementById('createChannelTitle').textContent = 'Novo Canal Canónico (a partir de Review)';
       document.getElementById('createChannelSubmitBtn').textContent = 'Criar e aprovar';
-      document.getElementById('reviewApproveModal').hidden = true;
       loadCatalogTab('channels');
-      const form = document.getElementById('createChannelForm');
-      form.hidden = false;
-      form.scrollIntoView({ behavior: 'smooth' });
+      openModalPanel('createChannelForm');
     }
 
     function closeReviewApproveModal() {
-      document.getElementById('reviewApproveModal').hidden = true;
       _pendingReviewFingerprint = null;
       _pendingReviewIdentity = '';
+      _pendingReviewGroup = '';
       document.getElementById('reviewApproveStatus').textContent = '';
       document.getElementById('reviewApproveActions').hidden = false;
       document.getElementById('reviewApproveAddAlias').hidden = true;
       document.getElementById('reviewApproveExclude').hidden = true;
+      closeModalPanel();
     }
 
     function excludeReview(fingerprint) {
@@ -9556,6 +9663,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
     window.loadChannelSourceSelectionPolicies = loadChannelSourceSelectionPolicies;
     window.loadChannelSourceSelectionKeys = loadChannelSourceSelectionKeys;
     window.editChannelSourceSelectionPolicy = editChannelSourceSelectionPolicy;
+    window.newChannelSourceSelectionPolicy = newChannelSourceSelectionPolicy;
     window.saveChannelSourceSelectionPolicy = saveChannelSourceSelectionPolicy;
     window.deleteChannelSourceSelectionPolicy = deleteChannelSourceSelectionPolicy;
     window.loadSourceSelectionPreview = loadSourceSelectionPreview;
@@ -9869,6 +9977,60 @@ const rows = Object.entries(inv).map(([k, v]) => {
     window.startLiveRun = startLiveRun;
     window.loadLiveRun = loadLiveRun;
 
+    // Modal centrado reutilizável. Os painéis de edição vivem dentro de tabs
+    // ocultas; openModalPanel adopta o elemento movendo-o para #modalRoot
+    // enquanto aberto e devolve-o à posição original no fecho.
+    var _modalEl = null, _modalParent = null, _modalAnchor = null, _modalPrevFocus = null;
+    function openModalPanel(id) {
+      var el = document.getElementById(id);
+      if (!el || _modalEl === el) return;
+      closeModalPanel();
+      _modalParent = el.parentNode;
+      _modalAnchor = el.nextSibling;
+      _modalPrevFocus = document.activeElement;
+      var root = document.getElementById('modalRoot');
+      root.appendChild(el);
+      el.hidden = false;
+      el.classList.add('modal-panel');
+      if (!el.querySelector('.modal-close')) {
+        var x = document.createElement('button');
+        x.className = 'modal-close';
+        x.type = 'button';
+        x.setAttribute('aria-label', 'Fechar');
+        x.textContent = '\u00d7';
+        x.onclick = closeModalPanel;
+        el.insertBefore(x, el.firstChild);
+      }
+      root.hidden = false;
+      root.classList.add('open');
+      document.body.classList.add('modal-open');
+      var f = el.querySelector('input:not([type=hidden]),select,textarea,button');
+      if (f && f.focus) f.focus();
+      _modalEl = el;
+    }
+    function closeModalPanel() {
+      if (_modalEl) {
+        _modalEl.classList.remove('modal-panel');
+        var x = _modalEl.querySelector('.modal-close');
+        if (x) x.remove();
+        _modalEl.hidden = true;
+        if (_modalParent) _modalParent.insertBefore(_modalEl, _modalAnchor);
+        _modalEl = null;
+      }
+      var root = document.getElementById('modalRoot');
+      if (root) { root.classList.remove('open'); root.hidden = true; }
+      document.body.classList.remove('modal-open');
+      if (_modalPrevFocus && _modalPrevFocus.focus) { try { _modalPrevFocus.focus(); } catch (e) {} }
+      _modalPrevFocus = null;
+    }
+    window.openModalPanel = openModalPanel;
+    window.closeModalPanel = closeModalPanel;
+    (function () {
+      var root = document.getElementById('modalRoot');
+      if (root) root.addEventListener('click', function (e) { if (e.target === root) closeModalPanel(); });
+      document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && _modalEl) closeModalPanel(); });
+    })();
+
     // W1 — Restauro de escopo dos handlers inline. O script principal está
     // dentro de uma IIFE, pelo que as funções declaradas aqui não são
     // globais. Os atributos inline do HTML (onclick/onchange/oninput)
@@ -9912,6 +10074,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
     window.toggleScheduledJob = toggleScheduledJob;
     window.deleteScheduledJob = deleteScheduledJob;
     window.submitCreateOrderingList = submitCreateOrderingList;
+    window.showCreateOrderingForm = showCreateOrderingForm;
     window.editOrderingList = editOrderingList;
     window.saveOrderingListEdit = saveOrderingListEdit;
     window.cancelOrderingListEdit = cancelOrderingListEdit;
@@ -9923,11 +10086,12 @@ const rows = Object.entries(inv).map(([k, v]) => {
     window.moveOrderingItem = moveOrderingItem;
     window.toggleOrderingItem = toggleOrderingItem;
     window.removeOrderingItem = removeOrderingItem;
-    window.submitCreateGroup = submitCreateGroup;
+    window.showCreateCanonicalGroup = showCreateCanonicalGroup;
+    window.editCanonicalGroup = editCanonicalGroup;
+    window.submitCanonicalGroupEdit = submitCanonicalGroupEdit;
     window.deleteCanonicalGroup = deleteCanonicalGroup;
-    window.submitCreateGroupMapping = submitCreateGroupMapping;
-    window.deleteGroupMapping = deleteGroupMapping;
-    window.saveImportPolicy = saveImportPolicy;
+    window.editImportPolicy = editImportPolicy;
+    window.submitImportPolicyEdit = submitImportPolicyEdit;
     window.loadDegradation = loadDegradation;
     window.loadMatchingAudits = loadMatchingAudits;
     window.loadSyncRunSteps = loadSyncRunSteps;

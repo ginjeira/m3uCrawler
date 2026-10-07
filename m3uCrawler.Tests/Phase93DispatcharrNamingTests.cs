@@ -101,7 +101,7 @@ public class Phase93DispatcharrNamingTests
     {
         var (dbPath, resolver) = await NewCatalogAsync();
         var channel = await resolver.CreateCanonicalChannelAsync(
-            "x", "Nome Canónico", EditorialCategory.Live, CanonicalEditorialGroup.PortugalLive,
+            "x", "Nome Canónico", EditorialCategory.Live, CanonicalGroupKeys.PortugalGeneralistas,
             PublicationPolicy.CreateEligible, true, new List<string>(), country: "pt");
 
         var handler = new CapturingHandler();
@@ -128,7 +128,7 @@ public class Phase93DispatcharrNamingTests
     {
         var (dbPath, resolver) = await NewCatalogAsync();
         var channel = await resolver.CreateCanonicalChannelAsync(
-            "x", "Nome Canónico", EditorialCategory.Live, CanonicalEditorialGroup.PortugalLive,
+            "x", "Nome Canónico", EditorialCategory.Live, CanonicalGroupKeys.PortugalGeneralistas,
             PublicationPolicy.CreateEligible, true, new List<string>(), country: "pt");
         await resolver.EnsureChannelOwnershipAsync(
             dispatcharrChannelId: 100,

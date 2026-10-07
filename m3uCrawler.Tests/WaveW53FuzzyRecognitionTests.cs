@@ -55,13 +55,13 @@ public class WaveW53FuzzyRecognitionTests : IAsyncLifetime
     private Task<CanonicalChannelEntity> Ch(
         string key, string displayName, bool enabled = true, params string[] aliases)
         => _catalog.CreateCanonicalChannelAsync(
-            key, displayName, EditorialCategory.Live, CanonicalEditorialGroup.PortugalLive,
+            key, displayName, EditorialCategory.Live, CanonicalGroupKeys.PortugalGeneralistas,
             PublicationPolicy.CreateEligible, enabled, aliases);
 
     private Task<CanonicalChannelEntity> ChInGroup(
-        string key, string displayName, CanonicalEditorialGroup group, string country, params string[] aliases)
+        string key, string displayName, string groupKey, string country, params string[] aliases)
         => _catalog.CreateCanonicalChannelAsync(
-            key, displayName, EditorialCategory.Live, group,
+            key, displayName, EditorialCategory.Live, groupKey,
             PublicationPolicy.CreateEligible, true, aliases, country);
 
     private static RecognitionPolicy FuzzyPolicy(
@@ -427,8 +427,8 @@ public class WaveW53FuzzyRecognitionTests : IAsyncLifetime
     [Fact]
     public async Task Case20_Canonical_metadata_does_not_influence_score()
     {
-        await ChInGroup("w53-meta-a", "CNN International", CanonicalEditorialGroup.PortugalLive, "pt");
-        await ChInGroup("w53-meta-b", "CNN International", CanonicalEditorialGroup.Foreign, "es");
+        await ChInGroup("w53-meta-a", "CNN International", CanonicalGroupKeys.PortugalGeneralistas, "pt");
+        await ChInGroup("w53-meta-b", "CNN International", CanonicalGroupKeys.International, "es");
 
         var r = await _catalog.ResolveAsync(Norm("CNN Internat"), null, FuzzyPolicy(threshold: 80, margin: 0));
 

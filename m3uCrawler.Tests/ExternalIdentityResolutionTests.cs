@@ -172,11 +172,11 @@ public class ExternalIdentityResolutionTests : IDisposable
 
         var channelA = await resolver.CreateCanonicalChannelAsync(
             "w4b-ext-a", "Ext A", EditorialCategory.Live,
-            CanonicalEditorialGroup.PortugalLive, PublicationPolicy.CreateEligible,
+            CanonicalGroupKeys.PortugalGeneralistas, PublicationPolicy.CreateEligible,
             isEnabled: true, normalizedAliases: Array.Empty<string>());
         var channelB = await resolver.CreateCanonicalChannelAsync(
             "w4b-ext-b", "Ext B", EditorialCategory.Live,
-            CanonicalEditorialGroup.PortugalLive, PublicationPolicy.CreateEligible,
+            CanonicalGroupKeys.PortugalGeneralistas, PublicationPolicy.CreateEligible,
             isEnabled: true, normalizedAliases: new[] { "canal partilhado" });
 
         // Sem identidade externa, o nome/alias resolve para B.
@@ -210,11 +210,11 @@ public class ExternalIdentityResolutionTests : IDisposable
 
         var disabled = await resolver.CreateCanonicalChannelAsync(
             "w4b-ext-disabled", "Ext Disabled", EditorialCategory.Live,
-            CanonicalEditorialGroup.PortugalLive, PublicationPolicy.CreateEligible,
+            CanonicalGroupKeys.PortugalGeneralistas, PublicationPolicy.CreateEligible,
             isEnabled: false, normalizedAliases: Array.Empty<string>());
         var active = await resolver.CreateCanonicalChannelAsync(
             "w4b-ext-active", "Ext Active", EditorialCategory.Live,
-            CanonicalEditorialGroup.PortugalLive, PublicationPolicy.CreateEligible,
+            CanonicalGroupKeys.PortugalGeneralistas, PublicationPolicy.CreateEligible,
             isEnabled: true, normalizedAliases: new[] { "canal activo" });
 
         Assert.Equal(RecordExternalIdentityOutcome.Created,
@@ -239,11 +239,11 @@ public class ExternalIdentityResolutionTests : IDisposable
 
         var channelA = await resolver.CreateCanonicalChannelAsync(
             "w4b-amb-a", "Amb A", EditorialCategory.Live,
-            CanonicalEditorialGroup.PortugalLive, PublicationPolicy.CreateEligible,
+            CanonicalGroupKeys.PortugalGeneralistas, PublicationPolicy.CreateEligible,
             isEnabled: true, normalizedAliases: Array.Empty<string>());
         var channelB = await resolver.CreateCanonicalChannelAsync(
             "w4b-amb-b", "Amb B", EditorialCategory.Live,
-            CanonicalEditorialGroup.PortugalLive, PublicationPolicy.CreateEligible,
+            CanonicalGroupKeys.PortugalGeneralistas, PublicationPolicy.CreateEligible,
             isEnabled: true, normalizedAliases: Array.Empty<string>());
 
         Assert.Equal(RecordExternalIdentityOutcome.Created,
@@ -266,11 +266,11 @@ public class ExternalIdentityResolutionTests : IDisposable
 
         var channelA = await resolver.CreateCanonicalChannelAsync(
             "w4b-ambp-a", "AmbP A", EditorialCategory.Live,
-            CanonicalEditorialGroup.PortugalLive, PublicationPolicy.CreateEligible,
+            CanonicalGroupKeys.PortugalGeneralistas, PublicationPolicy.CreateEligible,
             isEnabled: true, normalizedAliases: Array.Empty<string>());
         var channelB = await resolver.CreateCanonicalChannelAsync(
             "w4b-ambp-b", "AmbP B", EditorialCategory.Live,
-            CanonicalEditorialGroup.PortugalLive, PublicationPolicy.CreateEligible,
+            CanonicalGroupKeys.PortugalGeneralistas, PublicationPolicy.CreateEligible,
             isEnabled: true, normalizedAliases: Array.Empty<string>());
 
         await resolver.RecordExternalIdentityAsync(
@@ -320,7 +320,7 @@ public class ExternalIdentityResolutionTests : IDisposable
 
         var channel = await resolver.CreateCanonicalChannelAsync(
             "w4b-canon", "Canon", EditorialCategory.Live,
-            CanonicalEditorialGroup.PortugalLive, PublicationPolicy.CreateEligible,
+            CanonicalGroupKeys.PortugalGeneralistas, PublicationPolicy.CreateEligible,
             isEnabled: true, normalizedAliases: Array.Empty<string>());
 
         await resolver.RecordExternalIdentityAsync(
@@ -541,7 +541,7 @@ public class ExternalIdentityResolutionTests : IDisposable
             Key = "w4b-other",
             DisplayName = "Other",
             EditorialCategory = EditorialCategory.Live,
-            EditorialGroup = CanonicalEditorialGroup.PortugalLive,
+            GroupId = null,
             PublicationPolicy = PublicationPolicy.CreateEligible,
             IsEnabled = true,
             CreatedAtUtc = DateTime.UtcNow,

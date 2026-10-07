@@ -150,7 +150,7 @@ public class WaveW55ReviewApiTests : IAsyncLifetime
 
     private Task<CanonicalChannelEntity> NewChannelAsync(string key, params string[] aliases)
         => _resolver.CreateCanonicalChannelAsync(
-            key, key, EditorialCategory.Live, CanonicalEditorialGroup.PortugalLive,
+            key, key, EditorialCategory.Live, CanonicalGroupKeys.PortugalGeneralistas,
             PublicationPolicy.CreateEligible, isEnabled: true, normalizedAliases: aliases.ToList());
 
     private async Task<List<AuditRecordEntity>> ReadAuditRowsAsync()
