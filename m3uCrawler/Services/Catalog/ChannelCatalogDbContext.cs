@@ -449,6 +449,15 @@ public sealed class ChannelCatalogDbContext : DbContext
             e.Property(x => x.CreatedAtUtc).IsRequired();
             e.Property(x => x.UpdatedAtUtc).IsRequired();
             e.HasIndex(x => x.Key).IsUnique();
+            // DC-11a / DC-D4 — no máximo uma OrderingList por país.
+            // Índice parcial único (SQLite): só se aplica a linhas com
+            // Country não nulo, pelo que listas sem país (Country IS NULL)
+            // continuam a poder coexistir. A identidade do país é a string
+            // normalizada (trim; vazio→null), nunca uma representação
+            // sanitizada.
+            e.HasIndex(x => x.Country)
+                .IsUnique()
+                .HasFilter("\"Country\" IS NOT NULL");
             e.HasMany(x => x.Items)
                 .WithOne(i => i.OrderingList)
                 .HasForeignKey(i => i.OrderingListId)
@@ -633,6 +642,9 @@ public sealed class ChannelCatalogDbContext : DbContext
             e.Property(x => x.Name).IsRequired().HasMaxLength(120);
             e.Property(x => x.CronExpression).IsRequired().HasMaxLength(80);
             e.Property(x => x.ActionName).IsRequired().HasMaxLength(80);
+            // DC-9 — overrides de discovery por job (JSON camelCase).
+            // Nullable: sem overrides herda a configuração global.
+            e.Property(x => x.DiscoveryJson).HasMaxLength(2000);
             e.Property(x => x.IsEnabled).IsRequired();
             e.Property(x => x.LastResult).HasMaxLength(120);
             e.Property(x => x.CreatedAtUtc).IsRequired();

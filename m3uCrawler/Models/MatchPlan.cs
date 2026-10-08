@@ -102,7 +102,7 @@ namespace m3uCrawler.Models
 
         [JsonPropertyName("outcome")] public SyncOutcome Outcome { get; init; }
         [JsonPropertyName("existingChannelId")] public long? ExistingChannelId { get; init; }
-        [JsonPropertyName("proposedChannelNumber")] public double? ProposedChannelNumber { get; init; }
+        [JsonPropertyName("proposedChannelNumber")] public double? ProposedChannelNumber { get; set; }
         [JsonPropertyName("channelGroupName")] public string? ChannelGroupName { get; init; }
         [JsonPropertyName("matchReason")] public string MatchReason { get; init; } = string.Empty;
         [JsonPropertyName("matchScore")] public int MatchScore { get; init; }

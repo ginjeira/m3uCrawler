@@ -463,6 +463,25 @@ public class SetupConfigEndpointTests : IAsyncLifetime
         Assert.Equal("IPTV", patchDoc.RootElement.GetProperty("targetGroupName").GetString());
     }
 
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(101)]
+    public async Task Dispatcharr_config_post_rejects_out_of_range_match_threshold(int threshold)
+    {
+        var harness = StartHarness();
+        await ReachReadyAsync(harness);
+        var csrf = await LoginAsync(harness);
+
+        var post = await PostJsonAsync(
+            harness,
+            "/api/dispatcharr/config",
+            JsonSerializer.Serialize(new { matchThreshold = threshold }),
+            csrf);
+
+        Assert.Equal(HttpStatusCode.BadRequest, post.StatusCode);
+        Assert.Contains("invalid-payload", await post.Content.ReadAsStringAsync());
+    }
+
     [Fact]
     public async Task Dispatcharr_test_persists_result_for_readiness()
     {
@@ -559,11 +578,21 @@ public class SetupConfigEndpointTests : IAsyncLifetime
         // GET sobre um path POST-only.
         var get = await harness.Client.GetAsync("/api/dispatcharr/test");
         Assert.Equal(HttpStatusCode.MethodNotAllowed, get.StatusCode);
+        Assert.Equal("POST", AllowHeader(get));
+        Assert.Contains("method-not-allowed", await get.Content.ReadAsStringAsync());
 
         // POST sobre um path GET-only.
         var post = await PostJsonAsync(harness, "/api/telegram/auth/status", "{}", csrf);
         Assert.Equal(HttpStatusCode.MethodNotAllowed, post.StatusCode);
+        Assert.Equal("GET", AllowHeader(post));
     }
+
+    private static string AllowHeader(HttpResponseMessage response)
+        => response.Content.Headers.Allow.Count > 0
+            ? string.Join(", ", response.Content.Headers.Allow)
+            : response.Headers.TryGetValues("Allow", out var values)
+                ? string.Join(", ", values)
+                : string.Empty;
 
     [Fact]
     public async Task Setup_services_absent_return_503()

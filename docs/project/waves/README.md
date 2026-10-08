@@ -70,3 +70,12 @@ waves de recuperação `W1–W7` estão em
 Registo de **execução**: `W1`–`W6` implementadas (2026-10-04); `W7` **parcial** (auditoria de
 código/harness/runtime local da imagem W6 validada; deployment no servidor + Run/Dry/Sync reais
 pendentes de deploy e autorização). Estado corrente em `docs/PROJECT_STATUS.md`.
+
+## Consolidação do Dashboard (2026-10-08) — execução
+
+Auditoria do Dashboard (navegação/IA, cobertura backend↔UI, robustez do front-end, sanitização e testes) e
+plano de waves `DC-1…DC-12` (incluindo DC-9, configuração de discovery por Scheduled Job), com a decisão
+registada **DC-D1 (Opção A)** para a escolha manual de modo no
+Live Run. Registo de **execução**: `DC-1`–`DC-12` implementadas (2026-10-08), incluindo o harness de testes
+JS com Jint (DC-8) e as correcções de revisão (H1, M1–M8) — ver `CHANGELOG.md` [Unreleased]. Ver
+[`2026-10-08-dashboard-consolidation-plan.md`](2026-10-08-dashboard-consolidation-plan.md).

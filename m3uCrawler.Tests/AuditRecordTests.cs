@@ -272,6 +272,47 @@ public class AuditRecordEndpointTests : IAsyncLifetime
             WithCsrf(HttpMethod.Post, "/api/audit", "{}", csrf));
         Assert.Equal(HttpStatusCode.MethodNotAllowed, response.StatusCode);
     }
+
+    [Fact]
+    public async Task Audit_endpoint_respects_limit_and_caps_at_1000()
+    {
+        var harness = StartHarness();
+        await ReachReadyAsync(harness);
+        await LoginAsync(harness);
+
+        // DC-5b — cobertura do filtro `limit`: respeitado quando explícito e
+        // limitado ao tecto de 1000 (default 100) pelo handler.
+        await using (var context = _factory.CreateDbContext())
+        {
+            for (var i = 0; i < 1005; i++)
+            {
+                context.AuditRecords.Add(new AuditRecordEntity
+                {
+                    OccurredAtUtc = FixedNow.AddSeconds(i),
+                    ActorType = "system",
+                    Operation = "bulk." + i,
+                    ObjectType = "bulk-object",
+                    ObjectId = "bulk-1",
+                    Result = "success",
+                });
+            }
+            await context.SaveChangesAsync();
+        }
+
+        var two = await harness.Client.GetAsync("/api/audit?objectType=bulk-object&limit=2");
+        Assert.Equal(HttpStatusCode.OK, two.StatusCode);
+        using (var doc = JsonDocument.Parse(await two.Content.ReadAsStringAsync()))
+        {
+            Assert.Equal(2, doc.RootElement.GetArrayLength());
+        }
+
+        var capped = await harness.Client.GetAsync("/api/audit?objectType=bulk-object&limit=5000");
+        Assert.Equal(HttpStatusCode.OK, capped.StatusCode);
+        using (var doc = JsonDocument.Parse(await capped.Content.ReadAsStringAsync()))
+        {
+            Assert.Equal(1000, doc.RootElement.GetArrayLength());
+        }
+    }
 }
 
 /// <summary>

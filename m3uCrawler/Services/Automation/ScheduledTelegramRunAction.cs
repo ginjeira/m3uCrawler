@@ -37,7 +37,7 @@ namespace m3uCrawler.Services.Automation;
 /// activo devolve <see cref="AlreadyRunningResult"/>.
 /// </para>
 /// </summary>
-public sealed class ScheduledTelegramRunAction : IScheduledAction
+public sealed class ScheduledTelegramRunAction : IScheduledAction, IJobAwareScheduledAction
 {
     /// <summary>Nome estável para o ciclo Telegram normal.</summary>
     public const string TelegramActionName = "telegramRun";
@@ -80,7 +80,10 @@ public sealed class ScheduledTelegramRunAction : IScheduledAction
     public ScheduledActionCapabilities RequiredCapabilities =>
         ScheduledActionCapabilities.Telegram;
 
-    public async Task<string> ExecuteAsync(CancellationToken cancellationToken)
+    public Task<string> ExecuteAsync(CancellationToken cancellationToken)
+        => ExecuteAsync(new ScheduledJobContext(0, string.Empty, Name), cancellationToken);
+
+    public async Task<string> ExecuteAsync(ScheduledJobContext job, CancellationToken cancellationToken)
     {
         var coordinator = _host?.Coordinator;
         if (coordinator is null)
@@ -88,10 +91,13 @@ public sealed class ScheduledTelegramRunAction : IScheduledAction
             return NotConfiguredResult;
         }
 
-        // Wave C — O scheduler não usa um snapshot do arranque: lê os
-        // parâmetros de discovery persistidos neste instante, para que uma
-        // edição no dashboard se aplique à execução agendada seguinte.
-        var discovery = _discoverySettings?.Load() ?? new DiscoverySettings();
+        // Wave C / DC-9 — O scheduler não usa um snapshot do arranque: lê
+        // os parâmetros persistidos neste instante e aplica os overrides do
+        // job (se existirem). Sem overrides, herda a configuração global.
+        var overrides = job.Discovery;
+        var discovery = _discoverySettings is not null
+            ? _discoverySettings.Resolve(overrides)
+            : overrides?.ApplyTo(new DiscoverySettings()) ?? new DiscoverySettings();
 
         var request = new LiveRunRequest
         {
@@ -102,6 +108,7 @@ public sealed class ScheduledTelegramRunAction : IScheduledAction
             Keyword = discovery.Keyword,
             HistoryHours = discovery.HistoryHours,
             MaxStreams = discovery.MaxStreams,
+            MinHistoryHours = discovery.MinHistoryHours,
         };
 
         LiveRunOutcome outcome;

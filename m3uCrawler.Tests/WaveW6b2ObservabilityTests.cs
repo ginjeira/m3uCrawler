@@ -332,6 +332,76 @@ public class WaveW6b2ObservabilityTests : IAsyncLifetime
         }
     }
 
+    [Fact]
+    public async Task ChannelSource_observations_endpoint_supports_get_limit_and_post_recording()
+    {
+        // DC-5c — cobertura HTTP dos endpoints consumidos pela nova UI de
+        // observações: GET com `limit` e POST (enums válidos e inválidos).
+        var key = $"w6b2-obs-http-{Guid.NewGuid():N}".Substring(0, 32);
+        var stream = MakeStream("RTP 1", "http://x.example/rtp1-http.ts",
+            working: true, testedAt: DateTime.UtcNow.AddMinutes(-1), responseTime: 90);
+        await NewIngestor().IngestAsync(new[] { stream }, key, "Telegram", "pt");
+        var cs = await SingleChannelSourceAsync(key);
+
+        var harness = DashboardBootstrapEndpointTests.DashboardHarness.Start(
+            _outputDir, _resolver, new PlaylistComposerService(_factory),
+            new ImportHistoryService(_outputDir),
+            lifecycle: null, auth: null, bootstrap: null, webToken: null, standalone: true);
+        try
+        {
+            // POST válido.
+            var postValid = await harness.Client.PostAsync(
+                $"/api/catalog/channel-sources/{cs.Id}/observations",
+                new StringContent(
+                    "{\"quality\":\"HD\",\"epg\":\"Available\",\"availability\":\"Reachable\",\"responseTimeMs\":42}",
+                    Encoding.UTF8, "application/json"));
+            Assert.Equal(HttpStatusCode.OK, postValid.StatusCode);
+            using (var doc = JsonDocument.Parse(await postValid.Content.ReadAsStringAsync()))
+            {
+                Assert.True(doc.RootElement.GetProperty("recorded").GetBoolean());
+            }
+
+            // GET com limit — devolve no máximo o número pedido.
+            var getLimited = await harness.Client.GetAsync(
+                $"/api/catalog/channel-sources/{cs.Id}/observations?limit=1");
+            Assert.Equal(HttpStatusCode.OK, getLimited.StatusCode);
+            using (var doc = JsonDocument.Parse(await getLimited.Content.ReadAsStringAsync()))
+            {
+                Assert.Single(doc.RootElement.EnumerateArray());
+            }
+
+            // POST com enums inválidos cai nos defaults sem falhar (200 recorded).
+            var postInvalid = await harness.Client.PostAsync(
+                $"/api/catalog/channel-sources/{cs.Id}/observations",
+                new StringContent(
+                    "{\"quality\":\"NOPE\",\"epg\":\"NOPE\",\"availability\":\"NOPE\",\"responseTimeMs\":0}",
+                    Encoding.UTF8, "application/json"));
+            Assert.Equal(HttpStatusCode.OK, postInvalid.StatusCode);
+            using (var doc = JsonDocument.Parse(await postInvalid.Content.ReadAsStringAsync()))
+            {
+                Assert.True(doc.RootElement.GetProperty("recorded").GetBoolean());
+            }
+
+            // O fallback produziu Unknown/Unknown/Discovered.
+            var all = await harness.Client.GetAsync(
+                $"/api/catalog/channel-sources/{cs.Id}/observations?limit=200");
+            Assert.Equal(HttpStatusCode.OK, all.StatusCode);
+            using (var doc = JsonDocument.Parse(await all.Content.ReadAsStringAsync()))
+            {
+                Assert.Contains(doc.RootElement.EnumerateArray(),
+                    e => e.GetProperty("quality").GetString() == "Unknown"
+                      && e.GetProperty("epg").GetString() == "Unknown"
+                      && e.GetProperty("availability").GetString() == "Discovered");
+            }
+        }
+        finally
+        {
+            await harness.DisposeAsync();
+            WebDashboardService.SetAuth(null, null);
+            WebDashboardService.SetConfigurationLifecycle(null);
+        }
+    }
+
     // ============================================================
     // Helpers
     // ============================================================

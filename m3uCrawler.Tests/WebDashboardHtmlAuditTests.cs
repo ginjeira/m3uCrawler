@@ -95,6 +95,70 @@ public class WebDashboardHtmlAuditTests
         Assert.Contains("idx < 0 || idx >= historyCache.length", html);
     }
 
+    [Fact]
+    public void Dashboard_diagnostics_inventory_is_written_only_by_loadDiagnostics()
+    {
+        var html = InvokeBuildHtml();
+
+        // DC-4 — loadPlaylist must not write the diagnostics inventory node
+        // (#diagInventory belongs to the Diagnóstico view only).
+        var loadPlaylistStart = html.IndexOf("async function loadPlaylist(", StringComparison.Ordinal);
+        Assert.True(loadPlaylistStart >= 0, "loadPlaylist não encontrada.");
+        var loadPlaylistEnd = html.IndexOf("async function loadDiagnostics(", loadPlaylistStart, StringComparison.Ordinal);
+        Assert.True(loadPlaylistEnd > loadPlaylistStart, "Fim de loadPlaylist não encontrado.");
+        var loadPlaylistBody = html.Substring(loadPlaylistStart, loadPlaylistEnd - loadPlaylistStart);
+        Assert.DoesNotContain("diagInventory", loadPlaylistBody);
+
+        // The Playlist view has its own dedicated node for the file listing.
+        Assert.Contains("id='playlistFiles'", html);
+        Assert.Contains("document.getElementById('playlistFiles')", html);
+
+        // loadDiagnostics remains the sole writer of #diagInventory.
+        var diagnosticsStart = html.IndexOf("async function loadDiagnostics(", StringComparison.Ordinal);
+        Assert.True(diagnosticsStart >= 0, "loadDiagnostics não encontrada.");
+        var diagnosticsEnd = html.IndexOf("// ===== CATALOG =====", diagnosticsStart, StringComparison.Ordinal);
+        Assert.True(diagnosticsEnd > diagnosticsStart, "Fim de loadDiagnostics não encontrado.");
+        var diagnosticsBody = html.Substring(diagnosticsStart, diagnosticsEnd - diagnosticsStart);
+        Assert.Contains("document.getElementById('diagInventory').innerHTML", diagnosticsBody);
+    }
+
+    [Fact]
+    public void Dashboard_country_data_setup_deep_links_to_countries_view()
+    {
+        var html = InvokeBuildHtml();
+
+        // DC-4 — setupConfigure('countryData') must open the Canais / Países
+        // view (view-countries), not the Catalog view.
+        var idx = html.IndexOf("if (key === 'countryData')", StringComparison.Ordinal);
+        Assert.True(idx >= 0, "Mapeamento de countryData não encontrado.");
+        var snippet = html.Substring(idx, Math.Min(80, html.Length - idx));
+        Assert.Contains("showView('countries')", snippet);
+        Assert.DoesNotContain("showView('catalog')", snippet);
+
+        // The setup label remains the Portuguese "Dados de país".
+        Assert.Contains("countryData: 'Dados de país'", html);
+    }
+
+    [Fact]
+    public void Dashboard_live_run_does_not_duplicate_scheduled_jobs_listing()
+    {
+        var html = InvokeBuildHtml();
+
+        // DC-4 — the inline scheduled-jobs loader/table was removed from
+        // Live Run; the listing lives only in Catálogo → Scheduled Jobs.
+        Assert.DoesNotContain("loadLiveRunScheduled", html);
+        Assert.DoesNotContain("id='liveRunScheduled'", html);
+
+        // A deep-link into the Catalog "scheduled" sub-tab replaces it.
+        Assert.Contains("function openScheduledJobs(", html);
+        Assert.Contains("loadCatalogTab('scheduled')", html);
+        Assert.Contains("onclick='openScheduledJobs()'", html);
+
+        // The explanatory text about the Telegram actions remains.
+        Assert.Contains("telegramRun", html);
+        Assert.Contains("telegramMaintainRun", html);
+    }
+
     private static string InvokeBuildHtml()
     {
         var method = typeof(WebDashboardService).GetMethod(

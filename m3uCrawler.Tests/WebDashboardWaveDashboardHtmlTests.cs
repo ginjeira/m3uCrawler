@@ -34,7 +34,7 @@ public class WebDashboardWaveDashboardHtmlTests
 
         // GET (leitura) e POST (mutação) do mesmo endpoint.
         Assert.Contains("safeFetchJson('/api/discovery/settings'", html);
-        Assert.Contains("fetch('/api/discovery/settings'", html);
+        Assert.Contains("apiRequest('/api/discovery/settings'", html);
         Assert.Contains("method: 'POST'", html);
 
         // Explainer da janela inclusiva (substring estável).

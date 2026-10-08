@@ -135,6 +135,41 @@ public sealed class WaveW3HttpSemanticsTests : IAsyncLifetime
         Assert.Equal(HttpStatusCode.MethodNotAllowed, response.StatusCode);
     }
 
+    // ===================== DC-6 — método não permitido (405) =====================
+
+    [Theory]
+    [InlineData("GET", "/api/run/start", "POST")]
+    [InlineData("GET", "/api/country/save", "POST")]
+    [InlineData("GET", "/api/validation/test", "POST")]
+    [InlineData("POST", "/api/country", "GET, DELETE")]
+    [InlineData("POST", "/api/playlist", "GET")]
+    [InlineData("POST", "/api/playlist_temp/preview", "GET")]
+    [InlineData("POST", "/api/publication/status", "GET")]
+    [InlineData("POST", "/api/run/status", "GET")]
+    [InlineData("POST", "/api/country/validate", "GET")]
+    public async Task Wrong_verb_on_known_route_returns_405_json_with_correct_allow(
+        string method, string path, string expectedAllow)
+    {
+        using var request = new HttpRequestMessage(new HttpMethod(method), path)
+        {
+            Content = method == "GET" ? null : Json("{}"),
+        };
+
+        var response = await Client.SendAsync(request, ShortToken());
+
+        Assert.Equal(HttpStatusCode.MethodNotAllowed, response.StatusCode);
+        Assert.Equal("application/json", response.Content.Headers.ContentType?.MediaType);
+        var body = await response.Content.ReadAsStringAsync();
+        Assert.Contains("method-not-allowed", body);
+
+        var allow = response.Content.Headers.Allow.Count > 0
+            ? string.Join(", ", response.Content.Headers.Allow)
+            : response.Headers.TryGetValues("Allow", out var values)
+                ? string.Join(", ", values)
+                : string.Empty;
+        Assert.Equal(expectedAllow, allow);
+    }
+
     [Fact]
     public async Task Ordering_put_now_routes_and_updates_metadata()
     {

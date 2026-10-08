@@ -799,6 +799,15 @@ namespace m3uCrawler.Services
 
             if (requestPath.Equals("/api/country", StringComparison.OrdinalIgnoreCase))
             {
+                // DC-6 — só GET (leitura) e DELETE (remoção) são suportados;
+                // outros verbos devolvem 405 em vez de caírem na leitura.
+                if (!context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase)
+                    && !context.Request.HttpMethod.Equals("DELETE", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteMethodNotAllowedAsync(context.Response, "GET, DELETE");
+                    return;
+                }
+
                 var countryCode = context.Request.QueryString["country"];
                 if (string.IsNullOrWhiteSpace(countryCode))
                 {
@@ -843,6 +852,11 @@ namespace m3uCrawler.Services
 
             if (requestPath.Equals("/api/country/validate", StringComparison.OrdinalIgnoreCase))
             {
+                if (!context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteMethodNotAllowedAsync(context.Response, "GET");
+                    return;
+                }
                 var countryCode = context.Request.QueryString["country"] ?? "pt";
                 var countryList = new CountryChannelListService(ResolveCountriesDir());
                 var affinityMembers = await LoadCountryAffinityMembersAsync();
@@ -870,8 +884,13 @@ namespace m3uCrawler.Services
                 return;
             }
 
-            if (requestPath.Equals("/api/country/save", StringComparison.OrdinalIgnoreCase) && context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+            if (requestPath.Equals("/api/country/save", StringComparison.OrdinalIgnoreCase))
             {
+                if (!context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteMethodNotAllowedAsync(context.Response, "POST");
+                    return;
+                }
                 try
                 {
                     using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
@@ -899,6 +918,11 @@ namespace m3uCrawler.Services
 
             if (requestPath.Equals("/api/playlist", StringComparison.OrdinalIgnoreCase))
             {
+                if (!context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteMethodNotAllowedAsync(context.Response, "GET");
+                    return;
+                }
                 var mainPath = Path.Combine(outputDir, "playlist.m3u");
                 if (!File.Exists(mainPath))
                 {
@@ -916,6 +940,11 @@ namespace m3uCrawler.Services
             // disponível no endpoint /api/playlist.
             if (requestPath.Equals("/api/playlist/preview", StringComparison.OrdinalIgnoreCase))
             {
+                if (!context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteMethodNotAllowedAsync(context.Response, "GET");
+                    return;
+                }
                 var mainPath = Path.Combine(outputDir, "playlist.m3u");
                 if (!File.Exists(mainPath))
                 {
@@ -931,6 +960,11 @@ namespace m3uCrawler.Services
 
             if (requestPath.Equals("/api/playlist_temp", StringComparison.OrdinalIgnoreCase))
             {
+                if (!context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteMethodNotAllowedAsync(context.Response, "GET");
+                    return;
+                }
                 var tempPath = Path.Combine(outputDir, "playlist_temp.m3u");
                 if (!File.Exists(tempPath))
                 {
@@ -945,6 +979,11 @@ namespace m3uCrawler.Services
 
             if (requestPath.Equals("/api/playlist_temp/preview", StringComparison.OrdinalIgnoreCase))
             {
+                if (!context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteMethodNotAllowedAsync(context.Response, "GET");
+                    return;
+                }
                 var tempPath = Path.Combine(outputDir, "playlist_temp.m3u");
                 if (!File.Exists(tempPath))
                 {
@@ -1164,12 +1203,21 @@ namespace m3uCrawler.Services
             // machine token). O host decide se há pipeline configurada.
             if (requestPath.Equals("/api/run/status", StringComparison.OrdinalIgnoreCase))
             {
+                if (!context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteMethodNotAllowedAsync(context.Response, "GET");
+                    return;
+                }
                 await HandleRunStatusEndpointAsync(context);
                 return;
             }
-            if (requestPath.Equals("/api/run/start", StringComparison.OrdinalIgnoreCase)
-                && context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+            if (requestPath.Equals("/api/run/start", StringComparison.OrdinalIgnoreCase))
             {
+                if (!context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteMethodNotAllowedAsync(context.Response, "POST");
+                    return;
+                }
                 await HandleRunStartEndpointAsync(context);
                 return;
             }
@@ -1179,10 +1227,7 @@ namespace m3uCrawler.Services
             {
                 if (!context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
                 {
-                    await WriteJsonAsync(
-                        context.Response,
-                        new { error = "Método não permitido." },
-                        HttpStatusCode.MethodNotAllowed);
+                    await WriteMethodNotAllowedAsync(context.Response, "GET");
                     return;
                 }
 
@@ -1603,12 +1648,15 @@ namespace m3uCrawler.Services
                 await WriteJsonAsync(context.Response, filtered.Select(r => new
                 {
                     id = r.Id,
+                    // `fingerprint` é a identidade `sfp1` (não é credencial) e
+                    // mantém-se cru; os textos humanos passam por
+                    // `SanitizeReviewText` (mesma superfície da nova API).
                     fingerprint = r.Fingerprint,
-                    normalizedIdentity = r.NormalizedIdentity,
-                    sourceGroup = r.SourceGroup,
-                    reasonSignature = r.ReasonSignature,
+                    normalizedIdentity = SanitizeReviewText(r.NormalizedIdentity),
+                    sourceGroup = SanitizeReviewText(r.SourceGroup),
+                    reasonSignature = SanitizeReviewText(r.ReasonSignature),
                     state = r.State.ToString(),
-                    note = r.Note,
+                    note = SanitizeReviewText(r.Note),
                     approvedCanonicalChannelId = r.ApprovedCanonicalChannelId,
                     createdAtUtc = r.CreatedAtUtc.ToString("o"),
                     updatedAtUtc = r.UpdatedAtUtc.ToString("o"),
@@ -1928,7 +1976,7 @@ namespace m3uCrawler.Services
                     normalizedIdentity = r.NormalizedIdentity,
                     originalTitle = r.OriginalTitle,
                     countryCode = r.CountryCode,
-                    streamUrl = r.StreamUrl,
+                    streamUrl = CredentialSanitizer.SanitizeUrl(r.StreamUrl),
                     sourceGroup = r.SourceGroup,
                     reasonSignature = r.ReasonSignature,
                     state = r.State.ToString(),
@@ -2044,6 +2092,13 @@ namespace m3uCrawler.Services
                         await WriteJsonAsync(context.Response, OrderingListSummaryToJson(list), HttpStatusCode.Created);
                         return;
                     }
+                    catch (ChannelAdministrationException ex)
+                    {
+                        // DC-11a / DC-D4 — colisão de país → 409 (payload
+                        // inválido continua a sair como 400 no catch geral).
+                        await WriteChannelAdminError(context.Response, ex);
+                        return;
+                    }
                     catch (Exception ex)
                     {
                         context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
@@ -2132,6 +2187,13 @@ namespace m3uCrawler.Services
                                 beforeList is null ? null : OrderingListSummaryToJson(beforeList),
                                 OrderingListSummaryToJson(updated), AuditResult.Success);
                             await WriteJsonAsync(context.Response, new { updated = true, id = listId });
+                            return;
+                        }
+                        catch (ChannelAdministrationException ex)
+                        {
+                            // DC-11a / DC-D4 — colisão de país → 409; Name
+                            // em branco continua a sair como 400.
+                            await WriteChannelAdminError(context.Response, ex);
                             return;
                         }
                         catch (Exception ex)
@@ -2671,7 +2733,8 @@ namespace m3uCrawler.Services
                             return;
                         }
                         var saved = await _catalogResolver.UpsertScheduledJobAsync(
-                            payload.Name, payload.CronExpression, payload.ActionName, payload.IsEnabled);
+                            payload.Name, payload.CronExpression, payload.ActionName, payload.IsEnabled,
+                            discoveryJson: BuildScheduledJobDiscoveryJson(payload));
                         await RecordAuditAsync(auditActor, "catalog.scheduled-job.upsert", "scheduled-job",
                             saved.Id.ToString(), null, ScheduledJobToJson(saved), AuditResult.Success);
                         await WriteJsonAsync(context.Response, ScheduledJobToJson(saved));
@@ -3632,9 +3695,13 @@ namespace m3uCrawler.Services
                 return;
             }
 
-            if (requestPath.Equals("/api/validation/test", StringComparison.OrdinalIgnoreCase)
-                && context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+            if (requestPath.Equals("/api/validation/test", StringComparison.OrdinalIgnoreCase))
             {
+                if (!context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteMethodNotAllowedAsync(context.Response, "POST");
+                    return;
+                }
                 try
                 {
                     using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8);
@@ -3769,6 +3836,7 @@ namespace m3uCrawler.Services
                 ChannelAdministrationError.ChannelNotFound => HttpStatusCode.NotFound,
                 ChannelAdministrationError.HasOwnership => HttpStatusCode.Conflict,
                 ChannelAdministrationError.ReviewConflict => HttpStatusCode.Conflict,
+                ChannelAdministrationError.CountryConflict => HttpStatusCode.Conflict,
                 _ => HttpStatusCode.BadRequest,
             };
             // Nota: WriteJsonAsync repõe sempre o status; o código tem de
@@ -4263,6 +4331,14 @@ namespace m3uCrawler.Services
             }
         }
 
+        // DC-6 — O recurso Review expõe o contrato canónico (`subject`,
+        // `reason`, `createdAt`/`updatedAt`/`resolvedAt`, `runId`) e, em
+        // adição, os nomes legacy (`fingerprint`, `normalizedIdentity`,
+        // `reasonSignature`, `createdAtUtc`/`updatedAtUtc`/`resolvedAtUtc`)
+        // como aliases. A rota legacy `/api/catalog/reviews` mantém-se
+        // inalterada (DL-120/D5); esta é a superfície que a DC-5 pode usar
+        // para migrar a UI sem drift de nomes. Todos os textos passam por
+        // `SanitizeReviewText` (nunca credenciais em claro).
         private static object ReviewSummaryJson(ReviewItemEntity r) => new
         {
             id = r.Id,
@@ -4273,6 +4349,16 @@ namespace m3uCrawler.Services
             // `runId` não existe no modelo actual (dependência C7/W5.6). Expõe-se
             // null explicitamente como limitação, não como solução definitiva.
             runId = (string?)null,
+            // Aliases de compatibilidade (nomes legacy).
+            fingerprint = r.Fingerprint,
+            normalizedIdentity = SanitizeReviewText(r.NormalizedIdentity),
+            sourceGroup = SanitizeReviewText(r.SourceGroup),
+            reasonSignature = SanitizeReviewText(r.ReasonSignature),
+            note = SanitizeReviewText(r.Note),
+            approvedCanonicalChannelId = r.ApprovedCanonicalChannelId,
+            createdAtUtc = r.CreatedAtUtc.ToString("o"),
+            updatedAtUtc = r.UpdatedAtUtc.ToString("o"),
+            resolvedAtUtc = r.ResolvedAtUtc?.ToString("o"),
         };
 
         private static object ReviewDetailJson(ReviewItemEntity r) => new
@@ -4280,13 +4366,20 @@ namespace m3uCrawler.Services
             id = r.Id,
             subject = SanitizeReviewText(r.NormalizedIdentity),
             state = r.State.ToString(),
-            sourceGroup = r.SourceGroup,
+            sourceGroup = SanitizeReviewText(r.SourceGroup),
             reason = SanitizeReviewText(r.ReasonSignature),
             note = SanitizeReviewText(r.Note),
             approvedCanonicalChannelId = r.ApprovedCanonicalChannelId,
             createdAt = r.CreatedAtUtc.ToString("o"),
             updatedAt = r.UpdatedAtUtc.ToString("o"),
             resolvedAt = r.ResolvedAtUtc?.ToString("o"),
+            // Aliases de compatibilidade (nomes legacy).
+            fingerprint = r.Fingerprint,
+            normalizedIdentity = SanitizeReviewText(r.NormalizedIdentity),
+            reasonSignature = SanitizeReviewText(r.ReasonSignature),
+            createdAtUtc = r.CreatedAtUtc.ToString("o"),
+            updatedAtUtc = r.UpdatedAtUtc.ToString("o"),
+            resolvedAtUtc = r.ResolvedAtUtc?.ToString("o"),
         };
 
         private static object ReviewLifecycleJson(ReviewLifecycleResult result, string correlationId) => new
@@ -4864,6 +4957,13 @@ namespace m3uCrawler.Services
         [JsonPropertyName("cronExpression")] public string? CronExpression { get; set; }
         [JsonPropertyName("actionName")] public string? ActionName { get; set; }
         [JsonPropertyName("isEnabled")] public bool IsEnabled { get; set; } = true;
+
+        // DC-9 — overrides opcionais de discovery por job. Ausente/null =
+        // herda a configuração global (sem override).
+        [JsonPropertyName("keyword")] public string? Keyword { get; set; }
+        [JsonPropertyName("minHistoryHours")] public int? MinHistoryHours { get; set; }
+        [JsonPropertyName("historyHours")] public int? HistoryHours { get; set; }
+        [JsonPropertyName("maxStreams")] public int? MaxStreams { get; set; }
     }
 
     private sealed class ScheduledJobEnablePayload
@@ -4879,7 +4979,9 @@ namespace m3uCrawler.Services
             key = s.Key,
             name = s.Name,
             kind = s.Kind.ToString(),
-            origin = s.Origin,
+            // DC-3 — boundary de saída: `origin` pode conter credenciais
+            // (URLs Xtream legacy/direct-DB); nunca devolver em claro.
+            origin = CredentialSanitizer.SanitizeUrl(s.Origin),
             priority = s.Priority,
             isEnabled = s.IsEnabled,
             lastDiscoveryAtUtc = s.LastDiscoveryAtUtc?.ToString("o"),
@@ -4896,7 +4998,7 @@ namespace m3uCrawler.Services
             id = cs.Id,
             canonicalChannelId = cs.CanonicalChannelId,
             sourceId = cs.SourceId,
-            streamUrl = cs.StreamUrl,
+            streamUrl = CredentialSanitizer.SanitizeUrl(cs.StreamUrl),
             externalStreamId = cs.ExternalStreamId,
             quality = cs.Quality.ToString(),
             epg = cs.Epg.ToString(),
@@ -5081,6 +5183,12 @@ namespace m3uCrawler.Services
 
     private static object ScheduledJobToJson(ScheduledJobEntity j)
     {
+        // DC-9 — overrides do job e a config efectiva (global herdada
+        // quando o campo está ausente). A UI usa `discovery` para
+        // pré-preencher e `effectiveDiscovery` para pré-visualizar.
+        var overrides = DiscoveryOverrides.TryParse(j.DiscoveryJson);
+        var global = new AppSettingsStore(ResolveRuntimeDataDir()).Load().Discovery;
+        var effective = overrides?.ApplyTo(global) ?? global;
         return new
         {
             id = j.Id,
@@ -5093,7 +5201,55 @@ namespace m3uCrawler.Services
             lastResult = j.LastResult,
             createdAtUtc = j.CreatedAtUtc.ToString("o"),
             updatedAtUtc = j.UpdatedAtUtc.ToString("o"),
+            discovery = overrides is null
+                ? null
+                : new
+                {
+                    keyword = overrides.Keyword,
+                    minHistoryHours = overrides.MinHistoryHours,
+                    historyHours = overrides.HistoryHours,
+                    maxStreams = overrides.MaxStreams,
+                },
+            effectiveDiscovery = new
+            {
+                keyword = effective.Keyword,
+                minHistoryHours = effective.MinHistoryHours,
+                historyHours = effective.HistoryHours,
+                maxStreams = effective.MaxStreams,
+            },
         };
+    }
+
+    /// <summary>
+    /// DC-9 — serializa os overrides de discovery de um payload de job.
+    /// Devolve <c>null</c> quando nenhum campo é fornecido (sem override).
+    ///
+    /// <para>
+    /// Valores fora do intervalo válido são normalizados para <c>null</c>
+    /// (herdam a configuração global), pelo que a persistência nunca guarda
+    /// overrides inválidos. Os limites espelham os overrides explícitos de
+    /// <c>POST /api/run/start</c> (<c>LiveRunApiMappings.ParseStartPayload</c>):
+    /// <c>historyHours</c> em <c>1..720</c>, <c>minHistoryHours</c> em
+    /// <c>0..<see cref="DiscoverySettings.MaxValidHistoryHours"/></c>,
+    /// <c>maxStreams</c> <c>&gt;= <see cref="DiscoverySettings.MinMaxStreams"/></c>.
+    /// </para>
+    /// </summary>
+    private static string? BuildScheduledJobDiscoveryJson(ScheduledJobPayload payload)
+    {
+        var keyword = string.IsNullOrWhiteSpace(payload.Keyword) ? null : payload.Keyword.Trim();
+        // Espelha LiveRunApiMappings.ParseStartPayload: historyHours em (0, 720].
+        var historyHours = payload.HistoryHours is > 0 and <= 24 * 30
+            ? payload.HistoryHours
+            : null;
+        var minHistoryHours = payload.MinHistoryHours is >= 0 and <= DiscoverySettings.MaxValidHistoryHours
+            ? payload.MinHistoryHours
+            : null;
+        var maxStreams = payload.MaxStreams is >= DiscoverySettings.MinMaxStreams
+            ? payload.MaxStreams
+            : null;
+
+        var overrides = new DiscoveryOverrides(keyword, minHistoryHours, historyHours, maxStreams);
+        return overrides.IsEmpty ? null : overrides.ToJson();
     }
 
     private static object DegradedStreamToJson(DegradedStreamSummary d)
@@ -5333,7 +5489,7 @@ namespace m3uCrawler.Services
                 canonicalKey = e.CanonicalKey,
                 displayName = e.DisplayName,
                 group = e.Group,
-                streamUrl = e.StreamUrl,
+                streamUrl = CredentialSanitizer.SanitizeUrl(e.StreamUrl),
                 chosenChannelSourceId = e.ChosenChannelSourceId,
                 sourceId = e.SourceId,
                 sourceName = e.SourceName,
@@ -5384,6 +5540,7 @@ namespace m3uCrawler.Services
     nav button.active { color: var(--text); border-bottom-color: var(--accent); }
     main { padding: 20px; max-width: 1400px; margin: 0 auto; }
     section[hidden] { display: none; }
+    [hidden] { display: none !important; }
     .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); margin-bottom: 20px; }
     .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
     .card h3 { margin: 0 0 8px 0; font-size: 13px; color: var(--muted); font-weight: 500; text-transform: uppercase; letter-spacing: 0.05em; }
@@ -5445,15 +5602,15 @@ namespace m3uCrawler.Services
 
     <nav id='nav'>
     <button data-view='setup' id='navSetupButton'>Setup <span id='setupNavBadge' class='badge err' style='margin-left:4px;padding:1px 6px;border-radius:999px;font-size:10px;display:none;'>!</span></button>
-    <button data-view='overview' class='active'>Overview</button>
+    <button data-view='overview' class='active'>Visão Geral</button>
     <button data-view='executions'>Execuções</button>
     <button data-view='discovery'>Descoberta</button>
     <button data-view='countries'>Canais / Países</button>
     <button data-view='playlist'>Playlist</button>
     <button data-view='dispatcharr'>Dispatcharr</button>
     <button data-view='catalog'>Catálogo</button>
-    <button data-view='validation'>Stream Validation</button>
-    <button data-view='liverun'>Live Run</button>
+    <button data-view='validation'>Validação de Streams</button>
+    <button data-view='liverun'>Execução ao Vivo</button>
     <button data-view='diagnostics'>Diagnóstico</button>
   </nav>
 
@@ -5484,7 +5641,7 @@ namespace m3uCrawler.Services
       <h2 style='font-size:18px;margin-top:0;'>Descoberta</h2>
 
       <div class='card' style='margin-bottom:12px;'>
-        <h3 style='font-size:14px;margin-top:0;'>Configuração de descoberta</h3>
+        <h3 style='font-size:14px;margin-top:0;'>Configuração de discovery predefinida</h3>
         <div class='toolbar' style='flex-wrap:wrap;'>
           <label class='muted' for='discoveryKeyword'>Pesquisa</label>
           <input id='discoveryKeyword' type='text' placeholder='portugal' style='min-width:160px;'>
@@ -5501,7 +5658,8 @@ namespace m3uCrawler.Services
         <p class='muted' style='font-size:12px;margin:8px 0 0;'>
           Limites: Min ≥ 0; Max 1–1440h; Min ≤ Max; MaxStreams ≥ 1.
           Min 0 = sem limite inferior (comportamento legacy).
-          Valores persistidos em <code>app_settings.json</code> e usados pela CLI, scheduler e runs manuais.
+          Valores persistidos em <code>app_settings.json</code>; são a base/fallback da CLI, dos runs manuais e dos jobs sem overrides.
+          Cada Scheduled Job pode definir overrides próprios (keyword/min/max/maxStreams).
         </p>
       </div>
 
@@ -5557,9 +5715,13 @@ namespace m3uCrawler.Services
       </div>
       <div class='card' style='margin-bottom:12px;'>
         <div class='muted' id='playlistMath'></div>
+        <h3 style='font-size:14px;margin-top:16px;'>Ficheiros em output/</h3>
+        <div id='playlistFiles'></div>
       </div>
-      <h3 style='font-size:14px;'>Pré-visualização (URLs sanitizadas — sem credenciais Xtream)</h3>
+      <h3 style='font-size:14px;margin-top:16px;'>Pré-visualização (URLs sanitizadas — sem credenciais Xtream)</h3>
       <pre id='playlistPreview'>a carregar…</pre>
+      <h3 style='font-size:14px;margin-top:16px;'>Pré-visualização playlist_temp.m3u (URLs sanitizadas — sem credenciais Xtream)</h3>
+      <pre id='playlistTempPreview'>a carregar…</pre>
     </section>
 
     <!-- DISPATCHARR -->
@@ -5574,6 +5736,9 @@ namespace m3uCrawler.Services
         <div id='dispatcharrActionStatus' class='muted' style='margin-top:8px;'></div>
       </div>
       <div id='dispatcharrOverview'></div>
+      <h3 style='font-size:14px;margin-top:24px;'>Classificação (último MatchPlan)</h3>
+      <div id='classificationStatus' class='muted' aria-live='polite'></div>
+      <div id='classificationSummary'></div>
       <h3 style='font-size:14px;margin-top:24px;'>Detalhes da última sincronização</h3>
       <div id='dispatcharrDetail'></div>
     </section>
@@ -5600,6 +5765,7 @@ namespace m3uCrawler.Services
         <button data-ctab='policies' hidden style='padding:8px 14px;'>Import Policies</button>
         <button data-ctab='groups' style='padding:8px 14px;'>Grupos</button>
         <button data-ctab='reviews' style='padding:8px 14px;'>Reviews</button>
+        <button data-ctab='audit' style='padding:8px 14px;'>Auditoria</button>
         <button data-ctab='syncruns' style='padding:8px 14px;'>Sync Runs</button>
         <button data-ctab='pending' style='padding:8px 14px;'>Pending <span id='pendingBadge' class='badge warn' style='margin-left:4px;padding:1px 6px;border-radius:999px;font-size:10px;display:none;'>0</span></button>
       </nav>
@@ -5702,6 +5868,25 @@ namespace m3uCrawler.Services
           </div>
           <div id='catalogChannelsTable'></div>
           <div id='channelDetailPanel' hidden style='margin-top:24px;'></div>
+          <div id='channelPolicyForm' hidden style='margin-bottom:16px;'>
+            <div class='card'>
+              <h3>Alterar Política de Publicação</h3>
+              <div>
+                <label for='channelPolicySelect' style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Política de Publicação</label>
+                <select id='channelPolicySelect' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                  <option value='CreateEligible'>CreateEligible</option>
+                  <option value='MergeOnly'>MergeOnly</option>
+                  <option value='ReviewOnly'>ReviewOnly</option>
+                  <option value='Excluded'>Excluded</option>
+                </select>
+              </div>
+              <p id='channelPolicyStatus' class='muted' aria-live='polite' style='margin:8px 0 0 0;min-height:18px;'></p>
+              <div style='margin-top:10px;display:flex;gap:8px;'>
+                <button onclick='confirmChannelPolicy()'>Guardar política</button>
+                <button class='secondary' onclick='closeModalPanel()'>Cancelar</button>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -5796,7 +5981,16 @@ namespace m3uCrawler.Services
       <div id='ctab-reviews' hidden>
         <div class='toolbar' style='margin-top:16px;'>
           <span class='muted' id='reviewsCount'></span>
-          <button class='secondary' onclick='loadCatalogReviews()'>Recarregar</button>
+          <select id='reviewsStateFilter' onchange='loadCatalogReviews(true)' style='background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+            <option value=''>Activos (Open/InReview)</option>
+            <option value='Open'>Open</option>
+            <option value='InReview'>InReview</option>
+            <option value='Resolved'>Resolved (histórico)</option>
+            <option value='Ignored'>Ignored (histórico)</option>
+          </select>
+          <button class='secondary' id='reviewsPrevBtn' onclick='reviewsPrevPage()' disabled>Anterior</button>
+          <button class='secondary' id='reviewsNextBtn' onclick='reviewsNextPage()' disabled>Próxima</button>
+          <button class='secondary' onclick='loadCatalogReviews(true)'>Recarregar</button>
         </div>
         <div id='catalogReviewsTable'></div>
 
@@ -5840,9 +6034,37 @@ namespace m3uCrawler.Services
               </div>
             </div>
 
+            <div id='reviewReopen' hidden style='margin-top:12px;display:grid;gap:10px;'>
+              <div>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Justificação da reabertura</label>
+                <input id='reviewReopenReason' type='text' placeholder='nova evidência' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              </div>
+              <div style='display:flex;gap:8px;'>
+                <button onclick='submitReviewReopen()'>Confirmar Reabertura</button>
+                <button class='secondary' onclick='closeReviewApproveModal()'>Cancelar</button>
+              </div>
+            </div>
+
             <p id='reviewApproveStatus' class='muted' style='margin-top:10px;'></p>
           </div>
         </div>
+      </div>
+
+      <!-- TAB: Auditoria (DC-5b — visualizador de GET /api/audit) -->
+      <div id='ctab-audit' hidden>
+        <div class='toolbar' style='margin-top:16px;'>
+          <span class='muted' id='auditCount'></span>
+          <label class='muted'>Tipo de objecto</label>
+          <input id='auditObjectType' type='text' placeholder='ex: canonical-channel' style='background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+          <label class='muted'>Id do objecto</label>
+          <input id='auditObjectId' type='text' placeholder='ex: rtp-memoria' style='background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+          <label class='muted'>Limite</label>
+          <input id='auditLimit' type='number' min='1' max='1000' value='100' style='width:90px;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+          <button onclick='loadCatalogAudits()'>Aplicar</button>
+          <button class='secondary' onclick='loadCatalogAudits()'>Recarregar</button>
+        </div>
+        <div id='auditStatus' class='muted' style='margin-top:8px;' aria-live='polite'></div>
+        <div id='auditTable'></div>
       </div>
 
       <!-- TAB: Sync Runs -->
@@ -5915,6 +6137,62 @@ namespace m3uCrawler.Services
           </div>
           <div id='channelSourcesTable'></div>
         </div>
+
+        <!-- DC-5c — histórico de observações de um channel-source (GET/POST existentes) -->
+        <div id='channelSourceObservationsPanel' hidden>
+          <div class='card'>
+            <h3 id='csObservationsTitle'>Observações do channel-source</h3>
+            <p class='muted'>Histórico de observações (qualidade, EPG, disponibilidade e tempo de resposta). O endpoint devolve no máximo 200 amostras por pedido.</p>
+            <div class='toolbar'>
+              <button class='secondary' onclick='loadChannelSourceObservations()'>Recarregar</button>
+              <button class='secondary' onclick='closeModalPanel()'>Fechar</button>
+            </div>
+            <div id='csObservationsStatus' class='muted' style='margin-top:8px;' aria-live='polite'></div>
+            <div id='csObservationsTable' style='margin-top:8px;'></div>
+
+            <h4 style='margin:16px 0 8px 0;'>Registar observação</h4>
+            <div style='display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));'>
+              <div>
+                <label for='csObservationQuality' class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Quality (StreamQuality)</label>
+                <select id='csObservationQuality' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                  <option value='Unknown'>Unknown</option>
+                  <option value='SD'>SD</option>
+                  <option value='HD'>HD</option>
+                  <option value='FHD'>FHD</option>
+                  <option value='UHD'>UHD</option>
+                  <option value='FourK'>FourK</option>
+                </select>
+              </div>
+              <div>
+                <label for='csObservationEpg' class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>EPG (EpgState)</label>
+                <select id='csObservationEpg' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                  <option value='Unknown'>Unknown</option>
+                  <option value='Available'>Available</option>
+                  <option value='Unavailable'>Unavailable</option>
+                </select>
+              </div>
+              <div>
+                <label for='csObservationAvailability' class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Availability (AvailabilityState)</label>
+                <select id='csObservationAvailability' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                  <option value='Discovered'>Discovered</option>
+                  <option value='Validated'>Validated</option>
+                  <option value='Reachable'>Reachable</option>
+                  <option value='Unreachable'>Unreachable</option>
+                  <option value='Timeout'>Timeout</option>
+                  <option value='Dead'>Dead</option>
+                </select>
+              </div>
+              <div>
+                <label for='csObservationResponseTimeMs' class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>responseTimeMs (opcional)</label>
+                <input id='csObservationResponseTimeMs' type='number' min='0' placeholder='ex: 250' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              </div>
+            </div>
+            <div style='margin-top:10px;display:flex;gap:8px;'>
+              <button onclick='recordChannelSourceObservation()'>Registar</button>
+              <button class='secondary' onclick='closeModalPanel()'>Cancelar</button>
+            </div>
+          </div>
+        </div>
       </div>
 
       <!-- TAB: Ordering Lists (PHASE 5) -->
@@ -5973,6 +6251,18 @@ namespace m3uCrawler.Services
             <div style='margin-top:10px;display:flex;gap:8px;'>
               <button onclick='saveOrderingListEdit()'>Guardar</button>
               <button class='secondary' onclick='cancelOrderingListEdit()'>Cancelar</button>
+            </div>
+          </div>
+          <div id='orderingDuplicateForm' hidden style='margin-top:16px;'>
+            <h4 style='margin:0 0 8px 0;'>Duplicar lista</h4>
+            <div>
+              <label for='orderingDuplicateKey' style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Key da nova lista (slug único)</label>
+              <input id='orderingDuplicateKey' placeholder='ex: pt-principal-copy' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+            </div>
+            <p id='orderingDuplicateStatus' class='muted' aria-live='polite' style='margin:8px 0 0 0;min-height:18px;'></p>
+            <div style='margin-top:10px;display:flex;gap:8px;'>
+              <button onclick='confirmDuplicateOrderingList()'>Duplicar</button>
+              <button class='secondary' onclick='closeModalPanel()'>Cancelar</button>
             </div>
           </div>
         </div>
@@ -6126,7 +6416,7 @@ namespace m3uCrawler.Services
       <div id='ctab-scheduled' hidden>
         <div class='card' style='margin-top:16px;'>
           <h3>Scheduled Jobs</h3>
-          <p class='muted'>Jobs persistidos em SQLite. O scheduler calcula o próximo tick a partir da expressão cron (5 campos) e persiste <code>lastRunAtUtc</code> + <code>nextRunAtUtc</code>.</p>
+          <p class='muted'>Jobs persistidos em SQLite. O scheduler calcula o próximo tick a partir da expressão cron (5 campos) e persiste <code>lastRunAtUtc</code> + <code>nextRunAtUtc</code>. A expressão Cron é o único valor guardado; o assistente de frequência abaixo apenas a preenche.</p>
           <div id='scheduledJobsTable'></div>
           <div style='margin-top:10px;'>
             <button onclick='newScheduledJob()'>+ Novo job</button>
@@ -6170,11 +6460,38 @@ namespace m3uCrawler.Services
                 </select>
               </div>
             </div>
-            <div style='margin-top:10px;display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;'>
+            <!-- DC-9 — overrides de discovery por job -->
+            <div style='margin-top:10px;border:1px dashed var(--border);border-radius:8px;padding:10px;'>
+              <div style='font-weight:600;margin-bottom:4px;'>Overrides de discovery (opcional)</div>
+              <p class='muted' style='margin:0 0 8px 0;font-size:12px;'>Em branco herda a <strong>configuração de discovery predefinida</strong>. Preenchido, o job usa os seus próprios parâmetros com precedência sobre a global.</p>
+              <div style='display:grid;gap:8px;grid-template-columns:1fr 1fr 1fr 1fr;'>
+                <div>
+                  <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;' for='schedDiscKeyword'>Keyword</label>
+                  <input id='schedDiscKeyword' data-sched-create='discoveryKeyword' type='text' placeholder='herda a global' oninput='updateSchedDiscoveryPreview()' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                </div>
+                <div>
+                  <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;' for='schedDiscMinHours'>Min (h)</label>
+                  <input id='schedDiscMinHours' data-sched-create='discoveryMinHistoryHours' type='number' min='0' step='1' placeholder='herda a global' oninput='updateSchedDiscoveryPreview()' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                </div>
+                <div>
+                  <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;' for='schedDiscHistoryHours'>History (h)</label>
+                  <input id='schedDiscHistoryHours' data-sched-create='discoveryHistoryHours' type='number' min='1' max='1440' step='1' placeholder='herda a global' oninput='updateSchedDiscoveryPreview()' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                </div>
+                <div>
+                  <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;' for='schedDiscMaxStreams'>Max streams</label>
+                  <input id='schedDiscMaxStreams' data-sched-create='discoveryMaxStreams' type='number' min='1' step='1' placeholder='herda a global' oninput='updateSchedDiscoveryPreview()' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+                </div>
+              </div>
+              <div id='schedDiscoveryPreview' class='muted' style='margin-top:6px;font-size:12px;'>Efetivo: —</div>
+            </div>
+            <div style='margin-top:10px;border:1px dashed var(--border);border-radius:8px;padding:10px;background:var(--panel-2);'>
+              <div style='font-weight:600;margin-bottom:4px;'>Assistente de frequência (preenche o campo Cron)</div>
+              <p class='muted' style='margin:0 0 8px 0;font-size:12px;'>Escolha um padrão e o campo Cron (5 campos, UTC) é preenchido automaticamente. Para regras que o assistente não cobre (dia do mês, mês, listas/ranges), escolha <strong>Manual</strong> e edite o Cron directamente.</p>
+              <div style='display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;'>
               <div>
-                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Frequência</label>
+                <label style='display:block;color:var(--muted);font-size:12px;margin-bottom:4px;'>Frequência (assistente)</label>
                 <select id='schedFreqKind' onchange='applySchedFrequency()' style='background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
-                  <option value='manual'>Manual (cron)</option>
+                  <option value='manual'>Manual (editar Cron directamente)</option>
                   <option value='daily'>Todos os dias</option>
                   <option value='hours'>A cada N horas</option>
                   <option value='weekly'>Semanal</option>
@@ -6200,7 +6517,8 @@ namespace m3uCrawler.Services
                   <option value='0'>Domingo</option>
                 </select>
               </div>
-              <button type='button' class='secondary' onclick='applySchedFrequency()'>Aplicar frequência</button>
+              <button type='button' class='secondary' onclick='applySchedFrequency()'>Preencher Cron</button>
+              </div>
             </div>
             <div style='margin-top:10px;display:flex;gap:8px;align-items:center;'>
               <button onclick='submitCreateScheduledJob()'>Guardar</button>
@@ -6314,7 +6632,7 @@ namespace m3uCrawler.Services
 
     <!-- STREAM VALIDATION (PHASE 9A) -->
     <section id='view-validation' hidden>
-      <h2 style='font-size:18px;margin-top:0;'>Stream Validation</h2>
+      <h2 style='font-size:18px;margin-top:0;'>Validação de Streams</h2>
       <p class='muted'>Política operacional do teste de streams. Os valores são persistidos em <code>runtime-data/stream_validation_policy.json</code>.</p>
       <div class='card'>
         <h3>Política de validação</h3>
@@ -6350,11 +6668,40 @@ namespace m3uCrawler.Services
 
     <!-- LIVE RUN (PHASE 9C.4) -->
     <section id='view-liverun' hidden>
-      <h2 style='font-size:18px;margin-top:0;'>Live Run</h2>
+      <h2 style='font-size:18px;margin-top:0;'>Execução ao Vivo</h2>
       <div class='toolbar'>
         <span class='muted' id='liveRunPollState'>a actualizar automaticamente…</span>
         <button id='liveRunStartBtn' onclick='startLiveRun()' disabled>Run now</button>
         <button class='secondary' onclick='loadLiveRun()'>Recarregar</button>
+      </div>
+      <div class='card' style='margin-bottom:12px;'>
+        <h3 style='margin-top:0;'>Run now</h3>
+        <p class='muted' style='margin:0 0 10px;'>Escolha o modo e overrides opcionais. Sem overrides, o run usa a configuração de discovery persistida.</p>
+        <div style='display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));'>
+          <div>
+            <label for='liveRunMode' class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Modo</label>
+            <select id='liveRunMode' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              <option value='telegram'>Telegram (ciclo único)</option>
+              <option value='telegram-maintain'>Telegram (manutenção)</option>
+            </select>
+          </div>
+          <div>
+            <label for='liveRunKeyword' class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Keyword (opcional)</label>
+            <input id='liveRunKeyword' type='text' placeholder='ex: m3u' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+          </div>
+          <div>
+            <label for='liveRunHistoryHours' class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>History hours (opcional)</label>
+            <input id='liveRunHistoryHours' type='number' min='1' max='720' placeholder='ex: 72' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+          </div>
+          <div>
+            <label for='liveRunMinHistoryHours' class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Min history hours (opcional)</label>
+            <input id='liveRunMinHistoryHours' type='number' min='0' max='1440' placeholder='ex: 0' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+          </div>
+          <div>
+            <label for='liveRunMaxStreams' class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Max streams (opcional)</label>
+            <input id='liveRunMaxStreams' type='number' min='1' max='5000' placeholder='ex: 500' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+          </div>
+        </div>
       </div>
       <div class='card' style='margin-bottom:12px;'>
         <div id='liveRunTriggerState' class='muted'></div>
@@ -6371,9 +6718,10 @@ namespace m3uCrawler.Services
         O agendamento usa as expressões cron existentes em
         <b>Scheduled Jobs</b> com as acções <code>telegramRun</code> e
         <code>telegramMaintainRun</code>. Não há um segundo scheduler nem
-        <code>StartAtUtc</code>: a UI calcula a expressão cron.
+        <code>StartAtUtc</code>: a UI calcula a expressão cron. A listagem de jobs
+        é mantida em Catálogo → Scheduled Jobs (fonte única; não é duplicada aqui).
       </div>
-      <div id='liveRunScheduled'></div>
+      <button class='secondary' onclick='openScheduledJobs()'>Ver em Catálogo → Scheduled Jobs</button>
     </section>
 
     <!-- SETUP (PHASE 9C — Wave 6) -->
@@ -6446,7 +6794,38 @@ namespace m3uCrawler.Services
               <option value='false'>não</option>
             </select>
           </div>
+          <div>
+            <label class='muted' for='setupDispatcharrMatchThreshold' style='display:block;font-size:12px;margin-bottom:4px;'>match_threshold</label>
+            <input id='setupDispatcharrMatchThreshold' type='number' min='0' max='100' step='1' placeholder='75' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+          </div>
+          <div>
+            <label class='muted' for='setupDispatcharrAutoCreateGroups' style='display:block;font-size:12px;margin-bottom:4px;'>auto_create_groups</label>
+            <select id='setupDispatcharrAutoCreateGroups' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+              <option value='false'>não</option>
+              <option value='true'>sim</option>
+            </select>
+          </div>
+          <div>
+            <label class='muted' for='setupDispatcharrProviderPriority' style='display:block;font-size:12px;margin-bottom:4px;'>provider_priority (vírgulas)</label>
+            <input id='setupDispatcharrProviderPriority' type='text' placeholder='provider-b, provider-a' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+          </div>
+          <div>
+            <label class='muted' for='setupDispatcharrAliasFile' style='display:block;font-size:12px;margin-bottom:4px;'>alias_file</label>
+            <input id='setupDispatcharrAliasFile' type='text' placeholder='aliases.json' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+          </div>
+          <div>
+            <label class='muted' for='setupDispatcharrUsername' style='display:block;font-size:12px;margin-bottom:4px;'>username</label>
+            <input id='setupDispatcharrUsername' type='text' placeholder='configurado' autocomplete='off' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+          </div>
+          <div>
+            <label class='muted' for='setupDispatcharrPassword' style='display:block;font-size:12px;margin-bottom:4px;'>password</label>
+            <input id='setupDispatcharrPassword' type='password' placeholder='configurado' autocomplete='off' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+          </div>
         </div>
+        <p class='muted' style='font-size:12px;margin:10px 0 0 0;'>
+          target_group_name (só leitura): <span id='setupDispatcharrTargetGroupName'>—</span>.
+          Não aplicado pelo sync actual (lacuna conhecida); o grupo de publicação vem do grupo do canal canónico.
+        </p>
         <div class='toolbar' style='margin-top:12px;'>
           <button onclick='saveDispatcharrConfig()'>Guardar configuração</button>
           <button class='secondary' onclick='testDispatcharrConnection()'>Testar ligação</button>
@@ -6510,6 +6889,59 @@ namespace m3uCrawler.Services
     async function safeFetchJson(url, fallback) {
       try { const r = await fetch(url); if (!r.ok) return fallback || { error: `HTTP ${r.status}` }; return await r.json(); }
       catch (e) { return fallback || { error: e.message }; }
+    }
+
+    // DC-2 — helper canónico de mutação (POST/PUT/PATCH/DELETE).
+    // Envolve `fetch` em try/catch (nunca propaga rejeições de rede),
+    // serializa `body` objecto para JSON, lê o corpo de forma segura
+    // (`text` + parse tolerante; nunca `r.json()` num ramo de erro) e
+    // devolve um resultado normalizado { ok, status, json, error }.
+    // Espelha o `api()` do bootstrap e partilha a extracção de mensagem de
+    // erro com `readErrorBody`.
+    async function apiRequest(path, opts) {
+      opts = opts || {};
+      var method = opts.method || 'GET';
+      var headers = {};
+      if (opts.headers) {
+        for (var hk in opts.headers) {
+          if (Object.prototype.hasOwnProperty.call(opts.headers, hk)) headers[hk] = opts.headers[hk];
+        }
+      }
+      var body = opts.body;
+      try {
+        if (body !== undefined && body !== null && typeof body !== 'string') {
+          headers['Content-Type'] = 'application/json';
+          body = JSON.stringify(body);
+        }
+        var r = await fetch(path, { method: method, headers: headers, body: body, signal: opts.signal });
+        var text = '';
+        try { text = await r.text(); } catch (e) { text = ''; }
+        var json = null;
+        if (text) { try { json = JSON.parse(text); } catch (e) { json = null; } }
+        var error = r.ok ? null : errorMessageFromBody(json, text, r.status);
+        return { ok: r.ok, status: r.status, json: json, error: error };
+      } catch (e) {
+        return { ok: false, status: 0, json: null, error: (e && e.message) ? e.message : 'falha de rede' };
+      }
+    }
+
+    // DC-2 — mensagem de erro normalizada a partir de um corpo já lido.
+    // Partilhada por `apiRequest` e `readErrorBody` para uma superfície de
+    // erro consistente (JSON.parse tolerante, texto cru como fallback).
+    function errorMessageFromBody(json, text, status) {
+      if (json && json.error) return json.error;
+      if (text) return text;
+      return 'HTTP ' + status;
+    }
+
+    // DC-2 — superfície de erro uniforme para elementos de estado inline
+    // (substitui texto ad-hoc e permite migrar `alert()` quando existe
+    // um nó de estado dedicado). Aceita um id ou o próprio elemento.
+    function setStatus(target, message, ok) {
+      var el = (typeof target === 'string') ? document.getElementById(target) : target;
+      if (!el) return;
+      el.textContent = message;
+      el.style.color = ok ? 'var(--ok)' : 'var(--err)';
     }
 
     async function loadOverview() {
@@ -6759,12 +7191,17 @@ namespace m3uCrawler.Services
       out.textContent = 'Janela inclusiva: ' + (isNaN(min) ? '?' : min) + 'h ≤ idade da mensagem ≤ ' + (isNaN(max) ? '?' : max) + 'h';
     }
 
+    // DC-9 — cache da configuração global de discovery, usada como
+    // fallback na pré-visualização do efetivo dos overrides por job.
+    let _discoveryGlobalCache = null;
+
     async function loadDiscoverySettings() {
       const s = await safeFetchJson('/api/discovery/settings', null);
       if (!s || s.error) {
         discoverySettingsBadge('error', (s && s.error) ? s.error : 'falha ao carregar configuração');
         return false;
       }
+      _discoveryGlobalCache = s;
       const kw = document.getElementById('discoveryKeyword');
       const min = document.getElementById('discoveryMinHistoryHours');
       const max = document.getElementById('discoveryMaxHistoryHours');
@@ -6788,23 +7225,13 @@ namespace m3uCrawler.Services
         minHistoryHours: minEl ? parseInt(minEl.value, 10) : NaN,
         maxStreams: msEl ? parseInt(msEl.value, 10) : NaN
       };
-      try {
-        const r = await fetch('/api/discovery/settings', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body)
-        });
-        let resp = null;
-        try { resp = await r.json(); } catch (e) { resp = null; }
-        if (!r.ok) {
-          discoverySettingsBadge('error', (resp && resp.error) ? resp.error : ('HTTP ' + r.status));
-          return;
-        }
-        const reloaded = await loadDiscoverySettings();
-        discoverySettingsBadge(reloaded ? 'info' : 'error', reloaded ? 'guardado' : 'guardado, mas falhou recarregar');
-      } catch (e) {
-        discoverySettingsBadge('error', (e && e.message) ? e.message : 'falha de rede');
+      const res = await apiRequest('/api/discovery/settings', { method: 'POST', body: body });
+      if (!res.ok) {
+        discoverySettingsBadge('error', res.error);
+        return;
       }
+      const reloaded = await loadDiscoverySettings();
+      discoverySettingsBadge(reloaded ? 'info' : 'error', reloaded ? 'guardado' : 'guardado, mas falhou recarregar');
     }
 
     let countryOptions = [];
@@ -6837,17 +7264,17 @@ namespace m3uCrawler.Services
           // W6 — Preservar o displayName amigável existente; não o
           // substituir por code.toUpperCase().
           const displayName = btn.getAttribute('data-displayname') || code;
-          const r = await fetch('/api/country/save', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ country: code, displayName, channels }) });
-          if (r.ok) { alert('Lista guardada.'); await loadCountries(); } else { alert('Erro: ' + (await r.text())); }
+          const res = await apiRequest('/api/country/save', { method: 'POST', body: { country: code, displayName: displayName, channels: channels } });
+          if (res.ok) { alert('Lista guardada.'); await loadCountries(); } else { alert('Erro: ' + res.error); }
         });
       });
       document.querySelectorAll('button[data-delete-country]').forEach(btn => {
         btn.addEventListener('click', async () => {
           const code = btn.getAttribute('data-delete-country');
           if (!confirm(`Eliminar a configuração de país '${code}'? A playlist publicada não é alterada.`)) return;
-          const r = await fetch('/api/country?country=' + encodeURIComponent(code), { method: 'DELETE' });
-          if (r.ok) { await loadCountries(); }
-          else { alert('Erro: ' + r.status + ' ' + (await r.text())); }
+          const res = await apiRequest('/api/country?country=' + encodeURIComponent(code), { method: 'DELETE' });
+          if (res.ok) { await loadCountries(); }
+          else { alert('Erro: ' + res.error); }
         });
       });
       await loadCountryValidation();
@@ -6857,12 +7284,11 @@ namespace m3uCrawler.Services
       const code = (document.getElementById('newCountryCode').value || '').trim().toLowerCase();
       const displayName = (document.getElementById('newCountryName').value || '').trim();
       if (!code) { alert('Código de país é obrigatório.'); return; }
-      const r = await fetch('/api/country/save', {
+      const res = await apiRequest('/api/country/save', {
         method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ country: code, displayName: displayName, channels: [] })
+        body: { country: code, displayName: displayName, channels: [] }
       });
-      if (!r.ok) { alert('Erro: ' + r.status + ' ' + (await r.text())); return; }
+      if (!res.ok) { alert('Erro: ' + res.error); return; }
       document.getElementById('newCountryCode').value = '';
       document.getElementById('newCountryName').value = '';
       await loadCountries();
@@ -6901,8 +7327,11 @@ const rows = Object.entries(inv).map(([k, v]) => {
           return `<tr><td>${k}</td><td>${nfmt(v.size)} B <span class="row-counts">(${new Date(v.lastWriteUtc).toLocaleString()})</span></td></tr>`;
         }).join('');
         document.getElementById('playlistInventory').innerHTML = '· ' + Object.entries(inv).map(([k, v]) => v && v.present ? `${k}=${nfmt(v.size)}B` : `${k}=ausente`).join(' · ');
-        document.getElementById('diagInventory').innerHTML = `<table><thead><tr><th>Ficheiro</th><th>Tamanho</th></tr></thead><tbody>${rows}</tbody></table>`;
-      } catch (e) {}
+        document.getElementById('playlistFiles').innerHTML = `<table><thead><tr><th>Ficheiro</th><th>Tamanho</th></tr></thead><tbody>${rows}</tbody></table>`;
+      } catch (e) {
+        const inv = document.getElementById('playlistInventory');
+        if (inv) inv.textContent = 'Erro ao carregar inventário: ' + (e && e.message ? e.message : 'falha');
+      }
       try {
         const r = await fetch('/api/playlist/preview');
         const txt = r.ok ? (await r.text()) : 'Playlist não disponível.';
@@ -6915,9 +7344,75 @@ const rows = Object.entries(inv).map(([k, v]) => {
       } catch (e) {
         document.getElementById('playlistPreview').textContent = 'Erro ao carregar playlist.';
       }
+      // DC-5e — pré-visualização de `playlist_temp.m3u` (endpoint sanitizado).
+      // A pré-visualização de `playlist.m3u` acima mantém-se intocada.
+      try {
+        const r = await fetch('/api/playlist_temp/preview');
+        const t = document.getElementById('playlistTempPreview');
+        if (t) {
+          if (r.ok) {
+            const txt = await r.text();
+            t.textContent = txt.split('\n').filter(Boolean).slice(0, 80).join('\n');
+          } else if (r.status === 404) {
+            t.textContent = 'playlist_temp.m3u não encontrada';
+          } else {
+            t.textContent = 'Erro ao carregar playlist temporária (HTTP ' + r.status + ').';
+          }
+        }
+      } catch (e) {
+        const t = document.getElementById('playlistTempPreview');
+        if (t) t.textContent = 'Erro ao carregar playlist temporária: ' + (e && e.message ? e.message : 'falha');
+      }
+    }
+
+    // DC-5d — sumário de classificação do último MatchPlan publicado.
+    // O endpoint devolve sempre 200; quando não existe plano o corpo é
+    // `{ error: "Sem plano de classificação disponível." }`, que é tratado
+    // como estado "sem dados" (mensagem clara, sem erro fatal). As contagens
+    // por ChannelKind e a amostra de exclusões não contêm credenciais.
+    async function loadClassificationSummary() {
+      const target = document.getElementById('classificationSummary');
+      const status = document.getElementById('classificationStatus');
+      if (!target) return;
+      if (status) setStatus(status, 'A carregar classificação…', true);
+      const res = await apiRequest('/api/classification-summary');
+      if (!res.ok) {
+        target.innerHTML = '';
+        if (status) setStatus(status, 'Erro ao carregar classificação: ' + (res.error || 'falha'), false);
+        return;
+      }
+      const data = res.json;
+      if (!data || data.error) {
+        target.innerHTML = `<p class='muted'>${escapeHtml((data && data.error) || 'Sem plano de classificação disponível.')}</p>`;
+        if (status) setStatus(status, 'Sem plano de classificação disponível.', true);
+        return;
+      }
+      const classif = data.classification || {};
+      const classifRows = Object.keys(classif).map(k =>
+        `<tr><td>${escapeHtml(k)}</td><td>${nfmt(classif[k] || 0)}</td></tr>`).join('');
+      const sample = data.sample || [];
+      const sampleRows = sample.map(e => `
+        <tr>
+          <td>${escapeHtml(e.title || '')}</td>
+          <td>${escapeHtml(e.group || '')}</td>
+          <td>${escapeHtml(e.kind || '')}</td>
+          <td>${escapeHtml(e.reason || '')}</td>
+        </tr>`).join('');
+      target.innerHTML = `
+        <div class='card'>
+          <p class='row-counts'>Plano gerado: ${escapeHtml(tsLocal(data.planGeneratedAtUtc))} ·
+            fonte: <code>${escapeHtml(data.planSourcePlaylistPath || '—')}</code> ·
+            excluídos: <strong>${nfmt(data.excludedCount || 0)}</strong></p>
+          <h3 style='font-size:14px;'>Contagens por ChannelKind</h3>
+          ${classifRows ? `<table><thead><tr><th>Kind</th><th>Total</th></tr></thead><tbody>${classifRows}</tbody></table>` : `<p class='muted'>Sem contagens.</p>`}
+          <h3 style='font-size:14px;'>Amostra de exclusões (${nfmt(sample.length)})</h3>
+          ${sampleRows ? `<table><thead><tr><th>Título</th><th>Grupo</th><th>Kind</th><th>Razão</th></tr></thead><tbody>${sampleRows}</tbody></table>` : `<p class='muted'>Sem amostra de exclusões.</p>`}
+        </div>`;
+      if (status) setStatus(status, 'Classificação carregada.', true);
     }
 
     async function loadDispatcharr() {
+      loadClassificationSummary();
       const s = await safeFetchJson('/api/dispatcharr/state', null);
       const target = document.getElementById('dispatcharrOverview');
       const detail = document.getElementById('dispatcharrDetail');
@@ -6998,24 +7493,18 @@ const rows = Object.entries(inv).map(([k, v]) => {
       if (dispatcharrActionBusy) return;
       setDispatcharrActionBusy(true, mode === 'dry-run' ? 'A executar Dry Run…' : 'A sincronizar Dispatcharr…');
       try {
-        const r = await fetch(path, {
+        const res = await apiRequest(path, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ playlistPath: 'playlist.m3u' })
+          body: { playlistPath: 'playlist.m3u' }
         });
-        let body = null;
-        try { body = await r.json(); } catch (e) { body = null; }
-        if (!r.ok) {
+        if (!res.ok) {
           const status = document.getElementById('dispatcharrActionStatus');
-          const code = (body && (body.error || body.message)) ? (body.error || body.message) : ('HTTP ' + r.status);
-          const detail = (body && body.message && body.message !== code) ? (' · ' + body.message) : '';
+          const code = res.error;
+          const detail = (res.json && res.json.message && res.json.message !== code) ? (' · ' + res.json.message) : '';
           if (status) status.innerHTML = `<span class='badge err'>erro</span> ${escapeHtml(code)}${escapeHtml(detail)}`;
           return;
         }
-        renderDispatcharrActionResult(mode, body || {});
-      } catch (e) {
-        const status = document.getElementById('dispatcharrActionStatus');
-        if (status) status.innerHTML = `<span class='badge err'>erro</span> ${escapeHtml(e && e.message ? e.message : 'falha de rede')}`;
+        renderDispatcharrActionResult(mode, res.json || {});
       } finally {
         setDispatcharrActionBusy(false);
         await loadDispatcharr();
@@ -7052,10 +7541,9 @@ const rows = Object.entries(inv).map(([k, v]) => {
               <tr><th>Taxa de sucesso</th><td>${r.successRatePercent != null ? pct(r.successRatePercent) : '—'}</td><th>Testados balanceados</th><td>${r.testsBalanced ? '<span class="badge ok">sim</span>' : '<span class="badge warn">não (W+F≠T)</span>'}</td></tr>
             </table>
           </div>`;
-        try {
-          const raw = await fetch('/api/run-report');
-          if (raw.ok) document.getElementById('diagRawRunReport').textContent = JSON.stringify(await raw.json(), null, 2);
-        } catch(e) {}
+        const raw = await safeFetchJson('/api/run-report', null);
+        const rawEl = document.getElementById('diagRawRunReport');
+        if (rawEl) rawEl.textContent = raw ? JSON.stringify(raw, null, 2) : 'Erro ao carregar run report.';
       }
       const inv = await safeFetchJson('/api/output/inventory', {});
       const rows = Object.keys(inv).map(k => `<tr><td>${k}</td><td>${typeof inv[k] === 'number' ? (nfmt(inv[k]) + ' B') : (inv[k] === false ? 'ausente' : inv[k])}</td></tr>`).join('');
@@ -7083,11 +7571,8 @@ const rows = Object.entries(inv).map(([k, v]) => {
     // ===== CATALOG =====
     let currentCatalogTab = 'overview';
     async function loadCatalog() {
-      console.log('[DEBUG] loadCatalog called');
       const stats = await safeFetchJson('/api/catalog/stats', null);
-      console.log('[DEBUG] stats:', stats);
       if (!stats || stats.error) {
-        console.error('[DEBUG] stats error:', stats?.error);
         document.getElementById('catalogStats').innerHTML = `<div class='card'><p class='muted'>Catálogo não disponível: ${stats ? stats.error : 'erro de rede'}</p></div>`;
         return;
       }
@@ -7115,21 +7600,17 @@ const rows = Object.entries(inv).map(([k, v]) => {
       cards.push(metricCard('Scheduled Jobs', nfmt(stats.scheduledJobs || 0), '', 'Jobs agendados persistentes (PHASE 12).'));
       cards.push(metricCard('Pending (País)', nfmt(stats.pendingCountryApprovalsOpen || 0), `<span class='badge warn'>${nfmt(stats.pendingCountryApprovalsOpen || 0)}</span>`, 'Canais pendentes de aprovação manual por país.'));
       document.getElementById('catalogStats').innerHTML = cards.join('');
-      console.log('[DEBUG] catalogStats innerHTML set, cards:', cards.length);
       document.getElementById('catalogStatsDetail').innerHTML = `
         <p><strong>DB:</strong> <code>${dbg}</code></p>
         <p class='row-counts'>Actualizado: ${tsLocal(stats.generatedAtUtc)}</p>`;
       loadCatalogTab(currentCatalogTab);
-      console.log('[DEBUG] loadCatalogTab called');
     }
 
     function loadCatalogTab(tab) {
-      console.log('[DEBUG] loadCatalogTab called with tab:', tab);
       currentCatalogTab = tab;
       document.querySelectorAll('#catalogTabs button').forEach(b => b.classList.toggle('active', b.dataset.ctab === tab));
       document.querySelectorAll('[id^="ctab-"]').forEach(d => {
         const shouldHide = d.id !== 'ctab-' + tab;
-        console.log('[DEBUG] ctab', d.id, 'hidden:', shouldHide);
         d.hidden = shouldHide;
       });
       if (tab === 'channels') loadCatalogChannels();
@@ -7144,7 +7625,8 @@ const rows = Object.entries(inv).map(([k, v]) => {
       else if (tab === 'scheduled') { loadScheduledActions(); loadScheduledJobs(); }
       else if (tab === 'policies') loadImportPolicies();
       else if (tab === 'groups') loadCanonicalGroups();
-      else if (tab === 'reviews') loadCatalogReviews();
+      else if (tab === 'reviews') loadCatalogReviews(true);
+      else if (tab === 'audit') loadCatalogAudits();
       else if (tab === 'syncruns') loadCatalogSyncRuns();
       else if (tab === 'pending') loadPendingCountryApprovals();
     }
@@ -7154,12 +7636,17 @@ const rows = Object.entries(inv).map(([k, v]) => {
     let _canonicalGroupsCache = [];
     let _selectedChannelId = null;
     let _editingChannelId = null;
-    // W5 — estado do fluxo de aprovação de Review e do formulário de
-    // criação em modo Review.
-    let _pendingReviewFingerprint = null;
+    // W5 / DC-5a — estado do fluxo de aprovação de Review e do formulário de
+    // criação em modo Review. A identidade interna é o `ReviewItem.Id`
+    // numérico (a nova API `/api/review*`); o fingerprint é apenas
+    // apresentação. `_reviewRowsById` mapeia id → sumário da página actual.
+    let _pendingReviewId = null;
     let _pendingReviewIdentity = '';
     let _pendingReviewGroup = '';
-    let _reviewChannelFingerprint = null;
+    let _reviewChannelReviewId = null;
+    let _reviewRowsById = {};
+    let _reviewsOffset = 0;
+    const _reviewsLimit = 50;
 
     async function loadCatalogChannels() {
       await loadChannelGroupOptions();
@@ -7348,25 +7835,23 @@ const rows = Object.entries(inv).map(([k, v]) => {
       const input = document.getElementById('detailNewAlias');
       const alias = (input.value || '').trim();
       if (!alias) { alert('Alias é obrigatório.'); return; }
-      const r = await fetch('/api/catalog/channels/' + channelId + '/aliases', {
+      const res = await apiRequest('/api/catalog/channels/' + channelId + '/aliases', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ normalizedAlias: alias })
+        body: { normalizedAlias: alias }
       });
-      if (r.ok) {
+      if (res.ok) {
         input.value = '';
         await reloadChannelDetail(channelId);
       } else {
-        const err = await r.json();
-        alert('Erro: ' + (err.error || r.status));
+        alert('Erro: ' + res.error);
       }
     }
 
     async function removeAliasFromDetail(channelId, alias) {
       if (!confirm('Remover alias "' + alias + '"?')) return;
-      const r = await fetch('/api/catalog/channels/' + channelId + '/aliases/' + encodeURIComponent(alias), { method: 'DELETE' });
-      if (r.ok) await reloadChannelDetail(channelId);
-      else alert('Erro: ' + r.status);
+      const res = await apiRequest('/api/catalog/channels/' + channelId + '/aliases/' + encodeURIComponent(alias), { method: 'DELETE' });
+      if (res.ok) await reloadChannelDetail(channelId);
+      else alert('Erro: ' + res.error);
     }
 
     async function toggleChannelEnabled(channelId, nextValue) {
@@ -7380,45 +7865,56 @@ const rows = Object.entries(inv).map(([k, v]) => {
         publicationPolicy: c.publicationPolicy,
         isEnabled: nextValue
       };
-      const r = await fetch('/api/catalog/channels/' + channelId, {
+      const res = await apiRequest('/api/catalog/channels/' + channelId, {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
+        body: payload
       });
-      if (r.ok) {
+      if (res.ok) {
         await reloadChannelDetail(channelId);
         if (typeof loadCatalog === 'function') loadCatalog();
       } else {
-        const err = await r.json();
-        alert('Erro: ' + (err.error || r.status));
+        alert('Erro: ' + res.error);
       }
     }
 
-    async function toggleChannelPolicy(channelId, currentPolicy) {
-      const order = ['CreateEligible', 'MergeOnly', 'ReviewOnly', 'Excluded'];
-      const next = { CreateEligible: 'MergeOnly', MergeOnly: 'ReviewOnly', ReviewOnly: 'Excluded', Excluded: 'CreateEligible' };
-      const choice = prompt('Política actual: ' + currentPolicy + '\nNova política (' + order.join(' | ') + '):', next[currentPolicy] || 'CreateEligible');
-      if (!choice) return;
+    let _policyChannelId = null;
+
+    // DC-7 — substitui o diálogo nativo por um painel modal com <select>
+    // pré-selecionado na política actual; a confirmação faz o mesmo PUT.
+    function toggleChannelPolicy(channelId, currentPolicy) {
       const c = _channelsCache.find(x => x.id === channelId);
       if (!c) return;
+      _policyChannelId = channelId;
+      const sel = document.getElementById('channelPolicySelect');
+      if (sel) sel.value = currentPolicy || c.publicationPolicy || 'CreateEligible';
+      setStatus('channelPolicyStatus', '', true);
+      openModalPanel('channelPolicyForm');
+    }
+
+    async function confirmChannelPolicy() {
+      const channelId = _policyChannelId;
+      if (channelId == null) return;
+      const c = _channelsCache.find(x => x.id === channelId);
+      if (!c) { closeModalPanel(); return; }
+      const sel = document.getElementById('channelPolicySelect');
       const payload = {
         displayName: c.displayName,
         country: c.country,
         editorialCategory: c.editorialCategory,
         groupKey: c.groupKey,
-        publicationPolicy: choice.trim(),
+        publicationPolicy: sel ? sel.value : c.publicationPolicy,
         isEnabled: c.isEnabled
       };
-      const r = await fetch('/api/catalog/channels/' + channelId, {
+      const res = await apiRequest('/api/catalog/channels/' + channelId, {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
+        body: payload
       });
-      if (r.ok) {
+      if (res.ok) {
+        _policyChannelId = null;
+        closeModalPanel();
         await reloadChannelDetail(channelId);
       } else {
-        const err = await r.json();
-        alert('Erro: ' + (err.error || r.status));
+        setStatus('channelPolicyStatus', 'Erro: ' + res.error, false);
       }
     }
 
@@ -7426,7 +7922,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
       const c = _channelsCache.find(x => x.id === channelId);
       if (!c) return;
       _editingChannelId = channelId;
-      _reviewChannelFingerprint = null;
+      _reviewChannelReviewId = null;
       document.getElementById('newChannelDisplayName').value = c.displayName || '';
       document.getElementById('newChannelCountry').value = c.country || '';
       document.getElementById('newChannelCategory').value = c.editorialCategory || 'Live';
@@ -7449,20 +7945,19 @@ const rows = Object.entries(inv).map(([k, v]) => {
       const c = _channelsCache.find(x => x.id === channelId);
       if (!c) return;
       if (!confirm('Eliminar o canal "' + (c.displayName || c.key) + '" (#' + channelId + ')? Esta operação remove também os aliases.')) return;
-      const r = await fetch('/api/catalog/channels/' + channelId, { method: 'DELETE' });
-      if (r.ok) {
+      const res = await apiRequest('/api/catalog/channels/' + channelId, { method: 'DELETE' });
+      if (res.ok) {
         _selectedChannelId = null;
         await loadCatalogChannels();
         if (typeof loadCatalog === 'function') loadCatalog();
       } else {
-        const err = await r.json();
-        alert('Erro: ' + (err.error || r.status));
+        alert('Erro: ' + res.error);
       }
     }
 
     async function showCreateChannelForm() {
       _editingChannelId = null;
-      _reviewChannelFingerprint = null;
+      _reviewChannelReviewId = null;
       await loadChannelGroupOptions();
       const keyEl = document.getElementById('newChannelKey');
       keyEl.value = '';
@@ -7481,7 +7976,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
     }
     function hideCreateChannelForm() {
       _editingChannelId = null;
-      _reviewChannelFingerprint = null;
+      _reviewChannelReviewId = null;
       closeModalPanel();
     }
 
@@ -7497,12 +7992,11 @@ const rows = Object.entries(inv).map(([k, v]) => {
       if (editingId != null) {
         if (!displayName) { alert('Display Name é obrigatório.'); return; }
         const updatePayload = { displayName, country, editorialCategory, groupKey, publicationPolicy, isEnabled };
-        const r = await fetch('/api/catalog/channels/' + editingId, {
+        const res = await apiRequest('/api/catalog/channels/' + editingId, {
           method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(updatePayload)
+          body: updatePayload
         });
-        if (r.ok) {
+        if (res.ok) {
           hideCreateChannelForm();
           await loadCatalogChannels();
           _selectedChannelId = editingId;
@@ -7510,22 +8004,21 @@ const rows = Object.entries(inv).map(([k, v]) => {
           renderChannelDetail();
           if (typeof loadCatalog === 'function') loadCatalog();
         } else {
-          const err = await r.json();
-          alert('Erro: ' + (err.error || r.status));
+          alert('Erro: ' + res.error);
         }
         return;
       }
 
       // W5 — Modo Review: o formulário W4 é reutilizado, mas a criação é
       // declarada como mudança de catálogo na aprovação da Review.
-      const reviewFingerprint = _reviewChannelFingerprint;
-      if (reviewFingerprint) {
+      const reviewId = _reviewChannelReviewId;
+      if (reviewId) {
         const key = document.getElementById('newChannelKey').value.trim();
         if (!key) { alert('Key é obrigatória.'); return; }
         if (!displayName) { alert('Display Name é obrigatório.'); return; }
         const aliases = document.getElementById('newChannelAliases').value.split(/\r?\n/).map(a => a.trim()).filter(Boolean);
-        const reviewBody = {
-          action: 'create-channel',
+        const change = {
+          type: 'canonicalChannel',
           channel: {
             key,
             name: displayName,
@@ -7536,21 +8029,19 @@ const rows = Object.entries(inv).map(([k, v]) => {
             isEnabled,
           },
         };
-        if (aliases.length) reviewBody.alias = aliases[0];
-        const rr = await fetch('/api/catalog/reviews/' + encodeURIComponent(reviewFingerprint) + '/approve', {
+        if (aliases.length) change.alias = aliases[0];
+        const rr = await apiRequest('/api/review/resolve', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(reviewBody)
+          body: { reviewItemId: reviewId, change: change }
         });
         if (rr.ok) {
           hideCreateChannelForm();
           await loadCatalogChannels();
           loadCatalogTab('reviews');
-          loadCatalogReviews();
+          loadCatalogReviews(true);
           if (typeof loadCatalog === 'function') loadCatalog();
         } else {
-          const err = await rr.json().catch(() => ({}));
-          alert('Erro: ' + (err.error || rr.status));
+          alert('Erro: ' + reviewErrorText(rr));
         }
         return;
       }
@@ -7567,13 +8058,12 @@ const rows = Object.entries(inv).map(([k, v]) => {
       };
       if (!payload.key) { alert('Key é obrigatória.'); return; }
       if (!payload.displayName) { alert('Display Name é obrigatório.'); return; }
-      const r = await fetch('/api/catalog/channels', {
+      const res = await apiRequest('/api/catalog/channels', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
+        body: payload
       });
-      if (r.ok) {
-        const created = await r.json();
+      if (res.ok) {
+        const created = res.json || {};
         hideCreateChannelForm();
         await loadCatalogChannels();
         _selectedChannelId = created.id;
@@ -7581,8 +8071,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
         renderChannelDetail();
         if (typeof loadCatalog === 'function') loadCatalog();
       } else {
-        const err = await r.json();
-        alert('Erro: ' + (err.error || r.status));
+        alert('Erro: ' + res.error);
       }
     }
 
@@ -7644,18 +8133,11 @@ const rows = Object.entries(inv).map(([k, v]) => {
 
     async function saveValidationPolicy() {
       const payload = readValidationPolicyForm();
-      const r = await fetch('/api/validation/policy', {
+      const res = await apiRequest('/api/validation/policy', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        body: payload,
       });
-      const status = document.getElementById('validationPolicyStatus');
-      if (r.ok) {
-        status.textContent = 'Política guardada.';
-      } else {
-        const err = await r.json();
-        status.textContent = 'Erro: ' + (err.error || r.status);
-      }
+      setStatus('validationPolicyStatus', res.ok ? 'Política guardada.' : ('Erro: ' + res.error), res.ok);
     }
 
     async function runValidationTest() {
@@ -7664,17 +8146,15 @@ const rows = Object.entries(inv).map(([k, v]) => {
       const out = document.getElementById('validationTestResult');
       if (!urls.length) { out.textContent = 'Fornece URLs.'; return; }
       out.textContent = 'A testar ' + urls.length + ' URL(s)…';
-      const r = await fetch('/api/validation/test', {
+      const res = await apiRequest('/api/validation/test', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ urls }),
+        body: { urls: urls },
       });
-      if (!r.ok) {
-        const err = await r.json();
-        out.textContent = 'Erro: ' + (err.error || r.status);
+      if (!res.ok) {
+        out.textContent = 'Erro: ' + res.error;
         return;
       }
-      const body = await r.json();
+      const body = res.json || {};
       const m = body.metrics || {};
       const ok = m.succeeded || 0, total = m.tested || 0, cached = m.cached || 0, retries = m.retries || 0, peak = m.actualPeakConcurrency || 0;
       out.innerHTML = `<pre>tested=${total} succeeded=${ok} cached=${cached} retries=${retries} peak=${peak}\n${JSON.stringify(body.outcomes, null, 2).slice(0, 4000)}</pre>`;
@@ -7699,34 +8179,156 @@ const rows = Object.entries(inv).map(([k, v]) => {
         <table><thead><tr><th>Identidade</th><th>Disposição</th><th>Razão</th><th>Criado</th><th>Ações</th></tr></thead><tbody>${rows}</tbody></table>`;
     }
 
-    async function loadCatalogReviews() {
-      const reviews = await safeFetchJson('/api/catalog/reviews', []);
-      if (!Array.isArray(reviews)) { document.getElementById('catalogReviewsTable').innerHTML = '<p class="muted">Erro ao carregar reviews.</p>'; return; }
-      // O endpoint devolve apenas itens activos (Open/InReview) por omissão;
-      // estados terminais ficam no histórico e não são apresentados aqui.
-      const active = reviews.filter(r => r.state !== 'Resolved' && r.state !== 'Ignored');
-      document.getElementById('reviewsCount').textContent = `${active.length} activo(s).`;
-      if (!active.length) { document.getElementById('catalogReviewsTable').innerHTML = '<p class="muted">Nenhum item de revisão activo.</p>'; return; }
-      const rows = active.map(r => {
+    async function loadCatalogReviews(resetOffset) {
+      if (resetOffset) _reviewsOffset = 0;
+      const stateSel = document.getElementById('reviewsStateFilter');
+      const state = stateSel ? stateSel.value : '';
+      const params = new URLSearchParams();
+      if (state) params.set('state', state);
+      params.set('offset', String(_reviewsOffset));
+      params.set('limit', String(_reviewsLimit));
+      // DC-5a — a nova Review API (`/api/reviews`) devolve o array de sumários
+      // directamente e exclui estados terminais por omissão; o histórico
+      // obtém-se com `?state=`. A identidade interna é o `id` numérico.
+      const res = await apiRequest('/api/reviews?' + params.toString(), {});
+      const reviews = (res.ok && Array.isArray(res.json)) ? res.json : null;
+      const table = document.getElementById('catalogReviewsTable');
+      if (!reviews) {
+        table.innerHTML = '<p class="muted">Erro ao carregar reviews: ' + escapeHtml(reviewErrorText(res)) + '</p>';
+        document.getElementById('reviewsCount').textContent = '';
+        return;
+      }
+      _reviewRowsById = {};
+      reviews.forEach(r => { _reviewRowsById[String(r.id)] = r; });
+      const from = reviews.length ? _reviewsOffset + 1 : 0;
+      const to = _reviewsOffset + reviews.length;
+      document.getElementById('reviewsCount').textContent =
+        `${reviews.length} item(ns) · a mostrar ${from}–${to}${state ? ' · ' + state : ' · activos'}`;
+      const prevBtn = document.getElementById('reviewsPrevBtn');
+      const nextBtn = document.getElementById('reviewsNextBtn');
+      if (prevBtn) prevBtn.disabled = _reviewsOffset <= 0;
+      if (nextBtn) nextBtn.disabled = reviews.length < _reviewsLimit;
+      if (!reviews.length) { table.innerHTML = '<p class="muted">Nenhum item de revisão para este filtro.</p>'; return; }
+      const rows = reviews.map(r => {
         const stateBadge = r.state === 'Open' ? '<span class="badge warn">Open</span>'
-          : '<span class="badge warn">InReview</span>';
-        const actions = (r.state === 'Open' || r.state === 'InReview')
-          ? `<button style='padding:4px 8px;' onclick='approveReview("${r.fingerprint.replace(/"/g, '\\"')}","${(r.normalizedIdentity || '').replace(/"/g, '\\"')}","${(r.sourceGroup || '').replace(/"/g, '\\"')}")'>Approve</button>
-             <button class='secondary' style='padding:4px 8px;' onclick='excludeReview("${r.fingerprint.replace(/"/g, '\\"')}")'>Exclude</button>`
-          : '—';
-        return `<tr>
-          <td><code title='${r.fingerprint}'>${(r.fingerprint || '').slice(0, 12)}…</code></td>
-          <td><code>${r.normalizedIdentity || '—'}</code></td>
-          <td>${r.sourceGroup || '—'}</td>
-          <td>${r.reasonSignature || '—'}</td>
+          : r.state === 'InReview' ? '<span class="badge warn">InReview</span>'
+            : r.state === 'Resolved' ? '<span class="badge ok">Resolved</span>'
+              : '<span class="badge err">Ignored</span>';
+        const active = (r.state === 'Open' || r.state === 'InReview');
+        const actions = active
+          ? `<button style='padding:4px 8px;' onclick='approveReview(${r.id})'>Approve</button>
+             <button class='secondary' style='padding:4px 8px;' onclick='excludeReview(${r.id})'>Exclude</button>`
+          : `<button class='secondary' style='padding:4px 8px;' onclick='reopenReview(${r.id})'>Reabrir</button>`;
+        return `<tr data-review-id='${r.id}'>
+          <td><code title='${escapeAttr(r.fingerprint || '')}'>${escapeHtml((r.fingerprint || '').slice(0, 12))}…</code></td>
+          <td><code>${escapeHtml(r.normalizedIdentity || '—')}</code></td>
+          <td>${escapeHtml(r.sourceGroup || '—')}</td>
+          <td>${escapeHtml(r.reasonSignature || '—')}</td>
           <td>${stateBadge}</td>
-          <td>${r.note || '—'}</td>
+          <td>${escapeHtml(r.note || '—')}</td>
           <td>${tsLocal(r.createdAtUtc)}</td>
           <td>${actions}</td>
         </tr>`;
       }).join('');
-      document.getElementById('catalogReviewsTable').innerHTML = `
+      table.innerHTML = `
         <table><thead><tr><th>Fingerprint</th><th>Identidade</th><th>Source Group</th><th>Razão</th><th>Estado</th><th>Nota</th><th>Criado</th><th>Ações</th></tr></thead><tbody>${rows}</tbody></table>`;
+    }
+
+    function reviewsPrevPage() {
+      _reviewsOffset = Math.max(0, _reviewsOffset - _reviewsLimit);
+      loadCatalogReviews(false);
+    }
+
+    function reviewsNextPage() {
+      _reviewsOffset += _reviewsLimit;
+      loadCatalogReviews(false);
+    }
+
+    // DC-5a — superfície de erro uniforme para a nova Review API
+    // (`{ error, message, correlationId }`): prefere a mensagem sanitizada
+    // devolvida pela API e cai para o código quando não existe texto.
+    function reviewErrorText(res) {
+      if (res && res.json && res.json.message) return res.json.message;
+      if (res && res.error) return res.error;
+      return 'falha inesperada';
+    }
+
+    // DC-5b — visualizador de auditoria. Consome `GET /api/audit` com os
+    // filtros `objectType`/`objectId`/`limit` (default 100, cap 1000). Usa o
+    // helper `apiRequest` (DC-2) para uma superfície de erro consistente e
+    // trata explicitamente o 503 `audit-unavailable` (sem catálogo/serviço).
+    // Todo o conteúdo é apresentado como texto via `escapeHtml`; os JSON
+    // `beforeJson`/`afterJson` ficam em `<details>` compactos e expansíveis.
+    async function loadCatalogAudits() {
+      const typeEl = document.getElementById('auditObjectType');
+      const idEl = document.getElementById('auditObjectId');
+      const limitEl = document.getElementById('auditLimit');
+      const table = document.getElementById('auditTable');
+      const statusEl = document.getElementById('auditStatus');
+      const countEl = document.getElementById('auditCount');
+
+      const objectType = typeEl ? typeEl.value.trim() : '';
+      const objectId = idEl ? idEl.value.trim() : '';
+      let limit = limitEl ? parseInt(limitEl.value, 10) : 100;
+      if (!isFinite(limit) || limit <= 0) limit = 100;
+      if (limit > 1000) limit = 1000;
+      if (limitEl && String(limit) !== limitEl.value && limitEl.value !== '') limitEl.value = String(limit);
+
+      const params = new URLSearchParams();
+      if (objectType) params.set('objectType', objectType);
+      if (objectId) params.set('objectId', objectId);
+      params.set('limit', String(limit));
+
+      const res = await apiRequest('/api/audit?' + params.toString(), {});
+      if (!res.ok) {
+        if (table) table.innerHTML = '';
+        if (countEl) countEl.textContent = '';
+        if (statusEl) {
+          if (res.status === 503 && res.json && res.json.error === 'audit-unavailable') {
+            setStatus(statusEl, 'Auditoria indisponível: não há catálogo/serviço de auditoria (audit-unavailable).', false);
+          } else {
+            setStatus(statusEl, 'Erro ao carregar auditoria: ' + (res.error || ('HTTP ' + res.status)), false);
+          }
+        }
+        return;
+      }
+      if (statusEl) setStatus(statusEl, '', true);
+
+      const rows = Array.isArray(res.json) ? res.json : [];
+      if (countEl) {
+        const filterParts = [];
+        if (objectType) filterParts.push('tipo ' + objectType);
+        if (objectId) filterParts.push('id ' + objectId);
+        countEl.textContent = `${rows.length} registo(s) · limite ${limit}` + (filterParts.length ? ' · ' + filterParts.join(' · ') : '');
+      }
+      if (!rows.length) { table.innerHTML = '<p class="muted">Sem registos de auditoria para este filtro.</p>'; return; }
+
+      const jsonCell = (label, value) => {
+        if (value == null || value === '') return '—';
+        const text = (typeof value === 'string') ? value : JSON.stringify(value);
+        return `<details><summary>${escapeHtml(label)}</summary><pre style='white-space:pre-wrap;word-break:break-word;max-width:360px;margin:4px 0;'>${escapeHtml(text)}</pre></details>`;
+      };
+
+      const body = rows.map(r => {
+        const actor = r.actorName || r.actorType || '—';
+        const resultBadge = r.result === 'failure'
+          ? `<span class="badge err">${escapeHtml(r.result)}</span>`
+          : `<span class="badge ok">${escapeHtml(r.result || 'success')}</span>`;
+        const objectRef = escapeHtml(r.objectType || '—') + (r.objectId ? ' / ' + escapeHtml(r.objectId) : '');
+        return `<tr>
+          <td>${tsLocal(r.occurredAtUtc)}</td>
+          <td>${escapeHtml(actor)}</td>
+          <td><code>${escapeHtml(r.operation || '—')}</code></td>
+          <td>${objectRef}</td>
+          <td>${resultBadge}</td>
+          <td>${jsonCell('before', r.beforeJson)}</td>
+          <td>${jsonCell('after', r.afterJson)}</td>
+          <td>${escapeHtml(r.detail || '—')}</td>
+        </tr>`;
+      }).join('');
+
+      table.innerHTML = `
+        <table><thead><tr><th>Data/hora</th><th>Actor</th><th>Operação</th><th>Objecto</th><th>Resultado</th><th>Antes</th><th>Depois</th><th>Detalhe</th></tr></thead><tbody>${body}</tbody></table>`;
     }
 
     async function loadSources() {
@@ -7767,28 +8369,26 @@ const rows = Object.entries(inv).map(([k, v]) => {
       };
       if (!payload.key) { alert('Key é obrigatória.'); return; }
       if (!payload.name) { alert('Name é obrigatório.'); return; }
-      const r = await fetch('/api/catalog/sources', {
+      const res = await apiRequest('/api/catalog/sources', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        body: payload,
       });
-      if (r.ok) {
+      if (res.ok) {
         document.getElementById('sourceKey').value = '';
         document.getElementById('sourceName').value = '';
         document.getElementById('sourceOrigin').value = '';
         await loadSources();
         await loadChannelSources();
       } else {
-        const err = await r.json();
-        alert('Erro: ' + (err.error || r.status));
+        alert('Erro: ' + res.error);
       }
     }
 
     async function deleteSource(id) {
       if (!confirm('Eliminar a source #' + id + '? Os ChannelSources associados serão removidos em cascata.')) return;
-      const r = await fetch('/api/catalog/sources/' + id, { method: 'DELETE' });
-      if (r.ok) { await loadSources(); await loadChannelSources(); }
-      else { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
+      const res = await apiRequest('/api/catalog/sources/' + id, { method: 'DELETE' });
+      if (res.ok) { await loadSources(); await loadChannelSources(); }
+      else { alert('Erro: ' + res.error); }
     }
 
     async function loadChannelSources() {
@@ -7826,6 +8426,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
           <td>${escapeHtml(cs.matchMethod || '—')}</td>
           <td>${cs.isEnabled ? '<span class="badge ok">sim</span>' : '<span class="badge err">não</span>'}</td>
           <td><button class='secondary' onclick='toggleChannelSource(${cs.id}, ${!cs.isEnabled})'>${cs.isEnabled ? 'Desactivar' : 'Activar'}</button>
+              <button class='secondary' onclick='openChannelSourceObservations(${cs.id})'>Observações</button>
               <button class='secondary' onclick='deleteChannelSource(${cs.id})' style='color:var(--err);'>Eliminar</button></td>
         </tr>`;
       }).join('');
@@ -7833,20 +8434,89 @@ const rows = Object.entries(inv).map(([k, v]) => {
     }
 
     async function toggleChannelSource(id, next) {
-      const r = await fetch('/api/catalog/channel-sources/' + id, {
+      const res = await apiRequest('/api/catalog/channel-sources/' + id, {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ isEnabled: next }),
+        body: { isEnabled: next },
       });
-      if (r.ok) { await loadChannelSources(); }
-      else { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
+      if (res.ok) { await loadChannelSources(); }
+      else { alert('Erro: ' + res.error); }
     }
 
     async function deleteChannelSource(id) {
       if (!confirm('Eliminar o channel source #' + id + '?')) return;
-      const r = await fetch('/api/catalog/channel-sources/' + id, { method: 'DELETE' });
-      if (r.ok) { await loadChannelSources(); }
-      else { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
+      const res = await apiRequest('/api/catalog/channel-sources/' + id, { method: 'DELETE' });
+      if (res.ok) { await loadChannelSources(); }
+      else { alert('Erro: ' + res.error); }
+    }
+
+    // DC-5c — Histórico de observações de um channel-source. Consome os
+    // endpoints já existentes GET/POST
+    // `/api/catalog/channel-sources/{id}/observations` (até agora sem
+    // superfície na UI) via o helper `apiRequest` (DC-2). Todo o output é
+    // apresentado como texto escapado com `escapeHtml`.
+    let _csObservationsId = null;
+
+    async function openChannelSourceObservations(id) {
+      _csObservationsId = id;
+      const title = document.getElementById('csObservationsTitle');
+      if (title) title.textContent = 'Observações do channel-source #' + id;
+      const table = document.getElementById('csObservationsTable');
+      if (table) table.innerHTML = '';
+      const statusEl = document.getElementById('csObservationsStatus');
+      if (statusEl) setStatus(statusEl, 'a carregar…', true);
+      openModalPanel('channelSourceObservationsPanel');
+      await loadChannelSourceObservations();
+    }
+
+    async function loadChannelSourceObservations() {
+      if (_csObservationsId === null || _csObservationsId === undefined) return;
+      const table = document.getElementById('csObservationsTable');
+      const statusEl = document.getElementById('csObservationsStatus');
+      const res = await apiRequest('/api/catalog/channel-sources/' + _csObservationsId + '/observations?limit=200', {});
+      if (!res.ok) {
+        if (table) table.innerHTML = '';
+        if (statusEl) setStatus(statusEl, 'Erro ao carregar observações: ' + (res.error || ('HTTP ' + res.status)), false);
+        return;
+      }
+      const rows = Array.isArray(res.json) ? res.json : [];
+      if (statusEl) setStatus(statusEl, rows.length + ' observação(ões).', true);
+      if (!rows.length) { if (table) table.innerHTML = '<p class="muted">Sem observações registadas.</p>'; return; }
+      const body = rows.map(o => `<tr>
+        <td>${escapeHtml(tsLocal(o.observedAtUtc))}</td>
+        <td>${escapeHtml(o.quality || '—')}</td>
+        <td>${escapeHtml(o.epg || '—')}</td>
+        <td>${escapeHtml(o.availability || '—')}</td>
+        <td>${o.responseTimeMs == null ? '—' : escapeHtml(String(o.responseTimeMs))}</td>
+      </tr>`).join('');
+      if (table) table.innerHTML = `<table><thead><tr><th>Data/hora</th><th>Quality</th><th>EPG</th><th>Availability</th><th>responseTimeMs</th></tr></thead><tbody>${body}</tbody></table>`;
+    }
+
+    async function recordChannelSourceObservation() {
+      if (_csObservationsId === null || _csObservationsId === undefined) return;
+      const statusEl = document.getElementById('csObservationsStatus');
+      const qualityEl = document.getElementById('csObservationQuality');
+      const epgEl = document.getElementById('csObservationEpg');
+      const availabilityEl = document.getElementById('csObservationAvailability');
+      const responseEl = document.getElementById('csObservationResponseTimeMs');
+      const payload = {
+        quality: qualityEl ? qualityEl.value : null,
+        epg: epgEl ? epgEl.value : null,
+        availability: availabilityEl ? availabilityEl.value : null,
+      };
+      const rawMs = responseEl ? responseEl.value : '';
+      if (rawMs !== '' && rawMs != null) {
+        const ms = parseInt(rawMs, 10);
+        if (isFinite(ms) && ms >= 0) payload.responseTimeMs = ms;
+      }
+      const res = await apiRequest('/api/catalog/channel-sources/' + _csObservationsId + '/observations', {
+        method: 'POST',
+        body: payload,
+      });
+      if (!res.ok) {
+        if (statusEl) setStatus(statusEl, 'Erro ao registar observação: ' + (res.error || ('HTTP ' + res.status)), false);
+        return;
+      }
+      await loadChannelSourceObservations();
     }
 
     document.getElementById('channelSourceSourceFilter').addEventListener('change', loadChannelSources);
@@ -7870,7 +8540,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
         <td>
           <button class='secondary' onclick='editOrderingList(${l.id})'>Editar</button>
           <button class='secondary' onclick='previewOrderingList(${l.id})'>Preview</button>
-          <button class='secondary' onclick='duplicateOrderingList(${l.id}, "${escapeHtml(l.key)}")'>Duplicar</button>
+          <button class='secondary' onclick='duplicateOrderingList(${l.id}, ${escapeAttr(JSON.stringify(l.key))})'>Duplicar</button>
           <button class='secondary' style='color:var(--err);' onclick='deleteOrderingList(${l.id})'>Eliminar</button>
         </td>
       </tr>`).join('');
@@ -7905,18 +8575,22 @@ const rows = Object.entries(inv).map(([k, v]) => {
         isEnabled: document.querySelector("[data-ordering-edit='enabled']").value === 'true',
       };
       if (!payload.name) { alert('Nome é obrigatório.'); return; }
-      const r = await fetch('/api/catalog/ordering-lists/' + id, {
+      // DC-11a / DC-D4 — uma lista por país: bloqueia no cliente a colisão
+      // óbvia (o servidor continua a ser a autoridade → 409).
+      if (payload.country && _orderingListsCache.some(l => l.id !== id && l.country && l.country.toLowerCase() === payload.country.toLowerCase())) {
+        alert('Já existe uma Ordering List para o país "' + payload.country + '". Cada país só pode ter uma lista.');
+        return;
+      }
+      const res = await apiRequest('/api/catalog/ordering-lists/' + id, {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        body: payload,
       });
-      if (r.ok) {
+      if (res.ok) {
         cancelOrderingListEdit();
         await loadOrderingLists();
         if (_orderingListDetailCache && _orderingListDetailCache.id === id) await openOrderingList(id);
       } else {
-        const err = await r.json();
-        alert('Erro: ' + (err.error || r.status));
+        alert('Erro: ' + res.error);
       }
     }
 
@@ -7936,20 +8610,24 @@ const rows = Object.entries(inv).map(([k, v]) => {
         isEnabled: true,
       };
       if (!payload.key || !payload.name) { alert('Key e Name são obrigatórios.'); return; }
-      const r = await fetch('/api/catalog/ordering-lists', {
+      // DC-11a / DC-D4 — uma lista por país: bloqueia no cliente a colisão
+      // óbvia (o servidor continua a ser a autoridade → 409).
+      if (payload.country && _orderingListsCache.some(l => l.country && l.country.toLowerCase() === payload.country.toLowerCase())) {
+        alert('Já existe uma Ordering List para o país "' + payload.country + '". Cada país só pode ter uma lista.');
+        return;
+      }
+      const res = await apiRequest('/api/catalog/ordering-lists', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        body: payload,
       });
-      if (r.ok) {
+      if (res.ok) {
         document.querySelector("[data-ordering-create='key']").value = '';
         document.querySelector("[data-ordering-create='name']").value = '';
         document.querySelector("[data-ordering-create='country']").value = '';
         closeModalPanel();
         await loadOrderingLists();
       } else {
-        const err = await r.json();
-        alert('Erro: ' + (err.error || r.status));
+        alert('Erro: ' + res.error);
       }
     }
 
@@ -7972,6 +8650,8 @@ const rows = Object.entries(inv).map(([k, v]) => {
         <td>
           <button class='secondary' onclick='moveOrderingItem(${i.id}, ${i.position - 1})' ${i.position === 0 ? 'disabled' : ''}>↑</button>
           <button class='secondary' onclick='moveOrderingItem(${i.id}, ${i.position + 1})' ${i.position === items.length - 1 ? 'disabled' : ''}>↓</button>
+          <input id='orderingMovePos-${i.id}' type='number' min='1' max='${items.length}' placeholder='N' aria-label='Mover para posição' style='width:56px;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:4px;border-radius:6px;font:inherit;'>
+          <button class='secondary' onclick='moveOrderingItemToPosition(${i.id})'>Mover</button>
           <button class='secondary' onclick='toggleOrderingItem(${i.id}, ${!i.isEnabled})'>${i.isEnabled ? 'Desactivar' : 'Activar'}</button>
           <button class='secondary' style='color:var(--err);' onclick='removeOrderingItem(${i.id})'>Remover</button>
         </td>
@@ -8010,62 +8690,95 @@ const rows = Object.entries(inv).map(([k, v]) => {
       `;
     }
 
-    async function duplicateOrderingList(id, originalKey) {
-      const newKey = prompt('Key da nova lista (slug único):', originalKey + '-copy');
-      if (!newKey) return;
-      const r = await fetch('/api/catalog/ordering-lists/' + id + '/duplicate', {
+    let _duplicateOrderingId = null;
+
+    // DC-7 — substitui o diálogo nativo por um painel modal com input inline
+    // (default `originalKey + '-copy'`); a confirmação faz o mesmo POST.
+    function duplicateOrderingList(id, originalKey) {
+      _duplicateOrderingId = id;
+      const input = document.getElementById('orderingDuplicateKey');
+      if (input) input.value = (originalKey || '') + '-copy';
+      setStatus('orderingDuplicateStatus', '', true);
+      openModalPanel('orderingDuplicateForm');
+    }
+
+    async function confirmDuplicateOrderingList() {
+      if (_duplicateOrderingId == null) return;
+      const input = document.getElementById('orderingDuplicateKey');
+      const newKey = input ? input.value.trim() : '';
+      if (!newKey) { setStatus('orderingDuplicateStatus', 'Indica uma key.', false); return; }
+      const res = await apiRequest('/api/catalog/ordering-lists/' + _duplicateOrderingId + '/duplicate', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ newKey }),
+        body: { newKey: newKey },
       });
-      if (r.ok) { await loadOrderingLists(); }
-      else { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
+      if (res.ok) {
+        _duplicateOrderingId = null;
+        closeModalPanel();
+        await loadOrderingLists();
+      } else {
+        setStatus('orderingDuplicateStatus', 'Erro: ' + res.error, false);
+      }
     }
 
     async function deleteOrderingList(id) {
       if (!confirm('Eliminar a ordering list #' + id + '?')) return;
-      const r = await fetch('/api/catalog/ordering-lists/' + id, { method: 'DELETE' });
-      if (r.ok) { _orderingListDetailCache = null; document.getElementById('orderingDetail').innerHTML = ''; await loadOrderingLists(); }
-      else { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
+      const res = await apiRequest('/api/catalog/ordering-lists/' + id, { method: 'DELETE' });
+      if (res.ok) { _orderingListDetailCache = null; document.getElementById('orderingDetail').innerHTML = ''; await loadOrderingLists(); }
+      else { alert('Erro: ' + res.error); }
     }
 
     async function addOrderingItem(listId) {
       const sel = document.getElementById('addItemChannel');
       if (!sel || !sel.value) { alert('Escolhe um canal.'); return; }
-      const r = await fetch('/api/catalog/ordering-lists/' + listId + '/items', {
+      const res = await apiRequest('/api/catalog/ordering-lists/' + listId + '/items', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ canonicalChannelId: parseInt(sel.value, 10), isEnabled: true }),
+        body: { canonicalChannelId: parseInt(sel.value, 10), isEnabled: true },
       });
-      if (r.ok) { await openOrderingList(listId); }
-      else { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
+      if (res.ok) { await openOrderingList(listId); }
+      else { alert('Erro: ' + res.error); }
     }
 
     async function moveOrderingItem(itemId, newPos) {
-      const r = await fetch('/api/catalog/ordering-items/' + itemId, {
+      const res = await apiRequest('/api/catalog/ordering-items/' + itemId, {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ position: newPos }),
+        body: { position: newPos },
       });
-      if (r.ok && _orderingListDetailCache) await openOrderingList(_orderingListDetailCache.id);
-      else if (!r.ok) { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
+      if (res.ok && _orderingListDetailCache) await openOrderingList(_orderingListDetailCache.id);
+      else if (!res.ok) { alert('Erro: ' + res.error); }
+    }
+
+    // DC-12 — mover directamente para a posição N: o input é 1-based e o
+    // endpoint reindexa e insere em `position` 0-based. Reutiliza o PUT de
+    // `moveOrderingItem`; valida o intervalo no cliente antes de chamar.
+    async function moveOrderingItemToPosition(itemId) {
+      const input = document.getElementById('orderingMovePos-' + itemId);
+      if (!input) return;
+      const items = (_orderingListDetailCache && Array.isArray(_orderingListDetailCache.items)) ? _orderingListDetailCache.items : [];
+      const maxAttr = parseInt(input.max, 10);
+      const max = (isFinite(maxAttr) && maxAttr > 0) ? maxAttr : items.length;
+      const raw = String(input.value || '').trim();
+      const n = parseInt(raw, 10);
+      if (!isFinite(n) || n < 1 || n > max || String(n) !== raw) {
+        alert('Posição inválida: indica um número entre 1 e ' + max + '.');
+        return;
+      }
+      await moveOrderingItem(itemId, n - 1);
     }
 
     async function toggleOrderingItem(itemId, next) {
-      const r = await fetch('/api/catalog/ordering-items/' + itemId, {
+      const res = await apiRequest('/api/catalog/ordering-items/' + itemId, {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ isEnabled: next }),
+        body: { isEnabled: next },
       });
-      if (r.ok && _orderingListDetailCache) await openOrderingList(_orderingListDetailCache.id);
-      else if (!r.ok) { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
+      if (res.ok && _orderingListDetailCache) await openOrderingList(_orderingListDetailCache.id);
+      else if (!res.ok) { alert('Erro: ' + res.error); }
     }
 
     async function removeOrderingItem(itemId) {
       if (!confirm('Remover o item?')) return;
-      const r = await fetch('/api/catalog/ordering-items/' + itemId, { method: 'DELETE' });
-      if (r.ok && _orderingListDetailCache) await openOrderingList(_orderingListDetailCache.id);
-      else if (!r.ok) { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
+      const res = await apiRequest('/api/catalog/ordering-items/' + itemId, { method: 'DELETE' });
+      if (res.ok && _orderingListDetailCache) await openOrderingList(_orderingListDetailCache.id);
+      else if (!res.ok) { alert('Erro: ' + res.error); }
     }
 
     async function loadGlobalPriority() {
@@ -8089,13 +8802,12 @@ const rows = Object.entries(inv).map(([k, v]) => {
         preferredQuality: document.getElementById('gp_quality').value,
         allowFallback: document.getElementById('gp_fallback').value === 'true',
       };
-      const r = await fetch('/api/catalog/priority-policies', {
+      const res = await apiRequest('/api/catalog/priority-policies', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        body: payload,
       });
-      if (r.ok) alert('Política global guardada.');
-      else { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
+      if (res.ok) alert('Política global guardada.');
+      else alert('Erro: ' + res.error);
     }
 
     async function loadChannelPriority() {
@@ -8125,13 +8837,12 @@ const rows = Object.entries(inv).map(([k, v]) => {
         preferredQuality: document.getElementById('cp_quality').value,
         allowFallback: document.getElementById('cp_fallback').value === 'true',
       };
-      const r = await fetch('/api/catalog/priority-policies', {
+      const res = await apiRequest('/api/catalog/priority-policies', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        body: payload,
       });
-      if (r.ok) alert('Override guardado.');
-      else { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
+      if (res.ok) alert('Override guardado.');
+      else alert('Erro: ' + res.error);
     }
 
     // === PHASE 13 (Wave 13-4) — Global Source Selection Policy ===
@@ -8167,17 +8878,11 @@ const rows = Object.entries(inv).map(([k, v]) => {
         preferDistinctProviders: document.getElementById('ssp_preferDistinctProviders').value === 'true',
         allowFallbackToSameProvider: document.getElementById('ssp_allowFallbackToSameProvider').value === 'true',
       };
-      const r = await fetch('/api/catalog/source-selection-policies', {
+      const res = await apiRequest('/api/catalog/source-selection-policies', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        body: payload,
       });
-      if (r.ok) {
-        status.textContent = 'Política guardada.';
-      } else {
-        const err = await r.json();
-        status.textContent = 'Erro: ' + (err.error || r.status);
-      }
+      setStatus(status, res.ok ? 'Política guardada.' : ('Erro: ' + res.error), res.ok);
     }
 
     // === PHASE 13 (Wave 13-4b) — Per-channel Source Selection Policy ===
@@ -8252,18 +8957,16 @@ const rows = Object.entries(inv).map(([k, v]) => {
         preferDistinctProviders: document.getElementById('cssp_preferDistinctProviders').value === 'true',
         allowFallbackToSameProvider: document.getElementById('cssp_allowFallbackToSameProvider').value === 'true',
       };
-      const r = await fetch('/api/catalog/source-selection-policies/channels', {
+      const res = await apiRequest('/api/catalog/source-selection-policies/channels', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        body: payload,
       });
-      if (r.ok) {
-        status.textContent = 'Override guardado.';
+      if (res.ok) {
+        setStatus(status, 'Override guardado.', true);
         closeModalPanel();
         await loadChannelSourceSelectionPolicies();
       } else {
-        const err = await r.json();
-        status.textContent = 'Erro: ' + (err.error || r.status);
+        setStatus(status, 'Erro: ' + res.error, false);
       }
     }
 
@@ -8272,13 +8975,12 @@ const rows = Object.entries(inv).map(([k, v]) => {
       if (!p || !p.canonicalChannelKey) return;
       if (!confirm('Eliminar o override do canal "' + p.canonicalChannelKey + '"?')) return;
       const status = document.getElementById('channelSourceSelectionPolicyStatus');
-      const r = await fetch('/api/catalog/source-selection-policies/channels/' + encodeURIComponent(p.canonicalChannelKey), { method: 'DELETE' });
-      if (r.ok) {
-        status.textContent = 'Override eliminado.';
+      const res = await apiRequest('/api/catalog/source-selection-policies/channels/' + encodeURIComponent(p.canonicalChannelKey), { method: 'DELETE' });
+      if (res.ok) {
+        setStatus(status, 'Override eliminado.', true);
         await loadChannelSourceSelectionPolicies();
       } else {
-        const err = await r.json();
-        status.textContent = 'Erro: ' + (err.error || r.status);
+        setStatus(status, 'Erro: ' + res.error, false);
       }
     }
 
@@ -8423,13 +9125,12 @@ const rows = Object.entries(inv).map(([k, v]) => {
       const vod = document.getElementById('importPolicyEditVod').value;
       const target = document.getElementById('importPolicyEditTargets').value;
       const excluded = document.getElementById('importPolicyEditExcluded').value;
-      const r = await fetch('/api/catalog/import-policies', {
+      const res = await apiRequest('/api/catalog/import-policies', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mediaKind: _importPolicyEditingMediaKind, vodPolicy: vod, targetGroupsCsv: target, excludedGroupsCsv: excluded, isEnabled: true }),
+        body: { mediaKind: _importPolicyEditingMediaKind, vodPolicy: vod, targetGroupsCsv: target, excludedGroupsCsv: excluded, isEnabled: true },
       });
-      if (r.ok) { closeModalPanel(); await loadImportPolicies(); }
-      else { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
+      if (res.ok) { closeModalPanel(); await loadImportPolicies(); }
+      else { alert('Erro: ' + res.error); }
     }
 
     async function loadCanonicalGroups() {
@@ -8496,27 +9197,25 @@ const rows = Object.entries(inv).map(([k, v]) => {
         isDefault: document.getElementById('cgDefault').value === 'true',
       };
       if (!payload.key || !payload.displayName) { alert('Key e Display Name obrigatórios.'); return; }
-      const r = await fetch('/api/catalog/canonical-groups', {
+      const res = await apiRequest('/api/catalog/canonical-groups', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        body: payload,
       });
-      if (r.ok) {
+      if (res.ok) {
         _editingCanonicalGroupId = null;
         closeModalPanel();
         await loadCanonicalGroups();
         await loadChannelGroupOptions();
       } else {
-        const err = await r.json();
-        alert('Erro: ' + (err.error || r.status));
+        alert('Erro: ' + res.error);
       }
     }
 
     async function deleteCanonicalGroup(id) {
       if (!confirm('Eliminar o grupo #' + id + '?')) return;
-      const r = await fetch('/api/catalog/canonical-groups/' + id, { method: 'DELETE' });
-      if (r.ok) await loadCanonicalGroups();
-      else { const err = await r.json(); alert('Erro: ' + (err.error || r.status)); }
+      const res = await apiRequest('/api/catalog/canonical-groups/' + id, { method: 'DELETE' });
+      if (res.ok) await loadCanonicalGroups();
+      else { alert('Erro: ' + res.error); }
     }
 
     async function loadDegradation() {
@@ -8594,7 +9293,71 @@ const rows = Object.entries(inv).map(([k, v]) => {
     let _schedEditingId = null;
     let _schedJobsCache = [];
 
+    function schedDiscField(name) {
+      return document.querySelector("[data-sched-create=" + name + "]");
+    }
+
+    function schedDiscInt(name) {
+      const el = schedDiscField(name);
+      if (!el || el.value === '') return null;
+      const n = parseInt(el.value, 10);
+      return isNaN(n) ? null : n;
+    }
+
+    // DC-9 — pré-visualização do discovery efetivo do job (overrides
+    // aplicados sobre a configuração global em cache). Aplica os MESMOS
+    // limites do POST /api/catalog/scheduled-jobs (BuildScheduledJobDiscoveryJson):
+    // um valor fora do intervalo é tratado como ausente (herda a global),
+    // para o "efetivo" mostrado coincidir com o que o backend persiste.
+    // Limites espelham o POST /api/catalog/scheduled-jobs
+    // (BuildScheduledJobDiscoveryJson) e os overrides explícitos de
+    // POST /api/run/start: min 0..1440, history 1..720, maxStreams >= 1.
+    function schedDiscValidInt(name, lo, hi) {
+      const n = schedDiscInt(name);
+      if (n === null) return null;
+      if (n < lo || (hi !== null && n > hi)) return null;
+      return n;
+    }
+
+    function updateSchedDiscoveryPreview() {
+      const out = document.getElementById('schedDiscoveryPreview');
+      if (!out) return;
+      const g = _discoveryGlobalCache || { keyword: 'portugal', minHistoryHours: 0, historyHours: 24, maxStreams: 500 };
+      const kwEl = schedDiscField('discoveryKeyword');
+      const keyword = (kwEl && kwEl.value.trim()) ? kwEl.value.trim() : (g.keyword || 'portugal');
+      const min = schedDiscValidInt('discoveryMinHistoryHours', 0, 1440);
+      const hist = schedDiscValidInt('discoveryHistoryHours', 1, 720);
+      const max = schedDiscValidInt('discoveryMaxStreams', 1, null);
+      const histV = hist !== null ? hist : (g.historyHours != null ? g.historyHours : 24);
+      let minV = min !== null ? min : (g.minHistoryHours != null ? g.minHistoryHours : 0);
+      if (minV > histV) minV = 0;
+      const maxV = max !== null ? max : (g.maxStreams != null ? g.maxStreams : 500);
+      out.textContent = 'Efetivo: keyword="' + keyword + '", min=' + minV + 'h, history=' + histV + 'h, maxStreams=' + maxV;
+    }
+
+    function clearSchedDiscoveryFields() {
+      ['discoveryKeyword', 'discoveryMinHistoryHours', 'discoveryHistoryHours', 'discoveryMaxStreams'].forEach(function (n) {
+        const el = schedDiscField(n);
+        if (el) el.value = '';
+      });
+      updateSchedDiscoveryPreview();
+    }
+
+    function fillSchedDiscoveryFields(disc) {
+      const d = disc || {};
+      const kw = schedDiscField('discoveryKeyword');
+      const min = schedDiscField('discoveryMinHistoryHours');
+      const hist = schedDiscField('discoveryHistoryHours');
+      const max = schedDiscField('discoveryMaxStreams');
+      if (kw) kw.value = d.keyword != null ? d.keyword : '';
+      if (min) min.value = d.minHistoryHours != null ? d.minHistoryHours : '';
+      if (hist) hist.value = d.historyHours != null ? d.historyHours : '';
+      if (max) max.value = d.maxStreams != null ? d.maxStreams : '';
+      updateSchedDiscoveryPreview();
+    }
+
     async function loadScheduledJobs() {
+      if (!_discoveryGlobalCache) { await loadDiscoverySettings(); }
       const list = await safeFetchJson('/api/catalog/scheduled-jobs', []);
       _schedJobsCache = Array.isArray(list) ? list : [];
       if (!Array.isArray(list)) { document.getElementById('scheduledJobsTable').innerHTML = '<p class="muted">Erro.</p>'; return; }
@@ -8615,6 +9378,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
         </td>
       </tr>`).join('');
       document.getElementById('scheduledJobsTable').innerHTML = `<table><thead><tr><th>#</th><th>Name</th><th>Cron</th><th>Action</th><th>Activo</th><th>Último</th><th>Próximo</th><th>Resultado</th><th>Acções</th></tr></thead><tbody>${rows}</tbody></table>`;
+      updateSchedDiscoveryPreview();
     }
 
     function editScheduledJob(id) {
@@ -8636,6 +9400,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
         actionEl.value = job.actionName;
       }
       if (enabledEl) enabledEl.value = String(!!job.isEnabled);
+      fillSchedDiscoveryFields(job.discovery);
       _schedEditingId = id;
       updateSchedCronStatus();
       setSchedFormStatus('A editar job #' + id + ' (Name bloqueado). Guardar actualiza este job.', true);
@@ -8650,6 +9415,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
       if (nameEl) { nameEl.value = ''; nameEl.readOnly = false; }
       if (cronEl) cronEl.value = '';
       if (enabledEl) enabledEl.value = 'true';
+      clearSchedDiscoveryFields();
       updateSchedCronStatus();
       openModalPanel('scheduledJobForm');
     }
@@ -8665,48 +9431,52 @@ const rows = Object.entries(inv).map(([k, v]) => {
         actionName: actionEl ? actionEl.value.trim() : '',
         isEnabled: enabledEl ? enabledEl.value === 'true' : true,
       };
+      // DC-9 — overrides de discovery opcionais (ausentes = herda a global).
+      const discKeywordEl = schedDiscField('discoveryKeyword');
+      if (discKeywordEl && discKeywordEl.value.trim()) payload.keyword = discKeywordEl.value.trim();
+      const discMin = schedDiscInt('discoveryMinHistoryHours');
+      if (discMin !== null) payload.minHistoryHours = discMin;
+      const discHist = schedDiscInt('discoveryHistoryHours');
+      if (discHist !== null) payload.historyHours = discHist;
+      const discMax = schedDiscInt('discoveryMaxStreams');
+      if (discMax !== null) payload.maxStreams = discMax;
       if (!payload.name || !payload.cronExpression || !payload.actionName) {
         setSchedFormStatus('Name, Cron e Action são obrigatórios.', false); return;
       }
       const cronCheck = validateSchedCron(payload.cronExpression);
       if (!cronCheck.ok) { setSchedFormStatus(cronCheck.message, false); return; }
-      const r = await fetch('/api/catalog/scheduled-jobs', {
+      const res = await apiRequest('/api/catalog/scheduled-jobs', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        body: payload,
       });
-      if (r.ok) {
+      if (res.ok) {
         closeModalPanel();
         _schedEditingId = null;
         if (nameEl) { nameEl.value = ''; nameEl.readOnly = false; }
         if (cronEl) cronEl.value = '';
         if (enabledEl) enabledEl.value = 'true';
+        clearSchedDiscoveryFields();
         updateSchedCronStatus();
         await loadScheduledActions();
         if (actionEl && actionEl.options.length > 0) actionEl.selectedIndex = 0;
         setSchedFormStatus(`Guardado: action '${payload.actionName}' com cron '${payload.cronExpression}'. Upsert por Name: o mesmo Name actualiza o job existente.`, true);
         await loadScheduledJobs();
       } else {
-        const msg = await readErrorBody(r);
-        setSchedFormStatus('Erro: ' + msg, false);
+        setSchedFormStatus('Erro: ' + res.error, false);
       }
     }
 
     async function readErrorBody(r) {
       try {
         const txt = await r.text();
-        if (txt) {
-          try { const body = JSON.parse(txt); if (body && body.error) return body.error; } catch (e) { /* not JSON */ }
-          return txt;
-        }
+        let json = null;
+        if (txt) { try { json = JSON.parse(txt); } catch (e) { /* not JSON */ } }
+        return errorMessageFromBody(json, txt, r.status);
       } catch (e) { /* body indisponível */ }
       return 'HTTP ' + r.status;
     }
     function setSchedFormStatus(msg, ok) {
-      const el = document.getElementById('schedFormStatus');
-      if (!el) return;
-      el.textContent = msg;
-      el.style.color = ok ? 'var(--ok)' : 'var(--err)';
+      setStatus('schedFormStatus', msg, ok);
     }
     function schedParseScalar(token, min, max) {
       if (token === '*') return min;
@@ -8815,20 +9585,19 @@ const rows = Object.entries(inv).map(([k, v]) => {
     }
 
     async function toggleScheduledJob(id, next) {
-      const r = await fetch('/api/catalog/scheduled-jobs/' + id + '/enabled', {
+      const res = await apiRequest('/api/catalog/scheduled-jobs/' + id + '/enabled', {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ isEnabled: next }),
+        body: { isEnabled: next },
       });
-      if (r.ok) { await loadScheduledJobs(); }
-      else { const msg = await readErrorBody(r); setSchedFormStatus('Erro: ' + msg, false); }
+      if (res.ok) { await loadScheduledJobs(); }
+      else { setSchedFormStatus('Erro: ' + res.error, false); }
     }
 
     async function deleteScheduledJob(id) {
       if (!confirm('Eliminar o scheduled job #' + id + '?')) return;
-      const r = await fetch('/api/catalog/scheduled-jobs/' + id, { method: 'DELETE' });
-      if (r.ok) { await loadScheduledJobs(); }
-      else { const msg = await readErrorBody(r); setSchedFormStatus('Erro: ' + msg, false); }
+      const res = await apiRequest('/api/catalog/scheduled-jobs/' + id, { method: 'DELETE' });
+      if (res.ok) { await loadScheduledJobs(); }
+      else { setSchedFormStatus('Erro: ' + res.error, false); }
     }
 
     async function loadMatchingAudits() {
@@ -8951,16 +9720,16 @@ const rows = Object.entries(inv).map(([k, v]) => {
 
     async function approvePendingCountryApproval(id) {
       if (!confirm('Aprovar este canal? Será criada uma IdentityRule com ReviewOnly que permite fuzzy matching futuro.')) return;
-      const r = await fetch('/api/catalog/pending-country-approvals/' + id + '/approve', { method: 'POST' });
-      if (r.ok) { loadPendingCountryApprovals(); loadCatalog(); }
-      else { alert('Erro: ' + r.status); }
+      const res = await apiRequest('/api/catalog/pending-country-approvals/' + id + '/approve', { method: 'POST' });
+      if (res.ok) { loadPendingCountryApprovals(); loadCatalog(); }
+      else { alert('Erro: ' + res.error); }
     }
 
     async function rejectPendingCountryApproval(id) {
       if (!confirm('Reprovar este canal? Será criada uma IdentityRule com Excluded que impede este canal de ser aceite.')) return;
-      const r = await fetch('/api/catalog/pending-country-approvals/' + id + '/reject', { method: 'POST' });
-      if (r.ok) { loadPendingCountryApprovals(); loadCatalog(); }
-      else { alert('Erro: ' + r.status); }
+      const res = await apiRequest('/api/catalog/pending-country-approvals/' + id + '/reject', { method: 'POST' });
+      if (res.ok) { loadPendingCountryApprovals(); loadCatalog(); }
+      else { alert('Erro: ' + res.error); }
     }
 
     function showAddRuleForm() { openModalPanel('addRuleForm'); }
@@ -8971,25 +9740,23 @@ const rows = Object.entries(inv).map(([k, v]) => {
       const disposition = document.getElementById('ruleDisposition').value;
       const reason = document.getElementById('ruleReason').value.trim();
       if (!identity) { alert('Identidade é obrigatória.'); return; }
-      const r = await fetch('/api/catalog/identity-rules', {
+      const res = await apiRequest('/api/catalog/identity-rules', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ normalizedIdentity: identity, disposition, reason })
+        body: { normalizedIdentity: identity, disposition: disposition, reason: reason }
       });
-      if (r.ok) {
+      if (res.ok) {
         hideAddRuleForm();
         loadCatalogRules();
       } else {
-        const err = await r.json();
-        alert('Erro: ' + (err.error || r.status));
+        alert('Erro: ' + res.error);
       }
     }
 
     async function deleteRule(identity) {
       if (!confirm('Eliminar regra "' + identity + '"?')) return;
-      const r = await fetch('/api/catalog/identity-rules?identity=' + encodeURIComponent(identity), { method: 'DELETE' });
-      if (r.ok) { loadCatalogRules(); loadCatalog(); }
-      else { alert('Erro: ' + r.status); }
+      const res = await apiRequest('/api/catalog/identity-rules?identity=' + encodeURIComponent(identity), { method: 'DELETE' });
+      if (res.ok) { loadCatalogRules(); loadCatalog(); }
+      else { alert('Erro: ' + res.error); }
     }
 
     let _affinityEditId = null;
@@ -9041,17 +9808,15 @@ const rows = Object.entries(inv).map(([k, v]) => {
 
     async function saveAffinityDelimiter() {
       const value = (document.getElementById('affinityDelimiter').value || '').trim();
-      const r = await fetch('/api/settings', {
+      const res = await apiRequest('/api/settings', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ affinityVariantDelimiter: value })
+        body: { affinityVariantDelimiter: value }
       });
-      if (r.ok) {
+      if (res.ok) {
         await loadAppSettings();
         alert('Separador guardado: ' + _affinityDelimiter);
       } else {
-        const err = await r.json();
-        alert('Erro: ' + (err.error || r.status));
+        alert('Erro: ' + res.error);
       }
     }
 
@@ -9173,39 +9938,42 @@ const rows = Object.entries(inv).map(([k, v]) => {
       const url = _affinityEditId
         ? '/api/catalog/affinity-groups/' + _affinityEditId
         : '/api/catalog/affinity-groups';
-      const r = await fetch(url, {
+      const res = await apiRequest(url, {
         method: _affinityEditId ? 'PUT' : 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
+        body: payload
       });
-      if (r.ok) {
+      if (res.ok) {
         hideAddAffinityForm();
         loadAffinityGroups();
       } else {
-        const err = await r.json();
-        alert('Erro: ' + (err.error || r.status));
+        alert('Erro: ' + res.error);
       }
     }
 
     async function deleteAffinityGroup(id) {
       if (!confirm('Eliminar grupo de afinidade #' + id + '?')) return;
-      const r = await fetch('/api/catalog/affinity-groups/' + id + '/delete', { method: 'DELETE' });
-      if (r.ok) { loadAffinityGroups(); loadCatalog(); }
-      else { alert('Erro: ' + r.status); }
+      const res = await apiRequest('/api/catalog/affinity-groups/' + id + '/delete', { method: 'DELETE' });
+      if (res.ok) { loadAffinityGroups(); loadCatalog(); }
+      else { alert('Erro: ' + res.error); }
     }
 
-    // W5 — Aprovação estruturada: sem prompt, com escolha explícita
+    // W5 / DC-5a — Aprovação estruturada: sem prompt, com escolha explícita
     // Add Alias / Create Channel / Excluir e dropdown de canais existentes.
-    function approveReview(fingerprint, normalizedIdentity, sourceGroup) {
-      _pendingReviewFingerprint = fingerprint;
-      _pendingReviewIdentity = normalizedIdentity || '';
-      _pendingReviewGroup = sourceGroup || '';
+    // A identidade é o `ReviewItem.Id` numérico (nova API `/api/review*`);
+    // o sumário da linha actual vem de `_reviewRowsById`.
+    function approveReview(id) {
+      const row = _reviewRowsById[String(id)] || {};
+      _pendingReviewId = id;
+      _pendingReviewIdentity = row.normalizedIdentity || '';
+      _pendingReviewGroup = row.sourceGroup || '';
+      _reviewRowsById[String(id)] = row;
       document.getElementById('reviewApproveTitle').textContent = 'Aprovar Review';
-      document.getElementById('reviewApproveSubject').textContent = normalizedIdentity || fingerprint;
+      document.getElementById('reviewApproveSubject').textContent = _pendingReviewIdentity || String(id);
       document.getElementById('reviewApproveStatus').textContent = '';
       document.getElementById('reviewApproveActions').hidden = false;
       document.getElementById('reviewApproveAddAlias').hidden = true;
       document.getElementById('reviewApproveExclude').hidden = true;
+      document.getElementById('reviewReopen').hidden = true;
       openModalPanel('reviewApproveModal');
       loadReviewAliasChannels();
     }
@@ -9225,10 +9993,12 @@ const rows = Object.entries(inv).map(([k, v]) => {
       const actionsEl = document.getElementById('reviewApproveActions');
       const addAliasEl = document.getElementById('reviewApproveAddAlias');
       const excludeEl = document.getElementById('reviewApproveExclude');
+      const reopenEl = document.getElementById('reviewReopen');
       const statusEl = document.getElementById('reviewApproveStatus');
       actionsEl.hidden = true;
       addAliasEl.hidden = true;
       excludeEl.hidden = true;
+      reopenEl.hidden = true;
       statusEl.textContent = '';
       if (action === 'add-alias') {
         document.getElementById('reviewApproveTitle').textContent = 'Add Alias';
@@ -9241,58 +10011,80 @@ const rows = Object.entries(inv).map(([k, v]) => {
         const reasonEl = document.getElementById('reviewExcludeReason');
         if (reasonEl && !reasonEl.value) reasonEl.value = 'excluído por decisão administrativa';
         excludeEl.hidden = false;
+      } else if (action === 'reopen') {
+        document.getElementById('reviewApproveTitle').textContent = 'Reabrir Review';
+        const reopenReasonEl = document.getElementById('reviewReopenReason');
+        if (reopenReasonEl) reopenReasonEl.value = '';
+        reopenEl.hidden = false;
       } else if (action === 'create-channel') {
         showCreateChannelFormForReview();
       }
     }
 
     async function submitReviewAliasApproval() {
-      const fingerprint = _pendingReviewFingerprint;
-      if (!fingerprint) return;
+      const reviewId = _pendingReviewId;
+      if (!reviewId) return;
       const key = document.getElementById('reviewAliasChannel').value;
       const alias = (document.getElementById('reviewAliasValue').value || '').trim();
       const statusEl = document.getElementById('reviewApproveStatus');
       if (!key) { statusEl.textContent = 'Selecione o canal canónico existente.'; return; }
       statusEl.textContent = 'A aplicar…';
-      const body = { action: 'add-alias', canonicalChannelKey: key };
-      if (alias) body.alias = alias;
-      const r = await fetch('/api/catalog/reviews/' + encodeURIComponent(fingerprint) + '/approve', {
+      const change = { type: 'channelAlias', canonicalChannelKey: key };
+      if (alias) change.alias = alias;
+      const res = await apiRequest('/api/review/resolve', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
+        body: { reviewItemId: reviewId, change: change }
       });
-      if (r.ok) {
+      if (res.ok) {
         closeReviewApproveModal();
-        loadCatalogReviews(); loadCatalog();
+        loadCatalogReviews(true); loadCatalog();
       } else {
-        const err = await r.json().catch(() => ({}));
-        statusEl.textContent = 'Erro: ' + (err.error || r.status);
+        setStatus(statusEl, 'Erro: ' + reviewErrorText(res), false);
       }
     }
 
     async function submitReviewExclude() {
-      const fingerprint = _pendingReviewFingerprint;
-      if (!fingerprint) return;
+      const reviewId = _pendingReviewId;
+      if (!reviewId) return;
       const reason = (document.getElementById('reviewExcludeReason').value || '').trim();
       const statusEl = document.getElementById('reviewApproveStatus');
       if (!reason) { statusEl.textContent = 'A razão é obrigatória.'; return; }
       statusEl.textContent = 'A excluir…';
-      const r = await fetch('/api/catalog/reviews/' + encodeURIComponent(fingerprint) + '/exclude', {
+      const res = await apiRequest('/api/review/ignore', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'exclude', reason: reason })
+        body: { reviewItemId: reviewId, reason: reason }
       });
-      if (r.ok) {
+      if (res.ok) {
         closeReviewApproveModal();
-        loadCatalogReviews(); loadCatalog();
+        loadCatalogReviews(true); loadCatalog();
       } else {
-        const err = await r.json().catch(() => ({}));
-        statusEl.textContent = 'Erro: ' + (err.error || r.status);
+        setStatus(statusEl, 'Erro: ' + reviewErrorText(res), false);
+      }
+    }
+
+    // DC-5a — nova acção: a API W5.5 expõe `/api/review/reopen` e a UI não a
+    // tinha. Aplica-se a itens em estado terminal (Resolved/Ignored).
+    async function submitReviewReopen() {
+      const reviewId = _pendingReviewId;
+      if (!reviewId) return;
+      const justification = (document.getElementById('reviewReopenReason').value || '').trim();
+      const statusEl = document.getElementById('reviewApproveStatus');
+      if (!justification) { statusEl.textContent = 'A justificação é obrigatória.'; return; }
+      statusEl.textContent = 'A reabrir…';
+      const res = await apiRequest('/api/review/reopen', {
+        method: 'POST',
+        body: { reviewItemId: reviewId, justification: justification }
+      });
+      if (res.ok) {
+        closeReviewApproveModal();
+        loadCatalogReviews(true); loadCatalog();
+      } else {
+        setStatus(statusEl, 'Erro: ' + reviewErrorText(res), false);
       }
     }
 
     async function showCreateChannelFormForReview() {
-      _reviewChannelFingerprint = _pendingReviewFingerprint;
+      _reviewChannelReviewId = _pendingReviewId;
       _editingChannelId = null;
       await loadChannelGroupOptions();
       const keyEl = document.getElementById('newChannelKey');
@@ -9314,19 +10106,30 @@ const rows = Object.entries(inv).map(([k, v]) => {
     }
 
     function closeReviewApproveModal() {
-      _pendingReviewFingerprint = null;
+      _pendingReviewId = null;
       _pendingReviewIdentity = '';
       _pendingReviewGroup = '';
       document.getElementById('reviewApproveStatus').textContent = '';
       document.getElementById('reviewApproveActions').hidden = false;
       document.getElementById('reviewApproveAddAlias').hidden = true;
       document.getElementById('reviewApproveExclude').hidden = true;
+      document.getElementById('reviewReopen').hidden = true;
       closeModalPanel();
     }
 
-    function excludeReview(fingerprint) {
-      approveReview(fingerprint, '');
+    function excludeReview(id) {
+      approveReview(id);
       selectReviewAction('exclude');
+    }
+
+    function reopenReview(id) {
+      const row = _reviewRowsById[String(id)] || {};
+      _pendingReviewId = id;
+      _pendingReviewIdentity = row.normalizedIdentity || '';
+      _pendingReviewGroup = row.sourceGroup || '';
+      document.getElementById('reviewApproveSubject').textContent = _pendingReviewIdentity || String(id);
+      selectReviewAction('reopen');
+      openModalPanel('reviewApproveModal');
     }
 
     document.querySelectorAll('#catalogTabs button').forEach(b => b.addEventListener('click', () => loadCatalogTab(b.dataset.ctab)));
@@ -9344,17 +10147,10 @@ const rows = Object.entries(inv).map(([k, v]) => {
     }
 
     function setupFetch(path, method, body) {
-      return fetch(path, {
-        method: method,
-        headers: setupHeaders(),
-        body: body === undefined ? undefined : JSON.stringify(body)
-      }).then(function (r) {
-        return r.text().then(function (t) {
-          var j = null;
-          try { j = t ? JSON.parse(t) : null; } catch (e) { j = null; }
-          return { status: r.status, json: j };
-        });
-      });
+      // DC-2 — delega no helper canónico `apiRequest` (mesma leitura segura
+      // e mesmo tratamento de rede), preservando o contrato histórico
+      // { status, json } e o cabeçalho CSRF de Setup via `setupHeaders()`.
+      return apiRequest(path, { method: method, body: body, headers: setupHeaders() });
     }
 
     function setupItemLabel(key) {
@@ -9368,7 +10164,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
 
     function setupConfigure(key) {
       if (key === 'catalog' || key === 'sources') { showView('catalog'); return; }
-      if (key === 'countryData') { showView('catalog'); return; }
+      if (key === 'countryData') { showView('countries'); return; }
       if (key === 'output') { showView('diagnostics'); return; }
       showView('setup');
       var ids = { telegram: 'setupTelegramApiId', dispatcharr: 'setupDispatcharrBaseUrl' };
@@ -9517,21 +10313,58 @@ const rows = Object.entries(inv).map(([k, v]) => {
         document.getElementById('setupDispatcharrBaseUrl').value = s.baseUrl || '';
         document.getElementById('setupDispatcharrDryRun').value = s.dryRun ? 'true' : 'false';
         document.getElementById('setupDispatcharrApiKey').placeholder = s.hasApiKey ? 'configurado' : 'não configurado';
+        document.getElementById('setupDispatcharrMatchThreshold').value = s.matchThreshold || '';
+        document.getElementById('setupDispatcharrAutoCreateGroups').value = s.autoCreateGroups ? 'true' : 'false';
+        document.getElementById('setupDispatcharrProviderPriority').value =
+          Array.isArray(s.providerPriority) ? s.providerPriority.join(', ') : '';
+        document.getElementById('setupDispatcharrAliasFile').value = s.aliasFile || '';
+        document.getElementById('setupDispatcharrUsername').placeholder = s.hasUsername ? 'configurado' : 'não configurado';
+        document.getElementById('setupDispatcharrPassword').placeholder = s.hasPassword ? 'configurado' : 'não configurado';
+        document.getElementById('setupDispatcharrTargetGroupName').textContent = s.targetGroupName || '—';
       }
     }
 
     async function saveDispatcharrConfig() {
+      var el = document.getElementById('setupDispatcharrStatus');
+      var thresholdRaw = document.getElementById('setupDispatcharrMatchThreshold').value.trim();
+      var threshold = thresholdRaw === '' ? null : Number(thresholdRaw);
+      if (threshold !== null && (!isFinite(threshold) || threshold < 0 || threshold > 100)) {
+        el.textContent = 'match_threshold tem de ser um número entre 0 e 100.';
+        return;
+      }
       var body = {
         enabled: document.getElementById('setupDispatcharrEnabled').value === 'true',
         baseUrl: document.getElementById('setupDispatcharrBaseUrl').value.trim(),
         dryRun: document.getElementById('setupDispatcharrDryRun').value === 'true'
       };
+      if (threshold !== null) { body.matchThreshold = Math.trunc(threshold); }
+      body.autoCreateGroups = document.getElementById('setupDispatcharrAutoCreateGroups').value === 'true';
+      body.providerPriority = document.getElementById('setupDispatcharrProviderPriority').value
+        .split(',').map(function (p) { return p.trim(); }).filter(function (p) { return p !== ''; });
+      body.aliasFile = document.getElementById('setupDispatcharrAliasFile').value.trim();
       var apiKey = document.getElementById('setupDispatcharrApiKey').value.trim();
       if (apiKey) { body.apiKey = apiKey; }
+      var username = document.getElementById('setupDispatcharrUsername').value.trim();
+      if (username) { body.username = username; }
+      var secretInput = document.getElementById('setupDispatcharrPassword').value.trim();
+      if (secretInput) { body.password = secretInput; }
       var r = await setupFetch('/api/dispatcharr/config', 'POST', body);
-      if (r.status === 200 && r.json && r.json.hasApiKey) {
+      if (r.status === 200) {
+        el.textContent = 'Configuração guardada.';
         document.getElementById('setupDispatcharrApiKey').value = '';
-        document.getElementById('setupDispatcharrApiKey').placeholder = 'configurado';
+        document.getElementById('setupDispatcharrUsername').value = '';
+        document.getElementById('setupDispatcharrPassword').value = '';
+        if (r.json && r.json.hasApiKey) {
+          document.getElementById('setupDispatcharrApiKey').placeholder = 'configurado';
+        }
+        if (r.json && r.json.hasUsername) {
+          document.getElementById('setupDispatcharrUsername').placeholder = 'configurado';
+        }
+        if (r.json && r.json.hasPassword) {
+          document.getElementById('setupDispatcharrPassword').placeholder = 'configurado';
+        }
+      } else {
+        el.textContent = 'Erro ao guardar (HTTP ' + r.status + ').';
       }
       await loadSetupReadiness();
     }
@@ -9592,12 +10425,10 @@ const rows = Object.entries(inv).map(([k, v]) => {
     }
 
     function showView(name) {
-      console.log('[DEBUG] showView called:', name);
       if (name !== 'liverun') stopLiveRunPolling();
       document.querySelectorAll('main > section').forEach(s => s.hidden = true);
       const targetSection = document.getElementById('view-' + name);
       targetSection.hidden = false;
-      console.log('[DEBUG] view-' + name + ' hidden:', targetSection.hidden);
       document.querySelectorAll('nav button').forEach(b => b.classList.toggle('active', b.dataset.view === name));
       switch (name) {
         case 'overview': loadOverview(); break;
@@ -9640,14 +10471,19 @@ const rows = Object.entries(inv).map(([k, v]) => {
     window.hideAddRuleForm = hideAddRuleForm;
     window.submitAddRule = submitAddRule;
     window.loadCatalogReviews = loadCatalogReviews;
+    window.loadCatalogAudits = loadCatalogAudits;
     window.loadCatalogSyncRuns = loadCatalogSyncRuns;
     window.loadCatalogRules = loadCatalogRules;
     window.deleteRule = deleteRule;
+    window.reviewsPrevPage = reviewsPrevPage;
+    window.reviewsNextPage = reviewsNextPage;
     window.approveReview = approveReview;
     window.excludeReview = excludeReview;
+    window.reopenReview = reopenReview;
     window.selectReviewAction = selectReviewAction;
     window.submitReviewAliasApproval = submitReviewAliasApproval;
     window.submitReviewExclude = submitReviewExclude;
+    window.submitReviewReopen = submitReviewReopen;
     window.closeReviewApproveModal = closeReviewApproveModal;
     window.loadAffinityGroups = loadAffinityGroups;
     window.showAddAffinityForm = showAddAffinityForm;
@@ -9894,7 +10730,6 @@ const rows = Object.entries(inv).map(([k, v]) => {
         renderLiveRun(data);
         var st = document.getElementById('liveRunPollState');
         if (st) st.textContent = 'actualizado às ' + liveRunLastPollUtc.toLocaleTimeString() + ' (polling 3s)';
-        await loadLiveRunScheduled();
       } catch (e) {
         renderLiveRun({ error: e && e.message ? e.message : 'falha de rede' });
       } finally {
@@ -9902,54 +10737,60 @@ const rows = Object.entries(inv).map(([k, v]) => {
       }
     }
 
-    async function loadLiveRunScheduled() {
-      var el = document.getElementById('liveRunScheduled');
-      if (!el) return;
-      var list = await safeFetchJson('/api/catalog/scheduled-jobs', []);
-      if (!Array.isArray(list)) { el.innerHTML = "<p class='muted'>Erro ao carregar agendamentos.</p>"; return; }
-      var mine = list.filter(function (j) {
-        return j && (j.actionName === 'telegramRun' || j.actionName === 'telegramMaintainRun');
-      });
-      if (!mine.length) {
-        el.innerHTML = "<p class='muted'>Nenhuma execução Telegram agendada. Crie um job em <b>Scheduled Jobs</b> com a acção <code>telegramRun</code>.</p>";
-        return;
-      }
-      el.innerHTML = "<table><thead><tr><th>Nome</th><th>Cron</th><th>Acção</th><th>Activo</th><th>Próximo</th><th>Último resultado</th></tr></thead><tbody>" +
-        mine.map(function (j) {
-          return "<tr><td><code>" + escapeHtml(j.name || '') + "</code></td><td><code>" + escapeHtml(j.cronExpression || '') +
-            "</code></td><td>" + escapeHtml(j.actionName || '') + "</td><td>" +
-            (j.isEnabled ? "<span class='badge ok'>sim</span>" : "<span class='badge err'>não</span>") +
-            "</td><td>" + escapeHtml(j.nextRunAtUtc ? tsLocal(j.nextRunAtUtc) : '—') +
-            "</td><td>" + escapeHtml(j.lastResult || '—') + "</td></tr>";
-        }).join('') + "</tbody></table>";
+    function openScheduledJobs() {
+      // DC-4 — deep-link para a sub-tab única de agendamentos
+      // (Catálogo → Scheduled Jobs). A listagem não é duplicada no Live Run.
+      showView('catalog');
+      loadCatalogTab('scheduled');
     }
 
     async function startLiveRun() {
       var btn = document.getElementById('liveRunStartBtn');
       if (btn) { btn.disabled = true; btn.textContent = 'A arrancar…'; }
       try {
-        var r = await fetch('/api/run/start', {
+        // DC-1 — o corpo transporta sempre o modo (default telegram) e,
+        // quando preenchidos, os overrides opcionais de discovery. Os
+        // overrides ausentes são resolvidos pelo backend a partir da
+        // configuração persistida.
+        var payload = { mode: 'telegram' };
+        var modeEl = document.getElementById('liveRunMode');
+        if (modeEl && modeEl.value) payload.mode = modeEl.value;
+        var keywordEl = document.getElementById('liveRunKeyword');
+        if (keywordEl && keywordEl.value.trim()) payload.keyword = keywordEl.value.trim();
+        var historyEl = document.getElementById('liveRunHistoryHours');
+        if (historyEl && historyEl.value !== '') {
+          var hh = parseInt(historyEl.value, 10);
+          if (!isNaN(hh)) payload.historyHours = hh;
+        }
+        var minEl = document.getElementById('liveRunMinHistoryHours');
+        if (minEl && minEl.value !== '') {
+          var minh = parseInt(minEl.value, 10);
+          if (!isNaN(minh)) payload.minHistoryHours = minh;
+        }
+        var maxEl = document.getElementById('liveRunMaxStreams');
+        if (maxEl && maxEl.value !== '') {
+          var ms = parseInt(maxEl.value, 10);
+          if (!isNaN(ms)) payload.maxStreams = ms;
+        }
+        var res = await apiRequest('/api/run/start', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: '{}'
+          body: payload
         });
-        var body = null;
-        try { body = await r.json(); } catch (e) { body = null; }
-        if (r.status === 503) {
-          var msg = (body && body.error) ? body.error : 'trigger indisponível';
+        if (res.status === 503) {
+          var msg = res.error || 'trigger indisponível';
           if (btn) { btn.textContent = 'Run now'; }
           renderLiveRun({ error: msg, webAllowTrigger: false });
           return;
         }
-        if (r.status === 409) {
+        if (res.status === 409) {
           // Já existe execução: o polling mostra o estado real.
           if (btn) { btn.textContent = 'Run now'; }
           await loadLiveRun();
           return;
         }
-        if (!r.ok) {
+        if (!res.ok) {
           if (btn) { btn.textContent = 'Run now'; }
-          renderLiveRun({ error: (body && body.error) ? body.error : ('HTTP ' + r.status) });
+          renderLiveRun({ error: res.error || 'falha de rede' });
           return;
         }
         await loadLiveRun();
@@ -9976,6 +10817,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
 
     window.startLiveRun = startLiveRun;
     window.loadLiveRun = loadLiveRun;
+    window.openScheduledJobs = openScheduledJobs;
 
     // Modal centrado reutilizável. Os painéis de edição vivem dentro de tabs
     // ocultas; openModalPanel adopta o elemento movendo-o para #modalRoot
@@ -10048,6 +10890,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
     window.deleteChannel = deleteChannel;
     window.toggleChannelEnabled = toggleChannelEnabled;
     window.toggleChannelPolicy = toggleChannelPolicy;
+    window.confirmChannelPolicy = confirmChannelPolicy;
     window.addAliasFromDetail = addAliasFromDetail;
     window.removeAliasFromDetail = removeAliasFromDetail;
     window.loadHistory = loadHistory;
@@ -10060,6 +10903,9 @@ const rows = Object.entries(inv).map(([k, v]) => {
     window.deleteSource = deleteSource;
     window.toggleChannelSource = toggleChannelSource;
     window.deleteChannelSource = deleteChannelSource;
+    window.openChannelSourceObservations = openChannelSourceObservations;
+    window.loadChannelSourceObservations = loadChannelSourceObservations;
+    window.recordChannelSourceObservation = recordChannelSourceObservation;
     window.loadChannelPriority = loadChannelPriority;
     window.saveChannelPriority = saveChannelPriority;
     window.saveGlobalPriority = saveGlobalPriority;
@@ -10068,6 +10914,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
     window.runValidationTest = runValidationTest;
     window.updateSchedCronStatus = updateSchedCronStatus;
     window.applySchedFrequency = applySchedFrequency;
+    window.updateSchedDiscoveryPreview = updateSchedDiscoveryPreview;
     window.submitCreateScheduledJob = submitCreateScheduledJob;
     window.editScheduledJob = editScheduledJob;
     window.newScheduledJob = newScheduledJob;
@@ -10081,9 +10928,11 @@ const rows = Object.entries(inv).map(([k, v]) => {
     window.openOrderingList = openOrderingList;
     window.previewOrderingList = previewOrderingList;
     window.duplicateOrderingList = duplicateOrderingList;
+    window.confirmDuplicateOrderingList = confirmDuplicateOrderingList;
     window.deleteOrderingList = deleteOrderingList;
     window.addOrderingItem = addOrderingItem;
     window.moveOrderingItem = moveOrderingItem;
+    window.moveOrderingItemToPosition = moveOrderingItemToPosition;
     window.toggleOrderingItem = toggleOrderingItem;
     window.removeOrderingItem = removeOrderingItem;
     window.showCreateCanonicalGroup = showCreateCanonicalGroup;
@@ -10617,7 +11466,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
             var method = context.Request.HttpMethod;
             if (!method.Equals("POST", StringComparison.OrdinalIgnoreCase))
             {
-                await WriteMethodNotAllowedAsync(context.Response);
+                await WriteMethodNotAllowedAsync(context.Response, "POST");
                 return;
             }
 
@@ -11253,9 +12102,9 @@ const rows = Object.entries(inv).map(([k, v]) => {
 
             await WriteJsonAsync(context.Response, new
             {
-                CatalogChangedAtUtc = status.CatalogChangedAtUtc,
-                LastSuccessfulPublicationAtUtc = status.LastSuccessfulPublicationAtUtc,
-                PublicationPending = status.PublicationPending,
+                catalogChangedAtUtc = status.CatalogChangedAtUtc,
+                lastSuccessfulPublicationAtUtc = status.LastSuccessfulPublicationAtUtc,
+                publicationPending = status.PublicationPending,
             });
         }
 
@@ -11345,7 +12194,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
                 return;
             }
 
-            await WriteMethodNotAllowedAsync(context.Response);
+            await WriteMethodNotAllowedAsync(context.Response, "GET, POST");
         }
 
         private static async Task<CredentialsPayload?> TryReadCredentialsAsync(HttpListenerRequest request)
@@ -11580,7 +12429,7 @@ fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
                     return;
                 }
 
-                await WriteMethodNotAllowedAsync(context.Response);
+                await WriteMethodNotAllowedAsync(context.Response, "GET, POST");
                 return;
             }
 
@@ -11660,7 +12509,13 @@ fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
                     return;
                 }
 
-                await WriteMethodNotAllowedAsync(context.Response);
+                // As sub-rotas de auth são status (GET) e start/code/password (POST).
+                // O `Allow` reflecte o método real da rota conhecida.
+                var authAllow = requestPath.Equals(
+                    "/api/telegram/auth/status", StringComparison.OrdinalIgnoreCase)
+                    ? "GET"
+                    : "POST";
+                await WriteMethodNotAllowedAsync(context.Response, authAllow);
                 return;
             }
 
@@ -11689,12 +12544,39 @@ fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
                         return;
                     }
 
+                    // DC-3 — `baseUrl` é devolvido mascarado por
+                    // `DispatcharrConfigDisplayToJson` (CredentialSanitizer). O
+                    // formulário pode reenviar essa representação mascarada sem a
+                    // editar (round-trip): nesse caso mantemos o valor existente.
+                    // Qualquer outro valor com a máscara `***` é malformado e é
+                    // rejeitado (400) em vez de ser ignorado silenciosamente.
                     var beforeDispatcharr = _dispatcharrConfigurationService.GetForDisplay();
+                    var maskedBaseUrl = CredentialSanitizer.SanitizeUrl(beforeDispatcharr.BaseUrl);
+                    var baseUrl = payload.BaseUrl;
+                    if (baseUrl is not null)
+                    {
+                        if (string.Equals(baseUrl, maskedBaseUrl, StringComparison.Ordinal))
+                        {
+                            // Reenvio inalterado da representação mascarada.
+                            baseUrl = null;
+                        }
+                        else if (baseUrl.Contains("***", StringComparison.Ordinal))
+                        {
+                            // Edição de parte do valor mascarado (ex.:
+                            // `http://user:***@newhost`) — não é possível
+                            // reconstruir as credenciais; rejeitar.
+                            await WriteJsonAsync(
+                                context.Response,
+                                new { error = "baseUrl inválido (contém a máscara de credenciais)." },
+                                HttpStatusCode.BadRequest);
+                            return;
+                        }
+                    }
                     try
                     {
                         _dispatcharrConfigurationService.Save(new DispatcharrConfigurationWrite(
                             Enabled: payload.Enabled,
-                            BaseUrl: payload.BaseUrl,
+                            BaseUrl: baseUrl,
                             DryRun: payload.DryRun,
                             ApiKey: payload.ApiKey,
                             Username: payload.Username,
@@ -11723,7 +12605,7 @@ fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
                     return;
                 }
 
-                await WriteMethodNotAllowedAsync(context.Response);
+                await WriteMethodNotAllowedAsync(context.Response, "GET, POST");
                 return;
             }
 
@@ -11731,7 +12613,7 @@ fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
             {
                 if (!method.Equals("POST", StringComparison.OrdinalIgnoreCase))
                 {
-                    await WriteMethodNotAllowedAsync(context.Response);
+                    await WriteMethodNotAllowedAsync(context.Response, "POST");
                     return;
                 }
 
@@ -11782,7 +12664,7 @@ fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
             {
                 if (!method.Equals("GET", StringComparison.OrdinalIgnoreCase))
                 {
-                    await WriteMethodNotAllowedAsync(context.Response);
+                    await WriteMethodNotAllowedAsync(context.Response, "GET");
                     return;
                 }
 
@@ -11886,7 +12768,7 @@ fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
             => new
             {
                 enabled = display.Enabled,
-                baseUrl = display.BaseUrl,
+                baseUrl = CredentialSanitizer.SanitizeUrl(display.BaseUrl),
                 dryRun = display.DryRun,
                 hasApiKey = display.HasApiKey,
                 hasUsername = display.HasUsername,
@@ -11916,9 +12798,16 @@ fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
         private static Task WriteServiceUnavailableAsync(HttpListenerResponse response, string error)
             => WriteJsonAsync(response, new { error }, HttpStatusCode.ServiceUnavailable);
 
-        private static async Task WriteMethodNotAllowedAsync(HttpListenerResponse response)
+        /// <summary>
+        /// DC-6 — Resposta uniforme para método não permitido. O header
+        /// <c>Allow</c> reflecte os métodos realmente suportados pela rota
+        /// (não fixa <c>GET, POST</c>) e o corpo segue o envelope de erro
+        /// JSON <c>{ error }</c> usado no resto do dashboard.
+        /// </summary>
+        private static async Task WriteMethodNotAllowedAsync(
+            HttpListenerResponse response, string allow = "GET, POST")
         {
-            response.Headers["Allow"] = "GET, POST";
+            response.Headers["Allow"] = allow;
             await WriteJsonAsync(
                 response,
                 new { error = "method-not-allowed" },

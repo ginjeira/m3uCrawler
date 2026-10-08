@@ -127,10 +127,10 @@ public sealed class TelegramLiveRunExecutor : IRunPipeline, ILiveRunProgressAwar
         if (_discoverySettings is not null)
         {
             return _discoverySettings.Resolve(
-                request.Keyword, request.HistoryHours, request.MaxStreams);
+                request.Keyword, request.HistoryHours, request.MaxStreams, request.MinHistoryHours);
         }
 
         return new DiscoverySettings().WithOverrides(
-            request.Keyword, request.HistoryHours, request.MaxStreams);
+            request.Keyword, request.HistoryHours, request.MaxStreams, request.MinHistoryHours);
     }
 }

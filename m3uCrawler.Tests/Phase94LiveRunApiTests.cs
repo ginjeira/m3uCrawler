@@ -425,6 +425,31 @@ public class Phase94LiveRunApiTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Post_start_with_telegram_maintain_mode_is_accepted()
+    {
+        // DC-1 — o wire name canónico telegram-maintain não coincide com
+        // o nome do membro da enum (TelegramMaintain → "telegrammaintain"),
+        // por isso a aceitação depende do parser dedicado.
+        LiveRunRequest? captured = null;
+        var pipeline = new Phase94RunApiHarness.DelegatePipeline(r => captured = r);
+        var host = await BuildHostAsync(executor: _ => pipeline);
+        var harness = StartHarness(host, webAllowTrigger: true, standalone: true);
+
+        var response = await harness.Client.PostAsync(
+            "/api/run/start",
+            JsonBody(JsonSerializer.Serialize(new { mode = "telegram-maintain" })));
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+
+        for (var i = 0; i < 100 && captured is null; i++)
+        {
+            await Task.Delay(25);
+        }
+
+        Assert.NotNull(captured);
+        Assert.Equal(LiveRunMode.TelegramMaintain, captured!.Mode);
+    }
+
+    [Fact]
     public async Task Post_start_overrides_reach_the_pipeline_request()
     {
         // Wave C — overrides explícitos do dashboard devem chegar ao
@@ -622,6 +647,56 @@ public class Phase94LiveRunApiTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Dashboard_live_run_view_exposes_mode_selector_and_overrides()
+    {
+        var host = await BuildHostAsync(executor: _ => IdlePipeline());
+        var harness = StartHarness(host, webAllowTrigger: true, standalone: true);
+
+        var response = await harness.Client.GetAsync("/");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var html = await response.Content.ReadAsStringAsync();
+
+        // DC-1 — selector de modo + overrides opcionais.
+        Assert.Contains("id='liveRunMode'", html, StringComparison.Ordinal);
+        Assert.Contains("id='liveRunKeyword'", html, StringComparison.Ordinal);
+        Assert.Contains("id='liveRunHistoryHours'", html, StringComparison.Ordinal);
+        Assert.Contains("id='liveRunMaxStreams'", html, StringComparison.Ordinal);
+        Assert.Contains("value='telegram-maintain'", html, StringComparison.Ordinal);
+        Assert.Contains("id='liveRunStartBtn'", html, StringComparison.Ordinal);
+
+        // O corpo do POST é construído a partir do modo/overrides e
+        // transportado pelo helper canónico `apiRequest`; já não é o
+        // literal vazio.
+        Assert.Contains("apiRequest('/api/run/start'", html, StringComparison.Ordinal);
+        Assert.Contains("body: payload", html, StringComparison.Ordinal);
+        Assert.DoesNotContain("body: '{}'", html, StringComparison.Ordinal);
+
+        // O bloco da vista continua com <div> balanceados.
+        var start = html.IndexOf("id='view-liverun'", StringComparison.Ordinal);
+        Assert.True(start >= 0, "Vista view-liverun não encontrada.");
+        var end = html.IndexOf("</section>", start, StringComparison.Ordinal);
+        Assert.True(end > start, "Fecho da vista view-liverun não encontrado.");
+        var block = html.Substring(start, end - start);
+        Assert.Equal(CountOccurrences(block, "<div"), CountOccurrences(block, "</div>"));
+
+        // DC-1 não introduz prompt()/alert() no bloco.
+        Assert.DoesNotContain("prompt(", block, StringComparison.Ordinal);
+        Assert.DoesNotContain("alert(", block, StringComparison.Ordinal);
+    }
+
+    private static int CountOccurrences(string haystack, string needle)
+    {
+        var count = 0;
+        var idx = 0;
+        while ((idx = haystack.IndexOf(needle, idx, StringComparison.Ordinal)) >= 0)
+        {
+            count++;
+            idx += needle.Length;
+        }
+        return count;
+    }
+
+    [Fact]
     public void Status_payload_running_shape_exposes_counts_activities_and_recent_runs()
     {
         var running = new LiveRunSnapshot
@@ -746,6 +821,10 @@ public class Phase94LiveRunApiTests : IAsyncLifetime
             .Replace("invalid-new-password", "invalid-new-secret", StringComparison.OrdinalIgnoreCase)
             .Replace("/api/telegram/auth/password", "/api/telegram/auth/2fa", StringComparison.OrdinalIgnoreCase)
             .Replace("type='password'", "type='2fa'", StringComparison.OrdinalIgnoreCase)
+            .Replace("setupDispatcharrPassword", "setupDispatcharrSecret", StringComparison.OrdinalIgnoreCase)
+            .Replace("hasPassword", "hasSecret", StringComparison.OrdinalIgnoreCase)
+            .Replace("body.password", "body.secret", StringComparison.OrdinalIgnoreCase)
+            .Replace(">password<", ">segredo<", StringComparison.OrdinalIgnoreCase)
             .Replace("password:", "2fa:", StringComparison.OrdinalIgnoreCase);
 
         var combined = scrubbed + "\n" + statusBody;

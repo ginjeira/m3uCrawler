@@ -116,6 +116,57 @@ public sealed class WaveW4OrderingHttpTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Ordering_list_create_with_duplicate_country_returns_409()
+    {
+        var firstKey = $"w4-dup-{Guid.NewGuid():N}";
+        var create = await Client.PostAsync(
+            "/api/catalog/ordering-lists",
+            Json($"{{\"key\":\"{firstKey}\",\"name\":\"W4 PT\",\"country\":\"pt\",\"isEnabled\":true}}"),
+            ShortToken());
+        Assert.Equal(HttpStatusCode.Created, create.StatusCode);
+
+        var secondKey = $"w4-dup-{Guid.NewGuid():N}";
+        var conflict = await Client.PostAsync(
+            "/api/catalog/ordering-lists",
+            Json($"{{\"key\":\"{secondKey}\",\"name\":\"W4 PT 2\",\"country\":\"pt\",\"isEnabled\":true}}"),
+            ShortToken());
+
+        Assert.Equal(HttpStatusCode.Conflict, conflict.StatusCode);
+        using var doc = JsonDocument.Parse(await conflict.Content.ReadAsStringAsync());
+        Assert.Contains("pt", doc.RootElement.GetProperty("error").GetString());
+    }
+
+    [Fact]
+    public async Task Ordering_list_update_to_used_country_returns_409()
+    {
+        var keyA = $"w4-upd-a-{Guid.NewGuid():N}";
+        var createA = await Client.PostAsync(
+            "/api/catalog/ordering-lists",
+            Json($"{{\"key\":\"{keyA}\",\"name\":\"W4 A\",\"country\":\"pt\",\"isEnabled\":true}}"),
+            ShortToken());
+        Assert.Equal(HttpStatusCode.Created, createA.StatusCode);
+
+        var keyB = $"w4-upd-b-{Guid.NewGuid():N}";
+        var createB = await Client.PostAsync(
+            "/api/catalog/ordering-lists",
+            Json($"{{\"key\":\"{keyB}\",\"name\":\"W4 B\",\"country\":\"es\",\"isEnabled\":true}}"),
+            ShortToken());
+        Assert.Equal(HttpStatusCode.Created, createB.StatusCode);
+        long idB;
+        using (var doc = JsonDocument.Parse(await createB.Content.ReadAsStringAsync()))
+        {
+            idB = doc.RootElement.GetProperty("id").GetInt64();
+        }
+
+        var conflict = await Client.PutAsync(
+            $"/api/catalog/ordering-lists/{idB}",
+            Json("{\"name\":\"W4 B\",\"country\":\"pt\",\"isEnabled\":true}"),
+            ShortToken());
+
+        Assert.Equal(HttpStatusCode.Conflict, conflict.StatusCode);
+    }
+
+    [Fact]
     public async Task Ordering_list_put_missing_returns_404()
     {
         var update = await Client.PutAsync(

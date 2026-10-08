@@ -42,6 +42,11 @@ public class WaveW5UiHtmlTests
         Assert.Contains("id='reviewAliasValue'", html);
         Assert.Contains("id='reviewApproveStatus'", html);
         Assert.Contains("id='reviewExcludeReason'", html);
+        Assert.Contains("id='reviewReopen'", html);
+        Assert.Contains("id='reviewReopenReason'", html);
+        Assert.Contains("id='reviewsStateFilter'", html);
+        Assert.Contains("id='reviewsPrevBtn'", html);
+        Assert.Contains("id='reviewsNextBtn'", html);
 
         // Escolhas explícitas (sem prompt).
         Assert.Contains("selectReviewAction(\"add-alias\")", html);
@@ -56,8 +61,8 @@ public class WaveW5UiHtmlTests
         var body = Slice(html, "function approveReview(", "function loadReviewAliasChannels(");
 
         Assert.DoesNotContain("prompt(", body);
-        // A escolha passa a ser estruturada e guarda o item pendente.
-        Assert.Contains("_pendingReviewFingerprint", body);
+        // A escolha passa a ser estruturada e guarda o item pendente por id.
+        Assert.Contains("_pendingReviewId", body);
     }
 
     [Fact]
@@ -76,18 +81,51 @@ public class WaveW5UiHtmlTests
         var html = BuildDashboardHtml();
 
         Assert.Contains("function showCreateChannelFormForReview(", html);
-        Assert.Contains("_reviewChannelFingerprint", html);
+        Assert.Contains("_reviewChannelReviewId", html);
 
         // O modo Review abre o formulário W4 existente.
         var reviewBody = Slice(html, "function showCreateChannelFormForReview(", "function closeReviewApproveModal(");
         Assert.Contains("createChannelForm", reviewBody);
         Assert.Contains("loadCatalogTab('channels')", reviewBody);
 
-        // submitCreateChannel ramifica para o endpoint de aprovação da Review.
+        // submitCreateChannel ramifica para a nova Review API (id numérico).
         var submitBody = Slice(html, "async function submitCreateChannel(", "document.getElementById('channelsSearch')");
-        Assert.Contains("/api/catalog/reviews/", submitBody);
-        Assert.Contains("create-channel", submitBody);
+        Assert.Contains("/api/review/resolve", submitBody);
+        Assert.Contains("canonicalChannel", submitBody);
         Assert.Contains("isEnabled", submitBody);
+        Assert.DoesNotContain("/api/catalog/reviews/", submitBody);
+    }
+
+    [Fact]
+    public void Reviews_tab_uses_the_new_review_api_with_pagination()
+    {
+        var html = BuildDashboardHtml();
+
+        // Lista: nova API com paginação e filtro de estado; identidade por id.
+        var loader = Slice(html, "async function loadCatalogReviews(", "function reviewsPrevPage(");
+        Assert.Contains("/api/reviews?", loader);
+        Assert.Contains("params.set('offset'", loader);
+        Assert.Contains("params.set('limit'", loader);
+        Assert.Contains("params.set('state'", loader);
+        Assert.Contains("data-review-id", loader);
+        Assert.DoesNotContain("/api/catalog/reviews", loader);
+
+        // Acções: resolve (alias/channel), ignore e reopen — nada de legacy.
+        var alias = Slice(html, "async function submitReviewAliasApproval(", "async function submitReviewExclude(");
+        Assert.Contains("/api/review/resolve", alias);
+        Assert.Contains("channelAlias", alias);
+        Assert.Contains("canonicalChannelKey", alias);
+        Assert.DoesNotContain("/api/catalog/reviews/", alias);
+
+        var exclude = Slice(html, "async function submitReviewExclude(", "async function submitReviewReopen(");
+        Assert.Contains("/api/review/ignore", exclude);
+        Assert.Contains("reviewItemId", exclude);
+        Assert.DoesNotContain("/api/catalog/reviews/", exclude);
+
+        var reopen = Slice(html, "async function submitReviewReopen(", "async function showCreateChannelFormForReview(");
+        Assert.Contains("/api/review/reopen", reopen);
+        Assert.Contains("justification", reopen);
+        Assert.DoesNotContain("/api/catalog/reviews/", reopen);
     }
 
     [Fact]
@@ -95,9 +133,13 @@ public class WaveW5UiHtmlTests
     {
         var html = BuildDashboardHtml();
 
+        Assert.Contains("window.reviewsPrevPage = reviewsPrevPage;", html);
+        Assert.Contains("window.reviewsNextPage = reviewsNextPage;", html);
+        Assert.Contains("window.reopenReview = reopenReview;", html);
         Assert.Contains("window.selectReviewAction = selectReviewAction;", html);
         Assert.Contains("window.submitReviewAliasApproval = submitReviewAliasApproval;", html);
         Assert.Contains("window.submitReviewExclude = submitReviewExclude;", html);
+        Assert.Contains("window.submitReviewReopen = submitReviewReopen;", html);
         Assert.Contains("window.closeReviewApproveModal = closeReviewApproveModal;", html);
         Assert.Contains("window.showCreateChannelFormForReview = showCreateChannelFormForReview;", html);
     }

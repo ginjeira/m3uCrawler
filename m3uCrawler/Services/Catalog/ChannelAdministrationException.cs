@@ -39,4 +39,11 @@ public enum ChannelAdministrationError
     /// resolvida não é reaberta nem alterada silenciosamente.
     /// </summary>
     ReviewConflict = 6,
+
+    /// <summary>
+    /// DC-11a / DC-D4 — colisão de país numa <see cref="OrderingListEntity"/>:
+    /// é permitida no máximo uma OrderingList por país (não nulo). A camada
+    /// HTTP traduz este erro em 409 Conflict.
+    /// </summary>
+    CountryConflict = 7,
 }

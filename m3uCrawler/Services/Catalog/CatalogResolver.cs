@@ -2687,6 +2687,20 @@ public sealed class CatalogResolver
         return trimmed;
     }
 
+    /// <summary>
+    /// DC-11a — normaliza o país de uma <c>OrderingList</c> para
+    /// <b>minúsculas invariantes</b> (trim; vazio→null) para que <c>PT</c> e
+    /// <c>pt</c> colidam como o mesmo país. É deliberadamente distinto de
+    /// <see cref="NormalizeCountry"/> (partilhado com o canal canónico, cuja
+    /// identidade de país preserva a caixa); a normalização lowercase aplica-se
+    /// apenas às Ordering Lists.
+    /// </summary>
+    private static string? NormalizeOrderingListCountry(string? country)
+    {
+        var normalized = NormalizeCountry(country);
+        return normalized?.ToLowerInvariant();
+    }
+
     private static void ValidateDisplayName(string displayName)
     {
         if (string.IsNullOrWhiteSpace(displayName))
@@ -3476,10 +3490,20 @@ public sealed class CatalogResolver
         if (name.Length > 200) throw new ArgumentException("Name excede 200 caracteres.", nameof(name));
 
         var normalizedKey = key.Trim();
+        var normalizedCountry = NormalizeOrderingListCountry(country);
         await using var context = await _factory.CreateDbContextAsync(cancellationToken);
         if (await context.OrderingLists.AnyAsync(l => l.Key == normalizedKey, cancellationToken))
         {
             throw new InvalidOperationException($"Já existe uma OrderingList com a key '{normalizedKey}'.");
+        }
+
+        // DC-11a / DC-D4 — no máximo uma OrderingList por país.
+        if (normalizedCountry != null
+            && await context.OrderingLists.AnyAsync(l => l.Country == normalizedCountry, cancellationToken))
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.CountryConflict,
+                $"Já existe uma OrderingList para o país '{normalizedCountry}'.");
         }
 
         var now = DateTime.UtcNow;
@@ -3487,7 +3511,7 @@ public sealed class CatalogResolver
         {
             Key = normalizedKey,
             Name = name.Trim(),
-            Country = string.IsNullOrWhiteSpace(country) ? null : country.Trim(),
+            Country = normalizedCountry,
             Description = string.IsNullOrWhiteSpace(description) ? null : description.Trim(),
             IsEnabled = isEnabled,
             CreatedAtUtc = now,
@@ -3502,6 +3526,11 @@ public sealed class CatalogResolver
     /// W4 — actualiza os metadados de uma <see cref="OrderingListEntity"/>
     /// existente. A <c>Key</c> é imutável; só <c>Name</c>, <c>Country</c>,
     /// <c>Description</c> e <c>IsEnabled</c> são alteráveis.
+    /// DC-11a / DC-D4: o <c>Country</c> é normalizado (trim; vazio→null;
+    /// <b>minúsculas invariantes</b>, para que <c>PT</c> e <c>pt</c> colidam) e,
+    /// quando não nulo, não pode colidir com o de outra lista — nesse caso
+    /// lança <see cref="ChannelAdministrationException"/> com
+    /// <see cref="ChannelAdministrationError.CountryConflict"/>.
     /// </summary>
     public async Task<OrderingListEntity?> UpdateOrderingListAsync(
         long id, string name, string? country, string? description, bool isEnabled,
@@ -3513,12 +3542,24 @@ public sealed class CatalogResolver
                 ChannelAdministrationError.InvalidInput, "Name é obrigatório.");
         }
 
+        var normalizedCountry = NormalizeOrderingListCountry(country);
         await using var context = await _factory.CreateDbContextAsync(cancellationToken);
         var entity = await context.OrderingLists.FirstOrDefaultAsync(l => l.Id == id, cancellationToken);
         if (entity == null) return null;
 
+        // DC-11a / DC-D4 — no máximo uma OrderingList por país. Manter o
+        // próprio país é permitido; colidir com o de outra lista não.
+        if (normalizedCountry != null
+            && await context.OrderingLists.AnyAsync(
+                l => l.Id != id && l.Country == normalizedCountry, cancellationToken))
+        {
+            throw new ChannelAdministrationException(
+                ChannelAdministrationError.CountryConflict,
+                $"Já existe uma OrderingList para o país '{normalizedCountry}'.");
+        }
+
         entity.Name = name.Trim();
-        entity.Country = string.IsNullOrWhiteSpace(country) ? null : country.Trim();
+        entity.Country = normalizedCountry;
         entity.Description = string.IsNullOrWhiteSpace(description) ? null : description.Trim();
         entity.IsEnabled = isEnabled;
         entity.UpdatedAtUtc = DateTime.UtcNow;
@@ -3526,6 +3567,19 @@ public sealed class CatalogResolver
         return entity;
     }
 
+    /// <summary>
+    /// Duplica uma <see cref="OrderingListEntity"/> (metadados + items), com
+    /// uma nova <c>Key</c>. A <c>Key</c> nova só é validada como obrigatória
+    /// (não vazia); ao contrário de <see cref="CreateOrderingListAsync"/>, o
+    /// limite de 120 caracteres **não** é verificado aqui (a coluna tem esse
+    /// limite e uma chave demasiado longa falha na persistência).
+    /// DC-11a / DC-D4: a cópia <b>não herda</b> o <c>Country</c> da lista de
+    /// origem (é limpo para <c>null</c>) — a cópia não é a lista do país e
+    /// herdar o país violaria a unicidade "uma lista por país". A origem
+    /// mantém o seu <c>Country</c> intacto. Como a cópia fica sem país, a
+    /// normalização lowercase de <see cref="NormalizeOrderingListCountry"/>
+    /// não tem aqui matéria a normalizar.
+    /// </summary>
     public async Task<OrderingListEntity> DuplicateOrderingListAsync(
         long sourceListId, string newKey, string? newName = null,
         CancellationToken cancellationToken = default)
@@ -3548,7 +3602,8 @@ public sealed class CatalogResolver
         {
             Key = newKey.Trim(),
             Name = string.IsNullOrWhiteSpace(newName) ? $"{source.Name} (cópia)" : newName.Trim(),
-            Country = source.Country,
+            // DC-11a / DC-D4 — a cópia não é a lista do país: limpa o Country.
+            Country = null,
             Description = source.Description,
             IsEnabled = source.IsEnabled,
             CreatedAtUtc = now,
@@ -4659,7 +4714,8 @@ public sealed class CatalogResolver
 
     public async Task<ScheduledJobEntity> UpsertScheduledJobAsync(
         string name, string cronExpression, string actionName, bool isEnabled,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string? discoveryJson = null)
     {
         if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Name é obrigatório.", nameof(name));
         if (name.Length > 120) throw new ArgumentException("Name excede 120 caracteres.", nameof(name));
@@ -4679,6 +4735,8 @@ public sealed class CatalogResolver
             existing.CronExpression = cronExpression;
             existing.ActionName = actionName;
             existing.IsEnabled = isEnabled;
+            // DC-9 — upsert substitui os overrides (null limpa-os).
+            existing.DiscoveryJson = discoveryJson;
             existing.UpdatedAtUtc = now;
             existing.NextRunAtUtc = m3uCrawler.Services.Automation.CronExpression.Parse(cronExpression)
                 .NextOccurrence(now);
@@ -4691,6 +4749,7 @@ public sealed class CatalogResolver
             CronExpression = cronExpression,
             ActionName = actionName,
             IsEnabled = isEnabled,
+            DiscoveryJson = discoveryJson,
             CreatedAtUtc = now,
             UpdatedAtUtc = now,
             NextRunAtUtc = m3uCrawler.Services.Automation.CronExpression.Parse(cronExpression)

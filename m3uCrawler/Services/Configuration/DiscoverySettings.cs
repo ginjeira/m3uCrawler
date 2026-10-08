@@ -151,10 +151,21 @@ public sealed class DiscoverySettings
 
     /// <summary>
     /// Resolve os valores efectivos de uma execução: overrides explícitos
-    /// (CLI/API) substituem o valor persistido quando presentes e válidos;
-    /// caso contrário o valor persistido é mantido.
+    /// (CLI/API/job) substituem o valor persistido quando presentes e
+    /// válidos; caso contrário o valor persistido é mantido.
+    ///
+    /// <para>
+    /// <paramref name="minHistoryHours"/> é opcional (default
+    /// <c>null</c> = herda o persistido) e validado em
+    /// <c>0..<see cref="MaxValidHistoryHours"/></c>. A normalização de
+    /// janela invertida (<c>Min &gt; History</c> → <c>Min = 0</c>) mantém-se.
+    /// </para>
     /// </summary>
-    public DiscoverySettings WithOverrides(string? keyword, int? historyHours, int? maxStreams)
+    public DiscoverySettings WithOverrides(
+        string? keyword,
+        int? historyHours,
+        int? maxStreams,
+        int? minHistoryHours = null)
     {
         var effective = Clone();
         if (!string.IsNullOrWhiteSpace(keyword))
@@ -170,6 +181,11 @@ public sealed class DiscoverySettings
         if (maxStreams is >= MinMaxStreams)
         {
             effective.MaxStreams = maxStreams.Value;
+        }
+
+        if (minHistoryHours is >= 0 and <= MaxValidHistoryHours)
+        {
+            effective.MinHistoryHours = minHistoryHours.Value;
         }
 
         // Janela invertida após override do limite superior cai no

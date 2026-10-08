@@ -359,6 +359,7 @@ Content-Type: application/json
   "mode": "telegram" | "telegram-maintain",   # default: "telegram-maintain"
   "keyword": "portugal",                       # opcional
   "historyHours": 24,                          # opcional, default 24
+  "minHistoryHours": 0,                        # opcional (DC-9), default 0
   "maxStreams": 500                            # opcional, default 500
 }
 ```
@@ -702,15 +703,25 @@ Comportamento:
   `isRunning == true`; caso contrário, cada 10s.
 - A "ETA" usa `estimate.estimatedRemainingMs` se presente;
   sem isso, mostra apenas o tempo decorrido.
-- "Run now" abre um pequeno modal com:
-  - Dropdown `Mode`: `Telegram (single cycle)` / `Telegram (maintenance cycle)`.
-  - Inputs opcionais: `Keyword`, `History hours`, `Max streams`.
-  - Botão "Start" → `POST /api/run/start`.
-  - Após 202: troca o botão para "Run already started",
-    actualiza o badge para running, e passa a polling 2s.
-- Se a resposta for 409, o modal mostra
-  "Já existe um ciclo em curso (run #…, começou há Xm)" e
-  fecha automaticamente ao fim de 3s.
+- "Run now" (**implementado na vista Live Run, DC-1**) expõe:
+  - Dropdown `Mode` (`liveRunMode`): `telegram` (ciclo único, default) /
+    `telegram-maintain` (manutenção).
+  - Inputs opcionais: `Keyword` (`liveRunKeyword`), `History hours`
+    (`liveRunHistoryHours`, 1–720), `Min history hours`
+    (`liveRunMinHistoryHours`, 0–1440; DC-9) e `Max streams`
+    (`liveRunMaxStreams`, 1–5000). Vazios ⇒ o backend herda a configuração
+    de discovery persistida.
+  - Botão "Run now" → `POST /api/run/start` com
+    `{ mode, keyword?, historyHours?, minHistoryHours?, maxStreams? }`
+    (`mode` sempre presente).
+  - Os overrides de discovery **por Scheduled Job** (DC-9 / DC-D2) seguem a
+    mesma precedência `defaults.WithOverrides(overrides)`, persistidos em
+    `scheduled_jobs.DiscoveryJson`; ver `m3uCrawler/README.md` §
+    "Scheduler / Scheduled Jobs → Overrides de discovery por job".
+  - Após 202: actualiza o badge para running e passa a polling 3s.
+- Se a resposta for 409, o polling mostra o run em curso; 503
+  (`web-allow-trigger-disabled` / `pipeline-not-configured`) é apresentado
+  em erro com o botão reabilitado.
 
 ### 7.2 Tab "Runs" (secção existente)
 
@@ -1603,13 +1614,13 @@ Adições posteriores a 9C.4 na cadeia de observabilidade. Descritas aqui sem no
 - **Proveniência mensagem → candidate → playlist.** `CandidatePlaylist` passou a transportar `SourceMessageId`/`SourceMessageDateUtc` e `DiscoveredPlaylist` (em `telegram_run_report.json`) passou a expor `CandidateId`/`MessageId`/`MessageDateUtc` (camelCase) via `GET /api/discovered-playlists`. A cadeia resultante é `run → mensagem (messageId, messageDateUtc, chat em source) → candidateId → estado/workingStreams da playlist`.
 - **`runId` CLI vs `LiveRun`.** Em modo CLI **não** existe `runId` operacional de coordenador: apenas o `runId` de diagnóstico do `PipelineTrace` (processo-scoped, só activo com `M3UCRAWLER_TRACE`). O `runId` operacional (`LiveRun`, criado pelo `RunCoordinator`) só existe em runs via dashboard/scheduler. Os dois **não** são a mesma identidade (ver `docs/Reestructure/13-RUNS.md §1` e DL-124 em `docs/Reestructure/31-DECISION-LOCK.md`).
 - **Contador `StreamsSkippedAlreadyValidated`.** W-DEDUP (2026-10-01) deduplica o GET físico por run (`ValidationKey = sfp1`); `RunReport.StreamsTested` conta apenas validações físicas e os GETs evitados vão para `StreamsSkippedAlreadyValidated`, espelhado em `LiveRunCounts.StreamsSkippedAlreadyValidated` e exposto por `DashboardMetrics.SummarizeRun`. Detalhe normativo em `docs/Reestructure/08-VALIDATION.md §6`.
-- **Janela de histórico Min/Max.** W-HISTWIN introduziu `DiscoverySettings.MinHistoryHours` (default `0`) a par de `HistoryHours` (máximo), com `GET/POST /api/discovery/settings` a devolver/aceitar `minHistoryHours`. O trigger `POST /api/run/start` mantém o contrato antigo (sem `minHistoryHours`; tecto próprio `720h`). A UI HTML do dashboard expõe estes parâmetros desde a W-DASHBOARD (ver §18.10); o Schedule Min/Max continua para wave futura.
+- **Janela de histórico Min/Max.** W-HISTWIN introduziu `DiscoverySettings.MinHistoryHours` (default `0`) a par de `HistoryHours` (máximo), com `GET/POST /api/discovery/settings` a devolver/aceitar `minHistoryHours`. O trigger `POST /api/run/start` passou a aceitar `minHistoryHours` opcional na DC-9 (2026-10-08; validado em `[0, MaxValidHistoryHours]` e ignorado fora do intervalo). A UI HTML do dashboard expõe estes parâmetros desde a W-DASHBOARD (ver §18.10) e o "Run now" aceita overrides de modo/keyword/janela/`MaxStreams` (DC-1); os overrides de discovery por Scheduled Job foram implementados na DC-9 (ver `m3uCrawler/README.md` § "Overrides de discovery por job").
 
 ### 18.10 W-DASHBOARD — configuração de descoberta e Live View com contexto (2026-10-02)
 
 Extensão da cadeia de observabilidade implementada no working tree (não commitada). **Sem novos contratos de observabilidade** nem novo endpoint; o registo canónico de execução e os números da suite são `docs/PROJECT_STATUS.md`. Contratos HTTP actualizados em `docs/Reestructure/22-API-CONTRACTS.md` §13/§18.
 
-- **Configuração de descoberta.** A vista Descoberta passa a expor um card (`keyword`, `MinHistoryHours`, `HistoryHours`/Max, `MaxStreams`) que lê/grava pela SSOT `app_settings.json#discovery` via os endpoints existentes `GET/POST /api/discovery/settings`. A janela inclusiva é explicada no cliente a partir dos valores; erros 400 são inline e o formulário recarrega os valores persistidos. `POST /api/run/start` mantém o contrato antigo. Deliberadamente não expostos: credenciais, flags de deployment/restart, modos legacy, constantes técnicas e `dispatcharrTest` (ver `m3uCrawler/README.md` § "Configuração no Dashboard: o que está exposto e o que não").
+- **Configuração de descoberta.** A vista Descoberta passa a expor um card (`keyword`, `MinHistoryHours`, `HistoryHours`/Max, `MaxStreams`) que lê/grava pela SSOT `app_settings.json#discovery` via os endpoints existentes `GET/POST /api/discovery/settings`. A janela inclusiva é explicada no cliente a partir dos valores; erros 400 são inline e o formulário recarrega os valores persistidos. `POST /api/run/start` passou a aceitar overrides opcionais de discovery, incluindo `minHistoryHours` (DC-9, 2026-10-08). Deliberadamente não expostos: credenciais, flags de deployment/restart, modos legacy, constantes técnicas e `dispatcharrTest` (ver `m3uCrawler/README.md` § "Configuração no Dashboard: o que está exposto e o que não").
 - **Activities com contexto.** O payload de activities (`GET /api/run/status`) passa a incluir `metadata` (dict opcional de contexto por evento) e as activities de fase incluem `runId`; o `category` é renderizado como badge e o metadata como `key=value` na vista Live Run. Contexto por fase: leitura Telegram (`keyword` + janela), mensagem analisada (`messageId`/`messageDateUtc`/`chat`), candidate criado (`candidateId`/`kind`/`from`), promoção Xtream (`candidateId`/`parentCandidateId`), download/parse (`candidateId` + motivo), validação por país e por playlist (**physical N / reused M**) e Dispatcharr (contadores do sync; tipo de erro).
 - **W-DEDUP visível.** O `AccountValidator` emite uma activity por ronda de conta (`account validation: N physical, M reused, K failed`, conta mascarada) sem alterar a lógica de decisão. O contador `StreamsSkippedAlreadyValidated` passa a surgir no Live Run, no Overview (card + badge) e no histórico de Execuções (`ImportHistoryEntry.StreamsSkippedAlreadyValidated`; entradas antigas mostram `—`) — substitui o cálculo `t−(w+f)` do Overview, que nunca disparava.
 - **Proveniência nas tabelas.** A tabela de Descoberta dá colunas MessageId / Data mensagem (UTC) / Candidato; `GET /api/discovery/summary` propaga o primeiro candidato/`messageId` não-nulo do grupo deduplicado (`DiscoveredPlaylistSummary`). `GET /api/discovered-playlists` mantém a proveniência por item (§18.9).

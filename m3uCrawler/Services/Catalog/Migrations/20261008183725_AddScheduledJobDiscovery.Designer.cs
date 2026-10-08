@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using m3uCrawler.Services.Catalog;
 
@@ -10,9 +11,11 @@ using m3uCrawler.Services.Catalog;
 namespace m3uCrawler.Services.Catalog.Migrations
 {
     [DbContext(typeof(ChannelCatalogDbContext))]
-    partial class ChannelCatalogDbContextModelSnapshot : ModelSnapshot
+    [Migration("20261008183725_AddScheduledJobDiscovery")]
+    partial class AddScheduledJobDiscovery
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder.HasAnnotation("ProductVersion", "9.0.0");
@@ -947,10 +950,6 @@ namespace m3uCrawler.Services.Catalog.Migrations
                         .HasColumnType("TEXT");
 
                     b.HasKey("Id");
-
-                    b.HasIndex("Country")
-                        .IsUnique()
-                        .HasFilter("\"Country\" IS NOT NULL");
 
                     b.HasIndex("Key")
                         .IsUnique();

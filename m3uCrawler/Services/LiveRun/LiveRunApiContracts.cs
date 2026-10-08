@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Text.Json;
 using m3uCrawler.Services.Catalog;
+using m3uCrawler.Services.Configuration;
 
 namespace m3uCrawler.Services.LiveRun;
 
@@ -28,6 +29,9 @@ public sealed class LiveRunStartPayload
     public string? Keyword { get; set; }
     public int? HistoryHours { get; set; }
     public int? MaxStreams { get; set; }
+
+    /// <summary>DC-9 — limite mínimo da janela de histórico (opcional).</summary>
+    public int? MinHistoryHours { get; set; }
 }
 
 /// <summary>
@@ -296,17 +300,24 @@ internal static class LiveRunApiMappings
         if (payload is null) return null;
 
         LiveRunMode mode = LiveRunMode.Telegram;
-        if (!string.IsNullOrWhiteSpace(payload.Mode))
+        if (!string.IsNullOrWhiteSpace(payload.Mode)
+            && !LiveRunWireNames.TryParseMode(payload.Mode, out mode))
         {
-            if (!Enum.TryParse<LiveRunMode>(payload.Mode, ignoreCase: true, out mode))
-            {
-                // Rejeita explicitamente modos desconhecidos.
-                return null;
-            }
+            // Rejeita explicitamente modos desconhecidos. O wire name
+            // canónico telegram-maintain não coincide com o nome do
+            // membro da enum, por isso a validação é feita por um parser
+            // dedicado em vez de Enum.TryParse.
+            return null;
         }
 
         int? historyHours = payload.HistoryHours is > 0 and <= 24 * 30 ? payload.HistoryHours : null;
         int? maxStreams = payload.MaxStreams is > 0 and <= 5000 ? payload.MaxStreams : null;
+        // DC-9 — minHistoryHours validado no intervalo [0, MaxValidHistoryHours];
+        // fora do intervalo é ignorado (herda a config persistida), como os
+        // restantes overrides.
+        int? minHistoryHours = payload.MinHistoryHours is >= 0 and <= DiscoverySettings.MaxValidHistoryHours
+            ? payload.MinHistoryHours
+            : null;
 
         return new LiveRunRequest
         {
@@ -315,6 +326,7 @@ internal static class LiveRunApiMappings
             Keyword = string.IsNullOrWhiteSpace(payload.Keyword) ? null : payload.Keyword,
             HistoryHours = historyHours,
             MaxStreams = maxStreams,
+            MinHistoryHours = minHistoryHours,
         };
     }
 

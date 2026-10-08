@@ -16,12 +16,14 @@ public class WebDashboardHtmlTests
         Assert.NotNull(method);
         var html = (string)method!.Invoke(null, null)!;
 
-        Assert.Contains("Overview", html);
+        Assert.Contains("Visão Geral", html);
         Assert.Contains("Execuções", html);
         Assert.Contains("Descoberta", html);
         Assert.Contains("Canais / Países", html);
         Assert.Contains("Playlist", html);
         Assert.Contains("Dispatcharr", html);
+        Assert.Contains("Validação de Streams", html);
+        Assert.Contains("Execução ao Vivo", html);
         Assert.Contains("Diagnóstico", html);
         Assert.Contains("dispatcharr/state", html);  // /api/dispatcharr/state
         Assert.Contains("discovery/summary", html);

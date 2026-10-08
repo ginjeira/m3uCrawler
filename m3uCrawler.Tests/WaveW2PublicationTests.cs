@@ -192,7 +192,7 @@ public class WaveW2PublicationTests : IAsyncLifetime
     public async Task GeneratePlaylist_honors_selected_ordering_list_id()
     {
         var first = await _resolver.CreateOrderingListAsync("aaa", "AAA list", "pt", null);
-        var second = await _resolver.CreateOrderingListAsync("zzz", "ZZZ list", "pt", null);
+        var second = await _resolver.CreateOrderingListAsync("zzz", "ZZZ list", null, null);
 
         var outputDir = Path.Combine(_root, "generate");
         Directory.CreateDirectory(outputDir);
@@ -217,7 +217,7 @@ public class WaveW2PublicationTests : IAsyncLifetime
     public async Task GeneratePlaylist_without_id_falls_back_deterministically_to_first_list()
     {
         var first = await _resolver.CreateOrderingListAsync("aaa", "AAA list", "pt", null);
-        await _resolver.CreateOrderingListAsync("zzz", "ZZZ list", "pt", null);
+        await _resolver.CreateOrderingListAsync("zzz", "ZZZ list", null, null);
 
         var outputDir = Path.Combine(_root, "generate-fallback");
         Directory.CreateDirectory(outputDir);

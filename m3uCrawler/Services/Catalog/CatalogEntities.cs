@@ -702,6 +702,13 @@ public sealed class ScheduledJobEntity
     /// <summary>Nome lógico da acção (e.g. "discoverTelegram").</summary>
     public string ActionName { get; set; } = string.Empty;
 
+    /// <summary>
+    /// DC-9 — overrides de discovery do job em JSON (camelCase), aplicados
+    /// sobre a configuração global. <c>null</c> = sem overrides (herda a
+    /// global). Ver <c>m3uCrawler.Services.Configuration.DiscoveryOverrides</c>.
+    /// </summary>
+    public string? DiscoveryJson { get; set; }
+
     public bool IsEnabled { get; set; } = true;
 
     public DateTime? LastRunAtUtc { get; set; }

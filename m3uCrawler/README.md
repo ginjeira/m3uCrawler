@@ -151,10 +151,10 @@ A pesquisa no Telegram considera apenas mensagens cuja idade satisfaz `MinHistor
 - `--history-hours N` continua a definir o limite superior (Max), com o comportamento actual (`floor` 1; tecto 1440h = 60 dias).
 - `--min-history-hours N` define o limite inferior (≥ 0). `MinHistoryHours = 0` equivale ao comportamento legacy (`0 <= idade <= Max`), sem excluir mensagens recentes.
 - **Isolar faixas temporais do histórico** (útil para testes reproduzíveis de janelas): `--min-history-hours 384 --history-hours 720` considera apenas mensagens com idade entre 384h e 720h, sem reprocessar o histórico recente. Outros exemplos de faixas: 0→384, 720→1000.
-- **Persistência:** mesma SSOT `runtime-data/app_settings.json`, secção `discovery` (`historyHours` + novo `minHistoryHours`). `GET /api/discovery/settings` devolve `minHistoryHours`; `POST /api/discovery/settings` aceita `minHistoryHours` opcional (semântica de patch). O contrato de `/api/run/start` mantém-se e usa a janela persistida.
+- **Persistência:** mesma SSOT `runtime-data/app_settings.json`, secção `discovery` (`historyHours` + novo `minHistoryHours`). `GET /api/discovery/settings` devolve `minHistoryHours`; `POST /api/discovery/settings` aceita `minHistoryHours` opcional (semântica de patch). `POST /api/run/start` aceita agora `minHistoryHours` opcional (DC-9), validado em `[0, MaxValidHistoryHours]`; fora do intervalo é ignorado (herda o persistido). Sem overrides, o run usa a janela persistida.
 - **Validação:** `MinHistoryHours >= 0`, `MaxHistoryHours >= 0` e `MinHistoryHours <= MaxHistoryHours`. Valores inválidos são rejeitados na API (400) e os valores inválidos persistidos são normalizados para o default (`Min → 0`) pelo mecanismo `Sanitize` existente.
 
-A janela já está configurável na **UI do dashboard**, na vista Descoberta (card "Configuração de descoberta"): `keyword`, `MinHistoryHours`, `HistoryHours`/Max e `MaxStreams`, persistidos via `GET/POST /api/discovery/settings` (ex.: Min 425h / Max 450h ⇒ `425h ≤ idade ≤ 450h`; "Min 0 = sem limite inferior"). A integração com o **Schedule Min/Max** continua para wave futura. Ver "Configuração no Dashboard: o que está exposto e o que não" na secção do Dashboard.
+A janela já está configurável na **UI do dashboard**, na vista Descoberta (card "Configuração de discovery predefinida"): `keyword`, `MinHistoryHours`, `HistoryHours`/Max e `MaxStreams`, persistidos via `GET/POST /api/discovery/settings` (ex.: Min 425h / Max 450h ⇒ `425h ≤ idade ≤ 450h`; "Min 0 = sem limite inferior"). Esta configuração é a **base/fallback**; cada **Scheduled Job** pode sobrepor-lhe parâmetros próprios (DC-9 — ver "Scheduler / Scheduled Jobs") e o **"Run now"** da Execução ao Vivo aceita overrides pontuais de modo/keyword/janela/`MaxStreams` (DC-1). Ver "Configuração no Dashboard: o que está exposto e o que não" na secção do Dashboard.
 
 ### Proveniência da mensagem de origem (candidate → playlist)
 
@@ -336,6 +336,7 @@ A URL interna do candidato Xtream contém credenciais (necessárias para o downl
   - `output/telegram_run_report.json` (`RunReport`) — `DiscoveredPlaylists.Name` e `RejectionReasons` passam por `CredentialSanitizer.SanitizeUrl`.
   - `output/telegram_report_<timestamp>.json`, `output/telegram_maintain_report.json`, `output/report_<timestamp>.json` (relatórios JSON de playlist) — os URLs dos streams são sanitizados via `CredentialSanitizer.SanitizeUrl` antes da serialização.
   - Dashboard — a pré-visualização HTML (`<pre id='playlistPreview'>`) usa `GET /api/playlist/preview` (sanitizado via `CredentialSanitizer.SanitizeM3uContent`); os endpoints `/api/playlist*` mantêm-se funcionais para download explícito.
+  - Dashboard (projecções JSON, defense-in-depth) — o boundary de saída aplica `CredentialSanitizer.SanitizeUrl` ao `streamUrl` de `GET /api/catalog/sources/{id}/streams` (`ChannelSourceToJson`), ao preview de ordering lists (`PlaylistCompositionToJson`), ao `streamUrl` de `/api/catalog/pending-country-approvals` e ao `baseUrl` de `/api/dispatcharr/config`. Cobre linhas legacy/direct-DB que tenham escapado a sanitização em persistência. Para o Dispatcharr, um `baseUrl` já mascarado reenviado pelo formulário **não** é re-persistido (evita gravar `***`).
   - Mensagens de erro — sanitizadas via `CredentialSanitizer.SanitizeUrl` (download de playlist e templates).
 
 `CredentialSanitizer` mascara: `user:password@` em userinfo → `user:***@`; segmentos `user/pass` em `/live/`, `/movie/`, `/series/` → `***/***`; a forma **bare** de Xtream `scheme://host:port/<username>/<password>/<stream-id>` (sem o marcador `/live|movie|series/`) → `scheme://host:port/***/***/<stream-id>`, preservando scheme, host, porta explícita (e.g. `:8080`) e o stream id; parâmetros `username`, `password` e `token` em query string → `***`. O reconhecimento da forma bare é deliberadamente restritivo — exactamente 3 segmentos de path, os dois primeiros com ≥4 caracteres e o último um stream id numérico (extensão opcional) — pelo que URLs arbitrárias com 3 segmentos (e.g. `/path/to/playlist.m3u8`) não são afectadas. É aplicado em todas as combinações (userinfo + path + query).
@@ -565,29 +566,45 @@ O dashboard (`Services/WebDashboardService.cs`, `HttpListener`) serve a UI em `h
 | `/api/country/save` (POST) | Grava a lista de canais de um país (preserva o `displayName` enviado). |
 | `/api/country?country=pt` (DELETE) | **W6** — Elimina a configuração do país (`runtime-data/countries/<code>.json`). `200` quando eliminado, `404` quando ausente. Não altera a playlist publicada. |
 | `/api/playlist` / `/api/playlist_temp` | **Funcional**: conteúdo textual das playlists com URLs reais (necessário para reprodução Xtream). Usar para download explícito. |
-| `/api/playlist/preview` / `/api/playlist_temp/preview` | **Diagnóstico**: mesmo conteúdo com URLs sanitizadas (`CredentialSanitizer.SanitizeM3uContent`). Usado pela pré-visualização HTML para nunca expor credenciais. |
+| `/api/playlist/preview` / `/api/playlist_temp/preview` | **Diagnóstico**: mesmo conteúdo com URLs sanitizadas (`CredentialSanitizer.SanitizeM3uContent`). Usado pelas pré-visualizações HTML (`#playlistPreview` e `#playlistTempPreview`, DC-5e) para nunca expor credenciais. `playlist_temp.m3u` inexistente → `404` ("Playlist temporária não encontrada"). |
 | `/api/run-report` | `RunReport` da última execução (sanitizado). |
 | `/api/discovered-playlists` | Lista de playlists descobertas na última execução (sanitizado). |
+| `/api/audit` (GET) | **W6a/DC-5b** — Registos de auditoria administrativa, read-only. Filtros opcionais `objectType`, `objectId` e `limit` (default 100, cap 1000); ordenados por `occurredAtUtc`/`id` desc. Textos e JSON (`beforeJson`/`afterJson`) já sanitizados (`CredentialSanitizer`); sem catálogo/serviço de auditoria → `503 {"error":"audit-unavailable"}`. Visualizador na UI em Catálogo → **Auditoria**. |
+| `/api/classification-summary` (GET) | **DC-5d** — Sumário de classificação do último `MatchPlan` (`dispatcharr_plan_*.json`): contagens por `ChannelKind` (`classification`), `excludedCount`, amostra de exclusões (`title`/`group`/`kind`/`reason`) e metadados (`planGeneratedAtUtc`, `planSourcePlaylistPath`). Sem plano → `200 {"error":"Sem plano de classificação disponível."}` (estado "sem dados", não erro). Visualizado na UI em Dispatcharr → **Classificação (último MatchPlan)**. |
 | `/api/catalog/source-selection-policies` (GET/POST) | Política **global** de selecção de fontes por canal (ver secção seguinte). |
 | `/api/catalog/source-selection-policies/channels` (GET/POST) | Overrides **por canal** da política de selecção de fontes (identidade = chave canónica; ver secção seguinte). |
 | `/api/catalog/source-selection-policies/channels/{key}` (GET/DELETE) | Lê/elimina o override do canal canónico `{key}`. |
 | `/api/catalog/source-selection-policies/preview` (GET) | **Preview/dry-run read-only** da selecção de fontes: corre a mesma lógica da produção sobre o catálogo, sem publicar nem escrever. Ver secção seguinte. |
+| `/api/catalog/channel-sources/{id}/observations?limit={n}` (GET) | **DC-5c** — Histórico de observações de um *channel-source* (`quality`, `epg`, `availability`, `responseTimeMs`, `observedAtUtc`), mais recentes primeiro. `limit` default 200. Visualizador na UI em Catálogo → **Sources** (acção **Observações** por linha). |
+| `/api/catalog/channel-sources/{id}/observations` (POST) | **DC-5c** — Regista uma observação (`{ quality, epg, availability, responseTimeMs }`); enums (`StreamQuality`/`EpgState`/`AvailabilityState`) com parse tolerante (valor desconhecido → default sem falhar). Devolve `{ recorded: true }`. Usado pelo formulário da UI em Catálogo → **Sources**. |
+
+### Semântica HTTP e erros
+
+Os endpoints JSON devolvem erros no envelope `{ "error": "<código>" }`; as Review APIs (`/api/reviews`, `/api/review*`) usam `{ error, message, correlationId }`. Regras uniformes:
+
+- **405 Method Not Allowed** para verbos não suportados numa rota existente. O header `Allow` reflecte os métodos realmente suportados (não fixa `GET, POST`) e o corpo é `{"error":"method-not-allowed"}`. Exemplos: `POST` em `/api/run/start`, `/api/country/save`, `/api/validation/test` e `/api/dispatcharr/test`; `GET` em `/api/configuration/readiness`; `GET, POST` em `/api/discovery/settings`, `/api/telegram/config` e `/api/dispatcharr/config`; `GET` em `/api/telegram/auth/status`; `POST` nas restantes sub-rotas `/api/telegram/auth/*`.
+- **404 Not Found** apenas para rotas **inexistentes** (não para verbos errados em rotas existentes).
+- **`/api/country`** aceita `GET` (detalhe) e `DELETE` (remoção); outros verbos → `405` com `Allow: GET, DELETE`. **`/api/playlist`**, **`/api/playlist_temp`** e as variantes **`/preview`** são **GET-only** (outros verbos → `405` com `Allow: GET`); a playlist funcional continua intocada.
+- O recurso Review é exposto com o contrato canónico (`subject`, `reason`, `createdAt`/`updatedAt`/`resolvedAt`, `runId`) **e** com aliases legacy (`fingerprint`, `normalizedIdentity`, `reasonSignature`, `createdAtUtc`/`updatedAtUtc`/`resolvedAtUtc`). A **UI do separador Catálogo → Reviews já usa a nova API** (`GET /api/reviews`, `POST /api/review/{resolve|ignore|reopen}`) com **identidade por `id` numérico** (não pelo fingerprint) e **paginação** (`offset`/`limit`, cap 500); o filtro de estado mantém os activos por omissão e expõe o histórico via `?state=`. A rota legacy `/api/catalog/reviews` mantém-se inalterada no backend (DL-120/D5), apenas já não é consumida pela UI.
+- **Transporte e erros no front-end.** Os handlers de mutação do dashboard (POST/PUT/PATCH/DELETE) usam um único helper `apiRequest(path, { method, body, signal })`: envolve `fetch` em `try/catch` (nunca propaga rejeições de rede), serializa o corpo objecto para JSON, lê a resposta em `r.text()` com parse tolerante (nunca `r.json()` num ramo de erro) e devolve `{ ok, status, json, error }` com a mensagem normalizada (`json.error` → texto → `HTTP <status>` → mensagem de rede). A apresentação é uniforme — `setStatus(...)` em elementos de estado inline e `alert('Erro: ' + res.error)` onde não existe nó dedicado. As leituras de GET/polling mantêm `safeFetchJson`.
 
 ### Navegação do Dashboard
 
 O dashboard tem os seguintes separadores principais:
 
-- **Overview**: resumo do sistema com métricas da última execução, carteiras de streams, estado do Dispatcharr e **estado de publicação do catálogo** (DL-130). O card "Publicação do catálogo" consome `GET /api/publication/status` e apresenta os 4 estados (`Pendente` / `Em dia` / `Sem publicação anterior` / `Indisponível`) com badges `warn` / `ok` / `warn` / `muted`; o booleano `publicationPending` chega já calculado pelo backend e não é recalculado no frontend.
+- **Visão Geral**: resumo do sistema com métricas da última execução, carteiras de streams, estado do Dispatcharr e **estado de publicação do catálogo** (DL-130). O card "Publicação do catálogo" consome `GET /api/publication/status` e apresenta os 4 estados (`Pendente` / `Em dia` / `Sem publicação anterior` / `Indisponível`) com badges `warn` / `ok` / `warn` / `muted`; o booleano `publicationPending` chega já calculado pelo backend e não é recalculado no frontend.
 - **Execuções**: histórico detalhado das últimas 72h com métricas por execução.
-- **Descoberta**: card "Configuração de descoberta" (keyword, janela Min/Max, `MaxStreams`, via `/api/discovery/settings`) e playlists descobertas com filtros por estado, origem e país, incluindo colunas de proveniência MessageId / Data mensagem (UTC) / Candidato.
+- **Descoberta**: card "Configuração de discovery predefinida" (keyword, janela Min/Max, `MaxStreams`, via `/api/discovery/settings`) e playlists descobertas com filtros por estado, origem e país, incluindo colunas de proveniência MessageId / Data mensagem (UTC) / Candidato.
 - **Canais / Países**: validação da playlist actual por país e gestão das listas de aliases.
-- **Playlist**: visualização da playlist actual com links para download funcional.
-- **Dispatcharr**: estado da última sincronização e detalhes do plano/report.
+- **Playlist**: visualização da playlist actual e da intermédia (`playlist_temp.m3u`) com pré-visualizações sanitizadas (`GET /api/playlist/preview` e `GET /api/playlist_temp/preview`, DC-5e), links para download funcional e lista dos ficheiros em `output/`.
+- **Dispatcharr**: estado da última sincronização, card **Classificação (último MatchPlan)** (DC-5d, `GET /api/classification-summary`) e detalhes do plano/report.
 - **Catálogo**: gestão completa do catálogo de canais, incluindo o separador **Scheduled Jobs** (jobs cron persistentes; ver secção "Scheduler / Scheduled Jobs").
+- **Validação de Streams**: política operacional de teste de streams e dry-run de URLs.
+- **Execução ao Vivo**: observabilidade do `RunCoordinator` (estado, fases, contadores, actividades e últimas execuções 24h). O "Run now" permite escolher o modo (`telegram` / `telegram-maintain`) e overrides opcionais; a listagem de agendamentos não é duplicada aqui — há um deep-link para **Catálogo → Scheduled Jobs** (fonte única).
 - **Setup**: onboarding pós-bootstrap — banner `⚠️ SETUP REQUIRED`, prontidão por componente, config/autenticação Telegram e config/teste Dispatcharr (ver secção "Onboarding / Setup operacional").
 - **Diagnóstico**: inventário de ficheiros, RunReport completo e glossário de métricas.
 
-Os editores inline do dashboard (Canais, Reviews, Regras, Afinidade, Ordering, Scheduler, Source selection e Import policies) passam a abrir num modal centrado, com fecho por `Cancelar`, clique fora ou `Escape` e gestão de foco.
+Os editores inline do dashboard (Canais, Reviews, Regras, Afinidade, Ordering, Scheduler, Source selection e Import policies) passam a abrir num modal centrado, com fecho por `Cancelar`, clique fora ou `Escape` e gestão de foco: a abertura memoriza o elemento focado e o fecho restaura-o (sem lançar se o elemento tiver entretanto desaparecido). Não são usados diálogos nativos do browser para escolhas — por exemplo, **alterar a Política de publicação** de um canal (`channelPolicyForm` com `<select>` pré-selecionado) e **duplicar** uma Ordering List (`orderingDuplicateForm` com input pré-preenchido com `<key>-copy`) passam por painéis modais. No detalhe de uma Ordering List, cada item tem ainda um controlo **mover para posição N** (input numérico 1-based + botão *Mover*), que reutiliza `PUT /api/catalog/ordering-items/{id}` com `{ position }` 0-based (DC-12).
 
 ### Catálogo de Canais
 
@@ -600,9 +617,11 @@ O catálogo (`ChannelCatalogDbContext`, SQLite em `/data/channel-catalog.db`) ge
 | **Grupos** | Grupos canónicos de publicação, ordenados por `order` (ver "Grupos canónicos e atribuição por canal"). |
 | **Regras** | IdentityRules explícitas que sobrepõem o matching automático. Criar regra com `ReviewOnly` permite fuzzy matching futuro; `Excluded` bloqueia o canal permanentemente. |
 | **Afinidades** | Grupos com discriminator `Kind` (**Channel** ou **Country**). Uma Channel affinity liga variantes a um canal canónico (0..1 por `CanonicalChannelKey`); uma Country affinity liga variantes ao `CountryChannelValidator` para country-level targeting. As variantes são editadas num único campo separado pelo delimiter global (`/api/settings`, default `,`). |
-| **Reviews** | Itens de revisão do Dispatcharr (decisões ambíguas ou uncertainas pendentes de decisão humana). |
+| **Reviews** | Itens de revisão do Dispatcharr (decisões ambíguas ou uncertainas pendentes de decisão humana). A lista usa `GET /api/reviews` com paginação e filtro de estado (activos por omissão; `Resolved`/`Ignored` no histórico); as acções usam `POST /api/review/resolve` (Add Alias → `change.type='channelAlias'`; Create Channel → `change.type='canonicalChannel'`), `POST /api/review/ignore` (excluir, com `reason` obrigatório) e `POST /api/review/reopen` (reabrir um item terminal, com `justification`). A identidade interna é o `id` numérico do `ReviewItem`. |
+| **Auditoria** | Visualizador (DC-5b) dos registos de auditoria via `GET /api/audit`, com filtros `objectType`/`objectId`/`limit` (default 100, cap 1000) e tabela de data/hora local, actor, operação, objecto, resultado, `before`/`after` (JSON sanitizado em `<details>` expansível) e detalhe. `503 audit-unavailable` é apresentado como estado inline claro. Read-only. |
 | **Sync Runs** | Histórico de sincronizações Dispatcharr com contadores de created/merged/protected/removed. |
 | **Pending** | Canais que geraram dúvida no country-level targeting e aguardam decisão manual (ver secção seguinte). |
+| **Sources** | Sources de ingestão e *channel sources* associados. Cada linha de *channel source* tem a acção **Observações** (DC-5c) que abre o histórico de observações (`GET /api/catalog/channel-sources/{id}/observations?limit=200`) e permite registar uma nova amostra (`POST` no mesmo caminho com `quality`/`epg`/`availability`/`responseTimeMs`) via `apiRequest`. |
 | **Scheduled Jobs** | Jobs agendados persistentes (tabela SQLite `scheduled_jobs`): cron de 5 campos, acção, activo, último/próximo tick e último resultado. Ver secção "Scheduler / Scheduled Jobs". |
 
 ### Grupos canónicos e atribuição por canal
@@ -629,6 +648,72 @@ explícita do operador. Ver invariante em `AGENTS.md` §2.
 Migrações relevantes: `AddCanonicalChannelGroupFk` (introduz `GroupId`/`canonical_groups`),
 `DropGroupMappings` (remove `group_mappings`) e `DropEditorialGroupColumn`
 (remove `canonical_channels.EditorialGroup`).
+
+### Ordering Lists — uma lista por país (DC-11a / DC-D4)
+
+É permitida **no máximo uma Ordering List por país** (`OrderingListEntity.Country`).
+A unicidade por país garante que a lista de um país é inequívoca; o sync do
+Dispatcharr consome a **única** Ordering List activa (ver § "Sync do Dispatcharr
+a partir da Ordering List"). Múltiplas listas activas (possível apenas quando
+`Country` é nulo) tornariam a escolha indeterminística (DC-D3/DC-D4). A regra é
+imposta em três camadas:
+
+- **Schema:** índice parcial único `IX_ordering_lists_Country` sobre `Country`, com
+  filtro `"Country" IS NOT NULL` (migração `AddUniqueOrderingListCountry`). Listas sem
+  país (`Country` nulo) continuam a poder coexistir; listas com o mesmo país não nulo
+  são rejeitadas pela BD.
+- **Resolver (`CatalogResolver`):** `Country` é normalizado (trim; vazio→null) em
+  create/update/duplicate; `CreateOrderingListAsync` e `UpdateOrderingListAsync`
+  rejeitam a colisão de país com `ChannelAdministrationException`
+  (`ChannelAdministrationError.CountryConflict`). Manter o próprio país num update é
+  permitido.
+- **API/UI:** `POST /api/catalog/ordering-lists` e `PUT /api/catalog/ordering-lists/{id}`
+  devolvem **409 Conflict** (`{ "error": ... }`) na colisão de país; payload inválido
+  continua a sair como 400. A UI bloqueia a submissão de um país já usado (o servidor
+  permanece a autoridade).
+
+A duplicação de uma lista **não herda** o `Country` (a cópia não é a lista do país):
+`DuplicateOrderingListAsync` limpa o campo na cópia e a `Key` nova continua a ser
+validada como antes.
+
+#### Sync do Dispatcharr a partir da Ordering List (DC-11b / DC-D3)
+
+Quando existe **exactamente uma** Ordering List activa, o sync do Dispatcharr
+compõe o plano a partir dessa lista
+(`PlaylistComposerService.ComposeAsync` → `ChannelMatcher.BuildPlanFromCompositionAsync`)
+em vez de ler `output/playlist.m3u` cru:
+
+- **Membros:** só entram os canais `IsEnabled` da lista **com ≥1 fonte
+  elegível**; itens desactivados e canais sem fonte elegível são omitidos (o
+  compositor regista-os em `MissingChannels`).
+- **Ordem:** os canais **novos** são criados no Dispatcharr com
+  `channel_number` = **posição 0-based** do índice em `composition.Entries`
+  (a ordem da lista, sem gaps). Canais existentes **não** são reordenados nesta
+  wave (não existe `PATCH` de `channel_number` — follow-up).
+- **Agrupamento:** continua a ser o do **canal canónico**
+  (`CanonicalChannel.Group.DisplayName`); a Ordering List não define grupos.
+- **Canais fora da lista:** os canais `CrawlerManaged` existentes que deixem de
+  constar da lista são **mantidos** (não há DELETE/desactivação de canais); só
+  as streams dentro de um canal casado seguem a lógica actual de
+  remoção/substituição.
+- **Fallback (decisões C/D):** com **0** listas activas ou com **várias**
+  listas activas (selecção indeterminística), o sync cai no caminho legado
+  (`playlist.m3u`) e regista o motivo no feed do Live Run e na consola — sem
+  credenciais.
+- **Sem catálogo:** o caminho `CatalogUnavailable`/legado mantém-se intacto
+  (a resolução da lista só corre no caminho com catálogo).
+- **Endpoints `/api/dispatcharr/dry-run` e `/api/dispatcharr/sync`:** com uma
+  Ordering List activa, ambos compõem o plano a partir da lista (membros +
+  ordem) e **o `playlistPath` indicado no corpo é ignorado**. Sem lista activa
+  (0 ou >1), o `playlistPath` é usado como no caminho legado. O plano
+  (`dispatcharr_plan_*.json`, incluindo o dry-run) expõe
+  `proposedChannelNumber` = posição 0-based para os canais da lista; a
+  numeração é aplicada na criação de canais novos (canais existentes não são
+  reordenados nesta wave).
+- **Selecção de fontes ignorada:** com composição, a selecção de fontes
+  (artefacto `dispatcharr_selection_*.json`) é **ignorada** — a própria
+  Ordering List é a autoridade da fonte. Não há `PATCH streams=[]` nem DELETE
+  de streams por efeito da selecção.
 
 ### Pending Country Approvals
 
@@ -1138,10 +1223,10 @@ Bootstrap → Admin → Setup Required → Telegram → Dispatcharr → Sources 
 | `/api/telegram/auth/code` | POST | Submete o código de verificação. |
 | `/api/telegram/auth/password` | POST | Submete a password 2FA. |
 | `/api/telegram/auth/status` | GET | Estado do login (`state`, `userName`, `detail`, `configured`). |
-| `/api/dispatcharr/config` | GET/POST | Lê/grava `enabled`, `base_url`, `dry_run` e credenciais (nunca devolvidas). |
+| `/api/dispatcharr/config` | GET/POST | Lê/grava `enabled`, `base_url`, `dry_run`, `match_threshold`, `auto_create_groups`, `provider_priority`, `alias_file`, `target_group_name` e credenciais (nunca devolvidas). Patch semântico: chave ausente preserva o valor; `match_threshold` fora de 0–100 → 400 `invalid-payload`. |
 | `/api/dispatcharr/test` | POST | Teste de ligação read-only (`GET /api/core/version/`). |
-| `/api/dispatcharr/dry-run` | POST | **W6** — Gera `MatchPlan` + `SyncReport` sem escrever no Dispatcharr. Corpo `{ "playlistPath": "playlist.m3u" }` (caminho relativo resolvido sob o output dir). Devolve `{status, mode:"dry-run", planPath, reportPath, counts{...}}`. |
-| `/api/dispatcharr/sync` | POST | **W6** — Aplica a sincronização (mutação real no Dispatcharr, sujeita a `dispatcharr_enabled`/`dispatcharr_dry_run`). Mesmo contrato, `mode:"sync"`. |
+| `/api/dispatcharr/dry-run` | POST | **W6** — Gera `MatchPlan` + `SyncReport` sem escrever no Dispatcharr. Corpo `{ "playlistPath": "playlist.m3u" }` (caminho relativo resolvido sob o output dir). **DC-11b:** com uma Ordering List activa, o plano é composto da lista e o `playlistPath` é ignorado. Devolve `{status, mode:"dry-run", planPath, reportPath, counts{...}}`. |
+| `/api/dispatcharr/sync` | POST | **W6** — Aplica a sincronização (mutação real no Dispatcharr, sujeita a `dispatcharr_enabled`/`dispatcharr_dry_run`). Mesmo contrato, `mode:"sync"`; com uma Ordering List activa, segue a lista e ignora o `playlistPath`. |
 
 Todos os `POST` são métodos mutantes e, em `UserAuth`, exigem `X-CSRF-Token`.
 
@@ -1169,6 +1254,17 @@ por um writer atómico que preserva chaves desconhecidas e aplica permissões
 restritivas (600). O teste de ligação é **read-only** e distingue `CONNECTED`,
 `AUTHENTICATION_FAILED`, `UNREACHABLE`, `INVALID_CONFIGURATION` e `ERROR`;
 nunca faz escrita nem sincronização.
+
+O Setup → Dispatcharr (DC-5f) expõe agora os campos avançados suportados pela
+API e usados pelo sync (`DispatcharrSyncService`): `match_threshold`
+(`MatchingOptions.MatchThreshold`), `auto_create_groups`, `provider_priority`,
+`alias_file`, e `username`/`password` (write-only, placeholder *configurado*).
+`apiKey`, `username` e `password` só são enviados no POST quando preenchidos —
+campo vazio mantém o valor persistido. `match_threshold` é validado no cliente
+(0–100) e no servidor (400). O campo `target_group_name` é mostrado **apenas
+como leitura, informativo**, com uma nota explícita: é persistido mas **não
+aplicado** pelo sync actual (lacuna conhecida) — o grupo de publicação vem do
+grupo do canal canónico. Não é enviado no POST.
 
 ### Bootstrap Ready vs Operational Ready
 
@@ -1220,7 +1316,7 @@ registados. A pipeline invocada é sempre a existente
 | Endpoint | Comportamento |
 |---|---|
 | `GET /api/run/status` | Snapshot sanitizado: `isRunning`, `status`, `runId`, `mode`, `source`, `phase`, `phaseStartedAtUtc`, `durationMs`, `counts`, `recentActivities`, `recentRuns` (24 h), `webAllowTrigger`. `503 pipeline-not-configured` quando não há pipeline Telegram no processo. |
-| `POST /api/run/start` | Arranque assíncrono (não bloqueia até ao fim). `202` aceite · `409 already-running` · `503 web-allow-trigger-disabled` · `503 pipeline-not-configured` · `400 invalid payload` · `401`/`403` conforme o gate 9C.2. |
+| `POST /api/run/start` | Arranque assíncrono (não bloqueia até ao fim). Corpo opcional `{ mode, keyword?, historyHours?, maxStreams? }`: `mode` ∈ `telegram` \| `telegram-maintain` (default `telegram`; valor desconhecido → `400`), `historyHours` ∈ 1–720 e `maxStreams` ∈ 1–5000 (valores fora do intervalo ou ausentes caem no default persistido). `202` aceite · `409 already-running` · `503 web-allow-trigger-disabled` · `503 pipeline-not-configured` · `400 invalid payload` · `401`/`403` conforme o gate 9C.2. |
 | `GET /api/publication/status` | Snapshot derivado dos cursores de publicação do catálogo: `catalogChangedAtUtc` (`MAX` sobre `UpdatedAtUtc`/`CreatedAtUtc` das entidades que afectam a próxima `playlist.m3u`), `lastSuccessfulPublicationAtUtc` (`MAX(LiveRun.FinishedAtUtc) WHERE TerminalStatus=Completed AND Mode∈{telegram, telegram-maintain}`), `publicationPending` (`true` se o catálogo mudou depois da última publicação, ou se nunca houve uma publicação bem-sucedida). `503` quando o catálogo não está inicializado. DL-019/DL-130. |
 
 #### Cursores de publicação (DL-130)
@@ -1284,13 +1380,19 @@ paralelo). Cron inválido é rejeitado de forma segura: o job não executa, é
 neutralizado (`LastResult = invalid-cron:…`) e o tick continua a processar os
 restantes jobs.
 
-### Vista "Live Run" no dashboard
+### Vista "Execução ao Vivo" no dashboard
 
 Estado, runId, fase, desde quando, duração, última actualização, mensagem,
 contadores, últimas actividades, últimas execuções (24 h), estado do trigger,
-botão **Run now** e os jobs agendados Telegram. Actualização automática por
-**polling de 3 s** (apenas com a vista activa e sem pedidos sobrepostos). Não
-há SSE/WebSocket, tail de logs nem parsing de `docker logs`.
+botão **Run now** e um deep-link para os agendamentos Telegram. O "Run now" expõe
+um select de **Modo** (`telegram` / `telegram-maintain`) e overrides opcionais
+(`keyword`, `historyHours`, `minHistoryHours`, `maxStreams`) enviados em `POST /api/run/start`;
+sem overrides, o run usa a configuração de discovery persistida. A listagem de
+jobs agendados **não é duplicada** na vista: o botão abre
+**Catálogo → Scheduled Jobs** (`showView('catalog')` + sub-tab `scheduled`), que
+é a fonte única. Actualização automática por **polling de 3 s** (apenas com a
+vista activa e sem pedidos sobrepostos). Não há SSE/WebSocket, tail de logs nem
+parsing de `docker logs`.
 
 O feed de actividades (`recentActivities`) transporta agora **`metadata`** (dict opcional de contexto) e as actividades de fase incluem **`runId`**; cada actividade é apresentada com **badge de categoria** e o metadata como `key=value`. O contexto cobre a cadeia completa: leitura do Telegram (`keyword` + janela), mensagem analisada (`messageId`/`messageDateUtc`/`chat`), candidate criado (`candidateId`/`kind`/`from`), promoção Xtream (`candidateId`/`parentCandidateId`), download/parse (`candidateId` + motivo), validação por país e por playlist (**physical N / reused M**), conclusão do run e Dispatcharr (contadores do sync; tipo de erro).
 
@@ -1300,7 +1402,7 @@ Limitações: não há evento por stream individual (o ring buffer de 200 tornar
 
 ### Configuração no Dashboard: o que está exposto e o que não
 
-A vista **Descoberta** expõe a configuração operacional de discovery numa única card (SSOT `app_settings.json#discovery`, via `GET/POST /api/discovery/settings`): `keyword`, `MinHistoryHours` (≥ 0), `HistoryHours`/Max (1–1440) e `MaxStreams` (≥ 1). A janela inclusiva é explicada a partir dos valores (ex.: Min 425h / Max 450h ⇒ `425h ≤ idade ≤ 450h`) e "Min 0 = sem limite inferior (comportamento legacy)". Erros de validação do backend (HTTP 400) surgem inline e, após guardar, o formulário recarrega os valores persistidos.
+A vista **Descoberta** expõe a configuração operacional de discovery numa única card, **"Configuração de discovery predefinida"** (SSOT `app_settings.json#discovery`, via `GET/POST /api/discovery/settings`): `keyword`, `MinHistoryHours` (≥ 0), `HistoryHours`/Max (1–1440) e `MaxStreams` (≥ 1). A janela inclusiva é explicada a partir dos valores (ex.: Min 425h / Max 450h ⇒ `425h ≤ idade ≤ 450h`) e "Min 0 = sem limite inferior (comportamento legacy)". Erros de validação do backend (HTTP 400) surgem inline e, após guardar, o formulário recarrega os valores persistidos. Esta card é a **base/fallback** (CLI, runs manuais sem overrides e jobs sem overrides); cada **Scheduled Job** pode definir overrides próprios (ver "Scheduler / Scheduled Jobs").
 
 **Deliberadamente não expostos** (e porquê):
 
@@ -1309,11 +1411,28 @@ A vista **Descoberta** expõe a configuração operacional de discovery numa ún
 - **Modos legacy** (`--bot`, `--loop-hours`, `--fast`, `--scan-domain`).
 - **Constantes técnicas** (timeouts HTTP, `limit=200`, `maxConcurrency=5`, threshold país 3, poll do scheduler 30s, `ExactMatchScore`/`AmbiguityMargin`) — valores de engenharia, não parâmetros operacionais.
 - **`dispatcharrTest`** — estado derivado, não configuração.
-- **Extras Dispatcharr** suportados pela API mas ainda sem form nesta wave: `dispatcharr_match_threshold`, `dispatcharr_target_group_name`, `dispatcharr_alias_file`, `dispatcharr_provider_priority`, `dispatcharr_auto_create_groups` (seguimento).
+- **Extras Dispatcharr** — os campos `dispatcharr_match_threshold`, `dispatcharr_alias_file`, `dispatcharr_provider_priority` e `dispatcharr_auto_create_groups` são editáveis no Setup → Dispatcharr (DC-5f). **`dispatcharr_target_group_name`** é apenas mostrado em modo leitura: está persistido mas **não é aplicado** pelo sync actual (lacuna conhecida — o grupo de publicação vem do grupo do canal canónico). Ver secção "Dispatcharr (config + teste)".
 
 ## Scheduler / Scheduled Jobs
 
 O separador **Scheduled Jobs** do dashboard (dentro do **Catálogo**) gere jobs persistentes na tabela SQLite `scheduled_jobs`. Cada job tem `Name` único, `CronExpression` de 5 campos, `ActionName`, `IsEnabled` e os campos observáveis `LastRunAtUtc` / `NextRunAtUtc` / `LastResult`. O `ScheduledJobRunner` calcula o próximo tick a partir da expressão e é o único componente que dispara as acções.
+
+No formulário de criação, os controlos de frequência (Todos os dias / A cada N horas / Semanal / Manual) são apenas um assistente que preenche a expressão Cron (5 campos); o único valor persistido é a expressão Cron.
+
+### Overrides de discovery por job (DC-9 / DC-D2)
+
+Cada job pode definir os seus próprios parâmetros de discovery (`keyword`, `minHistoryHours`, `historyHours`, `maxStreams`), aplicados como **overrides sobre a configuração global** (`app_settings.json#discovery`). A precedência é:
+
+```
+efetivo = DiscoverySettings.Load().WithOverrides(overrides_do_job)
+```
+
+- **Sem overrides** (ou campos ausentes/null), o job **herda a global**. A configuração global mantém-se a base/fallback para a CLI, para os runs manuais sem overrides e para os jobs sem overrides.
+- Os overrides são persistidos na coluna `scheduled_jobs.DiscoveryJson` (JSON camelCase, nullable); campos ausentes no JSON herdam a global. Um `DiscoveryJson` inválido é ignorado (cai em `null`, herda a global) e **nunca impede o run**.
+- Precedência por campo: um override válido substitui o valor global; valores fora dos intervalos (`minHistoryHours` fora de `[0, MaxValidHistoryHours]`, `historyHours` fora de `[1, 1440]`, `maxStreams < 1`) são ignorados (herdam a global). A normalização de janela invertida (`Min > History` → `Min = 0`) mantém-se após os overrides.
+- Na UI (separador **Scheduled Jobs**), os campos de overrides são opcionais; em branco herdam a predefinição e a pré-visualização mostra o **efetivo**. A acção `telegramMaintainRun`/`telegramRun` usa os overrides do job quando existem; sem eles, o comportamento é idêntico ao anterior (config global).
+
+A listagem (`GET /api/catalog/scheduled-jobs`) e o retorno de `POST` incluem um objecto `discovery` (os overrides persistidos, `null` quando não há) e um `effectiveDiscovery` (o default herdado já resolvido). O `POST` aceita `keyword`, `minHistoryHours`, `historyHours` e `maxStreams` opcionais; ausentes/null significa sem override.
 
 O runner só é arrancado quando `--web` é passado (bootstrap do `ScheduledAutomationHost`), pelo que o scheduler depende do dashboard estar activo no processo. As duas acções Telegram (`telegramRun` / `telegramMaintainRun`) e a vista "Live Run" estão descritas em **Live Run Monitor** §"Arranque agendado (sem `StartAtUtc`)"; esta secção é a referência canónica para a API, o cron e as restantes acções.
 
@@ -1497,6 +1616,7 @@ Uma playlist estrangeira (ex.: apenas canais `La 1`, `Antena 3`, `Telecinco`) é
 - Testes: `dotnet test m3uCrawler.Tests/m3uCrawler.Tests.csproj --configuration Release --no-build --nologo` — referência operacional; **não** interpretar o número como propriedade permanente da arquitectura. Estado medido em **2026-10-02** (working tree de W-DASHBOARD): 2827 testes, com 1 falha pré-existente conhecida (observabilidade do dashboard, `WaveW6b2ObservabilityTests`) e 1 skipped; ver `docs/PROJECT_STATUS.md`.
 - **Execução real (2026-10-02):** cadeia Telegram→candidate→playlist→Dispatcharr exercitada em runtime (imagem local de `fcd442e`), com janela `--min-history-hours 425 --history-hours 450` e Dispatcharr em **dry-run**; artefactos gerados (playlist M3U, relatórios Telegram, plano/relatório Dispatcharr). Números detalhados em `docs/PROJECT_STATUS.md` (não duplicados aqui).
 - O runner descobre e executa todos os testes; não há testes que passem sem realmente exercitar o comportamento (detector, parser, validação por país com threshold/famílias/falsos-positivos, merge de manutenção).
+- **Testes de comportamento JS (DC-8):** o IIFE do Dashboard servido em `GET /` é extraído e executado in-process por um harness **Jint** (`m3uCrawler.Tests/DashboardJs/`, dependência **só de teste**) com um shim DOM/Web mínimo — determinístico, sem browser nem servidor externo; complementa os testes de markup/string.
 - Não há teste de integração de rede (Telegram/HTTP); os testes são unitários e independentes de infra-estrutura externa.
 
 ## Arquitectura do projecto

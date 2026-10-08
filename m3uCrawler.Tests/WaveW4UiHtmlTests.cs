@@ -41,6 +41,20 @@ public class WaveW4UiHtmlTests
     }
 
     [Fact]
+    public void Ordering_duplicate_handler_quotes_key_in_js_context()
+    {
+        var html = BuildDashboardHtml();
+
+        // A key é injectada como literal JS via JSON.stringify (e escapada
+        // para o atributo HTML), não como string com escapeHtml — que
+        // decodifica entidades e quebra a string JS com aspas.
+        Assert.Contains("duplicateOrderingList(${l.id}, ${escapeAttr(JSON.stringify(l.key))})", html);
+        Assert.DoesNotContain("duplicateOrderingList(${l.id}, \"${escapeHtml(l.key)}\")", html);
+        Assert.Contains("window.duplicateOrderingList = duplicateOrderingList;", html);
+        Assert.Contains("window.confirmDuplicateOrderingList = confirmDuplicateOrderingList;", html);
+    }
+
+    [Fact]
     public void Canonical_channel_create_form_exposes_category_and_group_selects()
     {
         var html = BuildDashboardHtml();

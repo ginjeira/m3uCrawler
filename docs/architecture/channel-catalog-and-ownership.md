@@ -622,3 +622,37 @@ A origem efectiva é, portanto, o **último produtor** que correu. Isto é o
 comportamento histórico e não é alterado nesta wave; o que fica explícito é
 que o sync usa exactamente `output/playlist.m3u` e que não existe uma
 segunda fonte. A futura selecção de fontes (PHASE 13) parte deste contrato.
+
+## 14. Sync a partir da Ordering List (DC-11b / DC-D3, 2026-10-08)
+
+O sync do Dispatcharr passa a compor o plano a partir da **Ordering List**
+quando existe **exactamente uma** lista activa, em vez de ler
+`output/playlist.m3u` cru. Isto substitui, nesse caso, a afirmação de §13 de
+que "o sync usa exactamente `output/playlist.m3u`".
+
+- **Resolução:** `DispatcharrSyncCoordinator.RunCoreAsync` (caminho com
+  catálogo) lista as Ordering Lists, filtra `IsEnabled` e, se houver
+  exactamente uma, compõe via `PlaylistComposerService.ComposeAsync` e passa a
+  `PlaylistComposition` a
+  `DispatcharrSyncService.RunAsync(playlistPath, selection, composition, ct)`.
+- **Fallback:** 0 listas activas ou >1 listas activas (selecção
+  indeterminística; DC-D4 permite no máximo uma por país) → `composition=null`,
+  caminho legado (`playlist.m3u`) e registo do motivo no feed do Live Run. Sem
+  catálogo (`allowLegacyWithoutCatalog`) nada muda.
+- **Membros/ordem:** membros = canais `IsEnabled` da lista com ≥1 fonte
+  elegível; os canais **novos** são criados com `channel_number` = posição
+  0-based na lista. Canais `CrawlerManaged` fora da lista são **mantidos** (sem
+  DELETE/desactivação). O agrupamento permanece o do canal canónico — a lista
+  não define grupos.
+- **Bridge:** `ChannelMatcher.BuildPlanFromCompositionAsync` (PHASE 10, agora
+  exposto em `IChannelMatcher`) converte a composição e reusa o pipeline de
+  matching existente — o contrato do `MatchPlan` não muda.
+- **Endpoints HTTP:** com uma Ordering List activa, `/api/dispatcharr/dry-run`
+  e `/api/dispatcharr/sync` compõem da lista e o `playlistPath` indicado é
+  **ignorado**; o plano (incluindo dry-run) expõe `proposedChannelNumber` =
+  posição 0-based. Uma **selecção de fontes** presente é ignorada quando há
+  composição (a lista é a autoridade da fonte), pelo que não há
+  `PATCH streams=[]`/DELETE induzidos pela selecção.
+
+Ver `m3uCrawler/README.md` § "Sync do Dispatcharr a partir da Ordering List" e
+`CHANGELOG.md` [Unreleased] (DC-11b).

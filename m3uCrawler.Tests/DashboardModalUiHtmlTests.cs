@@ -91,6 +91,21 @@ public class DashboardModalUiHtmlTests
     }
 
     [Fact]
+    public void Global_hidden_attribute_rule_overrides_inline_display()
+    {
+        var html = BuildDashboardHtml();
+
+        // Os sub-painéis do modal de Reviews combinam `hidden` com
+        // `style='display:grid/flex'` inline; sem uma regra global com
+        // `!important`, o inline sobrepõe o atributo e vários sub-painéis
+        // ficam visíveis em simultâneo.
+        Assert.Contains("[hidden] { display: none !important; }", html);
+        Assert.Contains("id='reviewApproveAddAlias' hidden style='margin-top:12px;display:grid", html);
+        Assert.Contains("id='reviewApproveExclude' hidden style='margin-top:12px;display:grid", html);
+        Assert.Contains("id='reviewReopen' hidden style='margin-top:12px;display:grid", html);
+    }
+
+    [Fact]
     public void Import_policies_tab_is_hidden_pending_w6b3()
     {
         var html = BuildDashboardHtml();

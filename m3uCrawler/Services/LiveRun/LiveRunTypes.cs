@@ -111,6 +111,12 @@ public sealed class LiveRunRequest
     public string? Keyword { get; init; }
     public int? HistoryHours { get; init; }
     public int? MaxStreams { get; init; }
+
+    /// <summary>
+    /// Limite mínimo da janela de histórico (DC-9). <c>null</c> herda o
+    /// valor da configuração persistida.
+    /// </summary>
+    public int? MinHistoryHours { get; init; }
 }
 
 /// <summary>
@@ -183,6 +189,37 @@ public static class LiveRunWireNames
         LiveRunSource.Manual => SourceManual,
         _ => SourceCli,
     };
+
+    /// <summary>
+    /// Valida e normaliza uma representação textual de Mode. Aceita os
+    /// wire names canónicos (<c>telegram</c>, <c>telegram-maintain</c>) e as
+    /// formas PascalCase/colapsadas (<c>Telegram</c>,
+    /// <c>TelegramMaintain</c>, <c>telegrammaintain</c>). <c>null</c> ou
+    /// whitespace cai no default <see cref="LiveRunMode.Telegram"/>. Qualquer
+    /// outro valor é rejeitado (<c>false</c>).
+    /// </summary>
+    public static bool TryParseMode(string? raw, out LiveRunMode mode)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            mode = LiveRunMode.Telegram;
+            return true;
+        }
+
+        switch (raw.Trim().ToLowerInvariant())
+        {
+            case ModeTelegram:
+                mode = LiveRunMode.Telegram;
+                return true;
+            case ModeTelegramMaintain:
+            case "telegrammaintain":
+                mode = LiveRunMode.TelegramMaintain;
+                return true;
+            default:
+                mode = LiveRunMode.Telegram;
+                return false;
+        }
+    }
 
     /// <summary>
     /// Normaliza uma representação textual de Mode. Valores

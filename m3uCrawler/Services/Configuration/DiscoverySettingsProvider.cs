@@ -27,6 +27,23 @@ public sealed class DiscoverySettingsProvider
     /// Resolve os valores efectivos para uma execução, aplicando os
     /// overrides explícitos sobre os valores persistidos.
     /// </summary>
-    public DiscoverySettings Resolve(string? keyword, int? historyHours, int? maxStreams)
-        => Load().WithOverrides(keyword, historyHours, maxStreams);
+    public DiscoverySettings Resolve(
+        string? keyword,
+        int? historyHours,
+        int? maxStreams,
+        int? minHistoryHours = null)
+        => Load().WithOverrides(keyword, historyHours, maxStreams, minHistoryHours);
+
+    /// <summary>
+    /// Resolve os valores efectivos aplicando overrides tipados de um job
+    /// (DC-9). <c>null</c> devolve os valores persistidos (herança total).
+    /// </summary>
+    public DiscoverySettings Resolve(DiscoveryOverrides? overrides)
+        => overrides is null
+            ? Load()
+            : Load().WithOverrides(
+                overrides.Keyword,
+                overrides.HistoryHours,
+                overrides.MaxStreams,
+                overrides.MinHistoryHours);
 }

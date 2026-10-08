@@ -101,9 +101,10 @@ public class WaveW6DispatcharrUiHtmlTests
         Assert.Contains("reportPath", render);
 
         var action = Slice(html, "async function runDispatcharrAction(", "async function runDispatcharrDryRun(");
-        // O erro real é lido do body (não mascarado por r.ok).
-        Assert.Contains("await r.json()", action);
-        Assert.Contains("body.error", action);
+        // O erro real é lido do resultado normalizado do helper (não mascarado por r.ok).
+        Assert.Contains("apiRequest(", action);
+        Assert.Contains("res.error", action);
+        Assert.Contains("res.json", action);
     }
 
     [Fact]
@@ -116,6 +117,65 @@ public class WaveW6DispatcharrUiHtmlTests
         Assert.DoesNotContain("api_key", action);
         Assert.DoesNotContain("password", action, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("Bearer", action);
+    }
+
+    // ────────────────────── DC-5f — Setup avançado ──────────────────────
+
+    [Fact]
+    public void Setup_dispatcharr_form_exposes_advanced_fields_with_labels()
+    {
+        var html = BuildDashboardHtml();
+
+        foreach (var id in new[]
+        {
+            "setupDispatcharrMatchThreshold", "setupDispatcharrAutoCreateGroups",
+            "setupDispatcharrProviderPriority", "setupDispatcharrAliasFile",
+            "setupDispatcharrUsername", "setupDispatcharrPassword",
+        })
+        {
+            Assert.Contains($"id='{id}'", html);
+            Assert.Contains($"for='{id}'", html);
+        }
+    }
+
+    [Fact]
+    public void Setup_dispatcharr_save_posts_advanced_fields_and_omits_target_group()
+    {
+        var html = BuildDashboardHtml();
+        var save = Slice(html, "async function saveDispatcharrConfig(", "function dispatcharrStatusLabel(");
+
+        Assert.Contains("matchThreshold", save);
+        Assert.Contains("autoCreateGroups", save);
+        Assert.Contains("providerPriority", save);
+        Assert.Contains("aliasFile", save);
+        Assert.Contains("body.username", save);
+        Assert.Contains("body.password", save);
+        Assert.DoesNotContain("targetGroupName", save);
+    }
+
+    [Fact]
+    public void Setup_dispatcharr_loader_populates_advanced_fields()
+    {
+        var html = BuildDashboardHtml();
+        var loader = Slice(html, "async function loadDispatcharrSetup(", "async function saveDispatcharrConfig(");
+
+        Assert.Contains("setupDispatcharrMatchThreshold", loader);
+        Assert.Contains("setupDispatcharrAutoCreateGroups", loader);
+        Assert.Contains("setupDispatcharrProviderPriority", loader);
+        Assert.Contains("setupDispatcharrAliasFile", loader);
+        Assert.Contains("hasUsername", loader);
+        Assert.Contains("hasPassword", loader);
+        Assert.Contains("setupDispatcharrTargetGroupName", loader);
+    }
+
+    [Fact]
+    public void Setup_dispatcharr_target_group_is_readonly_info_with_caveat()
+    {
+        var html = BuildDashboardHtml();
+
+        Assert.Contains("id='setupDispatcharrTargetGroupName'", html);
+        Assert.Contains("target_group_name (só leitura)", html);
+        Assert.Contains("Não aplicado pelo sync actual (lacuna conhecida)", html);
     }
 
     // ─────────────────────────── Countries ───────────────────────────

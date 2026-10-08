@@ -299,6 +299,14 @@ public sealed class DispatcharrSyncCoordinator
 
         try
         {
+            // DC-11b (DC-D3) — quando existe exactamente uma Ordering List
+            // activa, o sync compõe membros e ordem a partir dela em vez de
+            // ler `output/playlist.m3u` cru. Sem lista, ou com várias
+            // (selecção indeterminística — DC-D4), cai no caminho legado e
+            // regista o motivo. Nunca inclui credenciais no registo.
+            var composition = await TryResolveOrderingCompositionAsync(
+                effectiveCatalog, liveRunProgress, cancellationToken).ConfigureAwait(false);
+
             var aliases = AliasResolver.FromFile(cfg.AliasFile);
             var ordering = new StreamOrderingPolicy(cfg.ProviderPriority);
             var matcher = new ChannelMatcher(aliases, null, effectiveCatalog);
@@ -329,7 +337,7 @@ public sealed class DispatcharrSyncCoordinator
                     matcher: matcher,
                     catalog: effectiveCatalog);
             }
-            var syncResult = await sync.RunAsync(playlistPath, selection, cancellationToken).ConfigureAwait(false);
+            var syncResult = await sync.RunAsync(playlistPath, selection, composition, cancellationToken).ConfigureAwait(false);
 
             if (liveRunProgress is not null)
             {
@@ -362,6 +370,91 @@ public sealed class DispatcharrSyncCoordinator
             Console.WriteLine($"⚠️ Falha na sincronização Dispatcharr: {ex.Message}");
             return new DispatcharrSyncOutcome(DispatcharrSyncStatus.Failed, ex.GetType().Name);
         }
+    }
+
+    /// <summary>
+    /// DC-11b (DC-D3/DC-D4) — resolve a <see cref="PlaylistComposition"/> que
+    /// o sync deve seguir. Regra de selecção (sem nova config): com
+    /// <b>exactamente uma</b> Ordering List activa é essa a usada; com
+    /// <b>zero</b> ou <b>várias</b> activas a selecção é indeterminística e
+    /// devolve-se <c>null</c> (fallback legado) registando o motivo.
+    ///
+    /// <para>
+    /// A resolução é best-effort: qualquer falha (à excepção de
+    /// cancelamento) cai no caminho legado, sem abortar o sync nem
+    /// propagar detalhes potencialmente sensíveis. O registo nunca inclui
+    /// credenciais.
+    /// </para>
+    /// </summary>
+    private static async Task<PlaylistComposition?> TryResolveOrderingCompositionAsync(
+        CatalogResolver catalog,
+        ILiveRunProgress? liveRunProgress,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var lists = await catalog.ListOrderingListsAsync(cancellationToken).ConfigureAwait(false);
+            var active = new List<OrderingListEntity>();
+            foreach (var list in lists)
+            {
+                if (list.IsEnabled) active.Add(list);
+            }
+
+            if (active.Count == 1)
+            {
+                var list = active[0];
+                var composer = new PlaylistComposerService(catalog.GetFactory());
+                var composition = await composer
+                    .ComposeAsync(list.Id, cancellationToken: cancellationToken)
+                    .ConfigureAwait(false);
+
+                ReportOrderingSelection(
+                    liveRunProgress,
+                    LiveRunActivityLevel.Info,
+                    $"dispatcharr sync: a usar Ordering List '{list.Key}' " +
+                    $"({composition.Entries.Count} canais).");
+
+                return composition;
+            }
+
+            var reason = active.Count == 0
+                ? "nenhuma Ordering List activa"
+                : $"{active.Count} Ordering Lists activas (seleção ambígua)";
+            ReportOrderingSelection(
+                liveRunProgress,
+                LiveRunActivityLevel.Warning,
+                $"dispatcharr sync: fallback para playlist.m3u — {reason}.");
+
+            return null;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            ReportOrderingSelection(
+                liveRunProgress,
+                LiveRunActivityLevel.Warning,
+                "dispatcharr sync: fallback para playlist.m3u — " +
+                $"falha a resolver a Ordering List ({ex.GetType().Name}).");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// DC-11b — regista o motivo da selecção da Ordering List no feed do
+    /// Live Run (quando presente) e na consola. Mensagem sem credenciais.
+    /// </summary>
+    private static void ReportOrderingSelection(
+        ILiveRunProgress? liveRunProgress,
+        LiveRunActivityLevel level,
+        string message)
+    {
+        liveRunProgress?.ReportActivity(
+            LiveRunActivityCategory.Dispatcharr, level, message);
+        Console.WriteLine(
+            (level == LiveRunActivityLevel.Warning ? "⚠️ " : "ℹ️ ") + message);
     }
 
     /// <summary>

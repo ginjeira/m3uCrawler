@@ -16,6 +16,25 @@ namespace m3uCrawler.Services.Matching
             string dispatcharrBaseUrl,
             bool dryRun,
             DateTime? nowUtc = null);
+
+        /// <summary>
+        /// DC-11b — constrói um <see cref="MatchPlan"/> a partir de uma
+        /// <see cref="PlaylistComposition"/> pré-resolvida (Ordering List),
+        /// sem ler o ficheiro de playlist. Promovido à interface para que
+        /// o <c>DispatcharrSyncService</c> possa consumir a composição sem
+        /// depender do tipo concreto. O método já existia em
+        /// <see cref="ChannelMatcher"/> (PHASE 10) mas não tinha caller em
+        /// produção nem constava da interface.
+        /// </summary>
+        Task<MatchPlan> BuildPlanFromCompositionAsync(
+            PlaylistComposition composition,
+            DispatcharrState existing,
+            MatchingOptions options,
+            IStreamOrderingPolicy ordering,
+            string sourcePlaylistPath,
+            string dispatcharrBaseUrl,
+            bool dryRun,
+            DateTime? nowUtc = null);
     }
 
     public sealed class ChannelMatcher : IChannelMatcher
@@ -129,7 +148,7 @@ namespace m3uCrawler.Services.Matching
         /// e chama o pipeline existente.
         /// </summary>
         public async Task<MatchPlan> BuildPlanFromCompositionAsync(
-            Services.Catalog.PlaylistComposition composition,
+            PlaylistComposition composition,
             DispatcharrState existing,
             MatchingOptions options,
             IStreamOrderingPolicy ordering,

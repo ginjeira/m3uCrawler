@@ -279,6 +279,8 @@ docker inspect --format '{{.Image}}' m3ucrawler
 
 Compare o digest com `git rev-parse origin/main` — espera-se que a imagem tenha sido publicada nas últimas horas a partir desse commit. Se a imagem parecer muito antiga em relação ao commit, verificar os GitHub Actions de `docker-ghcr.yml` no commit correspondente antes de continuar (ver § 10).
 
+**Migrações no arranque.** A BD de catálogo (`/data/channel-catalog.db`) é migrada idempotentemente no arranque; havendo migrações pendentes, é criada primeiro uma cópia `.pre-migration-<ts>.db` ao lado da BD. Duas notas accionáveis para esta wave: a migração `AddScheduledJobDiscovery` (DC-9) é puramente aditiva (coluna nullable, sem acção); a migração `AddUniqueOrderingListCountry` (DC-11a) cria o índice parcial único `IX_ordering_lists_Country` (`Country` não nulo, colação NOCASE) e **faz falhar o arranque** se a BD tiver **duas Ordering Lists com o mesmo `Country`** (ex.: `PT` e `pt`). Nesse caso, restaurar o backup `.pre-migration-*` e corrigir o duplicado antes de voltar a subir. Ver `CHANGELOG.md` [Unreleased].
+
 ---
 
 ## 9. Rollback

@@ -36,7 +36,17 @@ public interface IScheduledAction
 /// Contexto do job entregue a acções que precisam de o interpretar (por
 /// exemplo, o sufixo <c>&lt;id&gt;</c> no nome do job).
 /// </summary>
-public sealed record ScheduledJobContext(long Id, string Name, string ActionName);
+/// <param name="Discovery">
+/// DC-9 — overrides de discovery do job (desserializados de
+/// <see cref="ScheduledJobEntity.DiscoveryJson"/>). <c>null</c> quando o
+/// job não define overrides (herda a configuração global) ou quando o
+/// JSON é inválido.
+/// </param>
+public sealed record ScheduledJobContext(
+    long Id,
+    string Name,
+    string ActionName,
+    DiscoveryOverrides? Discovery = null);
 
 /// <summary>
 /// Acção que precisa do job concreto que a disparou (nome/id). Mantém
@@ -207,9 +217,21 @@ public sealed class ScheduledJobRunner : IDisposable
             string result;
             try
             {
+                // DC-9 — os overrides de discovery do job viajam no
+                // contexto. JSON inválido cai em null (herda a global) e
+                // nunca impede o run. A telemetria distingue "sem overrides"
+                // de "JSON inválido": um job com DiscoveryJson não vazio
+                // mas não parseável é avisado (uma vez por execução) para
+                // deixar de descartar os overrides em silêncio.
+                var jobDiscovery = DiscoveryOverrides.TryParse(job.DiscoveryJson, out var invalidDiscoveryJson);
+                if (invalidDiscoveryJson)
+                {
+                    Console.WriteLine(
+                        $"⚠️ job '{job.Name}': DiscoveryJson inválido; a herdar a configuração global.");
+                }
                 result = action is IJobAwareScheduledAction aware
                     ? await aware.ExecuteAsync(
-                        new ScheduledJobContext(job.Id, job.Name, job.ActionName),
+                        new ScheduledJobContext(job.Id, job.Name, job.ActionName, jobDiscovery),
                         cancellationToken)
                     : await action.ExecuteAsync(cancellationToken);
             }

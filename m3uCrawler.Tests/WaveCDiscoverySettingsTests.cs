@@ -364,6 +364,42 @@ public class WaveCDiscoverySettingsTests : IAsyncLifetime
         Assert.Equal(123, request.MaxStreams);
     }
 
+    [Fact]
+    public void Start_payload_mapping_accepts_telegram_maintain_wire_name()
+    {
+        var request = LiveRunApiMappings.ParseStartPayload(new LiveRunStartPayload
+        {
+            Mode = "telegram-maintain",
+        });
+
+        Assert.NotNull(request);
+        Assert.Equal(LiveRunMode.TelegramMaintain, request!.Mode);
+    }
+
+    [Fact]
+    public void Start_payload_mapping_rejects_unknown_mode()
+    {
+        var request = LiveRunApiMappings.ParseStartPayload(new LiveRunStartPayload
+        {
+            Mode = "bogus",
+        });
+
+        Assert.Null(request);
+    }
+
+    [Fact]
+    public void Start_payload_mapping_defaults_without_overrides()
+    {
+        var request = LiveRunApiMappings.ParseStartPayload(new LiveRunStartPayload());
+
+        Assert.NotNull(request);
+        Assert.Equal(LiveRunMode.Telegram, request!.Mode);
+        Assert.Equal(LiveRunSource.Manual, request.Source);
+        Assert.Null(request.Keyword);
+        Assert.Null(request.HistoryHours);
+        Assert.Null(request.MaxStreams);
+    }
+
     // ==================== Scheduler: Telegram action ====================
 
     [Fact]

@@ -148,19 +148,18 @@ public class SourceSelectionPolicyPersistenceTests : IAsyncLifetime
         }
 
         // Pré-existente: um job agendado inserido antes de re-inicializar.
+        // A BD está no schema anterior (sem DiscoveryJson, coluna adicionada
+        // numa migration posterior); usa-se SQL directo para não depender do
+        // modelo corrente.
         var jobName = $"pre-13-4-{Guid.NewGuid():N}";
+        var now = DateTime.UtcNow;
         await using (var seed = _factory.CreateDbContext())
         {
-            seed.ScheduledJobs.Add(new ScheduledJobEntity
-            {
-                Name = jobName,
-                CronExpression = "0 * * * *",
-                ActionName = "discoverTelegram",
-                IsEnabled = true,
-                CreatedAtUtc = DateTime.UtcNow,
-                UpdatedAtUtc = DateTime.UtcNow,
-            });
-            await seed.SaveChangesAsync();
+            await seed.Database.ExecuteSqlRawAsync(
+                "INSERT INTO scheduled_jobs " +
+                "(Name, CronExpression, ActionName, IsEnabled, LastResult, CreatedAtUtc, UpdatedAtUtc) " +
+                "VALUES ({0}, {1}, {2}, 1, '', {3}, {3});",
+                jobName, "0 * * * *", "discoverTelegram", now);
         }
 
         var bootstrapper = new ChannelCatalogBootstrapper(_dbPath);
