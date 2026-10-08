@@ -8,8 +8,9 @@ COPY . .
 # o build corre num contexto sem .git/ (que é o caso do Docker build).
 #
 # Fonte canónica única: as variáveis do GitHub Actions (${{ github.sha }},
-# ${{ github.run_number }}, ${{ github.event.repository.updated_at }}, e
-# ${{ github.ref }}). Nenhum valor é definido à mão.
+# ${{ github.run_number }}, ${{ github.ref }}) e a data do build calculada
+# pelo workflow (step `Compute build date`, `date -u`). Nenhum valor é
+# definido à mão.
 #
 # Os defaults abaixo só servem para `docker build` manual sem -build-arg;
 # nunca devem chegar a produção porque o workflow docker-ghcr.yml é o

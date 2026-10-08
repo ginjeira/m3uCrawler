@@ -68,6 +68,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Compute build date
+        id: builddate
+        run: echo "value=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
       - name: Compute metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -90,7 +94,7 @@ jobs:
             org.opencontainers.image.description=m3uCrawler — Telegram/M3U discovery, country validation and stream testing
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.created=${{ github.run_started_at }}
+            org.opencontainers.image.created=${{ steps.builddate.outputs.value }}
 
       - name: Build and push image
         id: build
@@ -119,7 +123,7 @@ jobs:
             "M3uCrawlerVersion=${{ github.ref }}"
             "M3uCrawlerCommitSha=${{ github.sha }}"
             "M3uCrawlerBuildNumber=${{ github.run_number }}"
-            "M3uCrawlerBuildDate=${{ github.run_started_at }}"
+            "M3uCrawlerBuildDate=${{ steps.builddate.outputs.value }}"
 
       - name: Resolve published digest
         id: digest
