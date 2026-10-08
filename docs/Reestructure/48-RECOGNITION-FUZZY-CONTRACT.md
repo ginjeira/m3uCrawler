@@ -169,7 +169,7 @@ uma decisão de scope separada (§14, `OPEN-D2`).
 | número / posição | **NO** (restrição fechada) | número não é identidade | — | `05 §7` |
 | `Quality` (HD/FHD/SD/4K) | **NO** (restrição fechada) | qualidade nunca é Matching | — | `05 §8` |
 | `Fingerprint` | **NO** (restrição fechada) | fingerprint é evidência técnica de stream, não identidade de canal | — | `05 §4` (DL-001/DL-002) |
-| `Country` / `EditorialGroup` | **NO** (score); possível blocking futuro | não é evidência de nome; pode reduzir universo sem decidir identidade | — | W5.3 F1 |
+| `Country` / `Group` | **NO** (score); possível blocking futuro | não é evidência de nome; pode reduzir universo sem decidir identidade | — | W5.3 F1 |
 
 `DECISION F1` — O passo fuzzy compara a identidade normalizada da query contra
 (a) `CanonicalChannel.DisplayName` normalizado e (b) cada
@@ -374,7 +374,7 @@ universo.
 - O passo fuzzy só corre depois de os passos 1–5 falharem, pelo que candidatos
   já resolvidos exactamente nunca chegam aqui.
 
-`INFERENCE` — Um filtro de blocking (ex.: mesmo `Country`/`EditorialGroup` ou
+`INFERENCE` — Um filtro de blocking (ex.: mesmo `Country`/`Group` ou
 namespace) poderia reduzir o universo, mas introduziria um critério de
 identidade não normativo. Fica explicitamente fora do v1.
 

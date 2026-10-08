@@ -2,7 +2,7 @@
 
 1. Criar CanonicalChannel porque uma stream desconhecida apareceu.
 2. Usar número do operador para reconhecer identidade.
-3. Usar group-title como grupo canónico sem mapping.
+3. Usar `group-title` como grupo canónico sem este ser propriedade do canal.
 4. Usar qualidade para reconhecer identidade.
 5. Fazer fuzzy match e escolher silenciosamente um dos empates.
 6. Misturar ChannelSource com CanonicalChannel.
