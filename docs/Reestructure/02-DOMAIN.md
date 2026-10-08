@@ -25,7 +25,6 @@ O domínio é constituído, no mínimo, por:
 - OrderingList
 - OrderingItem
 - CanonicalGroup
-- GroupMapping
 - GeneratedPlaylist
 - DispatcharrResource
 - OwnershipRecord
@@ -62,7 +61,7 @@ Cada entidade tem uma única autoridade, com a seguinte correspondência (detalh
 `SourcePriorityPolicy`, `SourceSelectionPolicy`, `OrderingList`.
 
 ### Apresentação
-`CanonicalGroup`, `GroupMapping`, `GeneratedPlaylist`.
+`CanonicalGroup`, `GeneratedPlaylist` (o grupo é propriedade do canal canónico via `CanonicalChannel.GroupId`).
 
 ### Integração
 `DispatcharrResource`, `OwnershipRecord`.

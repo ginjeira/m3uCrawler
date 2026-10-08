@@ -596,7 +596,8 @@ O catálogo (`ChannelCatalogDbContext`, SQLite em `/data/channel-catalog.db`) ge
 | Separador | Conteúdo |
 |---|---|
 | **Visão Geral** | Estatísticas agregadas do catálogo (canais, aliases, regras, pending approvals). |
-| **Canais** | Catálogo canónico por país: DisplayName, Key, **País**, Categoria, Grupo editorial, Política de publicação, Activo, Aliases. |
+| **Canais** | Catálogo canónico por país: DisplayName, Key, **País**, Categoria, Grupo de publicação (grupo canónico, `groupKey`/`groupName`), Política de publicação, Activo, Aliases. |
+| **Grupos** | Grupos canónicos de publicação, ordenados por `order` (ver "Grupos canónicos e atribuição por canal"). |
 | **Regras** | IdentityRules explícitas que sobrepõem o matching automático. Criar regra com `ReviewOnly` permite fuzzy matching futuro; `Excluded` bloqueia o canal permanentemente. |
 | **Afinidades** | Grupos com discriminator `Kind` (**Channel** ou **Country**). Uma Channel affinity liga variantes a um canal canónico (0..1 por `CanonicalChannelKey`); uma Country affinity liga variantes ao `CountryChannelValidator` para country-level targeting. As variantes são editadas num único campo separado pelo delimiter global (`/api/settings`, default `,`). |
 | **Reviews** | Itens de revisão do Dispatcharr (decisões ambíguas ou uncertainas pendentes de decisão humana). |
@@ -624,6 +625,10 @@ O formulário de canal (criar/editar) e a API usam `groupKey`; o campo legacy
 `editorialGroup` e a feature *Group Mapping* (source→canónico) foram removidos
 (Waves D1/D2). A sugestão é apenas um default — o valor persistido é sempre a escolha
 explícita do operador. Ver invariante em `AGENTS.md` §2.
+
+Migrações relevantes: `AddCanonicalChannelGroupFk` (introduz `GroupId`/`canonical_groups`),
+`DropGroupMappings` (remove `group_mappings`) e `DropEditorialGroupColumn`
+(remove `canonical_channels.EditorialGroup`).
 
 ### Pending Country Approvals
 
@@ -938,14 +943,15 @@ Considera-se evidência (entidades que não são criadas por migration/seed numa
 instalação nova) a existência de qualquer uma de:
 
 - catálogo persistente: `sources`, `channel-sources`, observações, `ordering
-  lists/items`, `import policies`, grupos canónicos e mappings, jobs agendados,
+  lists/items`, `import policies`, jobs agendados,
   `sync-runs/steps`, `review items`, `matching audits`, `pending country
   approvals`, `affinity groups`, ownership Dispatcharr e `identity rules`;
 - artefactos de output: `import_history.json`, `playlist.m3u`,
   `telegram_run_report.json` ou `telegram_playlist_*.m3u`.
 
-`CanonicalChannels`, `ChannelAliases` (seed/baseline) e
-`SourcePriorityPolicies` (default global lazily) **não** contam como evidência.
+`CanonicalChannels`, `ChannelAliases` (seed/baseline),
+`CanonicalGroups` (criados por migration/seed) e `SourcePriorityPolicies`
+(default global lazily) **não** contam como evidência.
 
 ### Persistência
 

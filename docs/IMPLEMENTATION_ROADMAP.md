@@ -8,6 +8,14 @@ Este documento transforma a visão arquitectural definida em:
 
 num plano concreto de implementação.
 
+> **Nota (2026-10-08):** este documento é anterior às **Waves A–D**. O grupo de
+> publicação é agora uma **propriedade do canal canónico**
+> (`CanonicalChannel.GroupId` → `CanonicalGroup`); o enum `CanonicalEditorialGroup`,
+> a coluna `canonical_channels.EditorialGroup` e a entidade/tabela/endpoints
+> `group_mappings` foram removidos. As referências a `EditorialGroup`/heurística e
+> a `GroupMapping`/`group-mappings` abaixo são **históricas**. Ver `AGENTS.md` §2 e
+> `m3uCrawler/README.md`.
+
 O objectivo é evoluir o m3uCrawler de um crawler/discovery pipeline para uma plataforma funcional de:
 
 ```text
@@ -246,7 +254,7 @@ CanonicalId
 DisplayName
 Country
 Category
-EditorialGroup
+GroupId        # grupo de publicação (histórico: EditorialGroup)
 PublicationPolicy
 Enabled
 CreatedAt
@@ -328,7 +336,7 @@ Não deve ser tratada como configuração imutável.
 - `m3uCrawler.Tests/CatalogBaselineImporterTests.cs` (NOVO): 19 testes cobrindo conversão de `canonical_id`, resolução de grupo/categoria, idempotência, preservação de canais pré-existentes, sanitização do report, integração com o ficheiro baseline real.
 - `m3uCrawler/Services/Catalog/ChannelCatalogBootstrapper.cs` (modificado): `TryImportBaselineAsync` chamado automaticamente após `SeedAsync`. Procura o baseline em três localizações canónicas (env var `M3U_BASELINE_PATH`, `CWD/docs/catalog/`, `<binary>/../../../../../docs/catalog/`). Falha na importação é registada em log mas não aborta o arranque.
 - **Não** substituiu o `CatalogSeed` programático — coexiste. O baseline é o source primário do seed PT; `CatalogSeed` permanece como fallback.
-- **Limitação conhecida** (PHASE 6 — Grupos): os grupos editoriais continuam a ser o enum `CanonicalEditorialGroup` em vez de entidades persistentes. A resolução de categoria editorial a partir do baseline é heurística (palavras-chave em aliases/nome). PHASE 6 dos grupos está planeada para depois.
+- **Limitação histórica** (PHASE 6 — Grupos, pré-Waves A–D): referia que os grupos editoriais continuavam a ser o enum `CanonicalEditorialGroup` em vez de entidades persistentes, com resolução de categoria editorial heurística a partir do baseline. **Resolvido (Waves A–D, 2026-10-07):** o enum e a coluna `canonical_channels.EditorialGroup` foram removidos; o grupo de publicação é agora propriedade do canal (`CanonicalChannel.GroupId` → `canonical_groups`). Ver banner no topo.
 
 ---
 
@@ -1142,6 +1150,8 @@ Permitir:
 - excluir grupos.
 
 **Estado (2026-09-11)**: ✅ **concluído**.
+
+> **Histórico (pré-Waves A–D, corrigido 2026-10-08).** `GroupMappingEntity`, a tabela `group_mappings` e os endpoints `group-mappings` foram removidos (Wave D1); o grupo de publicação é agora propriedade do canal canónico (`CanonicalChannel.GroupId`). Ver banner no topo.
 
 - `m3uCrawler/Services/Catalog/CatalogEntities.cs` — adicionadas `ImportPolicyEntity`, `CanonicalGroupEntity`, `GroupMappingEntity` e enums `MediaKind`, `VodPolicy`.
 - `m3uCrawler/Services/Catalog/Migrations/*AddImportPoliciesAndGroups*` — tabelas `import_policies`, `canonical_groups`, `group_mappings` com índices únicos apropriados (`MediaKind`, `Key`, `(SourceKind, SourceGroupTitle)`).
@@ -2565,6 +2575,8 @@ administrativa completa). Restavam dois refinamentos:
   `playlist.m3u` real usando a `PlaylistComposition`.
 
 ## 6. PHASE 8 — TV/Radio/VOD/Groups
+
+> **Histórico (pré-Waves A–D, corrigido 2026-10-08).** `GroupMappingEntity`/`group_mappings` foram removidos; o grupo é propriedade do canal (`CanonicalChannel.GroupId`). Ver banner no topo.
 
 - Modelos: `ImportPolicyEntity` (MediaKind + VodPolicy + CSVs
   target/excluded), `CanonicalGroupEntity` (key, displayName,

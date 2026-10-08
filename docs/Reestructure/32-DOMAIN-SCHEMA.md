@@ -316,13 +316,15 @@ Constraint: `(OrderingListId, Position)` único; um `CanonicalChannel` não pode
 Campos:
 - `Id`
 - `Key`
-- `Name`
-- `MediaKind`
-- ordering/output metadata.
+- `DisplayName`
+- `Country`
+- `Order`
+- `IsEnabled`
+- `IsDefault`
 
 ## GroupMapping
 
-Converte evidência de origem em CanonicalGroup segundo regra explícita.
+**Removido.** A entidade/tabela `group_mappings` foi eliminada; o grupo de publicação é uma propriedade do `CanonicalChannel` (`GroupId` → `CanonicalGroup`).
 
 ## GeneratedPlaylist
 

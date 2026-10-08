@@ -21,7 +21,7 @@ O mesmo canal pode existir em várias listas/posições.
 
 `CanonicalGroup` é grupo canónico do output.
 
-`GroupMapping` converte grupos/indicadores de origem para grupos canónicos segundo regras explícitas.
+O grupo de publicação é uma propriedade do canal canónico (`GroupId` → `CanonicalGroup`); o `group-title` da Source é evidência/sugestão apenas.
 
 `group-title` da Source é evidência, não verdade canónica.
 
