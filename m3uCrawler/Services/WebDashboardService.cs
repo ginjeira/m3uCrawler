@@ -633,6 +633,11 @@ namespace m3uCrawler.Services
             var (authMode, lifecycleState) = await ResolveAuthDecisionAsync();
             var sessionId = GetCookieValue(context.Request, SessionCookieName);
             var isRootPath = requestPath.Length == 0 || requestPath == "/";
+            // Fase 0 — a UI nova é servida em /next, tratada como a raiz (mesmo
+            // gate de sessão + injecção de CSRF). A raiz (/) continua a servir a
+            // variante Legacy, byte-idêntica.
+            var isNextPath = requestPath.Equals("/next", StringComparison.OrdinalIgnoreCase);
+            var isUiRoot = isRootPath || isNextPath;
             // W5.5 (B2) — os erros de gate (401/403) das novas Review APIs usam o
             // envelope {error,message,correlationId}; os restantes endpoints
             // mantêm o formato existente.
@@ -676,7 +681,7 @@ namespace m3uCrawler.Services
             // --- Enforcement para os restantes endpoints existentes ---
             // Não é um segundo pipeline: é um único gate que decide, por modo,
             // se o handler existente pode correr.
-            if (!isRootPath && !IsAlwaysPublicPath(requestPath))
+            if (!isUiRoot && !IsAlwaysPublicPath(requestPath))
             {
                 if (authMode == AuthMode.Bootstrap && !machineAuthorized)
                 {
@@ -3737,13 +3742,13 @@ namespace m3uCrawler.Services
                 }
             }
 
-            if (isRootPath && authMode == AuthMode.Bootstrap)
+            if (isUiRoot && authMode == AuthMode.Bootstrap)
             {
                 RedirectTo(context.Response, "/bootstrap");
                 return;
             }
 
-            if (isRootPath && authMode == AuthMode.UserAuth)
+            if (isUiRoot && authMode == AuthMode.UserAuth)
             {
                 var rootSession = _authService != null
                     ? await _authService.ValidateSessionAsync(sessionId)
@@ -3758,16 +3763,20 @@ namespace m3uCrawler.Services
                 // apenas em memória JavaScript da página (nunca em URL, query,
                 // localStorage ou logs), para que o helper de fetch o envie
                 // automaticamente em métodos mutantes.
-                await WriteHtmlAsync(context.Response, BuildHtmlPage(rootSession.CsrfToken));
+                await WriteHtmlAsync(
+                    context.Response,
+                    BuildHtmlPageFor(rootSession.CsrfToken, VariantFor(isNextPath)));
                 return;
             }
 
-            if (isRootPath)
+            if (isUiRoot)
             {
-                // W3 — A página do Dashboard só é servida na raiz. Qualquer
-                // outro path não correspondido NÃO pode devolver HTML 200 como
-                // se fosse uma API válida.
-                await WriteHtmlAsync(context.Response, BuildHtmlPage());
+                // W3 — A página do Dashboard só é servida na raiz (e, na Fase 0,
+                // em /next). Qualquer outro path não correspondido NÃO pode
+                // devolver HTML 200 como se fosse uma API válida.
+                await WriteHtmlAsync(
+                    context.Response,
+                    BuildHtmlPageFor(null, VariantFor(isNextPath)));
                 return;
             }
 
@@ -4631,8 +4640,11 @@ namespace m3uCrawler.Services
     /// localStorage ou logs. Sem token (legacy/bootstrap) o helper não é injectado.
     /// </summary>
     private static string BuildHtmlPage(string? csrfToken = null)
+        => BuildHtmlPageFor(csrfToken, DashboardVariant.Legacy);
+
+    private static string BuildHtmlPageFor(string? csrfToken, DashboardVariant variant)
     {
-        var html = BuildDashboardHtml();
+        var html = BuildDashboardHtmlFor(variant);
         if (string.IsNullOrEmpty(csrfToken))
         {
             return html;
@@ -5229,7 +5241,9 @@ namespace m3uCrawler.Services
     /// (herdam a configuração global), pelo que a persistência nunca guarda
     /// overrides inválidos. Os limites espelham os overrides explícitos de
     /// <c>POST /api/run/start</c> (<c>LiveRunApiMappings.ParseStartPayload</c>):
-    /// <c>historyHours</c> em <c>1..720</c>, <c>minHistoryHours</c> em
+    /// <c>historyHours</c> em
+    /// <c>1..<see cref="DiscoverySettings.MaxValidHistoryHours"/></c> (=1440),
+    /// <c>minHistoryHours</c> em
     /// <c>0..<see cref="DiscoverySettings.MaxValidHistoryHours"/></c>,
     /// <c>maxStreams</c> <c>&gt;= <see cref="DiscoverySettings.MinMaxStreams"/></c>.
     /// </para>
@@ -5237,8 +5251,9 @@ namespace m3uCrawler.Services
     private static string? BuildScheduledJobDiscoveryJson(ScheduledJobPayload payload)
     {
         var keyword = string.IsNullOrWhiteSpace(payload.Keyword) ? null : payload.Keyword.Trim();
-        // Espelha LiveRunApiMappings.ParseStartPayload: historyHours em (0, 720].
-        var historyHours = payload.HistoryHours is > 0 and <= 24 * 30
+        // Espelha LiveRunApiMappings.ParseStartPayload: historyHours em
+        // (0, DiscoverySettings.MaxValidHistoryHours] (=1440).
+        var historyHours = payload.HistoryHours is > 0 and <= DiscoverySettings.MaxValidHistoryHours
             ? payload.HistoryHours
             : null;
         var minHistoryHours = payload.MinHistoryHours is >= 0 and <= DiscoverySettings.MaxValidHistoryHours
@@ -5503,7 +5518,19 @@ namespace m3uCrawler.Services
         };
     }
 
+    private enum DashboardVariant
+    {
+        Legacy = 0,
+        Next = 1,
+    }
+
     private static string BuildDashboardHtml()
+        => BuildDashboardHtmlFor(DashboardVariant.Legacy);
+
+    private static DashboardVariant VariantFor(bool isNext)
+        => isNext ? DashboardVariant.Next : DashboardVariant.Legacy;
+
+    private static string BuildDashboardHtmlFor(DashboardVariant variant)
         {
             string s = """
 <!doctype html>
@@ -5746,7 +5773,6 @@ namespace m3uCrawler.Services
     <!-- CATÁLOGO -->
     <section id='view-catalog' hidden>
       <h2 style='font-size:18px;margin-top:0;'>Catálogo de Canais</h2>
-      <div class='grid' id='catalogStats'></div>
 
       <h3 style='font-size:14px;margin-top:24px;'>Sub-separadores</h3>
       <nav id='catalogTabs' style='background:transparent;border-bottom:1px solid var(--border);padding:0;gap:4px;'>
@@ -5772,6 +5798,7 @@ namespace m3uCrawler.Services
 
       <!-- TAB: Visão Geral -->
       <div id='ctab-overview'>
+        <div class='grid' id='catalogStats' style='margin-top:16px;'></div>
         <div class='card' style='margin-top:16px;'>
           <h3>Estatísticas do Catálogo</h3>
           <div id='catalogStatsDetail'></div>
@@ -6065,6 +6092,20 @@ namespace m3uCrawler.Services
         </div>
         <div id='auditStatus' class='muted' style='margin-top:8px;' aria-live='polite'></div>
         <div id='auditTable'></div>
+
+        <!-- DC-5b — detalhe Antes/Depois em modal (evita o corte do
+             <details> dentro de célula estreita com table{overflow:hidden}). -->
+        <div id='auditJsonModal' hidden>
+          <div class='card'>
+            <h3 id='auditJsonTitle'>Auditoria</h3>
+            <div class='muted' id='auditJsonMeta' style='font-size:12px;margin-bottom:8px;'></div>
+            <div style='font-weight:600;margin-top:8px;'>Antes</div>
+            <pre id='auditJsonBefore' style='white-space:pre-wrap;word-break:break-word;max-height:220px;overflow:auto;'></pre>
+            <div style='font-weight:600;margin-top:8px;'>Depois</div>
+            <pre id='auditJsonAfter' style='white-space:pre-wrap;word-break:break-word;max-height:220px;overflow:auto;'></pre>
+            <div style='margin-top:10px;'><button type='button' onclick='closeModalPanel()'>Fechar</button></div>
+          </div>
+        </div>
       </div>
 
       <!-- TAB: Sync Runs -->
@@ -6691,7 +6732,7 @@ namespace m3uCrawler.Services
           </div>
           <div>
             <label for='liveRunHistoryHours' class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>History hours (opcional)</label>
-            <input id='liveRunHistoryHours' type='number' min='1' max='720' placeholder='ex: 72' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+            <input id='liveRunHistoryHours' type='number' min='1' max='1440' placeholder='ex: 72' style='width:100%;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
           </div>
           <div>
             <label for='liveRunMinHistoryHours' class='muted' style='display:block;font-size:12px;margin-bottom:4px;'>Min history hours (opcional)</label>
@@ -8258,7 +8299,10 @@ const rows = Object.entries(inv).map(([k, v]) => {
     // helper `apiRequest` (DC-2) para uma superfície de erro consistente e
     // trata explicitamente o 503 `audit-unavailable` (sem catálogo/serviço).
     // Todo o conteúdo é apresentado como texto via `escapeHtml`; os JSON
-    // `beforeJson`/`afterJson` ficam em `<details>` compactos e expansíveis.
+    // `beforeJson`/`afterJson` abrem num modal de detalhe (`showAuditJson`)
+    // em vez de `<details>` dentro da célula (que era cortado pela largura
+    // estreita da coluna + `table{overflow:hidden}`).
+    let _auditRowsCache = [];
     async function loadCatalogAudits() {
       const typeEl = document.getElementById('auditObjectType');
       const idEl = document.getElementById('auditObjectId');
@@ -8295,6 +8339,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
       if (statusEl) setStatus(statusEl, '', true);
 
       const rows = Array.isArray(res.json) ? res.json : [];
+      _auditRowsCache = rows;
       if (countEl) {
         const filterParts = [];
         if (objectType) filterParts.push('tipo ' + objectType);
@@ -8303,10 +8348,10 @@ const rows = Object.entries(inv).map(([k, v]) => {
       }
       if (!rows.length) { table.innerHTML = '<p class="muted">Sem registos de auditoria para este filtro.</p>'; return; }
 
-      const jsonCell = (label, value) => {
+      const jsonCell = (label, r) => {
+        const value = label === 'before' ? r.beforeJson : r.afterJson;
         if (value == null || value === '') return '—';
-        const text = (typeof value === 'string') ? value : JSON.stringify(value);
-        return `<details><summary>${escapeHtml(label)}</summary><pre style='white-space:pre-wrap;word-break:break-word;max-width:360px;margin:4px 0;'>${escapeHtml(text)}</pre></details>`;
+        return `<button class='secondary' type='button' onclick='showAuditJson(${r.id}, "${label}")'>Ver</button>`;
       };
 
       const body = rows.map(r => {
@@ -8321,14 +8366,54 @@ const rows = Object.entries(inv).map(([k, v]) => {
           <td><code>${escapeHtml(r.operation || '—')}</code></td>
           <td>${objectRef}</td>
           <td>${resultBadge}</td>
-          <td>${jsonCell('before', r.beforeJson)}</td>
-          <td>${jsonCell('after', r.afterJson)}</td>
+          <td>${jsonCell('before', r)}</td>
+          <td>${jsonCell('after', r)}</td>
           <td>${escapeHtml(r.detail || '—')}</td>
         </tr>`;
       }).join('');
 
       table.innerHTML = `
         <table><thead><tr><th>Data/hora</th><th>Actor</th><th>Operação</th><th>Objecto</th><th>Resultado</th><th>Antes</th><th>Depois</th><th>Detalhe</th></tr></thead><tbody>${body}</tbody></table>`;
+    }
+
+    // DC-5b — pretty-print tolerante de um valor beforeJson/afterJson. Strings
+    // são tentadas como JSON; se não forem JSON válido devolvem-se cruas.
+    function prettyJson(value) {
+      if (value == null || value === '') return '—';
+      if (typeof value === 'string') {
+        try { return JSON.stringify(JSON.parse(value), null, 2); } catch (e) { return value; }
+      }
+      try { return JSON.stringify(value, null, 2); } catch (e) { return String(value); }
+    }
+
+    // DC-5b — abre o modal de detalhe da auditoria, preenchendo metadados e os
+    // JSON Antes/Depois. A `_auditRowsCache` é preenchida por `loadCatalogAudits`
+    // e o registo é localizado pelo `id` numérico. `which` assinala o lado
+    // clicado (ambos são sempre apresentados). O conteúdo usa `textContent`,
+    // pelo que é inserido como texto (XSS-safe), sem passar por innerHTML.
+    function showAuditJson(id, which) {
+      const row = (_auditRowsCache || []).find(r => r.id === id);
+      if (!row) return;
+
+      const titleEl = document.getElementById('auditJsonTitle');
+      if (titleEl) titleEl.textContent = `Auditoria #${id} — ${row.operation || '—'}`;
+
+      const metaEl = document.getElementById('auditJsonMeta');
+      if (metaEl) {
+        const parts = [];
+        parts.push(tsLocal(row.occurredAtUtc));
+        parts.push('actor: ' + (row.actorName || row.actorType || '—'));
+        parts.push('objecto: ' + (row.objectType || '—') + (row.objectId ? ' / ' + row.objectId : ''));
+        parts.push('resultado: ' + (row.result || 'success'));
+        metaEl.textContent = parts.join(' · ');
+      }
+
+      const beforeEl = document.getElementById('auditJsonBefore');
+      if (beforeEl) beforeEl.textContent = prettyJson(row.beforeJson);
+      const afterEl = document.getElementById('auditJsonAfter');
+      if (afterEl) afterEl.textContent = prettyJson(row.afterJson);
+
+      openModalPanel('auditJsonModal');
     }
 
     async function loadSources() {
@@ -9311,12 +9396,22 @@ const rows = Object.entries(inv).map(([k, v]) => {
     // para o "efetivo" mostrado coincidir com o que o backend persiste.
     // Limites espelham o POST /api/catalog/scheduled-jobs
     // (BuildScheduledJobDiscoveryJson) e os overrides explícitos de
-    // POST /api/run/start: min 0..1440, history 1..720, maxStreams >= 1.
+    // POST /api/run/start: min 0..1440, history 1..1440, maxStreams >= 1.
     function schedDiscValidInt(name, lo, hi) {
       const n = schedDiscInt(name);
       if (n === null) return null;
       if (n < lo || (hi !== null && n > hi)) return null;
       return n;
+    }
+
+    // Verdadeiro quando o campo está preenchido mas fora do intervalo válido
+    // (distingue "vazio" de "inválido" para emitir feedback ao utilizador).
+    function schedDiscOutOfRange(name, lo, hi) {
+      const el = schedDiscField(name);
+      if (!el || el.value === '') return false;
+      const n = parseInt(el.value, 10);
+      if (isNaN(n)) return false;
+      return n < lo || (hi !== null && n > hi);
     }
 
     function updateSchedDiscoveryPreview() {
@@ -9326,13 +9421,24 @@ const rows = Object.entries(inv).map(([k, v]) => {
       const kwEl = schedDiscField('discoveryKeyword');
       const keyword = (kwEl && kwEl.value.trim()) ? kwEl.value.trim() : (g.keyword || 'portugal');
       const min = schedDiscValidInt('discoveryMinHistoryHours', 0, 1440);
-      const hist = schedDiscValidInt('discoveryHistoryHours', 1, 720);
+      const hist = schedDiscValidInt('discoveryHistoryHours', 1, 1440);
       const max = schedDiscValidInt('discoveryMaxStreams', 1, null);
       const histV = hist !== null ? hist : (g.historyHours != null ? g.historyHours : 24);
       let minV = min !== null ? min : (g.minHistoryHours != null ? g.minHistoryHours : 0);
       if (minV > histV) minV = 0;
       const maxV = max !== null ? max : (g.maxStreams != null ? g.maxStreams : 500);
-      out.textContent = 'Efetivo: keyword="' + keyword + '", min=' + minV + 'h, history=' + histV + 'h, maxStreams=' + maxV;
+      const warnings = [];
+      if (schedDiscOutOfRange('discoveryHistoryHours', 1, 1440)) {
+        warnings.push('⚠️ history fora de 1..1440 (será ignorado; herdará a global)');
+      }
+      if (schedDiscOutOfRange('discoveryMinHistoryHours', 0, 1440)) {
+        warnings.push('⚠️ min fora de 0..1440 (será ignorado; herdará a global)');
+      }
+      if (schedDiscOutOfRange('discoveryMaxStreams', 1, null)) {
+        warnings.push('⚠️ maxStreams fora de >=1 (será ignorado; herdará a global)');
+      }
+      out.textContent = 'Efetivo: keyword="' + keyword + '", min=' + minV + 'h, history=' + histV + 'h, maxStreams=' + maxV
+        + (warnings.length ? ' ' + warnings.join(' ') : '');
     }
 
     function clearSchedDiscoveryFields() {
@@ -10472,6 +10578,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
     window.submitAddRule = submitAddRule;
     window.loadCatalogReviews = loadCatalogReviews;
     window.loadCatalogAudits = loadCatalogAudits;
+    window.showAuditJson = showAuditJson;
     window.loadCatalogSyncRuns = loadCatalogSyncRuns;
     window.loadCatalogRules = loadCatalogRules;
     window.deleteRule = deleteRule;
@@ -10952,7 +11059,513 @@ const rows = Object.entries(inv).map(([k, v]) => {
 </body>
 </html>
 """;
-            return s;
+            return variant == DashboardVariant.Legacy ? s : ApplyNextVariant(s);
+        }
+
+        /// <summary>
+        /// Fase 0 da refactorização da IA do dashboard (estratégia A — builder
+        /// parametrizado por variante). Aplica <b>apenas</b> transformações de
+        /// navegação sobre a string base; corpos de vista e JS ficam intactos.
+        /// A variante <c>Legacy</c> nunca passa por este método, pelo que a
+        /// página servida em <c>GET /</c> permanece byte-idêntica.
+        /// </summary>
+        private static string ApplyNextVariant(string html)
+        {
+            // (a) Nav de topo: "Canais / Países" → "Países" (bloco exacto do botão).
+            html = html.Replace(
+                "<button data-view='countries'>Canais / Países</button>",
+                "<button data-view='countries'>Países</button>");
+
+            // (b) Sub-tabs do Catálogo: reagrupados por natureza e renomeados.
+            // Os `data-ctab` e handlers mantêm-se intactos (a ordem não importa
+            // para a lógica JS, que se baseia em `data-ctab`).
+            html = html.Replace(
+                """
+      <nav id='catalogTabs' style='background:transparent;border-bottom:1px solid var(--border);padding:0;gap:4px;'>
+        <button data-ctab='overview' class='active' style='padding:8px 14px;'>Visão Geral</button>
+        <button data-ctab='channels' style='padding:8px 14px;'>Canais</button>
+        <button data-ctab='rules' style='padding:8px 14px;'>Regras</button>
+        <button data-ctab='affinity' style='padding:8px 14px;'>Afinidades</button>
+        <button data-ctab='sources' style='padding:8px 14px;'>Sources</button>
+        <button data-ctab='ordering' style='padding:8px 14px;'>Ordering</button>
+        <button data-ctab='priority' style='padding:8px 14px;'>Source Priority</button>
+        <button data-ctab='sourceselection' style='padding:8px 14px;'>Source Selection</button>
+        <button data-ctab='matching' style='padding:8px 14px;'>Matching</button>
+        <button data-ctab='degradation' style='padding:8px 14px;'>Degradação</button>
+        <button data-ctab='scheduled' style='padding:8px 14px;'>Scheduled Jobs</button>
+        <!-- Import Policies oculto até decisão W6b-3 (funcionalidade inerte, sem consumidor). Endpoints/entidade mantidos. -->
+        <button data-ctab='policies' hidden style='padding:8px 14px;'>Import Policies</button>
+        <button data-ctab='groups' style='padding:8px 14px;'>Grupos</button>
+        <button data-ctab='reviews' style='padding:8px 14px;'>Reviews</button>
+        <button data-ctab='audit' style='padding:8px 14px;'>Auditoria</button>
+        <button data-ctab='syncruns' style='padding:8px 14px;'>Sync Runs</button>
+        <button data-ctab='pending' style='padding:8px 14px;'>Pending <span id='pendingBadge' class='badge warn' style='margin-left:4px;padding:1px 6px;border-radius:999px;font-size:10px;display:none;'>0</span></button>
+      </nav>
+""",
+                """
+      <nav id='catalogTabs' style='background:transparent;border-bottom:1px solid var(--border);padding:0;gap:4px;'>
+        <span class='ctab-group'>Dados</span>
+        <button data-ctab='channels' style='padding:8px 14px;'>Canais</button>
+        <button data-ctab='rules' style='padding:8px 14px;'>Regras</button>
+        <button data-ctab='affinity' style='padding:8px 14px;'>Afinidades</button>
+        <button data-ctab='sources' style='padding:8px 14px;'>Origens</button>
+        <button data-ctab='groups' style='padding:8px 14px;'>Grupos</button>
+        <button data-ctab='reviews' style='padding:8px 14px;'>Reviews</button>
+        <button data-ctab='pending' style='padding:8px 14px;'>Pending <span id='pendingBadge' class='badge warn' style='margin-left:4px;padding:1px 6px;border-radius:999px;font-size:10px;display:none;'>0</span></button>
+        <span class='ctab-group'>Configuração</span>
+        <button data-ctab='ordering' style='padding:8px 14px;'>Ordenação</button>
+        <button data-ctab='priority' style='padding:8px 14px;'>Prioridade de Fontes</button>
+        <button data-ctab='sourceselection' style='padding:8px 14px;'>Selecção de Fontes</button>
+        <button data-ctab='scheduled' style='padding:8px 14px;'>Agendamento</button>
+        <!-- Import Policies oculto até decisão W6b-3 (funcionalidade inerte, sem consumidor). Endpoints/entidade mantidos. -->
+        <button data-ctab='policies' hidden style='padding:8px 14px;'>Import Policies</button>
+        <span class='ctab-group'>Monitorização</span>
+        <button data-ctab='overview' class='active' style='padding:8px 14px;'>Visão Geral</button>
+      </nav>
+""");
+
+            // (c) CSS dos separadores de grupo, inserido antes do primeiro
+            // (e único) `</style>` do dashboard.
+            var styleCloseIndex = html.IndexOf("  </style>", StringComparison.Ordinal);
+            if (styleCloseIndex >= 0)
+            {
+                html = html.Insert(
+                    styleCloseIndex,
+                    "    .ctab-group { align-self:center; font-size:11px; text-transform:uppercase; letter-spacing:0.04em; color:var(--muted); margin:0 6px; }\n");
+            }
+
+            // (d) Header: link discreto para a UI clássica (apenas na Next).
+            html = html.Replace(
+                "    <span class='meta' id='metaLine'>a carregar…</span>",
+                "    <span class='meta' id='metaLine'>a carregar…</span> <a href='/' style='font-size:12px;color:var(--muted);margin-left:8px;'>UI clássica</a>");
+
+            // (e) Fase 1 — workspace Dispatcharr: mover o card de configuração
+            // do Setup para a vista Dispatcharr (config + ações + estado num só
+            // local, resolve a dispersão I1). O bloco é capturado literalmente
+            // da string base; os ids e handlers mantêm-se, pelo que o JS
+            // partilhado continua a funcionar sem alterações.
+            const string dispSetupStart =
+                "      <div class='card'>\n        <h3>Dispatcharr</h3>\n";
+            const string dispSetupEnd =
+                "        <div id='setupDispatcharrStatus' class='setup-status muted'>—</div>\n      </div>";
+            var dispConfigStart = html.IndexOf(dispSetupStart, StringComparison.Ordinal);
+            if (dispConfigStart >= 0)
+            {
+                var dispConfigEndRel = html.IndexOf(dispSetupEnd, dispConfigStart, StringComparison.Ordinal);
+                if (dispConfigEndRel >= 0)
+                {
+                    var dispConfigEnd = dispConfigEndRel + dispSetupEnd.Length;
+                    var dispConfigCard = html.Substring(dispConfigStart, dispConfigEnd - dispConfigStart);
+
+                    // No lugar removido do Setup fica apenas uma referência curta.
+                    const string dispatcharrShortcutCard = """
+      <div class='card'>
+        <h3>Dispatcharr</h3>
+        <p class='muted'>A configuração e o estado do Dispatcharr estão na vista <strong>Dispatcharr</strong>.</p>
+        <div class='toolbar' style='margin-top:12px;'>
+          <button id='nextGotoDispatcharr'>Abrir Dispatcharr</button>
+        </div>
+      </div>
+""";
+                    html = html.Remove(dispConfigStart, dispConfigCard.Length)
+                               .Insert(dispConfigStart, dispatcharrShortcutCard);
+
+                    // Inserir o card movido dentro da vista Dispatcharr, logo a
+                    // seguir ao card de ações Dry Run/Sync, e depois o card de
+                    // referência read-only aos factores que determinam o plano.
+                    const string dispatcharrActionsAnchor =
+                        "        <div id='dispatcharrActionStatus' class='muted' style='margin-top:8px;'></div>\n      </div>\n";
+                    var actionsEnd = html.IndexOf(dispatcharrActionsAnchor, StringComparison.Ordinal);
+                    if (actionsEnd >= 0)
+                    {
+                        const string dispatcharrFactorsCard = """
+      <div class='card' style='margin-top:16px;'>
+        <h3>Factores que determinam o plano</h3>
+        <p class='muted'>O plano de sincronização do Dispatcharr é determinado por três configurações do catálogo (editáveis no separador Catálogo):</p>
+        <ul class='muted' style='margin:8px 0 0 0;padding-left:18px;'>
+          <li><strong>Source Selection</strong> — quantas fontes por canal vão para o Dispatcharr.</li>
+          <li><strong>Source Priority</strong> — qual a qualidade/fonte preferida.</li>
+          <li><strong>Ordering</strong> — membros e ordem (channel_number).</li>
+        </ul>
+        <div class='toolbar' style='margin-top:12px;'>
+          <button id='nextGotoSourceSelection' class='secondary'>Selecção de Fontes</button>
+          <button id='nextGotoPriority' class='secondary'>Prioridade de Fontes</button>
+          <button id='nextGotoOrdering' class='secondary'>Ordenação</button>
+        </div>
+      </div>
+""";
+                        var insertAt = actionsEnd + dispatcharrActionsAnchor.Length;
+                        html = html.Insert(
+                            insertAt,
+                            "\n" + dispConfigCard + "\n\n" + dispatcharrFactorsCard + "\n");
+                    }
+                }
+            }
+
+            // (f) Fase 1 + Fase 2 — wiring exclusivo da variante Next. O JS
+            // partilhado não é alterado: usamos os handlers internos já ligados
+            // (window.loadSetup / window.loadValidationPolicy, exportados) e
+            // cliques sintéticos para navegar entre vistas/sub-tabs. O bloco de
+            // config é preenchido por um loader local que espelha
+            // `loadDiscoverySettings` (não exportado). Acrescentado apenas à
+            // variante Next.
+            html = html.Replace(
+                "</body>",
+                """
+<script>(function(){
+  function go(view){var b=document.querySelector("nav button[data-view='"+view+"']");if(b)b.click();}
+  function goTab(t){go('catalog');var b=document.querySelector("#catalogTabs button[data-ctab='"+t+"']");if(b)b.click();}
+  function loadDiscoveryLocal(){
+    fetch('/api/discovery/settings').then(function(r){return r.ok?r.json():null;}).then(function(s){
+      if(!s||s.error)return;
+      var kw=document.getElementById('discoveryKeyword');
+      var min=document.getElementById('discoveryMinHistoryHours');
+      var max=document.getElementById('discoveryMaxHistoryHours');
+      var ms=document.getElementById('discoveryMaxStreams');
+      if(kw&&s.keyword!=null)kw.value=s.keyword;
+      if(min&&s.minHistoryHours!=null)min.value=s.minHistoryHours;
+      if(max&&s.historyHours!=null)max.value=s.historyHours;
+      if(ms&&s.maxStreams!=null)ms.value=s.maxStreams;
+    }).catch(function(){});
+  }
+  var currentCfg='discovery';
+  function setCfgActive(t){
+    currentCfg=t;
+    document.querySelectorAll('#configTabs button').forEach(function(b){b.classList.toggle('active',b.dataset.cfgtab===t);});
+    var secs=document.querySelectorAll("[id^='cfg-']");
+    for(var i=0;i<secs.length;i++){secs[i].hidden=(secs[i].id!=='cfg-'+t);}
+  }
+  function cfgTab(t){setCfgActive(t);if(t==='discovery')loadDiscoveryLocal();if(t==='validation'&&window.loadValidationPolicy)window.loadValidationPolicy();}
+  document.querySelectorAll('#configTabs button').forEach(function(b){b.addEventListener('click',function(){cfgTab(b.dataset.cfgtab);});});
+  var cv=document.querySelector("nav button[data-view='config']");
+  if(cv)cv.addEventListener('click',function(){if(window.loadValidationPolicy)window.loadValidationPolicy();loadDiscoveryLocal();setCfgActive(currentCfg);});
+  var d=document.querySelector("nav button[data-view='dispatcharr']");
+  if(d)d.addEventListener('click',function(){if(window.loadSetup)window.loadSetup();});
+  var nd=document.getElementById('nextGotoDispatcharr');if(nd)nd.addEventListener('click',function(){go('dispatcharr');});
+  [['nextGotoSourceSelection','sourceselection'],['nextGotoPriority','priority'],['nextGotoOrdering','ordering']].forEach(function(p){var el=document.getElementById(p[0]);if(el)el.addEventListener('click',function(){goTab(p[1]);});});
+  [['nextGotoConfigDiscovery','discovery'],['nextGotoConfigValidation','validation'],['nextGotoConfigSecurity','security']].forEach(function(p){var el=document.getElementById(p[0]);if(el)el.addEventListener('click',function(){go('config');cfgTab(p[1]);});});
+  var cfgLinks={'cfgGotoOrdering':'ordering','cfgGotoSourceSelection':'sourceselection','cfgGotoPriority':'priority','cfgGotoGroups':'groups','cfgGotoScheduled':'scheduled'};
+  Object.keys(cfgLinks).forEach(function(id){var el=document.getElementById(id);if(el)el.addEventListener('click',function(){goTab(cfgLinks[id]);});});
+  var gso=document.getElementById('cfgGotoScheduledOverrides');if(gso)gso.addEventListener('click',function(){goTab('scheduled');});
+  var gro=document.getElementById('cfgGotoRunOverrides');if(gro)gro.addEventListener('click',function(){go('liverun');});
+  setCfgActive(currentCfg);
+  function setMontActive(t){
+    document.querySelectorAll('#monitoringTabs button').forEach(function(b){b.classList.toggle('active',b.dataset.monttab===t);});
+    var secs=document.querySelectorAll("[id^='mont-']");
+    for(var i=0;i<secs.length;i++){secs[i].hidden=(secs[i].id!=='mont-'+t);}
+  }
+  function montTab(t){
+    setMontActive(t);
+    if(t==='matching'&&window.loadMatchingAudits)window.loadMatchingAudits();
+    else if(t==='degradation'&&window.loadDegradation)window.loadDegradation();
+    else if(t==='audit'&&window.loadCatalogAudits)window.loadCatalogAudits();
+    else if(t==='syncruns'&&window.loadCatalogSyncRuns)window.loadCatalogSyncRuns();
+  }
+  document.querySelectorAll('#monitoringTabs button').forEach(function(b){b.addEventListener('click',function(){montTab(b.dataset.monttab);});});
+  var mv=document.querySelector("nav button[data-view='monitoring']");
+  if(mv)mv.addEventListener('click',function(){montTab('matching');});
+  var orn=document.getElementById('opRunNow');if(orn)orn.addEventListener('click',function(){go('liverun');});
+  ['opDispatcharrDryRun','opDispatcharrSync','opDispatcharrTest'].forEach(function(id){var el=document.getElementById(id);if(el)el.addEventListener('click',function(){go('dispatcharr');});});
+  var ovc=document.getElementById('opValidateCountry');if(ovc)ovc.addEventListener('click',function(){go('countries');});
+  var ngm=document.getElementById('nextGotoMonitoring');if(ngm)ngm.addEventListener('click',function(){go('monitoring');});
+  var ngov=document.getElementById('nextGotoOperationsValidation');if(ngov)ngov.addEventListener('click',function(){go('operations');});
+  setMontActive('matching');
+})();</script>
+""" + "</body>");
+
+            // (g) Fase 2 — hub "Configuração": nova área de topo com uma página
+            // por domínio (resolve a dispersão I2). Toda a transformação vive
+            // neste método; a variante Legacy nunca passa por aqui, pelo que
+            // `GET /` permanece byte-idêntico.
+
+            // (g.1) Nav de topo: botão "Configuração" logo após "Setup", ou
+            // seja, imediatamente antes do botão "Visão Geral".
+            html = html.Replace(
+                "    <button data-view='overview' class='active'>Visão Geral</button>",
+                "    <button data-view='config'>Configuração</button>\n    <button data-view='overview' class='active'>Visão Geral</button>");
+
+            // (g.2) Extração literal dos três cards que passam a viver no hub.
+            // Em cada local original fica uma nota com atalho. Os ids e
+            // handlers mantêm-se, pelo que o JS partilhado continua válido.
+            static bool TryExtractBlock(string source, string start, string end, out string block, out int at)
+            {
+                block = string.Empty;
+                at = source.IndexOf(start, StringComparison.Ordinal);
+                if (at < 0) return false;
+                var endRel = source.IndexOf(end, at, StringComparison.Ordinal);
+                if (endRel < 0) return false;
+                var stop = endRel + end.Length;
+                block = source.Substring(at, stop - at);
+                return true;
+            }
+
+            const string discCardStart =
+                "      <div class='card' style='margin-bottom:12px;'>\n        <h3 style='font-size:14px;margin-top:0;'>Configuração de discovery predefinida</h3>\n";
+            const string discCardEnd =
+                "          Cada Scheduled Job pode definir overrides próprios (keyword/min/max/maxStreams).\n        </p>\n      </div>";
+            const string discNote = """
+      <div class='card' style='margin-bottom:12px;'>
+        <h3 style='font-size:14px;margin-top:0;'>Configuração de discovery predefinida</h3>
+        <p class='muted'>Configuração movida para <strong>Configuração → Descoberta</strong>. A tabela de candidatos abaixo permanece nesta vista.</p>
+        <div class='toolbar' style='margin-top:12px;'>
+          <button id='nextGotoConfigDiscovery'>Abrir Configuração → Descoberta</button>
+        </div>
+      </div>
+""";
+
+            const string valCardStart =
+                "      <div class='card'>\n        <h3>Política de validação</h3>\n";
+            const string valCardEnd =
+                "        <div id='validationPolicyStatus' class='muted' style='margin-top:8px;'></div>\n      </div>";
+            const string valNote = """
+      <div class='card'>
+        <h3>Política de validação</h3>
+        <p class='muted'>A política foi movida para <strong>Configuração → Validação de Streams</strong>. O dry-run abaixo permanece nesta vista.</p>
+        <div class='toolbar' style='margin-top:12px;'>
+          <button id='nextGotoConfigValidation'>Abrir Configuração → Validação</button>
+        </div>
+      </div>
+""";
+
+            const string pwdCardStart =
+                "      <div class='card' style='margin-top:16px;'>\n        <h3>Alterar password</h3>\n";
+            const string pwdCardEnd =
+                "        <div id='accountPasswordStatus' class='setup-status muted'>—</div>\n      </div>";
+            const string pwdNote = """
+      <div class='card' style='margin-top:16px;'>
+        <h3>Alterar password</h3>
+        <p class='muted'>A alteração de password foi movida para <strong>Configuração → Segurança</strong>.</p>
+        <div class='toolbar' style='margin-top:12px;'>
+          <button id='nextGotoConfigSecurity'>Abrir Configuração → Segurança</button>
+        </div>
+      </div>
+""";
+
+            var discCard = string.Empty;
+            var valCard = string.Empty;
+            var pwdCard = string.Empty;
+            if (TryExtractBlock(html, discCardStart, discCardEnd, out var dc, out var dcAt))
+            {
+                discCard = dc;
+                html = html.Remove(dcAt, dc.Length).Insert(dcAt, discNote);
+            }
+            if (TryExtractBlock(html, valCardStart, valCardEnd, out var vc, out var vcAt))
+            {
+                valCard = vc;
+                html = html.Remove(vcAt, vc.Length).Insert(vcAt, valNote);
+            }
+            if (TryExtractBlock(html, pwdCardStart, pwdCardEnd, out var pc, out var pcAt))
+            {
+                pwdCard = pc;
+                html = html.Remove(pcAt, pc.Length).Insert(pcAt, pwdNote);
+            }
+
+            // (g.3) Nova secção sibling (`main > section`) com o hub. Tem de
+            // ser filha directa de `<main>` para o `showView` a mostrar/ocultar.
+            // Publicação e Agendamento são páginas-índice (read-only) que ligam
+            // aos editores actuais; a movimentação completa vem em fase futura.
+            const string cfgHead = """
+    <!-- CONFIGURAÇÃO (Fase 2) -->
+    <section id='view-config' hidden>
+      <h2 style='font-size:18px;margin-top:0;'>Configuração</h2>
+      <nav id='configTabs' style='background:transparent;border-bottom:1px solid var(--border);padding:0;gap:4px;'>
+        <button data-cfgtab='discovery' class='active' style='padding:8px 14px;'>Descoberta</button>
+        <button data-cfgtab='validation' style='padding:8px 14px;'>Validação de Streams</button>
+        <button data-cfgtab='publication' style='padding:8px 14px;'>Publicação</button>
+        <button data-cfgtab='scheduling' style='padding:8px 14px;'>Agendamento</button>
+        <button data-cfgtab='security' style='padding:8px 14px;'>Segurança</button>
+      </nav>
+      <div id='cfg-discovery'>
+        <div class='card' style='margin-bottom:12px;'>
+          <h3 style='font-size:14px;margin-top:0;'>Precedência de discovery</h3>
+          <p class='muted'>Configuração efectiva: <strong>predefinição global → override por job → override por run</strong>. A validação de limites é feita no servidor (o cliente apenas apresenta a base e os overrides).</p>
+          <div class='toolbar' style='margin-top:12px;'>
+            <button id='cfgGotoScheduledOverrides' class='secondary'>Overrides por job (Agendamento)</button>
+            <button id='cfgGotoRunOverrides' class='secondary'>Overrides por run (Execução ao Vivo)</button>
+          </div>
+        </div>
+""";
+            const string cfgValOpen = "\n      </div>\n      <div id='cfg-validation' hidden>\n";
+            const string cfgPublication = """
+      </div>
+      <div id='cfg-publication' hidden>
+        <div class='card'>
+          <h3>Publicação</h3>
+          <p class='muted'>Página-índice (read-only). Os editores canónicos permanecem no Catálogo nesta fase; a movimentação completa fica para uma fase posterior.</p>
+          <ul class='muted' style='margin:8px 0 0 0;padding-left:18px;'>
+            <li><strong>Ordenação</strong> — ordem / <code>channel_number</code> no Dispatcharr.</li>
+            <li><strong>Selecção de Fontes</strong> — quantas fontes por canal são publicadas.</li>
+            <li><strong>Prioridade de Fontes</strong> — fonte preferida por canal.</li>
+            <li><strong>Grupos</strong> — grupos de publicação do canal canónico.</li>
+          </ul>
+          <div class='toolbar' style='margin-top:12px;'>
+            <button id='cfgGotoOrdering' class='secondary'>Ordenação</button>
+            <button id='cfgGotoSourceSelection' class='secondary'>Selecção de Fontes</button>
+            <button id='cfgGotoPriority' class='secondary'>Prioridade de Fontes</button>
+            <button id='cfgGotoGroups' class='secondary'>Grupos</button>
+          </div>
+        </div>
+      </div>
+      <div id='cfg-scheduling' hidden>
+        <div class='card'>
+          <h3>Agendamento</h3>
+          <p class='muted'>Página-índice (read-only). Os Scheduled Jobs (cron/action/enabled e overrides de discovery) permanecem no Catálogo nesta fase.</p>
+          <div class='toolbar' style='margin-top:12px;'>
+            <button id='cfgGotoScheduled' class='secondary'>Abrir Agendamento (Catálogo)</button>
+          </div>
+        </div>
+      </div>
+      <div id='cfg-security' hidden>
+""";
+            const string cfgFoot = """
+      </div>
+    </section>
+""";
+            var cfgSection = cfgHead + discCard + cfgValOpen + valCard + cfgPublication + pwdCard + cfgFoot;
+            var mainCloseAt = html.IndexOf("  </main>", StringComparison.Ordinal);
+            if (mainCloseAt >= 0)
+            {
+                html = html.Insert(mainCloseAt, cfgSection + "\n");
+            }
+
+            // (h) Fase 3 — áreas "Operações" e "Monitorização" (resolve I3/I4).
+            // Toda a transformação vive neste método; a Legacy nunca passa por
+            // aqui, pelo que `GET /` permanece byte-idêntico.
+
+            // (h.1) Nav de topo: "Operações" e "Monitorização" logo após "Visão
+            // Geral" (a Configuração já foi inserida em (g.1)).
+            html = html.Replace(
+                "    <button data-view='overview' class='active'>Visão Geral</button>",
+                "    <button data-view='overview' class='active'>Visão Geral</button>\n    <button data-view='operations'>Operações</button>\n    <button data-view='monitoring'>Monitorização</button>");
+
+            // (h.2) Operações → Validação: mover o card "Dry-run" (textarea
+            // `validationTestUrls` + botão + resultado) de `view-validation` para
+            // `#view-operations`. No local original fica uma nota com atalho;
+            // ids/handlers preservados.
+            const string valTestStart =
+                "      <div class='card' style='margin-top:16px;'>\n        <h3>Dry-run</h3>\n";
+            const string valTestEnd =
+                "        <div id='validationTestResult' class='muted' style='margin-top:8px;'></div>\n      </div>";
+            const string valTestNote = """
+      <div class='card' style='margin-top:16px;'>
+        <h3>Testar URLs</h3>
+        <p class='muted'>O teste de URLs foi movido para <strong>Operações → Validação</strong>.</p>
+        <div class='toolbar' style='margin-top:12px;'>
+          <button id='nextGotoOperationsValidation'>Abrir Operações</button>
+        </div>
+      </div>
+""";
+            var valTestCard = string.Empty;
+            if (TryExtractBlock(html, valTestStart, valTestEnd, out var vt, out var vtAt))
+            {
+                valTestCard = vt;
+                html = html.Remove(vtAt, vt.Length).Insert(vtAt, valTestNote);
+            }
+
+            // (h.3) Monitorização: mover os 4 contentores INFO do Catálogo
+            // (`ctab-*`) para a nova área, renomeando apenas o id do contentor
+            // (`ctab-*` → `mont-*`); os ids internos das tabelas/loaders mantêm-se.
+            // O contentor de Matching fica visível por omissão; os restantes
+            // começam `hidden` (o JS alterna).
+            string ExtractContainer(string ctabId, string endMarker, bool visible)
+            {
+                var start = "      <div id='" + ctabId + "' hidden>";
+                if (!TryExtractBlock(html, start, endMarker, out var block, out var at))
+                {
+                    return string.Empty;
+                }
+                html = html.Remove(at, block.Length);
+                var montId = "mont-" + ctabId.Substring("ctab-".Length);
+                var open = visible
+                    ? "<div id='" + montId + "'>"
+                    : "<div id='" + montId + "' hidden>";
+                return block.Replace(start, open);
+            }
+
+            var matchingBlock = ExtractContainer(
+                "ctab-matching",
+                "          <div id='matchingAuditsTable'></div>\n        </div>\n      </div>",
+                visible: true);
+            var degradationBlock = ExtractContainer(
+                "ctab-degradation",
+                "          <div id='degradationTable'></div>\n        </div>\n      </div>",
+                visible: false);
+            var auditBlock = ExtractContainer(
+                "ctab-audit",
+                "            <div style='margin-top:10px;'><button type='button' onclick='closeModalPanel()'>Fechar</button></div>\n          </div>\n        </div>\n      </div>",
+                visible: false);
+            var syncrunsBlock = ExtractContainer(
+                "ctab-syncruns",
+                "        <div id='catalogSyncRunsTable'></div>\n      </div>",
+                visible: false);
+
+            // Nota/atalho no Catálogo a apontar que estas vistas passaram para
+            // Monitorização.
+            html = html.Replace(
+                "        <button data-ctab='overview' class='active' style='padding:8px 14px;'>Visão Geral</button>\n      </nav>",
+                "        <button data-ctab='overview' class='active' style='padding:8px 14px;'>Visão Geral</button>\n      </nav>\n\n      <div class='card' style='margin-top:16px;'>\n        <p class='muted'>As vistas <strong>Matching</strong>, <strong>Degradação</strong>, <strong>Auditoria</strong> e <strong>Sync Runs</strong> passaram para a área <strong>Monitorização</strong> no menu de topo.</p>\n        <div class='toolbar' style='margin-top:12px;'>\n          <button id='nextGotoMonitoring'>Abrir Monitorização</button>\n        </div>\n      </div>");
+
+            // (h.4) Novas secções sibling (`main > section`). Operações agrega as
+            // ações one-shot; Monitorização recebe os 4 contentores movidos.
+            const string operationsHead = """
+    <!-- OPERAÇÕES (Fase 3) -->
+    <section id='view-operations' hidden>
+      <h2 style='font-size:18px;margin-top:0;'>Operações</h2>
+      <p class='muted'>Ações one-shot agrupadas num só local. O feedback detalhado permanece no contexto de cada ação (Execução ao Vivo, workspace Dispatcharr, Canais / Países).</p>
+      <h3 style='font-size:14px;margin-top:24px;'>Execução</h3>
+      <div class='card'>
+        <p class='muted'>Arranca um ciclo de descoberta (Telegram) com overrides opcionais.</p>
+        <div class='toolbar' style='margin-top:12px;'>
+          <button id='opRunNow'>Correr agora (Execução ao Vivo)</button>
+        </div>
+      </div>
+      <h3 style='font-size:14px;margin-top:24px;'>Dispatcharr</h3>
+      <div class='card'>
+        <p class='muted'>Dry Run valida o plano sem escrever, Sync aplica o plano e o teste verifica a ligação. O estado e o feedback ficam no workspace Dispatcharr.</p>
+        <div class='toolbar' style='margin-top:12px;'>
+          <button id='opDispatcharrDryRun' class='secondary'>Dry Run</button>
+          <button id='opDispatcharrSync' class='secondary'>Sync</button>
+          <button id='opDispatcharrTest' class='secondary'>Testar ligação</button>
+        </div>
+      </div>
+      <h3 style='font-size:14px;margin-top:24px;'>Validação</h3>
+      <p class='muted'>Testa uma lista de URLs com a política de validação corrente.</p>
+""";
+            const string operationsFoot = """
+      <h3 style='font-size:14px;margin-top:24px;'>País</h3>
+      <div class='card'>
+        <p class='muted'>Corre a validação da playlist contra os canais e indicadores do país.</p>
+        <div class='toolbar' style='margin-top:12px;'>
+          <button id='opValidateCountry'>Validar país (Canais / Países)</button>
+        </div>
+      </div>
+    </section>
+""";
+            var operationsSection = operationsHead + valTestCard + "\n" + operationsFoot;
+
+            const string monitoringHead = """
+    <!-- MONITORIZAÇÃO (Fase 3) -->
+    <section id='view-monitoring' hidden>
+      <h2 style='font-size:18px;margin-top:0;'>Monitorização</h2>
+      <nav id='monitoringTabs' style='background:transparent;border-bottom:1px solid var(--border);padding:0;gap:4px;'>
+        <button data-monttab='matching' class='active' style='padding:8px 14px;'>Matching</button>
+        <button data-monttab='degradation' style='padding:8px 14px;'>Degradação</button>
+        <button data-monttab='audit' style='padding:8px 14px;'>Auditoria</button>
+        <button data-monttab='syncruns' style='padding:8px 14px;'>Sync Runs</button>
+      </nav>
+""";
+            const string monitoringFoot = """
+    </section>
+""";
+            var monitoringSection = monitoringHead + matchingBlock + "\n" + degradationBlock + "\n" + auditBlock + "\n" + syncrunsBlock + "\n" + monitoringFoot;
+
+            mainCloseAt = html.IndexOf("  </main>", StringComparison.Ordinal);
+            if (mainCloseAt >= 0)
+            {
+                html = html.Insert(mainCloseAt, operationsSection + "\n" + monitoringSection + "\n");
+            }
+
+            return html;
         }
 
         // ---------- Autenticação opcional por token partilhado ----------

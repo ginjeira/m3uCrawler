@@ -299,12 +299,14 @@ public sealed class DispatcharrSyncCoordinator
 
         try
         {
-            // DC-11b (DC-D3) — quando existe exactamente uma Ordering List
-            // activa, o sync compõe membros e ordem a partir dela em vez de
-            // ler `output/playlist.m3u` cru. Sem lista, ou com várias
-            // (selecção indeterminística — DC-D4), cai no caminho legado e
-            // regista o motivo. Nunca inclui credenciais no registo.
-            var composition = await TryResolveOrderingCompositionAsync(
+            // Opção A (revisão do DC-11b) — o sync lê SEMPRE `playlist.m3u`
+            // como fonte de membros e streams (URLs reais + política de selecção
+            // de fontes). A Ordering List serve apenas para **ordem**: com
+            // exactamente uma lista activa resolvemos o mapa
+            // `canonicalId → rank` (1..N, por `Position`); com zero ou várias
+            // listas (selecção ambígua — DC-D4) não há numeração. Nunca inclui
+            // credenciais no registo.
+            var orderingRanks = await TryResolveOrderingRanksAsync(
                 effectiveCatalog, liveRunProgress, cancellationToken).ConfigureAwait(false);
 
             var aliases = AliasResolver.FromFile(cfg.AliasFile);
@@ -337,7 +339,7 @@ public sealed class DispatcharrSyncCoordinator
                     matcher: matcher,
                     catalog: effectiveCatalog);
             }
-            var syncResult = await sync.RunAsync(playlistPath, selection, composition, cancellationToken).ConfigureAwait(false);
+            var syncResult = await sync.RunAsync(playlistPath, selection, orderingRanks, cancellationToken).ConfigureAwait(false);
 
             if (liveRunProgress is not null)
             {
@@ -373,20 +375,28 @@ public sealed class DispatcharrSyncCoordinator
     }
 
     /// <summary>
-    /// DC-11b (DC-D3/DC-D4) — resolve a <see cref="PlaylistComposition"/> que
-    /// o sync deve seguir. Regra de selecção (sem nova config): com
-    /// <b>exactamente uma</b> Ordering List activa é essa a usada; com
+    /// Opção A (revisão do DC-11b / DC-D3/DC-D4) — resolve o mapa de
+    /// <b>ordenação</b> (<c>CanonicalChannelId → rank</c>) que o sync deve
+    /// aplicar a canais <b>novos</b>. Regra de selecção (sem nova config): com
+    /// <b>exactamente uma</b> Ordering List activa, os seus <b>itens activos</b>
+    /// são ordenados por <c>Position</c> e normalizados para ranks contíguos
+    /// <c>1..N</c> (itens desactivados são ignorados e não definem ordem); com
     /// <b>zero</b> ou <b>várias</b> activas a selecção é indeterminística e
-    /// devolve-se <c>null</c> (fallback legado) registando o motivo.
+    /// devolve-se <c>null</c> (sem numeração), registando o motivo.
     ///
     /// <para>
-    /// A resolução é best-effort: qualquer falha (à excepção de
-    /// cancelamento) cai no caminho legado, sem abortar o sync nem
-    /// propagar detalhes potencialmente sensíveis. O registo nunca inclui
-    /// credenciais.
+    /// A lista é apenas <b>autoridade de ordem</b>: os membros e as streams
+    /// continuam a vir de <c>playlist.m3u</c> (opção A). Só os <b>itens
+    /// activos</b> (<c>IsEnabled</c>) definem ordem; um item <b>desactivado</b>
+    /// não ocupa rank. Como a pertença é definida pela playlist (não pela
+    /// lista), o canal de um item desactivado continua a ser criado, mas é
+    /// numerado no <b>fim</b> — a seguir aos itens activos, junto com os canais
+    /// fora da lista. A resolução é best-effort: qualquer falha (à excepção de
+    /// cancelamento) devolve <c>null</c>, sem abortar o sync nem propagar
+    /// detalhes potencialmente sensíveis. O registo nunca inclui credenciais.
     /// </para>
     /// </summary>
-    private static async Task<PlaylistComposition?> TryResolveOrderingCompositionAsync(
+    private static async Task<IReadOnlyDictionary<long, int>?> TryResolveOrderingRanksAsync(
         CatalogResolver catalog,
         ILiveRunProgress? liveRunProgress,
         CancellationToken cancellationToken)
@@ -403,18 +413,28 @@ public sealed class DispatcharrSyncCoordinator
             if (active.Count == 1)
             {
                 var list = active[0];
-                var composer = new PlaylistComposerService(catalog.GetFactory());
-                var composition = await composer
-                    .ComposeAsync(list.Id, cancellationToken: cancellationToken)
+                var loaded = await catalog
+                    .GetOrderingListAsync(list.Id, includeItems: true, cancellationToken)
                     .ConfigureAwait(false);
+
+                var ranks = new Dictionary<long, int>();
+                var rank = 1;
+                foreach (var item in (loaded?.Items ?? new List<OrderingItemEntity>())
+                    .OrderBy(i => i.Position))
+                {
+                    if (!item.IsEnabled) continue;
+                    if (item.CanonicalChannelId <= 0) continue;
+                    if (ranks.ContainsKey(item.CanonicalChannelId)) continue;
+                    ranks[item.CanonicalChannelId] = rank++;
+                }
 
                 ReportOrderingSelection(
                     liveRunProgress,
                     LiveRunActivityLevel.Info,
-                    $"dispatcharr sync: a usar Ordering List '{list.Key}' " +
-                    $"({composition.Entries.Count} canais).");
+                    $"dispatcharr sync: Ordering List '{list.Key}' define a ordem de " +
+                    $"{ranks.Count} canal(is); membros/streams vêm de playlist.m3u.");
 
-                return composition;
+                return ranks;
             }
 
             var reason = active.Count == 0
@@ -423,7 +443,8 @@ public sealed class DispatcharrSyncCoordinator
             ReportOrderingSelection(
                 liveRunProgress,
                 LiveRunActivityLevel.Warning,
-                $"dispatcharr sync: fallback para playlist.m3u — {reason}.");
+                $"dispatcharr sync: sem numeração por Ordering List ({reason}); " +
+                "membros/streams vêm de playlist.m3u.");
 
             return null;
         }
@@ -436,15 +457,17 @@ public sealed class DispatcharrSyncCoordinator
             ReportOrderingSelection(
                 liveRunProgress,
                 LiveRunActivityLevel.Warning,
-                "dispatcharr sync: fallback para playlist.m3u — " +
-                $"falha a resolver a Ordering List ({ex.GetType().Name}).");
+                "dispatcharr sync: sem numeração por Ordering List " +
+                $"(falha a resolver a lista: {ex.GetType().Name}); " +
+                "membros/streams vêm de playlist.m3u.");
             return null;
         }
     }
 
     /// <summary>
-    /// DC-11b — regista o motivo da selecção da Ordering List no feed do
-    /// Live Run (quando presente) e na consola. Mensagem sem credenciais.
+    /// Opção A (revisão do DC-11b) — regista o resultado da resolução da
+    /// Ordering List no feed do Live Run (quando presente) e na consola.
+    /// Mensagem sem credenciais.
     /// </summary>
     private static void ReportOrderingSelection(
         ILiveRunProgress? liveRunProgress,

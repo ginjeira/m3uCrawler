@@ -365,6 +365,32 @@ public class WaveCDiscoverySettingsTests : IAsyncLifetime
     }
 
     [Fact]
+    public void Start_payload_mapping_accepts_history_hours_at_max()
+    {
+        var request = LiveRunApiMappings.ParseStartPayload(new LiveRunStartPayload
+        {
+            HistoryHours = DiscoverySettings.MaxValidHistoryHours,
+        });
+
+        Assert.NotNull(request);
+        Assert.Equal(DiscoverySettings.MaxValidHistoryHours, request!.HistoryHours);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(DiscoverySettings.MaxValidHistoryHours + 1)]
+    public void Start_payload_mapping_ignores_out_of_range_history_hours(int badHistory)
+    {
+        var request = LiveRunApiMappings.ParseStartPayload(new LiveRunStartPayload
+        {
+            HistoryHours = badHistory,
+        });
+
+        Assert.NotNull(request);
+        Assert.Null(request!.HistoryHours);
+    }
+
+    [Fact]
     public void Start_payload_mapping_accepts_telegram_maintain_wire_name()
     {
         var request = LiveRunApiMappings.ParseStartPayload(new LiveRunStartPayload

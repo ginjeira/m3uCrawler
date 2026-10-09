@@ -17,25 +17,28 @@ using Xunit;
 namespace m3uCrawler.Tests;
 
 /// <summary>
-/// DC-11b (DC-D3/DC-D4) — o sync do Dispatcharr segue a Ordering List para
-/// <b>membros</b> e <b>ordem</b> (não para agrupamento).
+/// Opção A (revisão do DC-11b / DC-D3/DC-D4, 2026-10-09) — o sync do
+/// Dispatcharr lê <c>playlist.m3u</c> como fonte de <b>membros e streams</b>
+/// (URLs reais + política de selecção). A Ordering List serve <b>apenas para
+/// ordem</b>: os canais <b>novos</b> listados recebem
+/// <c>channel_number</c> = rank 1-based (por <c>Position</c>, normalizado);
+/// canais na playlist fora da lista são numerados a seguir (N+1, N+2, ...);
+/// canais existentes nunca são renumerados.
 ///
 /// <list type="bullet">
-///   <item>com exactamente uma Ordering List activa, o plano é construído a
-///         partir da composição e os canais novos recebem
-///         <c>channel_number</c> = posição (0-based) na lista;</item>
-///   <item>itens desactivados e canais sem fonte elegível são omitidos;</item>
-///   <item>canais <c>CrawlerManaged</c> existentes fora da lista NÃO são
-///         removidos nem alterados (decisão A);</item>
-///   <item>com zero ou várias listas activas, cai no caminho legado
-///         (<c>output/playlist.m3u</c>) e regista o motivo (decisões C/D);</item>
+///   <item>com exactamente uma Ordering List activa, aplica-se a numeração;</item>
+///   <item>só os itens activos definem ordem; itens desactivados não definem
+///         ordem e os seus canais são numerados no fim, com os não-listados;</item>
+///   <item>com zero ou várias listas activas, não há numeração (ambíguo);</item>
+///   <item>a lista NÃO define membros: canais listados mas ausentes da
+///         playlist não são criados;</item>
+///   <item>canais <c>CrawlerManaged</c> fora da playlist não são removidos;</item>
 ///   <item>sem catálogo o comportamento é intacto
 ///         (<c>CatalogUnavailable</c> / legado).</item>
 /// </list>
 ///
 /// SQLite isolado por teste; nenhuma chamada de rede real (transporte HTTP
-/// falso). A posição usada é a do índice em <c>composition.Entries</c>
-/// (<c>Position</c> 0-based, consistente com o plano).
+/// falso).
 /// </summary>
 public class Dc11bOrderingListSyncTests : IAsyncLifetime
 {
@@ -72,27 +75,106 @@ public class Dc11bOrderingListSyncTests : IAsyncLifetime
     }
 
     // ────────────────────────────────────────────────────────────────────
-    // 1. Lista única activa → plano da composição + channel_number = posição
+    // 1. O sync lê playlist.m3u: várias streams por canal (URLs reais)
     // ────────────────────────────────────────────────────────────────────
 
     [Fact]
-    public async Task Single_active_ordering_list_builds_plan_and_numbers_channels_by_position()
+    public async Task Sync_reads_playlist_and_creates_channel_with_all_streams()
+    {
+        await CreateCanonicalAsync("dc11b-multi", "DC11b Multi");
+        await WritePlaylistAsync(
+            ("News", "DC11b Multi", "http://dc11b.example/multi-1.ts"),
+            ("News", "DC11b Multi", "http://dc11b.example/multi-2.ts"),
+            ("News", "DC11b Multi", "http://dc11b.example/multi-3.ts"));
+
+        var handler = new SyncHandler();
+        var outcome = await NewCoordinator(handler).RunAsync(
+            PlaylistPath(), _outputDir, _resolver, selection: null, liveRunProgress: null);
+
+        Assert.Equal(DispatcharrSyncStatus.Succeeded, outcome.Status);
+
+        // Um único canal criado (membros vêm da playlist), com 3 streams.
+        var body = Assert.Single(handler.PostedChannelBodies);
+        using var doc = JsonDocument.Parse(body);
+        var root = doc.RootElement;
+        Assert.Equal("DC11b Multi", root.GetProperty("name").GetString());
+        Assert.Equal(3, root.GetProperty("streams").GetArrayLength());
+
+        // As URLs publicadas são as REAIS da playlist (nunca sanitizadas).
+        var postedUrls = ExtractPostedStreamUrls(handler.PostedStreamBodies);
+        Assert.Equal(3, postedUrls.Count);
+        Assert.Contains("http://dc11b.example/multi-1.ts", postedUrls);
+        Assert.Contains("http://dc11b.example/multi-2.ts", postedUrls);
+        Assert.Contains("http://dc11b.example/multi-3.ts", postedUrls);
+    }
+
+    [Fact]
+    public async Task Selection_artifact_limits_streams_per_channel()
+    {
+        var multiId = await CreateCanonicalAsync("dc11b-multi", "DC11b Multi");
+        await WritePlaylistAsync(
+            ("News", "DC11b Multi", "http://dc11b.example/multi-1.ts"),
+            ("News", "DC11b Multi", "http://dc11b.example/multi-2.ts"),
+            ("News", "DC11b Multi", "http://dc11b.example/multi-3.ts"));
+
+        // Política/selecção escolhe apenas 2 das 3 fontes.
+        var selection = new DispatcharrSourceSelection
+        {
+            Applied = true,
+            Channels = new List<ChannelSourceSelection>
+            {
+                new()
+                {
+                    CanonicalChannelKey = "dc11b-multi",
+                    CanonicalChannelId = multiId,
+                    Selected = new List<SelectedStreamSelection>
+                    {
+                        new() { StreamUrl = "http://dc11b.example/multi-1.ts", Rank = 1 },
+                        new() { StreamUrl = "http://dc11b.example/multi-2.ts", Rank = 2 },
+                    },
+                },
+            },
+        };
+
+        var handler = new SyncHandler();
+        var outcome = await NewCoordinator(handler).RunAsync(
+            PlaylistPath(), _outputDir, _resolver, selection, liveRunProgress: null);
+
+        Assert.Equal(DispatcharrSyncStatus.Succeeded, outcome.Status);
+
+        var body = Assert.Single(handler.PostedChannelBodies);
+        using var doc = JsonDocument.Parse(body);
+        Assert.Equal(2, doc.RootElement.GetProperty("streams").GetArrayLength());
+
+        var postedUrls = ExtractPostedStreamUrls(handler.PostedStreamBodies);
+        Assert.Equal(2, postedUrls.Count);
+        Assert.DoesNotContain("http://dc11b.example/multi-3.ts", postedUrls);
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // 2. Lista única activa → canal_number 1..N + fora da lista N+1..
+    // ────────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task Single_active_ordering_list_numbers_listed_channels_and_appends_unlisted()
     {
         var alphaId = await CreateCanonicalAsync("dc11b-alpha", "DC11b Alpha");
         var betaId = await CreateCanonicalAsync("dc11b-beta", "DC11b Beta");
-        await AddSourceAsync(alphaId, "http://dc11b.example/alpha.ts");
-        await AddSourceAsync(betaId, "http://dc11b.example/beta.ts");
+        await CreateCanonicalAsync("dc11b-extra-a", "DC11b Extra A");
+        await CreateCanonicalAsync("dc11b-extra-b", "DC11b Extra B");
 
-        // Ordem invertida face à criação: Beta é a posição 0, Alpha a 1.
+        // Ordem invertida face à playlist, com buracos nas posições
+        // (beta=3, alpha=8) → ranks normalizados beta=1, alpha=2.
         var list = await _resolver.CreateOrderingListAsync("dc11b-pt", "DC11b PT", "pt", null);
-        await _resolver.AddOrderingItemAsync(list.Id, betaId, position: 0);
-        await _resolver.AddOrderingItemAsync(list.Id, alphaId, position: 1);
+        await _resolver.AddOrderingItemAsync(list.Id, betaId, position: 3);
+        await _resolver.AddOrderingItemAsync(list.Id, alphaId, position: 8);
 
-        // Playlist crua COM um canal diferente: se fosse lida, apareceria
-        // um canal "PT: DC11b Legacy" (não deve).
-        await File.WriteAllTextAsync(
-            Path.Combine(_outputDir, "playlist.m3u"),
-            "#EXTM3U\n#EXTINF:-1 group-title=\"News\",PT: DC11b Legacy\nhttp://dc11b.example/legacy.ts\n");
+        // Playlist: os 4 canais, incluindo dois fora da lista (Extra A/B).
+        await WritePlaylistAsync(
+            ("News", "DC11b Alpha", "http://dc11b.example/alpha.ts"),
+            ("News", "DC11b Beta", "http://dc11b.example/beta.ts"),
+            ("News", "DC11b Extra A", "http://dc11b.example/extra-a.ts"),
+            ("News", "DC11b Extra B", "http://dc11b.example/extra-b.ts"));
 
         var handler = new SyncHandler();
         var outcome = await NewCoordinator(handler).RunAsync(
@@ -102,19 +184,21 @@ public class Dc11bOrderingListSyncTests : IAsyncLifetime
         Assert.NotNull(outcome.Report);
 
         var created = ExtractCreatedChannels(handler.PostedChannelBodies);
-        Assert.Equal(2, created.Count);
+        Assert.Equal(4, created.Count);
 
-        // Ordem da lista: Beta=0, Alpha=1 (posição = índice 0-based).
-        Assert.Equal(0d, created["DC11b Beta"]!.Value);
-        Assert.Equal(1d, created["DC11b Alpha"]!.Value);
-        Assert.DoesNotContain("PT: DC11b Legacy", created.Keys);
+        // Listados: ranks 1..N (1-based) pela ordem da lista.
+        Assert.Equal(1d, created["DC11b Beta"]);
+        Assert.Equal(2d, created["DC11b Alpha"]);
+        // Fora da lista: N+1, N+2 pela ordem determinística do plano.
+        Assert.Equal(3d, created["DC11b Extra A"]);
+        Assert.Equal(4d, created["DC11b Extra B"]);
 
-        // DC-11b — o próprio plano reflecte a numeração da Ordering List
-        // (não só o POST de criação): proposedChannelNumber = posição.
-        var beta = outcome.Report!.Plan.Channels.Single(c => c.CanonicalName == "DC11b Beta");
-        var alpha = outcome.Report!.Plan.Channels.Single(c => c.CanonicalName == "DC11b Alpha");
-        Assert.Equal(0d, beta.ProposedChannelNumber);
-        Assert.Equal(1d, alpha.ProposedChannelNumber);
+        // O próprio plano reflecte a numeração.
+        var plan = outcome.Report!.Plan.Channels.ToDictionary(c => c.CanonicalName, c => c.ProposedChannelNumber);
+        Assert.Equal(2d, plan["DC11b Alpha"]);
+        Assert.Equal(1d, plan["DC11b Beta"]);
+        Assert.Equal(3d, plan["DC11b Extra A"]);
+        Assert.Equal(4d, plan["DC11b Extra B"]);
 
         // E o JSON do plano gravado em disco também expõe a numeração.
         Assert.NotNull(outcome.Report!.PlanPath);
@@ -123,99 +207,63 @@ public class Dc11bOrderingListSyncTests : IAsyncLifetime
             .ToDictionary(
                 c => c.GetProperty("canonicalName").GetString()!,
                 c => c.GetProperty("proposedChannelNumber").GetDouble());
-        Assert.Equal(0d, planChannels["DC11b Beta"]);
-        Assert.Equal(1d, planChannels["DC11b Alpha"]);
+        Assert.Equal(1d, planChannels["DC11b Beta"]);
+        Assert.Equal(3d, planChannels["DC11b Extra A"]);
     }
 
-    // ────────────────────────────────────────────────────────────────────
-    // 2. Itens desactivados e canais sem fonte são omitidos (membros)
-    // ────────────────────────────────────────────────────────────────────
-
     [Fact]
-    public async Task Disabled_items_and_channels_without_source_are_omitted()
-    {
-        var alphaId = await CreateCanonicalAsync("dc11b-keep", "DC11b Keep");
-        var noSourceId = await CreateCanonicalAsync("dc11b-nosource", "DC11b NoSource");
-        var disabledId = await CreateCanonicalAsync("dc11b-disabled", "DC11b Disabled");
-        await AddSourceAsync(alphaId, "http://dc11b.example/keep.ts");
-        // NoSource: sem channel source → omitido.
-        await AddSourceAsync(disabledId, "http://dc11b.example/disabled.ts");
-
-        var list = await _resolver.CreateOrderingListAsync("dc11b-members", "DC11b Members", null, null);
-        await _resolver.AddOrderingItemAsync(list.Id, alphaId, position: 0);
-        await _resolver.AddOrderingItemAsync(list.Id, noSourceId, position: 1);
-        // Item desactivado com fonte elegível → ainda assim omitido.
-        await _resolver.AddOrderingItemAsync(list.Id, disabledId, position: 2, isEnabled: false);
-
-        var handler = new SyncHandler();
-        var outcome = await NewCoordinator(handler).RunAsync(
-            PlaylistPath(), _outputDir, _resolver, selection: null, liveRunProgress: null);
-
-        Assert.Equal(DispatcharrSyncStatus.Succeeded, outcome.Status);
-        var created = ExtractCreatedChannels(handler.PostedChannelBodies);
-        Assert.Single(created);
-        Assert.True(created.ContainsKey("DC11b Keep"));
-    }
-
-    // ────────────────────────────────────────────────────────────────────
-    // 3. Canais CrawlerManaged existentes fora da lista não são tocados
-    // ────────────────────────────────────────────────────────────────────
-
-    [Fact]
-    public async Task Existing_channels_outside_the_list_are_not_removed_or_modified()
+    public async Task Single_active_ordering_list_does_not_renumber_existing_channels()
     {
         var alphaId = await CreateCanonicalAsync("dc11b-alpha", "DC11b Alpha");
-        await AddSourceAsync(alphaId, "http://dc11b.example/alpha.ts");
+        var betaId = await CreateCanonicalAsync("dc11b-beta", "DC11b Beta");
 
-        var list = await _resolver.CreateOrderingListAsync("dc11b-only-alpha", "DC11b Only Alpha", null, null);
+        var list = await _resolver.CreateOrderingListAsync("dc11b-pt", "DC11b PT", "pt", null);
         await _resolver.AddOrderingItemAsync(list.Id, alphaId, position: 0);
+        await _resolver.AddOrderingItemAsync(list.Id, betaId, position: 1);
 
-        // Alpha já existe no Dispatcharr com a MESMA stream (idempotente).
-        // "Unrelated" existe mas não consta da lista.
+        // Alpha já existe no Dispatcharr (channel_number legado 5) com a
+        // MESMA stream. Beta é novo.
         var handler = new SyncHandler
         {
             Channels = new List<DispatcharrChannel>
             {
                 new(1, "DC11b Alpha", null, 5, null, new long[] { 7 }),
-                new(2, "DC11b Unrelated", null, 9, null, new long[] { 8 }),
             },
             Streams = new List<DispatcharrStream>
             {
                 new(7, "DC11b Alpha", "http://dc11b.example/alpha.ts",
-                    null, null, "external", false, true, null),
-                new(8, "DC11b Unrelated", "http://dc11b.example/unrelated.ts",
-                    null, null, "external", false, true, null),
+                    null, null, "external", true, true, null),
             },
         };
+
+        await WritePlaylistAsync(
+            ("News", "DC11b Alpha", "http://dc11b.example/alpha.ts"),
+            ("News", "DC11b Beta", "http://dc11b.example/beta.ts"));
 
         var outcome = await NewCoordinator(handler).RunAsync(
             PlaylistPath(), _outputDir, _resolver, selection: null, liveRunProgress: null);
 
         Assert.Equal(DispatcharrSyncStatus.Succeeded, outcome.Status);
-        Assert.NotNull(outcome.Report);
 
-        // O plano só tem o canal da lista; o "Unrelated" nunca entra.
-        Assert.DoesNotContain(outcome.Report!.Plan.Channels,
-            c => c.ExistingChannelId == 2);
+        // Apenas Beta é criado; Alpha (existente) não é renumerado nem
+        // recriado. O rank de Beta é 2 (posição na lista, 1-based).
+        var created = ExtractCreatedChannels(handler.PostedChannelBodies);
+        Assert.Single(created);
+        Assert.Equal(2d, created["DC11b Beta"]);
 
-        // Nenhum canal novo e nenhuma escrita sobre o canal fora da lista.
-        Assert.Empty(handler.PostedChannelBodies);
+        // Nenhum PATCH renumera o canal existente.
         Assert.DoesNotContain(handler.Writes,
-            w => w.Contains("/api/channels/channels/2/", StringComparison.Ordinal));
-        Assert.DoesNotContain(handler.Writes,
-            w => w.Contains("/api/channels/streams/8/", StringComparison.Ordinal));
+            w => w.StartsWith("PATCH", StringComparison.Ordinal)
+              && w.Contains("channel_number", StringComparison.Ordinal));
     }
 
     // ────────────────────────────────────────────────────────────────────
-    // 4. Zero / várias listas activas → fallback legado + motivo
+    // 3. Zero / várias listas activas → sem numeração
     // ────────────────────────────────────────────────────────────────────
 
     [Fact]
-    public async Task Zero_active_ordering_lists_falls_back_to_legacy_playlist()
+    public async Task Zero_active_ordering_lists_leaves_channels_unnumbered()
     {
-        // Canal canónico que casa com o nome da playlist legada, para que o
-        // caminho legado (com catálogo activo) produza um canal. Se a
-        // composição fosse (incorrectamente) usada, o plano ficaria vazio.
         await CreateCanonicalAsync("dc11b-legacy", "PT: DC11b Legacy");
         await WriteLegacyPlaylistAsync();
 
@@ -226,12 +274,11 @@ public class Dc11bOrderingListSyncTests : IAsyncLifetime
         Assert.Equal(DispatcharrSyncStatus.Succeeded, outcome.Status);
         var created = ExtractCreatedChannels(handler.PostedChannelBodies);
         Assert.True(created.ContainsKey("PT: DC11b Legacy"));
-        // Sem composição, não há número de canal (comportamento legado).
-        Assert.False(created.TryGetValue("PT: DC11b Legacy", out var number) && number.HasValue);
+        Assert.Null(created["PT: DC11b Legacy"]);
     }
 
     [Fact]
-    public async Task Multiple_active_ordering_lists_fall_back_to_legacy_and_record_reason()
+    public async Task Multiple_active_ordering_lists_leave_channels_unnumbered_and_record_reason()
     {
         await CreateCanonicalAsync("dc11b-legacy", "PT: DC11b Legacy");
         // Country nulo → duas listas coexistem (a unicidade por país da
@@ -248,12 +295,117 @@ public class Dc11bOrderingListSyncTests : IAsyncLifetime
         Assert.Equal(DispatcharrSyncStatus.Succeeded, outcome.Status);
         var created = ExtractCreatedChannels(handler.PostedChannelBodies);
         Assert.True(created.ContainsKey("PT: DC11b Legacy"));
+        Assert.Null(created["PT: DC11b Legacy"]);
         Assert.Contains(progress.Activities,
             a => a.Contains("Ordering Lists activas", StringComparison.Ordinal));
     }
 
     // ────────────────────────────────────────────────────────────────────
-    // 5. Sem catálogo → CatalogUnavailable intacto (DC-11b não altera)
+    // 3b. Item desactivado não define ordem — numerado no fim (com os não-listados)
+    // ────────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task Disabled_ordering_item_does_not_define_order_and_is_numbered_last()
+    {
+        var alphaId = await CreateCanonicalAsync("dc11b-alpha", "DC11b Alpha");
+        var betaId = await CreateCanonicalAsync("dc11b-beta", "DC11b Beta");
+        var gammaId = await CreateCanonicalAsync("dc11b-gamma", "DC11b Gamma");
+        await CreateCanonicalAsync("dc11b-extra", "DC11b Extra");
+
+        var list = await _resolver.CreateOrderingListAsync("dc11b-pt", "DC11b PT", "pt", null);
+        await _resolver.AddOrderingItemAsync(list.Id, alphaId, position: 0);
+        // Item desactivado: em opção A a pertença vem da playlist, logo o canal
+        // continua a ser criado — mas o item NÃO define ordem (não ocupa rank).
+        await _resolver.AddOrderingItemAsync(list.Id, betaId, position: 1, isEnabled: false);
+        await _resolver.AddOrderingItemAsync(list.Id, gammaId, position: 2);
+
+        await WritePlaylistAsync(
+            ("News", "DC11b Alpha", "http://dc11b.example/alpha.ts"),
+            ("News", "DC11b Beta", "http://dc11b.example/beta.ts"),
+            ("News", "DC11b Gamma", "http://dc11b.example/gamma.ts"),
+            ("News", "DC11b Extra", "http://dc11b.example/extra.ts"));
+
+        var handler = new SyncHandler();
+        var outcome = await NewCoordinator(handler).RunAsync(
+            PlaylistPath(), _outputDir, _resolver, selection: null, liveRunProgress: null);
+
+        Assert.Equal(DispatcharrSyncStatus.Succeeded, outcome.Status);
+        var created = ExtractCreatedChannels(handler.PostedChannelBodies);
+        Assert.Equal(4, created.Count);
+
+        // Activos ordenam: Alpha=1, Gamma=2 (o desactivado foi ignorado).
+        Assert.Equal(1d, created["DC11b Alpha"]);
+        Assert.Equal(2d, created["DC11b Gamma"]);
+        // O canal do item desactivado é criado (membros vêm da playlist), mas
+        // é numerado no FIM, junto com o não-listado (N+1, N+2, ...).
+        Assert.Equal(3d, created["DC11b Beta"]);
+        Assert.Equal(4d, created["DC11b Extra"]);
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // 4. Regressão — a lista NÃO define membros (sem composição)
+    // ────────────────────────────────────────────────────────────────────
+    [Fact]
+    public async Task Channel_listed_but_absent_from_playlist_is_not_created()
+    {
+        var listedId = await CreateCanonicalAsync("dc11b-listed", "DC11b Listed");
+        await CreateCanonicalAsync("dc11b-legacy", "PT: DC11b Legacy");
+
+        var list = await _resolver.CreateOrderingListAsync("dc11b-pt", "DC11b PT", "pt", null);
+        await _resolver.AddOrderingItemAsync(list.Id, listedId, position: 0);
+
+        // Playlist só contém o canal legado; o canal listado não consta.
+        await WriteLegacyPlaylistAsync();
+
+        var handler = new SyncHandler();
+        var outcome = await NewCoordinator(handler).RunAsync(
+            PlaylistPath(), _outputDir, _resolver, selection: null, liveRunProgress: null);
+
+        Assert.Equal(DispatcharrSyncStatus.Succeeded, outcome.Status);
+        var created = ExtractCreatedChannels(handler.PostedChannelBodies);
+        Assert.Single(created);
+        Assert.True(created.ContainsKey("PT: DC11b Legacy"));
+        Assert.DoesNotContain("DC11b Listed", created.Keys);
+    }
+
+    [Fact]
+    public async Task Existing_crawler_managed_channel_outside_playlist_is_not_removed()
+    {
+        await CreateCanonicalAsync("dc11b-legacy", "PT: DC11b Legacy");
+
+        // Canal CrawlerManaged existente que não consta da playlist.
+        var handler = new SyncHandler
+        {
+            Channels = new List<DispatcharrChannel>
+            {
+                new(2, "DC11b Unrelated", null, 9, null, new long[] { 8 }),
+            },
+            Streams = new List<DispatcharrStream>
+            {
+                new(8, "DC11b Unrelated", "http://dc11b.example/unrelated.ts",
+                    null, null, "external", true, true, null),
+            },
+        };
+        await _resolver.EnsureStreamOwnershipAsync(8, 2, StreamOwnership.CrawlerManaged, null);
+
+        await WriteLegacyPlaylistAsync();
+
+        var outcome = await NewCoordinator(handler).RunAsync(
+            PlaylistPath(), _outputDir, _resolver, selection: null, liveRunProgress: null);
+
+        Assert.Equal(DispatcharrSyncStatus.Succeeded, outcome.Status);
+
+        // Nenhum DELETE e nenhuma escrita sobre o canal/stream fora da playlist.
+        Assert.DoesNotContain(handler.Writes,
+            w => w.StartsWith("DELETE", StringComparison.Ordinal));
+        Assert.DoesNotContain(handler.Writes,
+            w => w.Contains("/api/channels/channels/2/", StringComparison.Ordinal));
+        Assert.DoesNotContain(handler.Writes,
+            w => w.Contains("/api/channels/streams/8/", StringComparison.Ordinal));
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // 5. Sem catálogo → CatalogUnavailable intacto
     // ────────────────────────────────────────────────────────────────────
 
     [Fact]
@@ -273,104 +425,25 @@ public class Dc11bOrderingListSyncTests : IAsyncLifetime
     }
 
     // ────────────────────────────────────────────────────────────────────
-    // 6. Regressão: composição nula mantém a leitura do ficheiro
-    // ────────────────────────────────────────────────────────────────────
-
-    [Fact]
-    public async Task Null_composition_still_reads_playlist_file()
-    {
-        await CreateCanonicalAsync("dc11b-legacy", "PT: DC11b Legacy");
-        await WriteLegacyPlaylistAsync();
-
-        var handler = new SyncHandler();
-        var outcome = await NewCoordinator(handler).RunAsync(
-            PlaylistPath(), _outputDir, _resolver, selection: null, liveRunProgress: null);
-
-        Assert.Equal(DispatcharrSyncStatus.Succeeded, outcome.Status);
-        // Com o catálogo sem listas, a composição é nula → leitura do
-        // ficheiro (o canal legado é criado).
-        Assert.Single(ExtractCreatedChannels(handler.PostedChannelBodies));
-    }
-
-    // ────────────────────────────────────────────────────────────────────
-    // 7. DC-11b (fix High) — composição ignora a selecção de fontes
-    // ────────────────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Regressão do caso que hoje falhava: composição (Ordering List) **plus**
-    /// selecção de fontes que escolhe uma fonte diferente. Sem o fix, a
-    /// selecção filtraria as streams da composição, esvaziando o canal
-    /// (PATCH streams=[]) e apagando streams CrawlerManaged (DELETE), e um
-    /// canal novo sem streams efectivas nem seria criado.
-    /// </summary>
-    [Fact]
-    public async Task Composition_ignores_selection_and_does_not_empty_or_delete_streams()
-    {
-        var alphaId = await CreateCanonicalAsync("dc11b-alpha", "DC11b Alpha");
-        var betaId = await CreateCanonicalAsync("dc11b-beta", "DC11b Beta");
-        await AddSourceAsync(alphaId, "http://dc11b.example/alpha.ts");
-        await AddSourceAsync(betaId, "http://dc11b.example/beta.ts");
-
-        var list = await _resolver.CreateOrderingListAsync("dc11b-pt", "DC11b PT", "pt", null);
-        await _resolver.AddOrderingItemAsync(list.Id, alphaId, position: 0);
-        await _resolver.AddOrderingItemAsync(list.Id, betaId, position: 1);
-
-        // Alpha já existe no Dispatcharr com a stream da composição
-        // (id 7), com ownership CrawlerManaged (logo, apagável).
-        var handler = new SyncHandler
-        {
-            Channels = new List<DispatcharrChannel>
-            {
-                new(1, "DC11b Alpha", null, 5, null, new long[] { 7 }),
-            },
-            Streams = new List<DispatcharrStream>
-            {
-                new(7, "DC11b Alpha", "http://dc11b.example/alpha.ts",
-                    null, null, "external", true, true, null),
-            },
-        };
-        await _resolver.EnsureStreamOwnershipAsync(7, 1, StreamOwnership.CrawlerManaged, null);
-
-        // Selecção adversarial: para ambos os canais, "seleccionadas" = [].
-        // Sob o comportamento antigo isto excluía a stream 7 (CrawlerManaged)
-        // e a stream nova de Beta, produzindo PATCH streams=[]/DELETE.
-        var selection = new DispatcharrSourceSelection
-        {
-            Applied = true,
-            Channels = new List<ChannelSourceSelection>
-            {
-                new() { CanonicalChannelKey = "dc11b-alpha", CanonicalChannelId = alphaId },
-                new() { CanonicalChannelKey = "dc11b-beta", CanonicalChannelId = betaId },
-            },
-        };
-
-        var outcome = await NewCoordinator(handler).RunAsync(
-            PlaylistPath(), _outputDir, _resolver, selection, liveRunProgress: null);
-
-        Assert.Equal(DispatcharrSyncStatus.Succeeded, outcome.Status);
-
-        // (a) nenhum DELETE de stream (a stream CrawlerManaged é preservada).
-        Assert.DoesNotContain(handler.Writes,
-            w => w.StartsWith("DELETE", StringComparison.Ordinal));
-        // (b) nenhum PATCH streams=[] (o canal existente não é esvaziado).
-        Assert.DoesNotContain(handler.Writes,
-            w => w.StartsWith("PATCH", StringComparison.Ordinal)
-              && w.Contains("\"streams\":[]", StringComparison.Ordinal));
-        // (c) a stream da composição é associada: Beta (canal novo) é criado.
-        Assert.True(ExtractCreatedChannels(handler.PostedChannelBodies)
-            .ContainsKey("DC11b Beta"));
-    }
-
-    // ────────────────────────────────────────────────────────────────────
     // Helpers de cenário
     // ────────────────────────────────────────────────────────────────────
 
     private string PlaylistPath() => Path.Combine(_outputDir, "playlist.m3u");
 
     private async Task WriteLegacyPlaylistAsync() =>
-        await File.WriteAllTextAsync(
-            PlaylistPath(),
-            "#EXTM3U\n#EXTINF:-1 group-title=\"News\",PT: DC11b Legacy\nhttp://dc11b.example/legacy.ts\n");
+        await WritePlaylistAsync(("News", "PT: DC11b Legacy", "http://dc11b.example/legacy.ts"));
+
+    private async Task WritePlaylistAsync(params (string Group, string Title, string Url)[] entries)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("#EXTM3U");
+        foreach (var entry in entries)
+        {
+            sb.AppendLine($"#EXTINF:-1 group-title=\"{entry.Group}\",{entry.Title}");
+            sb.AppendLine(entry.Url);
+        }
+        await File.WriteAllTextAsync(PlaylistPath(), sb.ToString());
+    }
 
     private async Task<long> CreateCanonicalAsync(string key, string displayName)
     {
@@ -379,16 +452,6 @@ public class Dc11bOrderingListSyncTests : IAsyncLifetime
             CanonicalGroupKeys.PortugalGeneralistas, PublicationPolicy.CreateEligible,
             isEnabled: true, normalizedAliases: new List<string>());
         return channel.Id;
-    }
-
-    private async Task AddSourceAsync(long channelId, string url)
-    {
-        var source = await _resolver.EnsureSourceAsync(
-            $"dc11b-src-{Guid.NewGuid():N}", "dc11b-src", SourceKind.Telegram,
-            "telegram://dc11b", 0);
-        await _resolver.RecordChannelSourceAsync(
-            channelId, source.Id, url,
-            availability: AvailabilityState.Discovered, matchMethod: "test");
     }
 
     private static DispatcharrConfig EnabledConfig() => new()
@@ -406,7 +469,7 @@ public class Dc11bOrderingListSyncTests : IAsyncLifetime
 
     /// <summary>
     /// Extrai (name → channel_number) dos corpos POST de criação de canal.
-    /// <c>HasValue=false</c> quando o payload não traz <c>channel_number</c>.
+    /// <c>null</c> quando o payload não traz <c>channel_number</c>.
     /// </summary>
     private static Dictionary<string, double?> ExtractCreatedChannels(IEnumerable<string> bodies)
     {
@@ -421,6 +484,20 @@ public class Dc11bOrderingListSyncTests : IAsyncLifetime
                 ? n.GetDouble()
                 : null;
             result[name] = number;
+        }
+        return result;
+    }
+
+    private static List<string> ExtractPostedStreamUrls(IEnumerable<string> bodies)
+    {
+        var result = new List<string>();
+        foreach (var body in bodies)
+        {
+            using var doc = JsonDocument.Parse(body);
+            if (doc.RootElement.TryGetProperty("url", out var url) && url.ValueKind == JsonValueKind.String)
+            {
+                result.Add(url.GetString()!);
+            }
         }
         return result;
     }
@@ -442,7 +519,7 @@ public class Dc11bOrderingListSyncTests : IAsyncLifetime
 
     /// <summary>
     /// Transporte HTTP falso: universo configurável, sem rede real. Captura
-    /// os corpos de criação de canal e todas as escritas (método ≠ GET).
+    /// os corpos de criação de canal/stream e todas as escritas (método ≠ GET).
     /// </summary>
     private sealed class SyncHandler : HttpMessageHandler
     {
@@ -451,6 +528,7 @@ public class Dc11bOrderingListSyncTests : IAsyncLifetime
         public List<DispatcharrChannelGroup> Groups { get; set; } = new();
         public List<string> Writes { get; } = new();
         public List<string> PostedChannelBodies { get; } = new();
+        public List<string> PostedStreamBodies { get; } = new();
 
         private long _nextChannelId = 1000;
         private long _nextStreamId = 5000;
@@ -495,7 +573,10 @@ public class Dc11bOrderingListSyncTests : IAsyncLifetime
                 return Json(new { id, name = "c", channel_number = (double?)null, streams = Array.Empty<long>() });
             }
             if (method == "POST" && path.EndsWith("/api/channels/streams/", StringComparison.Ordinal))
+            {
+                PostedStreamBodies.Add(body);
                 return Json(new { id = _nextStreamId++, name = "s", url = "u", is_custom = true });
+            }
             if (method == "POST" && path.EndsWith("/api/channels/groups/", StringComparison.Ordinal))
                 return Json(new { id = 700L, name = "g" });
 

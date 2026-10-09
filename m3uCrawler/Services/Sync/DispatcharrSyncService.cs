@@ -114,23 +114,24 @@ namespace m3uCrawler.Services.Sync
         }
 
         public Task<DispatcharrSyncResult> RunAsync(string playlistPath, CancellationToken ct = default)
-            => RunAsync(playlistPath, selection: null, composition: null, ct: ct);
+            => RunAsync(playlistPath, selection: null, orderingRankByCanonicalId: null, ct: ct);
 
         public Task<DispatcharrSyncResult> RunAsync(string playlistPath, DispatcharrSourceSelection? selection, CancellationToken ct = default)
-            => RunAsync(playlistPath, selection, composition: null, ct);
+            => RunAsync(playlistPath, selection, orderingRankByCanonicalId: null, ct);
 
         /// <summary>
-        /// DC-11b — overload que aceita uma <see cref="PlaylistComposition"/>
-        /// (Ordering List) como fonte autoritativa de <b>membros</b> e
-        /// <b>ordem</b> do plano. Quando <paramref name="composition"/> é
-        /// <c>null</c> o comportamento é exactamente o legado (leitura de
-        /// <paramref name="playlistPath"/>). A composição nunca redefine o
-        /// agrupamento: o grupo continua a ser o do canal canónico.
+        /// Opção A (revisão do DC-11b) — overload que aceita o mapa de
+        /// <b>ordenação</b> (<c>channel_number</c>) resolvido a partir da
+        /// Ordering List. O sync continua a ler <paramref name="playlistPath"/>
+        /// como fonte de <b>membros e streams</b> (URLs reais + política de
+        /// selecção); o mapa só define a numeração dos canais <b>novos</b> na
+        /// criação. Quando <paramref name="orderingRankByCanonicalId"/> é
+        /// <c>null</c>/vazio, nenhum canal recebe número (comportamento legado).
         /// </summary>
         public async Task<DispatcharrSyncResult> RunAsync(
             string playlistPath,
             DispatcharrSourceSelection? selection,
-            PlaylistComposition? composition,
+            IReadOnlyDictionary<long, int>? orderingRankByCanonicalId,
             CancellationToken ct = default)
         {
             if (!_config.Enabled)
@@ -140,22 +141,6 @@ namespace m3uCrawler.Services.Sync
             // pode ser interpretado como "seleccionar zero". Trata-se como
             // ausência de selecção (comportamento legacy).
             if (selection is { Applied: false }) selection = null;
-
-            // DC-11b (fix High — perda de dados) — quando existe uma
-            // composição (Ordering List) a autoridade de membros e de fonte
-            // é a própria lista. A selecção de fontes por artefacto é
-            // IGNORADA (nunca filtra nem desassocia streams), caso contrário
-            // `ComputeEffectiveStreams` descartaria streams fora do conjunto
-            // seleccionado e o ramo `selectionFiltered` emitiria
-            // `PATCH streams=[]`/DELETE. A decisão é centralizada aqui para
-            // que o comportamento não divirja entre callers.
-            if (composition != null && selection != null)
-            {
-                Console.WriteLine(
-                    "🧩 Composição (Ordering List) presente: selecção de fontes ignorada " +
-                    "(os membros e a fonte vêm da lista).");
-                selection = null;
-            }
 
             Directory.CreateDirectory(_outputDir);
 
@@ -169,24 +154,13 @@ namespace m3uCrawler.Services.Sync
 
                 var readStartedAt = DateTime.UtcNow;
 
-                // DC-11b — quando há composição, os membros e a ordem vêm da
-                // Ordering List (não se lê o ficheiro de playlist). `null`
-                // preserva o caminho legado (leitura de playlistPath).
-                IReadOnlyList<DiscoveredStream>? discovered = null;
-                int sourceItemCount;
-                if (composition != null)
-                {
-                    sourceItemCount = composition.Entries.Count;
-                    Console.WriteLine(
-                        $"📥 Plano composto a partir da Ordering List '{composition.OrderingListName}': " +
-                        $"{composition.Entries.Count} canais.");
-                }
-                else
-                {
-                    discovered = await PlaylistReader.ReadAsync(playlistPath, ct: ct);
-                    sourceItemCount = discovered.Count;
-                    Console.WriteLine($"📥 Streams extraídos da playlist: {discovered.Count}");
-                }
+                // Opção A (revisão do DC-11b) — os membros e as streams vêm
+                // SEMPRE de `playlistPath` (playlist publicada: URLs reais e
+                // política de selecção de fontes). A Ordering List só fornece a
+                // ordem via `orderingRankByCanonicalId`.
+                var discovered = await PlaylistReader.ReadAsync(playlistPath, ct: ct);
+                int sourceItemCount = discovered.Count;
+                Console.WriteLine($"📥 Streams extraídos da playlist: {discovered.Count}");
 
                 var existing = await FetchStateAsync(ct);
                 if (existing.Version != null)
@@ -198,57 +172,37 @@ namespace m3uCrawler.Services.Sync
                     Aliases = AliasMapFor(_aliases),
                 };
 
-                MatchPlan plan;
-                if (composition != null)
-                {
-                    plan = await _matcher.BuildPlanFromCompositionAsync(
-                        composition,
-                        existing,
-                        options,
-                        _ordering,
-                        playlistPath,
-                        _config.BaseUrl,
-                        _config.DryRun).ConfigureAwait(false);
-                }
-                else
-                {
-                    plan = _matcher.BuildPlan(
-                        discovered!,
-                        existing,
-                        options,
-                        _ordering,
-                        playlistPath,
-                        _config.BaseUrl,
-                        _config.DryRun);
-                }
+                var plan = _matcher.BuildPlan(
+                    discovered,
+                    existing,
+                    options,
+                    _ordering,
+                    playlistPath,
+                    _config.BaseUrl,
+                    _config.DryRun);
 
-                // DC-11b — mapa canónico → número de canal (posição 0-based
-                // na Ordering List). Usado apenas na criação de canais novos;
-                // canais existentes não são reordenados nesta wave (PATCH de
-                // channel_number é follow-up).
-                Dictionary<string, double>? channelNumberByKey = null;
-                Dictionary<long, double>? channelNumberById = null;
-                if (composition != null)
+                // Opção A (revisão do DC-11b) — numeração por canal a partir da
+                // Ordering List. Os canais novos cujo `CanonicalChannelId`
+                // consta do mapa recebem o `rank` (1..N); os restantes são
+                // numerados a seguir, pela ordem determinística do plano
+                // (N+1, N+2, ...). Não há renumeração de canais existentes: a
+                // aplicação de `channel_number` ocorre apenas na criação. Sem
+                // mapa, nenhum canal recebe número (comportamento legado).
+                if (orderingRankByCanonicalId is { Count: > 0 } rankById)
                 {
-                    channelNumberByKey = new Dictionary<string, double>(StringComparer.Ordinal);
-                    channelNumberById = new Dictionary<long, double>();
-                    for (int i = 0; i < composition.Entries.Count; i++)
-                    {
-                        var entry = composition.Entries[i];
-                        channelNumberByKey[entry.CanonicalKey] = i;
-                        channelNumberById[entry.CanonicalChannelId] = i;
-                    }
-
-                    // DC-11b — reflecte a numeração da Ordering List no próprio
-                    // plano (não só no `channel_number` da criação). Assim o
-                    // `dispatcharr_plan_*.json` e o dry-run expõem
-                    // `proposedChannelNumber` = posição 0-based. Os canais
-                    // existentes não são reordenados nesta wave (aplicação do
-                    // número é apenas na criação).
+                    var nextUnlisted = rankById.Count + 1;
                     foreach (var channel in plan.Channels)
                     {
-                        channel.ProposedChannelNumber = ResolveChannelNumber(
-                            channel, channelNumberByKey, channelNumberById);
+                        if (channel.Outcome != SyncOutcome.NewChannel) continue;
+                        if (channel.CanonicalChannelId.HasValue
+                            && rankById.TryGetValue(channel.CanonicalChannelId.Value, out var rank))
+                        {
+                            channel.ProposedChannelNumber = rank;
+                        }
+                        else
+                        {
+                            channel.ProposedChannelNumber = nextUnlisted++;
+                        }
                     }
                 }
 
@@ -300,8 +254,7 @@ namespace m3uCrawler.Services.Sync
                 else
                 {
                     var applyStartedAt = DateTime.UtcNow;
-                    await ApplyAsync(plan, existing, selection, failed, ct, recorder,
-                        channelNumberByKey, channelNumberById);
+                    await ApplyAsync(plan, existing, selection, failed, ct, recorder);
                     var applyFinishedAt = DateTime.UtcNow;
 
                     var succeededChannels = Math.Max(0, recorder.AttemptedChannels - recorder.ChannelsFailed);
@@ -488,9 +441,7 @@ namespace m3uCrawler.Services.Sync
         // PHASE W6b-2 — `recorder` (opcional, último para preservar as
         // chamadas posicionais existentes) acumula evidência para os
         // SyncRunStep; não altera a semântica de apply.
-        internal async Task ApplyAsync(MatchPlan plan, DispatcharrState existing, DispatcharrSourceSelection? selection, List<FailedReportEntry> failed, CancellationToken ct, DispatcharrApplyRecorder? recorder = null,
-            IReadOnlyDictionary<string, double>? channelNumberByCanonicalKey = null,
-            IReadOnlyDictionary<long, double>? channelNumberByCanonicalId = null)
+        internal async Task ApplyAsync(MatchPlan plan, DispatcharrState existing, DispatcharrSourceSelection? selection, List<FailedReportEntry> failed, CancellationToken ct, DispatcharrApplyRecorder? recorder = null)
         {
             // PHASE 13 (Wave 13-6 audit F1) — defesa redundante: um artefacto
             // não-aplicado nunca filtra.
@@ -579,9 +530,7 @@ namespace m3uCrawler.Services.Sync
                     effectiveStreams: selection == null ? null : effectiveStreams,
                     selectionFiltered: selection != null,
                     failed: failed,
-                    recorder: recorder,
-                    channelNumberByCanonicalKey: channelNumberByCanonicalKey,
-                    channelNumberByCanonicalId: channelNumberByCanonicalId);
+                    recorder: recorder);
 
                 // PHASE W6b-2 — evidência por canal para os SyncRunStep.
                 if (recorder != null)
@@ -894,34 +843,6 @@ namespace m3uCrawler.Services.Sync
             return null;
         }
 
-        /// <summary>
-        /// DC-11b — resolve o número de canal (posição 0-based) de um
-        /// <see cref="ChannelDecision"/> a partir dos mapas da Ordering List.
-        /// Prefere a identidade por <c>CanonicalChannelId</c> e recorre à
-        /// <c>CanonicalChannelKey</c> como fallback. Devolve <c>null</c>
-        /// quando não há composição (mapas nulos) ou não há entrada — o que
-        /// preserva o comportamento legado.
-        /// </summary>
-        private static double? ResolveChannelNumber(
-            ChannelDecision channel,
-            IReadOnlyDictionary<string, double>? byKey,
-            IReadOnlyDictionary<long, double>? byId)
-        {
-            if (byId != null
-                && channel.CanonicalChannelId.HasValue
-                && byId.TryGetValue(channel.CanonicalChannelId.Value, out var idNumber))
-            {
-                return idNumber;
-            }
-            if (byKey != null
-                && !string.IsNullOrWhiteSpace(channel.CanonicalChannelKey)
-                && byKey.TryGetValue(channel.CanonicalChannelKey!, out var keyNumber))
-            {
-                return keyNumber;
-            }
-            return null;
-        }
-
         internal sealed class ChannelApplyContext
         {
             public Dictionary<string, long> GroupByName { get; init; } = new();
@@ -949,9 +870,7 @@ namespace m3uCrawler.Services.Sync
             IReadOnlyList<StreamMatchDecision>? effectiveStreams = null,
             bool selectionFiltered = false,
             List<FailedReportEntry>? failed = null,
-            DispatcharrApplyRecorder? recorder = null,
-            IReadOnlyDictionary<string, double>? channelNumberByCanonicalKey = null,
-            IReadOnlyDictionary<long, double>? channelNumberByCanonicalId = null)
+            DispatcharrApplyRecorder? recorder = null)
         {
             channelOwnershipById ??= new Dictionary<long, ChannelOwnership>();
             var streams = effectiveStreams ?? channel.Streams;
@@ -1044,13 +963,12 @@ namespace m3uCrawler.Services.Sync
                         return ctx;
                     }
 
-                    // DC-11b — número de canal = posição (0-based) na
-                    // Ordering List. Resolve pela identidade canónica
-                    // (id preferido; key como fallback). Sem composição
-                    // (mapas nulos) ou sem entrada, mantém-se null
-                    // (comportamento legado).
-                    var channelNumber = ResolveChannelNumber(
-                        channel, channelNumberByCanonicalKey, channelNumberByCanonicalId);
+                    // Opção A (revisão do DC-11b) — `channel_number` = rank
+                    // resolvido a partir da Ordering List e reflectido no plano
+                    // (`ProposedChannelNumber`); `null` quando não há lista única
+                    // activa (comportamento legado). Aplicado apenas na criação;
+                    // canais existentes nunca são renumerados.
+                    var channelNumber = channel.ProposedChannelNumber;
 
                     var createdId = await _channels.CreateAsync(new NewChannelRequest
                     {

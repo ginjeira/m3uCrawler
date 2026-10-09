@@ -65,11 +65,33 @@ public class WaveDC5bAuditUiHtmlTests
         Assert.Contains("params.set('limit'", loader);
         Assert.Contains("apiRequest(", loader);
 
-        // JSON before/after em detalhes expansíveis e sempre como texto escapado.
+        // Antes/Depois abrem num modal de detalhe (botão "Ver"), não em
+        // `<details>` dentro da célula (que ficava cortado pela largura
+        // estreita da coluna + `table{overflow:hidden}`).
         Assert.Contains("escapeHtml(", loader);
-        Assert.Contains("<details>", loader);
+        Assert.Contains("showAuditJson(", loader);
+        Assert.Contains("<button", loader);
+        Assert.DoesNotContain("<details>", loader);
         Assert.Contains("beforeJson", loader);
         Assert.Contains("afterJson", loader);
+    }
+
+    [Fact]
+    public void Audit_json_detail_uses_modal_panel_and_export()
+    {
+        var html = BuildDashboardHtml();
+
+        // Painel modal oculto no tab Auditoria + título/labels Antes/Depois.
+        Assert.Contains("id='auditJsonModal'", html);
+        Assert.Contains("id='auditJsonTitle'", html);
+        Assert.Contains("id='auditJsonMeta'", html);
+        Assert.Contains("id='auditJsonBefore'", html);
+        Assert.Contains("id='auditJsonAfter'", html);
+
+        // A função está declarada e exportada para `window` (handlers inline).
+        Assert.Contains("function showAuditJson(", html);
+        Assert.Contains("window.showAuditJson = showAuditJson;", html);
+        Assert.Contains("openModalPanel('auditJsonModal')", html);
     }
 
     [Fact]

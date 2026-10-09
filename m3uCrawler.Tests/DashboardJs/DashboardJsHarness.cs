@@ -356,8 +356,8 @@ var navigator = { userAgent: 'jint-harness', clipboard: { writeText: function ()
 var localStorage = { getItem: function () { return null; }, setItem: function () { }, removeItem: function () { } };
 var sessionStorage = localStorage;
 
-if (typeof URLSearchParams === 'undefined') {
-  function URLSearchParams(init) {
+if (typeof globalThis.URLSearchParams === 'undefined') {
+  globalThis.URLSearchParams = function (init) {
     this._p = [];
     if (typeof init === 'string') {
       var parts = String(init).replace(/^\?/, '').split('&');
@@ -368,9 +368,13 @@ if (typeof URLSearchParams === 'undefined') {
       }
     }
     this.append = function (k, v) { this._p.push([k, v]); };
+    this.set = function (k, v) {
+      for (var j = 0; j < this._p.length; j++) { if (this._p[j][0] === k) { this._p[j][1] = v; return; } }
+      this._p.push([k, v]);
+    };
     this.get = function (k) { for (var j = 0; j < this._p.length; j++) if (this._p[j][0] === k) return this._p[j][1]; return null; };
     this.toString = function () { return this._p.map(function (x) { return x[0] + '=' + x[1]; }).join('&'); };
-  }
+  };
 }
 
 window.__test = {

@@ -310,7 +310,13 @@ internal static class LiveRunApiMappings
             return null;
         }
 
-        int? historyHours = payload.HistoryHours is > 0 and <= 24 * 30 ? payload.HistoryHours : null;
+        // DC-9 — historyHours validado em (0, MaxValidHistoryHours] (=1440),
+        // alinhado com a config global/CLI; fora do intervalo é ignorado
+        // (herda a config persistida), como os restantes overrides.
+        int? historyHours = payload.HistoryHours is > 0 and <= DiscoverySettings.MaxValidHistoryHours
+            ? payload.HistoryHours
+            : null;
+        // maxStreams mantém o tecto próprio de 5000.
         int? maxStreams = payload.MaxStreams is > 0 and <= 5000 ? payload.MaxStreams : null;
         // DC-9 — minHistoryHours validado no intervalo [0, MaxValidHistoryHours];
         // fora do intervalo é ignorado (herda a config persistida), como os

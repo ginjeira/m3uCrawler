@@ -545,7 +545,6 @@ public class Dc9ScheduledJobDiscoveryTests : IAsyncLifetime
 
     [Theory]
     [InlineData(0)]
-    [InlineData(24 * 30 + 1)]
     [InlineData(DiscoverySettings.MaxValidHistoryHours + 1)]
     public async Task Post_scheduled_job_nulls_out_of_range_history_hours(int badHistory)
     {
@@ -627,6 +626,42 @@ public class Dc9ScheduledJobDiscoveryTests : IAsyncLifetime
         Assert.Equal(DiscoverySettings.MinMaxStreams, disc.GetProperty("maxStreams").GetInt32());
     }
 
+    [Theory]
+    [InlineData(720)]
+    [InlineData(DiscoverySettings.MaxValidHistoryHours)]
+    public async Task Post_scheduled_job_accepts_history_hours_up_to_max(int historyHours)
+    {
+        var harness = StartHarness();
+        await ReachReadyAsync(harness);
+        var csrf = await LoginAsync(harness);
+
+        var body = JsonSerializer.Serialize(new
+        {
+            name = $"dc9-hist-{historyHours}",
+            cronExpression = "0 5 * * *",
+            actionName = ScheduledTelegramRunAction.TelegramActionName,
+            isEnabled = true,
+            historyHours,
+        });
+
+        var create = await harness.Client.SendAsync(
+            WithCsrf(HttpMethod.Post, "/api/catalog/scheduled-jobs", body, csrf));
+        Assert.Equal(HttpStatusCode.OK, create.StatusCode);
+
+        using (var created = JsonDocument.Parse(await create.Content.ReadAsStringAsync()))
+        {
+            var disc = created.RootElement.GetProperty("discovery");
+            Assert.Equal(JsonValueKind.Object, disc.ValueKind);
+            Assert.Equal(historyHours, disc.GetProperty("historyHours").GetInt32());
+        }
+
+        await using var ctx = _factory.CreateDbContext();
+        var persisted = await ctx.ScheduledJobs.AsNoTracking()
+            .SingleAsync(j => j.Name == $"dc9-hist-{historyHours}");
+        Assert.NotNull(persisted.DiscoveryJson);
+        Assert.Contains($"\"historyHours\":{historyHours}", persisted.DiscoveryJson);
+    }
+
     // ==================== Migração ====================
     [Fact]
     public async Task Migration_adds_discovery_json_column()
@@ -675,8 +710,9 @@ public class Dc9ScheduledJobDiscoveryTests : IAsyncLifetime
         // A pré-visualização normaliza valores fora do intervalo (herda a
         // global), com os mesmos limites do POST server-side.
         Assert.Contains("function schedDiscValidInt(", html);
+        Assert.Contains("function schedDiscOutOfRange(", html);
         Assert.Contains("schedDiscValidInt('discoveryMinHistoryHours', 0, 1440)", html);
-        Assert.Contains("schedDiscValidInt('discoveryHistoryHours', 1, 720)", html);
+        Assert.Contains("schedDiscValidInt('discoveryHistoryHours', 1, 1440)", html);
         Assert.Contains("schedDiscValidInt('discoveryMaxStreams', 1, null)", html);
     }
 

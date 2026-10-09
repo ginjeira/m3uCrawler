@@ -253,12 +253,12 @@ public class DashboardJsSmokeTests : IAsyncLifetime
         engine.SeedAttribute("data-sched-create", "discoveryHistoryHours");
         engine.SeedAttribute("data-sched-create", "discoveryMaxStreams");
 
-        // Fora do intervalo (history > 1440) → herdado da global (24h).
+        // Fora do intervalo (history > 1440) → herdado da global (24h) + aviso.
         engine.Exec("document.querySelector(\"[data-sched-create=discoveryHistoryHours]\").value='5000';");
         engine.Exec("window.__dc8.updateSchedDiscoveryPreview();");
-        Assert.Equal(
-            "Efetivo: keyword=\"portugal\", min=0h, history=24h, maxStreams=500",
-            engine.EvalString("window.__test.el('schedDiscoveryPreview').textContent"));
+        var outOfRange = engine.EvalString("window.__test.el('schedDiscoveryPreview').textContent");
+        Assert.Contains("history=24h", outOfRange);
+        Assert.Contains("⚠️ history fora de 1..1440 (será ignorado; herdará a global)", outOfRange);
 
         // Valor válido → usado directamente.
         engine.Exec("document.querySelector(\"[data-sched-create=discoveryHistoryHours]\").value='100';");
@@ -267,12 +267,19 @@ public class DashboardJsSmokeTests : IAsyncLifetime
             "history=100h",
             engine.EvalString("window.__test.el('schedDiscoveryPreview').textContent"));
 
-        // maxStreams < 1 → herdado da global (500).
+        // Limite máximo (1440) → aceite, sem aviso.
+        engine.Exec("document.querySelector(\"[data-sched-create=discoveryHistoryHours]\").value='1440';");
+        engine.Exec("window.__dc8.updateSchedDiscoveryPreview();");
+        var atMax = engine.EvalString("window.__test.el('schedDiscoveryPreview').textContent");
+        Assert.Contains("history=1440h", atMax);
+        Assert.DoesNotContain("⚠️ history", atMax);
+
+        // maxStreams < 1 → herdado da global (500) + aviso.
         engine.Exec("document.querySelector(\"[data-sched-create=discoveryMaxStreams]\").value='0';");
         engine.Exec("window.__dc8.updateSchedDiscoveryPreview();");
-        Assert.Contains(
-            "maxStreams=500",
-            engine.EvalString("window.__test.el('schedDiscoveryPreview').textContent"));
+        var badMax = engine.EvalString("window.__test.el('schedDiscoveryPreview').textContent");
+        Assert.Contains("maxStreams=500", badMax);
+        Assert.Contains("⚠️ maxStreams fora de >=1", badMax);
 
         Assert.Equal(
             "null",
@@ -349,5 +356,52 @@ public class DashboardJsSmokeTests : IAsyncLifetime
         engine.Exec("window.__test.el('orderingMovePos-42').value = 'abc';");
         engine.Eval("window.__dc8.moveOrderingItemToPosition(42)");
         Assert.Equal("1", engine.EvalString("String(window.__test.fetchCountFor('/api/catalog/ordering-items/42'))"));
+    }
+
+    // ---------------- DC-5b — modal Antes/Depois da auditoria ----------------
+
+    [Fact]
+    public void ShowAuditJson_fills_modal_with_pretty_printed_before_and_after()
+    {
+        var engine = NewEngine();
+
+        // Apenas a dependência externa é stubada: o array devolvido por
+        // GET /api/audit. `loadCatalogAudits` popula `_auditRowsCache`.
+        var rows = "[{\"id\":7,\"operation\":\"update\",\"occurredAtUtc\":\"2026-01-02T03:04:05Z\"," +
+            "\"actorName\":\"ana\",\"objectType\":\"channel\",\"objectId\":\"rtp\"," +
+            "\"result\":\"success\",\"beforeJson\":\"{\\\"a\\\":1}\",\"afterJson\":\"{\\\"a\\\":2}\"}]";
+        engine.SetFetch("ok", status: 200, body: rows);
+        engine.Eval("window.loadCatalogAudits()");
+
+        engine.Exec("window.showAuditJson(7, 'before');");
+
+        var title = engine.EvalString("window.__test.el('auditJsonTitle').textContent");
+        Assert.Contains("Auditoria #7", title);
+        Assert.Contains("update", title);
+        var meta = engine.EvalString("window.__test.el('auditJsonMeta').textContent");
+        Assert.Contains("actor: ana", meta);
+        Assert.Contains("channel / rtp", meta);
+        Assert.Contains("resultado: success", meta);
+
+        // JSON pretty-printed (2 espaços) e inserido como texto.
+        Assert.Equal("{\n  \"a\": 1\n}", engine.EvalString("window.__test.el('auditJsonBefore').textContent"));
+        Assert.Equal("{\n  \"a\": 2\n}", engine.EvalString("window.__test.el('auditJsonAfter').textContent"));
+
+        Assert.False(engine.EvalBool("window.__test.el('auditJsonModal').hidden"));
+        Assert.True(engine.EvalBool("window.__test.el('auditJsonModal').classList.contains('modal-panel')"));
+        Assert.True(engine.EvalBool("window.__test.el('auditJsonModal').parentNode === window.__test.el('modalRoot')"));
+    }
+
+    [Fact]
+    public void ShowAuditJson_is_noop_for_unknown_id()
+    {
+        var engine = NewEngine();
+        engine.SetFetch("ok", status: 200, body: "[]");
+        engine.Eval("window.loadCatalogAudits()");
+
+        engine.Exec("window.showAuditJson(999, 'before');");
+
+        // Sem registo correspondente não abre o modal (não ganha `modal-panel`).
+        Assert.False(engine.EvalBool("window.__test.el('auditJsonModal').classList.contains('modal-panel')"));
     }
 }

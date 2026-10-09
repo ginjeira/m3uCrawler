@@ -612,13 +612,13 @@ O catálogo (`ChannelCatalogDbContext`, SQLite em `/data/channel-catalog.db`) ge
 
 | Separador | Conteúdo |
 |---|---|
-| **Visão Geral** | Estatísticas agregadas do catálogo (canais, aliases, regras, pending approvals). |
+| **Visão Geral** | Métricas agregadas do catálogo (canais, aliases, regras, pending approvals) no grid `#catalogStats`, seguidas do card com o caminho da BD e a data de actualização (`#catalogStatsDetail`). |
 | **Canais** | Catálogo canónico por país: DisplayName, Key, **País**, Categoria, Grupo de publicação (grupo canónico, `groupKey`/`groupName`), Política de publicação, Activo, Aliases. |
 | **Grupos** | Grupos canónicos de publicação, ordenados por `order` (ver "Grupos canónicos e atribuição por canal"). |
 | **Regras** | IdentityRules explícitas que sobrepõem o matching automático. Criar regra com `ReviewOnly` permite fuzzy matching futuro; `Excluded` bloqueia o canal permanentemente. |
 | **Afinidades** | Grupos com discriminator `Kind` (**Channel** ou **Country**). Uma Channel affinity liga variantes a um canal canónico (0..1 por `CanonicalChannelKey`); uma Country affinity liga variantes ao `CountryChannelValidator` para country-level targeting. As variantes são editadas num único campo separado pelo delimiter global (`/api/settings`, default `,`). |
 | **Reviews** | Itens de revisão do Dispatcharr (decisões ambíguas ou uncertainas pendentes de decisão humana). A lista usa `GET /api/reviews` com paginação e filtro de estado (activos por omissão; `Resolved`/`Ignored` no histórico); as acções usam `POST /api/review/resolve` (Add Alias → `change.type='channelAlias'`; Create Channel → `change.type='canonicalChannel'`), `POST /api/review/ignore` (excluir, com `reason` obrigatório) e `POST /api/review/reopen` (reabrir um item terminal, com `justification`). A identidade interna é o `id` numérico do `ReviewItem`. |
-| **Auditoria** | Visualizador (DC-5b) dos registos de auditoria via `GET /api/audit`, com filtros `objectType`/`objectId`/`limit` (default 100, cap 1000) e tabela de data/hora local, actor, operação, objecto, resultado, `before`/`after` (JSON sanitizado em `<details>` expansível) e detalhe. `503 audit-unavailable` é apresentado como estado inline claro. Read-only. |
+| **Auditoria** | Visualizador (DC-5b) dos registos de auditoria via `GET /api/audit`, com filtros `objectType`/`objectId`/`limit` (default 100, cap 1000) e tabela de data/hora local, actor, operação, objecto, resultado, `before`/`after` (JSON sanitizado aberto num **modal de detalhe** `#auditJsonModal` — botão **Ver**, pretty-printed e como texto) e detalhe. `503 audit-unavailable` é apresentado como estado inline claro. Read-only. |
 | **Sync Runs** | Histórico de sincronizações Dispatcharr com contadores de created/merged/protected/removed. |
 | **Pending** | Canais que geraram dúvida no country-level targeting e aguardam decisão manual (ver secção seguinte). |
 | **Sources** | Sources de ingestão e *channel sources* associados. Cada linha de *channel source* tem a acção **Observações** (DC-5c) que abre o histórico de observações (`GET /api/catalog/channel-sources/{id}/observations?limit=200`) e permite registar uma nova amostra (`POST` no mesmo caminho com `quality`/`epg`/`availability`/`responseTimeMs`) via `apiRequest`. |
@@ -653,10 +653,10 @@ Migrações relevantes: `AddCanonicalChannelGroupFk` (introduz `GroupId`/`canoni
 
 É permitida **no máximo uma Ordering List por país** (`OrderingListEntity.Country`).
 A unicidade por país garante que a lista de um país é inequívoca; o sync do
-Dispatcharr consome a **única** Ordering List activa (ver § "Sync do Dispatcharr
-a partir da Ordering List"). Múltiplas listas activas (possível apenas quando
-`Country` é nulo) tornariam a escolha indeterminística (DC-D3/DC-D4). A regra é
-imposta em três camadas:
+Dispatcharr usa a **única** Ordering List activa apenas para a ordem (ver
+§ "Sync do Dispatcharr e Ordering List — só ordem"). Múltiplas listas activas
+(possível apenas quando `Country` é nulo) tornariam a escolha indeterminística
+(DC-D3/DC-D4). A regra é imposta em três camadas:
 
 - **Schema:** índice parcial único `IX_ordering_lists_Country` sobre `Country`, com
   filtro `"Country" IS NOT NULL` (migração `AddUniqueOrderingListCountry`). Listas sem
@@ -676,44 +676,49 @@ A duplicação de uma lista **não herda** o `Country` (a cópia não é a lista
 `DuplicateOrderingListAsync` limpa o campo na cópia e a `Key` nova continua a ser
 validada como antes.
 
-#### Sync do Dispatcharr a partir da Ordering List (DC-11b / DC-D3)
+#### Sync do Dispatcharr e Ordering List — só ordem (opção A, revisão do DC-11b/DC-D3)
 
-Quando existe **exactamente uma** Ordering List activa, o sync do Dispatcharr
-compõe o plano a partir dessa lista
-(`PlaylistComposerService.ComposeAsync` → `ChannelMatcher.BuildPlanFromCompositionAsync`)
-em vez de ler `output/playlist.m3u` cru:
+O sync do Dispatcharr lê **sempre** `output/playlist.m3u` como fonte de
+**membros e streams** (URLs reais; a política `maxSourcesPerChannel` já foi
+aplicada a montante pelo artefacto de selecção de fontes). A Ordering List
+**não define membros** — serve **apenas para ordem** (`channel_number`),
+por junção pelo `CanonicalChannelId`:
 
-- **Membros:** só entram os canais `IsEnabled` da lista **com ≥1 fonte
-  elegível**; itens desactivados e canais sem fonte elegível são omitidos (o
-  compositor regista-os em `MissingChannels`).
-- **Ordem:** os canais **novos** são criados no Dispatcharr com
-  `channel_number` = **posição 0-based** do índice em `composition.Entries`
-  (a ordem da lista, sem gaps). Canais existentes **não** são reordenados nesta
-  wave (não existe `PATCH` de `channel_number` — follow-up).
+- **Membros:** entram todos os canais descobertos na playlist publicada (como
+  antes do DC-11b). A lista não filtra nem acrescenta canais; canais listados
+  mas ausentes da playlist **não** são criados.
+- **Ordem:** quando existe **exactamente uma** Ordering List activa, só os
+  seus **itens activos** (`IsEnabled`) são ordenados por `Position` e
+  normalizados para ranks **contíguos 1..N** (mesmo que `Position` tenha
+  buracos). Os canais **novos** cujo `CanonicalChannelId` consta da lista
+  recebem `channel_number` = rank **1-based**; os canais na playlist **fora
+  da lista** são criados e numerados a seguir (**N+1, N+2, ...**, pela ordem
+  determinística do plano). Um item **desactivado** não define ordem (não
+  ocupa rank): o seu canal continua a ser criado (a pertença é definida pela
+  playlist, não pela lista), mas é numerado no **fim**, junto com os canais
+  fora da lista.
+- **Sem renumeração:** canais existentes **nunca** são reordenados (não existe
+  `PATCH` de `channel_number` — follow-up); `channel_number` só se aplica na
+  **criação**.
 - **Agrupamento:** continua a ser o do **canal canónico**
   (`CanonicalChannel.Group.DisplayName`); a Ordering List não define grupos.
-- **Canais fora da lista:** os canais `CrawlerManaged` existentes que deixem de
-  constar da lista são **mantidos** (não há DELETE/desactivação de canais); só
-  as streams dentro de um canal casado seguem a lógica actual de
+- **Canais fora da playlist:** os canais `CrawlerManaged` existentes que não
+  constem da playlist são **mantidos** (não há DELETE/desactivação de canais);
+  só as streams dentro de um canal casado seguem a lógica actual de
   remoção/substituição.
-- **Fallback (decisões C/D):** com **0** listas activas ou com **várias**
-  listas activas (selecção indeterminística), o sync cai no caminho legado
-  (`playlist.m3u`) e regista o motivo no feed do Live Run e na consola — sem
-  credenciais.
+- **Sem numeração (decisões C/D):** com **0** listas activas ou com **várias**
+  listas activas (selecção indeterminística), não há `channel_number`; o motivo
+  é registado no feed do Live Run e na consola — sem credenciais.
 - **Sem catálogo:** o caminho `CatalogUnavailable`/legado mantém-se intacto
   (a resolução da lista só corre no caminho com catálogo).
-- **Endpoints `/api/dispatcharr/dry-run` e `/api/dispatcharr/sync`:** com uma
-  Ordering List activa, ambos compõem o plano a partir da lista (membros +
-  ordem) e **o `playlistPath` indicado no corpo é ignorado**. Sem lista activa
-  (0 ou >1), o `playlistPath` é usado como no caminho legado. O plano
+- **Selecção de fontes aplicada:** o artefacto `dispatcharr_selection_*.json`
+  continua a filtrar as streams por canal (política `MaxSourcesPerChannel`);
+  não há o antigo H1 "composição ignora selecção".
+- **Endpoints `/api/dispatcharr/dry-run` e `/api/dispatcharr/sync`:** usam o
+  `playlistPath` indicado (ou `playlist.m3u`) como fonte de membros/streams e,
+  com uma Ordering List activa, numeram os canais **novos** como acima. O plano
   (`dispatcharr_plan_*.json`, incluindo o dry-run) expõe
-  `proposedChannelNumber` = posição 0-based para os canais da lista; a
-  numeração é aplicada na criação de canais novos (canais existentes não são
-  reordenados nesta wave).
-- **Selecção de fontes ignorada:** com composição, a selecção de fontes
-  (artefacto `dispatcharr_selection_*.json`) é **ignorada** — a própria
-  Ordering List é a autoridade da fonte. Não há `PATCH streams=[]` nem DELETE
-  de streams por efeito da selecção.
+  `proposedChannelNumber` = rank **1-based**.
 
 ### Pending Country Approvals
 
@@ -1225,8 +1230,8 @@ Bootstrap → Admin → Setup Required → Telegram → Dispatcharr → Sources 
 | `/api/telegram/auth/status` | GET | Estado do login (`state`, `userName`, `detail`, `configured`). |
 | `/api/dispatcharr/config` | GET/POST | Lê/grava `enabled`, `base_url`, `dry_run`, `match_threshold`, `auto_create_groups`, `provider_priority`, `alias_file`, `target_group_name` e credenciais (nunca devolvidas). Patch semântico: chave ausente preserva o valor; `match_threshold` fora de 0–100 → 400 `invalid-payload`. |
 | `/api/dispatcharr/test` | POST | Teste de ligação read-only (`GET /api/core/version/`). |
-| `/api/dispatcharr/dry-run` | POST | **W6** — Gera `MatchPlan` + `SyncReport` sem escrever no Dispatcharr. Corpo `{ "playlistPath": "playlist.m3u" }` (caminho relativo resolvido sob o output dir). **DC-11b:** com uma Ordering List activa, o plano é composto da lista e o `playlistPath` é ignorado. Devolve `{status, mode:"dry-run", planPath, reportPath, counts{...}}`. |
-| `/api/dispatcharr/sync` | POST | **W6** — Aplica a sincronização (mutação real no Dispatcharr, sujeita a `dispatcharr_enabled`/`dispatcharr_dry_run`). Mesmo contrato, `mode:"sync"`; com uma Ordering List activa, segue a lista e ignora o `playlistPath`. |
+| `/api/dispatcharr/dry-run` | POST | **W6** — Gera `MatchPlan` + `SyncReport` sem escrever no Dispatcharr. Corpo `{ "playlistPath": "playlist.m3u" }` (caminho relativo resolvido sob o output dir). O plano lê a playlist como fonte de membros/streams; com uma Ordering List activa, os canais novos recebem `channel_number` = rank 1-based (só ordem). Devolve `{status, mode:"dry-run", planPath, reportPath, counts{...}}`. |
+| `/api/dispatcharr/sync` | POST | **W6** — Aplica a sincronização (mutação real no Dispatcharr, sujeita a `dispatcharr_enabled`/`dispatcharr_dry_run`). Mesmo contrato, `mode:"sync"`; membros/streams da playlist e ordem pela Ordering List activa. |
 
 Todos os `POST` são métodos mutantes e, em `UserAuth`, exigem `X-CSRF-Token`.
 
@@ -1316,7 +1321,7 @@ registados. A pipeline invocada é sempre a existente
 | Endpoint | Comportamento |
 |---|---|
 | `GET /api/run/status` | Snapshot sanitizado: `isRunning`, `status`, `runId`, `mode`, `source`, `phase`, `phaseStartedAtUtc`, `durationMs`, `counts`, `recentActivities`, `recentRuns` (24 h), `webAllowTrigger`. `503 pipeline-not-configured` quando não há pipeline Telegram no processo. |
-| `POST /api/run/start` | Arranque assíncrono (não bloqueia até ao fim). Corpo opcional `{ mode, keyword?, historyHours?, maxStreams? }`: `mode` ∈ `telegram` \| `telegram-maintain` (default `telegram`; valor desconhecido → `400`), `historyHours` ∈ 1–720 e `maxStreams` ∈ 1–5000 (valores fora do intervalo ou ausentes caem no default persistido). `202` aceite · `409 already-running` · `503 web-allow-trigger-disabled` · `503 pipeline-not-configured` · `400 invalid payload` · `401`/`403` conforme o gate 9C.2. |
+| `POST /api/run/start` | Arranque assíncrono (não bloqueia até ao fim). Corpo opcional `{ mode, keyword?, historyHours?, maxStreams? }`: `mode` ∈ `telegram` \| `telegram-maintain` (default `telegram`; valor desconhecido → `400`), `historyHours` ∈ 1–1440 e `maxStreams` ∈ 1–5000 (valores fora do intervalo ou ausentes caem no default persistido). `202` aceite · `409 already-running` · `503 web-allow-trigger-disabled` · `503 pipeline-not-configured` · `400 invalid payload` · `401`/`403` conforme o gate 9C.2. |
 | `GET /api/publication/status` | Snapshot derivado dos cursores de publicação do catálogo: `catalogChangedAtUtc` (`MAX` sobre `UpdatedAtUtc`/`CreatedAtUtc` das entidades que afectam a próxima `playlist.m3u`), `lastSuccessfulPublicationAtUtc` (`MAX(LiveRun.FinishedAtUtc) WHERE TerminalStatus=Completed AND Mode∈{telegram, telegram-maintain}`), `publicationPending` (`true` se o catálogo mudou depois da última publicação, ou se nunca houve uma publicação bem-sucedida). `503` quando o catálogo não está inicializado. DL-019/DL-130. |
 
 #### Cursores de publicação (DL-130)
