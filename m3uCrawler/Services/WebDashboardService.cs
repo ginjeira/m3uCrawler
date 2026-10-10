@@ -1002,6 +1002,49 @@ namespace m3uCrawler.Services
                 return;
             }
 
+            // W-ACQUIRED (2026-10-10) — playlist de aquisição
+            // (playlist_acquired.m3u): todos os streams parseados das playlists
+            // funcionais para o país. Endpoint atrás do gate normal (não é
+            // público) e read-only (GET; outros métodos → 405).
+            if (requestPath.Equals("/api/playlist_acquired", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteMethodNotAllowedAsync(context.Response, "GET");
+                    return;
+                }
+                var acquiredPath = Path.Combine(outputDir, "playlist_acquired.m3u");
+                if (!File.Exists(acquiredPath))
+                {
+                    await WriteTextAsync(context.Response, "Playlist de aquisição não encontrada", HttpStatusCode.NotFound);
+                    return;
+                }
+
+                var content = await File.ReadAllTextAsync(acquiredPath, Encoding.UTF8);
+                await WriteTextAsync(context.Response, content, HttpStatusCode.OK, "audio/x-mpegurl");
+                return;
+            }
+
+            if (requestPath.Equals("/api/playlist_acquired/preview", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteMethodNotAllowedAsync(context.Response, "GET");
+                    return;
+                }
+                var acquiredPath = Path.Combine(outputDir, "playlist_acquired.m3u");
+                if (!File.Exists(acquiredPath))
+                {
+                    await WriteTextAsync(context.Response, "Playlist de aquisição não encontrada", HttpStatusCode.NotFound);
+                    return;
+                }
+
+                var content = await File.ReadAllTextAsync(acquiredPath, Encoding.UTF8);
+                var sanitized = CredentialSanitizer.SanitizeM3uContent(content);
+                await WriteTextAsync(context.Response, sanitized, HttpStatusCode.OK, "audio/x-mpegurl");
+                return;
+            }
+
             if (requestPath.Equals("/api/run-report", StringComparison.OrdinalIgnoreCase))
             {
                 var reportPath = Path.Combine(outputDir, "telegram_run_report.json");
@@ -4625,6 +4668,13 @@ namespace m3uCrawler.Services
         private static async Task WriteHtmlAsync(HttpListenerResponse response, string html)
         {
             response.ContentType = "text/html; charset=utf-8";
+            // Páginas HTML nunca devem ser reutilizadas de cache (browsers
+            // móveis/Android reutilizam uma `/next` antiga com o token CSRF
+            // desactualizado → `403 csrf-invalid`). Cobre `/`, `/next`,
+            // `/bootstrap` e `/login`.
+            response.Headers["Cache-Control"] = "no-store, no-cache, must-revalidate";
+            response.Headers["Pragma"] = "no-cache";
+            response.Headers["Expires"] = "0";
             var buffer = Encoding.UTF8.GetBytes(html);
             response.ContentLength64 = buffer.Length;
             await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
@@ -4721,6 +4771,13 @@ namespace m3uCrawler.Services
 
         [JsonPropertyName("keyword")]
         public string? Keyword { get; set; }
+
+        /// <summary>
+        /// W-FEED — fallback canónico na aquisição. <c>null</c> herda o
+        /// valor persistido (patch semantics).
+        /// </summary>
+        [JsonPropertyName("feedCanonicalFallback")]
+        public bool? FeedCanonicalFallback { get; set; }
     }
 
     /// <summary>
@@ -5678,6 +5735,10 @@ namespace m3uCrawler.Services
           <input id='discoveryMaxHistoryHours' type='number' min='1' max='1440' step='1' style='width:90px;'>
           <label class='muted' for='discoveryMaxStreams'>Máx streams</label>
           <input id='discoveryMaxStreams' type='number' min='1' step='1' style='width:90px;'>
+          <label class='muted' for='discoveryFeedCanonicalFallback'>
+            <input id='discoveryFeedCanonicalFallback' type='checkbox' style='vertical-align:middle;'>
+            Fallback canónico na aquisição
+          </label>
           <button id='discoverySettingsSaveBtn'>Guardar</button>
         </div>
         <p class='muted' id='discoveryWindowExplainer' style='margin:8px 0 0;'>Janela inclusiva: 0h ≤ idade da mensagem ≤ 24h</p>
@@ -5738,6 +5799,7 @@ namespace m3uCrawler.Services
       <div class='toolbar'>
         <a href='/api/playlist' target='_blank'>playlist.m3u (funcional)</a>
         <a href='/api/playlist_temp' target='_blank'>playlist_temp.m3u</a>
+        <a href='/api/playlist_acquired' target='_blank'>playlist_acquired.m3u</a>
         <span class='muted' id='playlistInventory'></span>
       </div>
       <div class='card' style='margin-bottom:12px;'>
@@ -5749,6 +5811,8 @@ namespace m3uCrawler.Services
       <pre id='playlistPreview'>a carregar…</pre>
       <h3 style='font-size:14px;margin-top:16px;'>Pré-visualização playlist_temp.m3u (URLs sanitizadas — sem credenciais Xtream)</h3>
       <pre id='playlistTempPreview'>a carregar…</pre>
+      <h3 style='font-size:14px;margin-top:16px;'>Pré-visualização playlist_acquired.m3u (URLs sanitizadas — sem credenciais Xtream)</h3>
+      <pre id='playlistAcquiredPreview'>a carregar…</pre>
     </section>
 
     <!-- DISPATCHARR -->
@@ -7251,6 +7315,8 @@ namespace m3uCrawler.Services
       if (min && s.minHistoryHours !== null && s.minHistoryHours !== undefined) min.value = s.minHistoryHours;
       if (max && s.historyHours !== null && s.historyHours !== undefined) max.value = s.historyHours;
       if (ms && s.maxStreams !== null && s.maxStreams !== undefined) ms.value = s.maxStreams;
+      const fcf = document.getElementById('discoveryFeedCanonicalFallback');
+      if (fcf && s.feedCanonicalFallback !== null && s.feedCanonicalFallback !== undefined) fcf.checked = !!s.feedCanonicalFallback;
       updateDiscoveryWindowExplainer();
       return true;
     }
@@ -7260,11 +7326,13 @@ namespace m3uCrawler.Services
       const minEl = document.getElementById('discoveryMinHistoryHours');
       const maxEl = document.getElementById('discoveryMaxHistoryHours');
       const msEl = document.getElementById('discoveryMaxStreams');
+      const fcfEl = document.getElementById('discoveryFeedCanonicalFallback');
       const body = {
         keyword: kwEl ? kwEl.value.trim() : '',
         historyHours: maxEl ? parseInt(maxEl.value, 10) : NaN,
         minHistoryHours: minEl ? parseInt(minEl.value, 10) : NaN,
-        maxStreams: msEl ? parseInt(msEl.value, 10) : NaN
+        maxStreams: msEl ? parseInt(msEl.value, 10) : NaN,
+        feedCanonicalFallback: fcfEl ? !!fcfEl.checked : null
       };
       const res = await apiRequest('/api/discovery/settings', { method: 'POST', body: body });
       if (!res.ok) {
@@ -7403,6 +7471,26 @@ const rows = Object.entries(inv).map(([k, v]) => {
       } catch (e) {
         const t = document.getElementById('playlistTempPreview');
         if (t) t.textContent = 'Erro ao carregar playlist temporária: ' + (e && e.message ? e.message : 'falha');
+      }
+      // W-ACQUIRED — pré-visualização de `playlist_acquired.m3u` (endpoint
+      // sanitizado). Playlist de aquisição: streams parseados das playlists
+      // funcionais para o país.
+      try {
+        const r = await fetch('/api/playlist_acquired/preview');
+        const a = document.getElementById('playlistAcquiredPreview');
+        if (a) {
+          if (r.ok) {
+            const txt = await r.text();
+            a.textContent = txt.split('\n').filter(Boolean).slice(0, 80).join('\n');
+          } else if (r.status === 404) {
+            a.textContent = 'playlist_acquired.m3u não encontrada';
+          } else {
+            a.textContent = 'Erro ao carregar playlist de aquisição (HTTP ' + r.status + ').';
+          }
+        }
+      } catch (e) {
+        const a = document.getElementById('playlistAcquiredPreview');
+        if (a) a.textContent = 'Erro ao carregar playlist de aquisição: ' + (e && e.message ? e.message : 'falha');
       }
     }
 
@@ -11226,6 +11314,8 @@ const rows = Object.entries(inv).map(([k, v]) => {
       if(min&&s.minHistoryHours!=null)min.value=s.minHistoryHours;
       if(max&&s.historyHours!=null)max.value=s.historyHours;
       if(ms&&s.maxStreams!=null)ms.value=s.maxStreams;
+      var fcf=document.getElementById('discoveryFeedCanonicalFallback');
+      if(fcf&&s.feedCanonicalFallback!=null)fcf.checked=!!s.feedCanonicalFallback;
     }).catch(function(){});
   }
   var currentCfg='discovery';
@@ -11271,6 +11361,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
   var ngov=document.getElementById('nextGotoOperationsValidation');if(ngov)ngov.addEventListener('click',function(){go('operations');});
   setMontActive('matching');
 })();</script>
+<script>(function(){if(typeof window.fetch!=='function'){return;}try{var _f=window.fetch;window.fetch=function(i,init){return _f(i,init).then(function(r){if(r&&r.status===403){try{r.clone().json().then(function(j){if(j&&j.error==='csrf-invalid'){try{if(!sessionStorage.getItem('m3u_csrf_reload')){sessionStorage.setItem('m3u_csrf_reload','1');location.reload();}}catch(e){}}}).catch(function(){});}catch(e){}}return r;});};}catch(e){}})();</script>
 """ + "</body>");
 
             // (g) Fase 2 — hub "Configuração": nova área de topo com uma página
@@ -12774,6 +12865,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
                 if (payload.MinHistoryHours.HasValue) candidate.MinHistoryHours = payload.MinHistoryHours.Value;
                 if (payload.MaxStreams.HasValue) candidate.MaxStreams = payload.MaxStreams.Value;
                 if (payload.Keyword is not null) candidate.Keyword = payload.Keyword;
+                if (payload.FeedCanonicalFallback.HasValue) candidate.FeedCanonicalFallback = payload.FeedCanonicalFallback.Value;
 
                 if (!candidate.TryValidate(out var error))
                 {
@@ -12790,6 +12882,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
                     minHistoryHours = current.Discovery.MinHistoryHours,
                     maxStreams = current.Discovery.MaxStreams,
                     keyword = current.Discovery.Keyword,
+                    feedCanonicalFallback = current.Discovery.FeedCanonicalFallback,
                 };
                 current.Discovery = candidate;
                 var saved = store.Save(current);
@@ -12801,6 +12894,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
                         minHistoryHours = saved.Discovery.MinHistoryHours,
                         maxStreams = saved.Discovery.MaxStreams,
                         keyword = saved.Discovery.Keyword,
+                        feedCanonicalFallback = saved.Discovery.FeedCanonicalFallback,
                     },
                     AuditResult.Success);
                 await WriteJsonAsync(context.Response, saved.Discovery);

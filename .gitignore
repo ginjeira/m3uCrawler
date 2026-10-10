@@ -32,4 +32,7 @@ m3uCrawler.Tests/Fixtures/
 # Local Docker Compose override with absolute Windows paths.
 docker-compose.local.yml
 
+# Compose environment file (holds M3UCRAWLER_WEB_TOKEN and similar secrets).
+.env
+
 

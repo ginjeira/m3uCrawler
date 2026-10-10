@@ -352,6 +352,31 @@ namespace m3uCrawler.Services
         }
 
         /// <summary>
+        /// Negative evidence (Opção C) exposta como predicado puro: verdadeiro
+        /// quando o <b>primeiro</b> token do título é um código ISO de país
+        /// estrangeiro reconhecido, para o país-alvo <c>pt</c>. É a mesma
+        /// regra aplicada por <see cref="ValidateStreams"/>; existe para que
+        /// o fallback canónico na aquisição (W-FEED) não sobreponha esta
+        /// evidência negativa — um título como <c>"BE - RTL TVI"</c> continua
+        /// rejeitado mesmo que resolva para um canal canónico.
+        /// </summary>
+        internal static bool HasForeignCountryPrefix(string? title, string countryCode)
+        {
+            if (string.IsNullOrWhiteSpace(title))
+            {
+                return false;
+            }
+
+            if (!string.Equals(countryCode, "pt", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            var tokens = Tokenize(NormalizeText(title));
+            return tokens.Count > 0 && ForeignCountryPrefixes.Contains(tokens[0]);
+        }
+
+        /// <summary>
         /// Verifica se um alias bate nos tokens do título. O conjunto de tokens do alias
         /// (versão normalizada) tem de estar totalmente contido nos tokens fornecidos.
         /// Ignora aliases que não tenham tokens após normalização.

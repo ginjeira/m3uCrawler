@@ -683,6 +683,29 @@ public class WaveCDiscoverySettingsTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Post_discovery_settings_persists_feed_canonical_fallback()
+    {
+        var harness = StartHarness(withAuth: true);
+        var csrf = await ReachReadyAndLoginAsync(harness);
+
+        var valid = await PostWithCsrfAsync(
+            harness, csrf,
+            JsonSerializer.Serialize(new { feedCanonicalFallback = false }));
+        Assert.Equal(HttpStatusCode.OK, valid.StatusCode);
+        using (var doc = JsonDocument.Parse(await valid.Content.ReadAsStringAsync()))
+        {
+            Assert.False(doc.RootElement.GetProperty("feedCanonicalFallback").GetBoolean());
+        }
+
+        Assert.False(new AppSettingsStore(_runtimeDataDir).Load().Discovery.FeedCanonicalFallback);
+
+        var get = await harness.Client.GetAsync("/api/discovery/settings");
+        Assert.Equal(HttpStatusCode.OK, get.StatusCode);
+        using var getDoc = JsonDocument.Parse(await get.Content.ReadAsStringAsync());
+        Assert.False(getDoc.RootElement.GetProperty("feedCanonicalFallback").GetBoolean());
+    }
+
+    [Fact]
     public async Task Post_discovery_settings_rejects_min_above_max()
     {
         var harness = StartHarness(withAuth: true);

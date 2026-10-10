@@ -14,8 +14,11 @@ using m3uCrawler.Services.Sync;
 using m3uCrawler.Services.Telegram;
 using m3uCrawler.Services.Validation;
 using m3uCrawler.Models;
+using m3uCrawler.Services.Epg;
 using System.Text;
 using System.Net;
+using System.IO.Compression;
+using System.Xml;
 
 namespace m3uCrawler
 {
@@ -626,7 +629,7 @@ namespace m3uCrawler
                 var telegramLiveRunExecutor = new TelegramLiveRunExecutor(
                     discover: async (effectiveDiscovery, progress, ct) =>
                     {
-                        var (streams, report) = await scraper.SearchAndTestM3UInTelegramAsync(
+                        var (streams, acquiredStreams, report) = await scraper.SearchAndTestM3UInTelegramAsync(
                             effectiveDiscovery.Keyword,
                             limit: 200,
                             maxConcurrency: 5,
@@ -638,8 +641,9 @@ namespace m3uCrawler
                             pipelineIngestor: pipelineIngestor,
                             pipelineSourceKey: $"telegram-{Slugify(effectiveDiscovery.Keyword)}",
                             liveRunProgress: progress,
-                            cancellationToken: ct);
-                        return new TelegramDiscoveryResult(streams, report);
+                            cancellationToken: ct,
+                            feedCanonicalFallback: effectiveDiscovery.FeedCanonicalFallback);
+                        return new TelegramDiscoveryResult(streams, report, acquiredStreams);
                     },
                     maintain: (effectiveDiscovery, progress, ct) => RunTelegramMaintenanceCycle(
                         scraper,
@@ -656,6 +660,7 @@ namespace m3uCrawler
                         pipelineIngestor,
                         countryCode,
                         countriesDirectory,
+                        effectiveDiscovery.FeedCanonicalFallback,
                         progress,
                         ct),
                     publication: publicationService,
@@ -805,7 +810,8 @@ namespace m3uCrawler
                                 args,
                                 pipelineIngestor,
                                 countryCode,
-                                countriesDirectory);
+                                countriesDirectory,
+                                cycleDiscovery.FeedCanonicalFallback);
                         }
                     }
                     else
@@ -833,7 +839,7 @@ namespace m3uCrawler
                             // Sem coordinator (catálogo indisponível): a CLI
                             // executa a discovery e publica pelo MESMO serviço
                             // partilhado usado pelo dashboard e scheduler.
-                            var (directStreams, directReport) = await scraper.SearchAndTestM3UInTelegramAsync(
+                            var (directStreams, directAcquiredStreams, directReport) = await scraper.SearchAndTestM3UInTelegramAsync(
                                 cycleDiscovery.Keyword,
                                 limit: 200,
                                 maxConcurrency: 5,
@@ -843,11 +849,13 @@ namespace m3uCrawler
                                 countryCode: countryCode,
                                 countriesDir: countriesDirectory,
                                 pipelineIngestor: pipelineIngestor,
-                                pipelineSourceKey: $"telegram-{Slugify(cycleDiscovery.Keyword)}");
+                                pipelineSourceKey: $"telegram-{Slugify(cycleDiscovery.Keyword)}",
+                                feedCanonicalFallback: cycleDiscovery.FeedCanonicalFallback);
 
                             await publicationService.PublishAsync(new RunPublicationRequest
                             {
                                 Streams = directStreams,
+                                AcquiredStreams = directAcquiredStreams,
                                 Report = directReport,
                                 Keyword = cycleDiscovery.Keyword,
                                 HistoryHours = cycleDiscovery.HistoryHours,
@@ -943,6 +951,14 @@ namespace m3uCrawler
                 await standaloneSync.RunAsync(
                     playlistPath, outputDir, standaloneCatalog, selection: null,
                     liveRunProgress: null, CancellationToken.None);
+                return;
+            }
+
+            // IMPORTAÇÃO DE EPG (XMLTV) → tvg-id curado dos canais canónicos.
+            // One-shot, apenas catálogo (sem HTTP de escrita no Dispatcharr).
+            if (args.Contains("--import-epg-tvg-ids"))
+            {
+                Environment.ExitCode = await RunImportEpgTvgIdsAsync(args);
                 return;
             }
 
@@ -1221,6 +1237,8 @@ namespace m3uCrawler
             Console.WriteLine("  --high-performance Mesmo que --fast");
             Console.WriteLine("  --dispatcharr-sync  Sincroniza uma playlist M3U já existente com Dispatcharr (sem Telegram)");
             Console.WriteLine("  --playlist PATH    Caminho da playlist a sincronizar (default: <output-dir>/playlist.m3u)");
+            Console.WriteLine("  --import-epg-tvg-ids URL|PATH  Importa uma EPG XMLTV (.xml/.xml.gz) e grava os ids dos canais como tvg-id curado dos canais canónicos do país");
+            Console.WriteLine("  --epg-country CODE  País da EPG a importar (default: o país activo de --country, senão pt)");
             Console.WriteLine("  --admin-reset-password USERNAME  Recupera a password do administrador (host-only; password lida do stdin, nunca de argv)");
             Console.WriteLine("  --help, -h        Mostra esta ajuda");
             Console.WriteLine("  --version, -V     Mostra versão (SemVer + commit SHA + build number + data) e sai");
@@ -1504,6 +1522,7 @@ namespace m3uCrawler
             PipelineIngestionService? pipelineIngestor,
             string countryCode = "pt",
             string? countriesDir = null,
+            bool feedCanonicalFallback = true,
             ILiveRunProgress? liveRunProgress = null,
             CancellationToken cancellationToken = default)
         {
@@ -1512,7 +1531,7 @@ namespace m3uCrawler
             Console.WriteLine();
             Console.WriteLine("🧹 Início do ciclo de manutenção Telegram...");
 
-            var (freshStreams, runReport) = await scraper.SearchAndTestM3UInTelegramAsync(
+            var (freshStreams, acquiredStreams, runReport) = await scraper.SearchAndTestM3UInTelegramAsync(
                 term,
                 limit: 200,
                 maxConcurrency: 5,
@@ -1525,7 +1544,8 @@ namespace m3uCrawler
                 pipelineIngestor: pipelineIngestor,
                 pipelineSourceKey: $"telegram-{Slugify(term)}",
                 liveRunProgress: liveRunProgress,
-                cancellationToken: cancellationToken);
+                cancellationToken: cancellationToken,
+                feedCanonicalFallback: feedCanonicalFallback);
 
             liveRunProgress?.ReportCounts(runReport);
 
@@ -1629,6 +1649,7 @@ namespace m3uCrawler
                 new RunPublicationRequest
                 {
                     Streams = finalStreams,
+                    AcquiredStreams = acquiredStreams,
                     Report = runReport,
                     Keyword = term,
                     HistoryHours = telegramHistoryHours,
@@ -1743,6 +1764,297 @@ namespace m3uCrawler
             var factory = new RuntimeChannelCatalogDbContextFactory(dbPath);
             // W5.4 — lifecycle de Review auditado na camada de serviço.
             return new CatalogResolver(factory, dbPath, new AuditService(factory));
+        }
+
+        /// <summary>
+        /// One-shot: importa os <c>id</c>s de uma EPG XMLTV como identidade
+        /// externa <c>tvg-id</c> (<see cref="ExternalIdentityNamespaces.TvgId"/>)
+        /// dos canais canónicos do país, para o sync do Dispatcharr passar a
+        /// emitir <c>tvg_id</c>. Requer catálogo. Não faz HTTP de escrita no
+        /// Dispatcharr. Código de saída: 0 em sucesso (mesmo com conflitos),
+        /// ≠ 0 em erro de catálogo/rede/parse.
+        /// </summary>
+        internal static async Task<int> RunImportEpgTvgIdsAsync(string[] args)
+        {
+            var source = GetOptionValue(args, "--import-epg-tvg-ids");
+            if (string.IsNullOrWhiteSpace(source))
+            {
+                Console.Error.WriteLine("❌ Indica a origem da EPG: --import-epg-tvg-ids <url|path>");
+                return 2;
+            }
+
+            // O país da EPG herda o país activo da CLI (--country; default "pt"),
+            // sobreponível por --epg-country.
+            var activeCountry = GetOptionValue(args, "--country") ?? "pt";
+            var epgCountry = (GetOptionValue(args, "--epg-country") ?? activeCountry)
+                .Trim().ToLowerInvariant();
+
+            CatalogResolver catalog;
+            try
+            {
+                catalog = await InitializeCatalogAsync(ResolveCatalogDbPath(args), CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine(
+                    $"❌ Catálogo indisponível. Importação de EPG abortada antes de qualquer escrita. " +
+                    $"Erro: {ex.GetType().Name}");
+                return 3;
+            }
+
+            IReadOnlyList<EpgChannel> epgChannels;
+            try
+            {
+                epgChannels = await LoadAndParseEpgAsync(source, CancellationToken.None);
+            }
+            catch (Exception ex) when (ex is HttpRequestException or IOException or InvalidDataException
+                or XmlException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+            {
+                Console.Error.WriteLine($"❌ Falha ao obter/parsar a EPG: {ex.Message}");
+                return 4;
+            }
+
+            var allChannels = await catalog.ListCanonicalChannelsAsync(CancellationToken.None);
+            var countryChannels = allChannels
+                .Where(c => string.IsNullOrWhiteSpace(c.Country)
+                            || string.Equals(c.Country.Trim(), epgCountry, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            var plan = EpgChannelMapper.Plan(countryChannels, epgChannels, epgCountry);
+
+            int created = 0, unchanged = 0, conflicts = 0, ignored = 0;
+            var conflictDetails = new List<string>();
+            foreach (var mapping in plan.Mappings)
+            {
+                var outcome = await catalog.RecordExternalIdentityAsync(
+                    mapping.CanonicalChannelId,
+                    providerId: null,
+                    @namespace: ExternalIdentityNamespaces.TvgId,
+                    rawValue: mapping.EpgId,
+                    origin: "epg-import",
+                    confidence: 1.0,
+                    CancellationToken.None);
+
+                switch (outcome)
+                {
+                    case RecordExternalIdentityOutcome.Created:
+                        created++;
+                        break;
+                    case RecordExternalIdentityOutcome.Unchanged:
+                        unchanged++;
+                        break;
+                    case RecordExternalIdentityOutcome.Conflict:
+                        conflicts++;
+                        conflictDetails.Add(
+                            $"{mapping.ChannelKey} → '{mapping.EpgId}' (já pertence a outro canal; não sobreposto)");
+                        break;
+                    default:
+                        ignored++;
+                        break;
+                }
+            }
+
+            Console.WriteLine();
+            Console.WriteLine($"📺 Mapeamento EPG → tvg-id (país '{epgCountry}')");
+            Console.WriteLine($"  EPG: {epgChannels.Count} canal(ais) lido(s) de {DescribeSource(source)}");
+            Console.WriteLine($"  Canais canónicos do país: {countryChannels.Count}");
+            Console.WriteLine(
+                $"  Mapeados: {plan.Mappings.Count}  |  Não casados: {plan.Unmatched.Count}  |  " +
+                $"Ambíguos: {plan.Ambiguous.Count}  |  Incertos: {plan.Uncertain.Count}");
+            Console.WriteLine(
+                $"  Identidades tvg-id: {created} criada(s), {unchanged} já existente(s), " +
+                $"{conflicts} conflito(s), {ignored} ignorada(s)");
+
+            foreach (var warning in plan.Warnings)
+            {
+                Console.WriteLine($"  ⚠️  {warning}");
+            }
+
+            foreach (var conflict in conflictDetails)
+            {
+                Console.WriteLine($"  ⚠️  conflito: {conflict}");
+            }
+
+            if (plan.Ambiguous.Count > 0)
+            {
+                Console.WriteLine("  Ambíguos (não mapeados):");
+                foreach (var item in plan.Ambiguous.Take(20))
+                {
+                    Console.WriteLine($"    • {item.ChannelKey}: {string.Join(", ", item.CandidateIds)}");
+                }
+            }
+
+            if (plan.Uncertain.Count > 0)
+            {
+                Console.WriteLine("  Incertos (variante não-normalizada; não mapeados):");
+                foreach (var item in plan.Uncertain.Take(20))
+                {
+                    Console.WriteLine($"    • {item.ChannelKey}: {item.CandidateId}");
+                }
+            }
+
+            Console.WriteLine();
+            Console.WriteLine($"✅ Importação de EPG concluída: {created} nova(s) identidade(s) tvg-id.");
+            return 0;
+        }
+
+        /// <summary>
+        /// Obtém o XMLTV de <paramref name="source"/> (URL http/https ou
+        /// ficheiro), descomprime gzip (por extensão <c>.gz</c>, cabeçalho
+        /// <c>Content-Encoding</c> ou <i>magic bytes</i>) e extrai os canais.
+        /// </summary>
+        private static async Task<IReadOnlyList<EpgChannel>> LoadAndParseEpgAsync(
+            string source, CancellationToken ct)
+        {
+            if (LooksLikeUrl(source))
+            {
+                using var client = new HttpClient { Timeout = TimeSpan.FromMinutes(5) };
+                using var response = await client.GetAsync(
+                    source, HttpCompletionOption.ResponseHeadersRead, ct);
+                response.EnsureSuccessStatusCode();
+
+                await using var network = await response.Content.ReadAsStreamAsync(ct);
+                var prefix = new byte[2];
+                var prefixCount = await ReadAtMostAsync(network, prefix, ct);
+                var gzip = source.EndsWith(".gz", StringComparison.OrdinalIgnoreCase)
+                    || response.Content.Headers.ContentEncoding.Any(
+                        e => e.Contains("gzip", StringComparison.OrdinalIgnoreCase))
+                    || LooksGzip(prefix, prefixCount);
+
+                await using var content = new PrefixStream(prefix, prefixCount, network);
+                if (gzip)
+                {
+                    await using var decompressed = new GZipStream(content, CompressionMode.Decompress);
+                    return await EpgChannelMapper.ParseAsync(decompressed, ct);
+                }
+
+                return await EpgChannelMapper.ParseAsync(content, ct);
+            }
+
+            await using var file = new FileStream(
+                source, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16, useAsync: true);
+            var magic = new byte[2];
+            var magicCount = await ReadAtMostAsync(file, magic, ct);
+            var isGzip = source.EndsWith(".gz", StringComparison.OrdinalIgnoreCase)
+                || LooksGzip(magic, magicCount);
+
+            await using var body = new PrefixStream(magic, magicCount, file);
+            if (isGzip)
+            {
+                await using var decompressed = new GZipStream(body, CompressionMode.Decompress);
+                return await EpgChannelMapper.ParseAsync(decompressed, ct);
+            }
+
+            return await EpgChannelMapper.ParseAsync(body, ct);
+        }
+
+        private static bool LooksLikeUrl(string source)
+            => source.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+               || source.StartsWith("https://", StringComparison.OrdinalIgnoreCase);
+
+        private static string DescribeSource(string source)
+            => LooksLikeUrl(source) ? CredentialSanitizer.SanitizeUrl(source) : source;
+
+        private static bool LooksGzip(byte[] prefix, int count)
+            => count >= 2 && prefix[0] == 0x1F && prefix[1] == 0x8B;
+
+        private static async Task<int> ReadAtMostAsync(Stream stream, byte[] buffer, CancellationToken ct)
+        {
+            var total = 0;
+            while (total < buffer.Length)
+            {
+                var read = await stream.ReadAsync(buffer.AsMemory(total, buffer.Length - total), ct);
+                if (read == 0) break;
+                total += read;
+            }
+
+            return total;
+        }
+
+        /// <summary>
+        /// Devolve primeiro os bytes já lidos (prefixo) e depois o resto do
+        /// stream — permite detetar gzip por <i>magic bytes</i> sem perder o
+        /// início do conteúdo.
+        /// </summary>
+        private sealed class PrefixStream : Stream
+        {
+            private readonly byte[] _prefix;
+            private readonly int _prefixCount;
+            private readonly Stream _inner;
+            private int _prefixPosition;
+            private bool _disposed;
+
+            public PrefixStream(byte[] prefix, int prefixCount, Stream inner)
+            {
+                _prefix = prefix;
+                _prefixCount = prefixCount;
+                _inner = inner;
+            }
+
+            public override bool CanRead => true;
+            public override bool CanSeek => false;
+            public override bool CanWrite => false;
+            public override long Length => throw new NotSupportedException();
+            public override long Position
+            {
+                get => throw new NotSupportedException();
+                set => throw new NotSupportedException();
+            }
+
+            public override void Flush() { }
+
+            public override int Read(byte[] buffer, int offset, int count)
+            {
+                if (_prefixPosition < _prefixCount)
+                {
+                    var available = Math.Min(count, _prefixCount - _prefixPosition);
+                    Array.Copy(_prefix, _prefixPosition, buffer, offset, available);
+                    _prefixPosition += available;
+                    return available;
+                }
+
+                return _inner.Read(buffer, offset, count);
+            }
+
+            public override async ValueTask<int> ReadAsync(
+                Memory<byte> buffer, CancellationToken cancellationToken = default)
+            {
+                if (_prefixPosition < _prefixCount)
+                {
+                    var available = Math.Min(buffer.Length, _prefixCount - _prefixPosition);
+                    _prefix.AsMemory(_prefixPosition, available).CopyTo(buffer);
+                    _prefixPosition += available;
+                    return available;
+                }
+
+                return await _inner.ReadAsync(buffer, cancellationToken);
+            }
+
+            public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+            public override void SetLength(long value) => throw new NotSupportedException();
+            public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+            protected override void Dispose(bool disposing)
+            {
+                if (!_disposed && disposing)
+                {
+                    _inner.Dispose();
+                    _disposed = true;
+                }
+
+                base.Dispose(disposing);
+            }
+
+            public override async ValueTask DisposeAsync()
+            {
+                if (!_disposed)
+                {
+                    await _inner.DisposeAsync();
+                    _disposed = true;
+                }
+
+                GC.SuppressFinalize(this);
+            }
         }
 
         /// <summary>

@@ -547,6 +547,23 @@ public class DashboardNextVariantTests
         Assert.Equal(legacyWithToken, BuildLegacyPage(token));
     }
 
+    // ===================== Safety net CSRF (só Next) =====================
+
+    [Fact]
+    public void Next_variant_injects_csrf_safety_net_only_in_next()
+    {
+        var next = BuildVariantHtml("Next");
+
+        // A rede de segurança (reload único por sessão em `csrf-invalid`) vive
+        // exclusivamente na variante Next.
+        Assert.Contains("m3u_csrf_reload", next);
+        Assert.Contains("csrf-invalid", next);
+        Assert.Contains("window.fetch", next);
+
+        // A Legacy permanece sem o marcador (identidade byte a byte preservada).
+        Assert.DoesNotContain("m3u_csrf_reload", BuildLegacyHtml());
+    }
+
     // ===================== Roteamento HTTP =====================
 
     [Collection("DashboardStaticState")]
@@ -749,6 +766,44 @@ public class DashboardNextVariantTests
             Assert.DoesNotContain("id='view-operations'", rootHtml);
             Assert.DoesNotContain("id='view-monitoring'", rootHtml);
             Assert.Contains("id='validationTestUrls'", rootHtml);
+        }
+
+        [Fact]
+        public async Task Html_responses_send_no_cache_headers()
+        {
+            await ReachReadyWithAdminAsync();
+
+            // Sem sessão, `/` e `/next` servem o login: as páginas HTML nunca
+            // devem ser reutilizadas de cache (evita um `/next` antigo com
+            // token CSRF desactualizado).
+            foreach (var path in new[] { "/", "/next" })
+            {
+                var response = await _harness!.Client.GetAsync(path);
+                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+                Assert.Contains(
+                    "no-store",
+                    string.Join(",", response.Headers.GetValues("Cache-Control")));
+                Assert.Contains(
+                    "no-cache",
+                    string.Join(",", response.Headers.GetValues("Pragma")));
+            }
+
+            // Com sessão, a variante Next continua a enviar os mesmos cabeçalhos.
+            var login = await _harness!.Client.PostAsync(
+                "/api/session",
+                new StringContent(
+                    JsonSerializer.Serialize(new { username = "admin", password = ValidPassword }),
+                    Encoding.UTF8, "application/json"));
+            Assert.Equal(HttpStatusCode.OK, login.StatusCode);
+
+            var next = await _harness.Client.GetAsync("/next");
+            Assert.Equal(HttpStatusCode.OK, next.StatusCode);
+            Assert.Contains(
+                "no-store",
+                string.Join(",", next.Headers.GetValues("Cache-Control")));
+            Assert.Contains(
+                "no-cache",
+                string.Join(",", next.Headers.GetValues("Pragma")));
         }
 
         private async Task ReachReadyWithAdminAsync()

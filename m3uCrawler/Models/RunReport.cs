@@ -119,6 +119,13 @@ namespace m3uCrawler.Models
         internal int _StreamsRejectedByCountry;
         public int StreamsRejectedByCountry { get => _StreamsRejectedByCountry; set => _StreamsRejectedByCountry = value; }
 
+        // W-FEED (2026-10-10): streams rejeitados pelo filtro de país mas aceites
+        // via fallback canónico na aquisição (resolvem para um canal canónico
+        // existente sem token de país no título). Subconjunto de
+        // StreamsAfterCountryFilter; nunca auto-cria canais.
+        internal int _StreamsMatchedViaCanonicalFallback;
+        public int StreamsMatchedViaCanonicalFallback { get => _StreamsMatchedViaCanonicalFallback; set => _StreamsMatchedViaCanonicalFallback = value; }
+
         internal int _StreamsTested;
         public int StreamsTested { get => _StreamsTested; set => _StreamsTested = value; }
         internal int _StreamsWorking;

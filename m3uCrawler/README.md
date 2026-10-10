@@ -116,6 +116,8 @@ As opções abaixo são as efectivamente reconhecidas pelo `Program.cs`. Opçõe
 | `--web-token TOKEN` | Token partilhado para proteger o dashboard (ver secção "Modelo de segurança do dashboard"). Opcional. |
 | `--web-allow-trigger` | Opt-in: permite `POST /api/run/start` (trigger manual) no dashboard. Default: desactivado ⇒ `503 web-allow-trigger-disabled`. |
 | `--admin-reset-password USERNAME` | Recuperação **host-only** da password de administrador: a password é lida interactivamente do stdin, **nunca** de argv. Ver secção "Alterar/recuperar password de administrador". |
+| `--import-epg-tvg-ids FONTE` | Importa uma EPG XMLTV (`.xml`/`.xml.gz`, URL ou ficheiro) e grava os `id` dos `<channel>` como identidade externa `tvg-id` dos canais canónicos do país. Requer catálogo. Ver secção "Importação de tvg-id a partir de EPG". |
+| `--epg-country CODIGO` | País da EPG a importar (padrão: o país activo de `--country`, senão `pt`). |
 | `--output-dir DIR` | Directório de saída (padrão: `output`). |
 | `--bot` | Modo bot Telegram. |
 | `--fast` / `--high-performance` | Aumenta a concorrência (modo de pesquisa web). |
@@ -155,6 +157,27 @@ A pesquisa no Telegram considera apenas mensagens cuja idade satisfaz `MinHistor
 - **Validação:** `MinHistoryHours >= 0`, `MaxHistoryHours >= 0` e `MinHistoryHours <= MaxHistoryHours`. Valores inválidos são rejeitados na API (400) e os valores inválidos persistidos são normalizados para o default (`Min → 0`) pelo mecanismo `Sanitize` existente.
 
 A janela já está configurável na **UI do dashboard**, na vista Descoberta (card "Configuração de discovery predefinida"): `keyword`, `MinHistoryHours`, `HistoryHours`/Max e `MaxStreams`, persistidos via `GET/POST /api/discovery/settings` (ex.: Min 425h / Max 450h ⇒ `425h ≤ idade ≤ 450h`; "Min 0 = sem limite inferior"). Esta configuração é a **base/fallback**; cada **Scheduled Job** pode sobrepor-lhe parâmetros próprios (DC-9 — ver "Scheduler / Scheduled Jobs") e o **"Run now"** da Execução ao Vivo aceita overrides pontuais de modo/keyword/janela/`MaxStreams` (DC-1). Ver "Configuração no Dashboard: o que está exposto e o que não" na secção do Dashboard.
+
+### Fallback canónico na aquisição (`feedCanonicalFallback`)
+
+Dentro de uma playlist que **passou o filtro de país** (`AnalyzePlaylist`), um stream é aceite quando (a) está identificado com o país pelo comportamento normal de `ValidateStreams` **ou** (b) quando o `feedCanonicalFallback` está activo e o stream **resolve para um canal canónico existente** (mesmo sem token de país no título).
+
+- **Setting:** `feedCanonicalFallback` (bool, default `true`), persistido na mesma SSOT `runtime-data/app_settings.json`, secção `discovery`. `GET /api/discovery/settings` devolve a flag; `POST /api/discovery/settings` aceita-a opcionalmente (patch semantics, `DiscoverySettingsPayload.feedCanonicalFallback`). Na UI do dashboard, o card "Configuração de discovery predefinida" expõe o checkbox "Fallback canónico na aquisição".
+- **Como resolve:** para os streams **rejeitados pela falta de token de país**, o pipeline normaliza o título (`ChannelNormalizer.Normalize`) e consulta `CatalogResolver.CanonicalChannelExistsByNormalizedIdentityAsync` — pertença por `canonical_channels.Key` (normalizada) e/ou `channel_aliases.NormalizedAlias`, apenas em canais canónicos **activos**.
+- **Nunca auto-cria canais.** É um predicado read-only de pertença; canais novos continuam a exigir o caminho normal de reconhecimento/publicação.
+- **Preserva a negative evidence de prefixo estrangeiro:** um título como `BE - RTL TVI` continua rejeitado, mesmo que resolva para um canal canónico (`CountryChannelValidator.HasForeignCountryPrefix`, activo para o país-alvo `pt`).
+- **País é parâmetro:** `FilterStreamsByCountryAsync(..., countryCode, catalogResolver, feedCanonicalFallback)` — o mecanismo não está preso a `pt`; o `countryCode` continua a ser o mesmo parâmetro do pipeline.
+- **Diagnóstico:** os aceites por este caminho contam em `RunReport.StreamsMatchedViaCanonicalFallback` (subconjunto de `StreamsAfterCountryFilter`). O modo de aquisição física não muda: o teste continua a ser só dos streams do país (incluindo os aceites pelo fallback).
+
+### Playlist de aquisição (`playlist_acquired.m3u`)
+
+Registra **todos os streams parseados** das playlists que foram **funcionais para o país** neste run:
+
+- **Definição de "funcional para o país":** a playlist passou o gate de país (`AnalyzePlaylist`) e tem **≥1 stream do país a funcionar** (working) após `TestStreamsAsync`. Playlists rejeitadas ou sem nenhum working **não** contribuem.
+- **Conteúdo:** acumula, por run, os streams parseados dessas playlists, com **dedup por URL** (`OrdinalIgnoreCase`, mantendo a primeira ocorrência) — igual à dedup do `playlist_temp.m3u`.
+- **Artefacto:** escrito ao lado de `playlist_temp.m3u`/`playlist.m3u` via `PlaylistManagerService.SaveToM3uPlaylistAtomic`. O caminho é devolvido em `RunPublicationResult.AcquiredPlaylistPath`. Só é escrito quando `RunPublicationRequest.AcquiredStreams` está presente e não vazio. **Não há custo extra**: o teste físico continua a ser só dos streams do país.
+- **Endpoints:** `GET /api/playlist_acquired` (conteúdo real, `audio/x-mpegurl`; `404` "Playlist de aquisição não encontrada" se ausente) e `GET /api/playlist_acquired/preview` (conteúdo sanitizado via `CredentialSanitizer.SanitizeM3uContent`). Ambos atrás do gate normal (não públicos); outros verbos → `405` com `Allow: GET`.
+- **UI:** a vista Playlist tem o link `playlist_acquired.m3u` (download) e a pré-visualização sanitizada (`#playlistAcquiredPreview`), no mesmo padrão de `playlist_temp.m3u`.
 
 ### Proveniência da mensagem de origem (candidate → playlist)
 
@@ -328,8 +351,8 @@ Telegram publication URLs (`https://t.me/<username>/<message>`) sem canal id exp
 A URL interna do candidato Xtream contém credenciais (necessárias para o download HTTP). O projecto distingue explicitamente entre **artefactos funcionais** e **artefactos de diagnóstico** para não quebrar a reprodução Xtream nem expor credenciais:
 
 - **Artefactos funcionais** (URLs reais, necessárias para reprodução):
-  - `output/playlist.m3u`, `output/playlist_temp.m3u`, `output/telegram_playlist_<timestamp>.m3u` — a playlist M3U contém as URLs reais (`http://host/live/USER/PASS/ID.ts`) porque sem creds os streams não reproduzem.
-  - Download via `GET /api/playlist` e `GET /api/playlist_temp` — devolvem a playlist funcional.
+  - `output/playlist.m3u`, `output/playlist_temp.m3u`, `output/playlist_acquired.m3u`, `output/telegram_playlist_<timestamp>.m3u` — a playlist M3U contém as URLs reais (`http://host/live/USER/PASS/ID.ts`) porque sem creds os streams não reproduzem.
+  - Download via `GET /api/playlist`, `GET /api/playlist_temp` e `GET /api/playlist_acquired` — devolvem a playlist funcional.
 
 - **Artefactos de diagnóstico** (URLs sanitizadas, nunca expõem creds):
   - Consola — todos os `Console.WriteLine` que tocam em URLs (`M3uTesterService`, `Program.cs` para listagem de streams funcionais e templates de scan-domain) usam `CredentialSanitizer.SanitizeUrl`.
@@ -565,8 +588,8 @@ O dashboard (`Services/WebDashboardService.cs`, `HttpListener`) serve a UI em `h
 | `/api/country/validate?country=pt` | **Validação de `output/playlist.m3u` usando `AnalyzePlaylist` com threshold 3** (alinhada com o pipeline). Devolve `isMatch` (= `IsTargetCountry`), `matchedAliases`, `recognizedChannelCount`, `threshold`, `totalChannels`, `playlistLength`, `sample`. |
 | `/api/country/save` (POST) | Grava a lista de canais de um país (preserva o `displayName` enviado). |
 | `/api/country?country=pt` (DELETE) | **W6** — Elimina a configuração do país (`runtime-data/countries/<code>.json`). `200` quando eliminado, `404` quando ausente. Não altera a playlist publicada. |
-| `/api/playlist` / `/api/playlist_temp` | **Funcional**: conteúdo textual das playlists com URLs reais (necessário para reprodução Xtream). Usar para download explícito. |
-| `/api/playlist/preview` / `/api/playlist_temp/preview` | **Diagnóstico**: mesmo conteúdo com URLs sanitizadas (`CredentialSanitizer.SanitizeM3uContent`). Usado pelas pré-visualizações HTML (`#playlistPreview` e `#playlistTempPreview`, DC-5e) para nunca expor credenciais. `playlist_temp.m3u` inexistente → `404` ("Playlist temporária não encontrada"). |
+| `/api/playlist` / `/api/playlist_temp` / `/api/playlist_acquired` | **Funcional**: conteúdo textual das playlists com URLs reais (necessário para reprodução Xtream). Usar para download explícito. `playlist_acquired.m3u` inexistente → `404` ("Playlist de aquisição não encontrada"). |
+| `/api/playlist/preview` / `/api/playlist_temp/preview` / `/api/playlist_acquired/preview` | **Diagnóstico**: mesmo conteúdo com URLs sanitizadas (`CredentialSanitizer.SanitizeM3uContent`). Usado pelas pré-visualizações HTML (`#playlistPreview`, `#playlistTempPreview`, `#playlistAcquiredPreview`) para nunca expor credenciais. `playlist_temp.m3u`/`playlist_acquired.m3u` inexistente → `404`. |
 | `/api/run-report` | `RunReport` da última execução (sanitizado). |
 | `/api/discovered-playlists` | Lista de playlists descobertas na última execução (sanitizado). |
 | `/api/audit` (GET) | **W6a/DC-5b** — Registos de auditoria administrativa, read-only. Filtros opcionais `objectType`, `objectId` e `limit` (default 100, cap 1000); ordenados por `occurredAtUtc`/`id` desc. Textos e JSON (`beforeJson`/`afterJson`) já sanitizados (`CredentialSanitizer`); sem catálogo/serviço de auditoria → `503 {"error":"audit-unavailable"}`. Visualizador na UI em Catálogo → **Auditoria**. |
@@ -584,7 +607,7 @@ Os endpoints JSON devolvem erros no envelope `{ "error": "<código>" }`; as Revi
 
 - **405 Method Not Allowed** para verbos não suportados numa rota existente. O header `Allow` reflecte os métodos realmente suportados (não fixa `GET, POST`) e o corpo é `{"error":"method-not-allowed"}`. Exemplos: `POST` em `/api/run/start`, `/api/country/save`, `/api/validation/test` e `/api/dispatcharr/test`; `GET` em `/api/configuration/readiness`; `GET, POST` em `/api/discovery/settings`, `/api/telegram/config` e `/api/dispatcharr/config`; `GET` em `/api/telegram/auth/status`; `POST` nas restantes sub-rotas `/api/telegram/auth/*`.
 - **404 Not Found** apenas para rotas **inexistentes** (não para verbos errados em rotas existentes).
-- **`/api/country`** aceita `GET` (detalhe) e `DELETE` (remoção); outros verbos → `405` com `Allow: GET, DELETE`. **`/api/playlist`**, **`/api/playlist_temp`** e as variantes **`/preview`** são **GET-only** (outros verbos → `405` com `Allow: GET`); a playlist funcional continua intocada.
+- **`/api/country`** aceita `GET` (detalhe) e `DELETE` (remoção); outros verbos → `405` com `Allow: GET, DELETE`. **`/api/playlist`**, **`/api/playlist_temp`**, **`/api/playlist_acquired`** e as variantes **`/preview`** são **GET-only** (outros verbos → `405` com `Allow: GET`); a playlist funcional continua intocada.
 - O recurso Review é exposto com o contrato canónico (`subject`, `reason`, `createdAt`/`updatedAt`/`resolvedAt`, `runId`) **e** com aliases legacy (`fingerprint`, `normalizedIdentity`, `reasonSignature`, `createdAtUtc`/`updatedAtUtc`/`resolvedAtUtc`). A **UI do separador Catálogo → Reviews já usa a nova API** (`GET /api/reviews`, `POST /api/review/{resolve|ignore|reopen}`) com **identidade por `id` numérico** (não pelo fingerprint) e **paginação** (`offset`/`limit`, cap 500); o filtro de estado mantém os activos por omissão e expõe o histórico via `?state=`. A rota legacy `/api/catalog/reviews` mantém-se inalterada no backend (DL-120/D5), apenas já não é consumida pela UI.
 - **Transporte e erros no front-end.** Os handlers de mutação do dashboard (POST/PUT/PATCH/DELETE) usam um único helper `apiRequest(path, { method, body, signal })`: envolve `fetch` em `try/catch` (nunca propaga rejeições de rede), serializa o corpo objecto para JSON, lê a resposta em `r.text()` com parse tolerante (nunca `r.json()` num ramo de erro) e devolve `{ ok, status, json, error }` com a mensagem normalizada (`json.error` → texto → `HTTP <status>` → mensagem de rede). A apresentação é uniforme — `setStatus(...)` em elementos de estado inline e `alert('Erro: ' + res.error)` onde não existe nó dedicado. As leituras de GET/polling mantêm `safeFetchJson`.
 
@@ -594,9 +617,9 @@ O dashboard tem os seguintes separadores principais:
 
 - **Visão Geral**: resumo do sistema com métricas da última execução, carteiras de streams, estado do Dispatcharr e **estado de publicação do catálogo** (DL-130). O card "Publicação do catálogo" consome `GET /api/publication/status` e apresenta os 4 estados (`Pendente` / `Em dia` / `Sem publicação anterior` / `Indisponível`) com badges `warn` / `ok` / `warn` / `muted`; o booleano `publicationPending` chega já calculado pelo backend e não é recalculado no frontend.
 - **Execuções**: histórico detalhado das últimas 72h com métricas por execução.
-- **Descoberta**: card "Configuração de discovery predefinida" (keyword, janela Min/Max, `MaxStreams`, via `/api/discovery/settings`) e playlists descobertas com filtros por estado, origem e país, incluindo colunas de proveniência MessageId / Data mensagem (UTC) / Candidato.
+- **Descoberta**: card "Configuração de discovery predefinida" (keyword, janela Min/Max, `MaxStreams`, checkbox `feedCanonicalFallback`, via `/api/discovery/settings`) e playlists descobertas com filtros por estado, origem e país, incluindo colunas de proveniência MessageId / Data mensagem (UTC) / Candidato.
 - **Canais / Países**: validação da playlist actual por país e gestão das listas de aliases.
-- **Playlist**: visualização da playlist actual e da intermédia (`playlist_temp.m3u`) com pré-visualizações sanitizadas (`GET /api/playlist/preview` e `GET /api/playlist_temp/preview`, DC-5e), links para download funcional e lista dos ficheiros em `output/`.
+- **Playlist**: visualização da playlist actual, da intermédia (`playlist_temp.m3u`) e da de aquisição (`playlist_acquired.m3u`) com pré-visualizações sanitizadas (`GET /api/playlist/preview`, `GET /api/playlist_temp/preview`, `GET /api/playlist_acquired/preview`), links para download funcional e lista dos ficheiros em `output/`.
 - **Dispatcharr**: estado da última sincronização, card **Classificação (último MatchPlan)** (DC-5d, `GET /api/classification-summary`) e detalhes do plano/report.
 - **Catálogo**: gestão completa do catálogo de canais, incluindo o separador **Scheduled Jobs** (jobs cron persistentes; ver secção "Scheduler / Scheduled Jobs").
 - **Validação de Streams**: política operacional de teste de streams e dry-run de URLs.
@@ -719,6 +742,69 @@ por junção pelo `CanonicalChannelId`:
   com uma Ordering List activa, numeram os canais **novos** como acima. O plano
   (`dispatcharr_plan_*.json`, incluindo o dry-run) expõe
   `proposedChannelNumber` = rank **1-based**.
+
+#### tvg_id e logo_url no sync do Dispatcharr (Parte A, 2026-10-10)
+
+Para casar EPG, os canais e streams criados no Dispatcharr passam a levar
+identificadores de EPG/logo. `tvg_id` e `logo_url` **não** são credenciais,
+logo **não** passam por `CredentialSanitizer` (ao contrário do `streamUrl`, que
+continua a ser sanitizado em todas as saídas de apresentação).
+
+- **Plano (`MatchPlan`):** cada `StreamMatchDecision` transporta `tvgId`
+  (de `DiscoveredStream.OriginalTvgId`) e `logoUrl` (de `M3uStream.Logo`).
+  Cada `ChannelDecision` transporta `epgTvgId`, resolvido por esta ordem:
+  1. o **tvg-id curado do canal canónico** — `CatalogResolver.GetCanonicalTvgIdAsync`
+     (namespace `ExternalIdentityNamespaces.TvgId`, valor canónico persistido);
+  2. senão, o `OriginalTvgId` do stream **representativo** da fonte;
+  3. senão, `null`.
+- **Criação:** `POST` de stream inclui `tvg_id`/`logo_url` quando não vazios;
+  `POST` de canal inclui `tvg_id` = `epgTvgId` quando não vazio.
+- **Canais/streams existentes (`CrawlerManaged`):** quando o valor actual (do
+  `DispatcharrState`) difere do alvo, é emitido um `PATCH` parcial
+  (`PATCH /api/channels/channels/{id}/` com `{ tvg_id }`; `PATCH
+  /api/channels/streams/{id}/` com `{ tvg_id }` e/ou `{ logo_url }`). Um
+  `epgTvgId`/`tvgId`/`logoUrl` nulo/ausente **nunca limpa** o valor existente.
+- **Não-interferência:** canais e streams `External`/`Unknown` (ou sem registo
+  de ownership com catálogo activo) **nunca** recebem `PATCH` de metadados. Em
+  modo legado (sem catálogo) aplica-se o fallback histórico `CrawlerManaged`.
+- **Observabilidade (aditivo):** `SyncReportCounts` ganha `channelTvgIdsPatched`
+  e `streamMetadataPatched`; é registado um `SyncRunStep` `apply-metadata`.
+  As decisões `Ambiguous`/`Skipped` e a ownership/remoção de streams ficam
+  inalteradas.
+
+#### Importação de tvg-id a partir de EPG (`--import-epg-tvg-ids`, Parte B, 2026-10-10)
+
+Para que o Dispatcharr case a EPG (e traga logos), o `tvg_id` dos canais precisa
+de corresponder ao `id` de um `<channel>` no XMLTV. O comando one-shot
+`--import-epg-tvg-ids` lê uma EPG e grava o id vencedor como identidade externa
+`tvg-id` (`ExternalIdentityNamespaces.TvgId`) do canal canónico — o mecanismo
+que o sync já consome (`CatalogResolver.GetCanonicalTvgIdAsync`).
+
+- **Uso:** `--import-epg-tvg-ids <url|path> [--epg-country pt]`. O `--epg-country`
+  herda o país activo (`--country`, default `pt`). URLs são obtidas por HTTP GET
+  e descomprimidas (`GZipStream`) quando a extensão é `.gz`, o cabeçalho
+  `Content-Encoding` é gzip ou o conteúdo começa pelos *magic bytes* gzip;
+  ficheiros `.gz` são descomprimidos por extensão/*magic bytes*. Requer catálogo
+  (aborta com código ≠ 0 se indisponível); erros de rede/parse devolvem código
+  ≠ 0.
+- **Matching (`EpgChannelMapper`, puro):** cada canal canónico do país
+  (`Key`, `DisplayName`, `channel_aliases`) é normalizado (remover sufixo de
+  país da EPG, remover separadores `.`/`-`/`_`/espaços, lowercase) e casado
+  contra o índice dos ids da EPG por forma normalizada **e** por forma sem `hd`.
+- **Ressalva de case:** o valor persistido passa por
+  `ExternalIdentityNormalizer.Normalize` (lowercase). A EPG pode declarar ids
+  dotted/PascalCase (ex.: `RTP.1.HD.pt`). O mapeador **prioriza** ids já na
+  forma normalizada (`Normalize(id) == id`) e **sem `HD`**; se só existir a
+  variante dotted/maiúsculas, o canal fica **incerto** e **não é gravado**
+  (evita gravar um valor que pode não casar por case). Várias variantes no
+  mesmo nível de preferência → **ambíguo**, não mapeado.
+- **Idempotência e conflitos:** a escrita usa
+  `CatalogResolver.RecordExternalIdentityAsync` (idempotente; nunca sobrepõe
+  uma associação existente; se o `namespace`+valor já pertence a outro canal, é
+  reportado como conflito e ignorado), tal como o `CatalogBaselineImporter`.
+  Uma segunda execução não adiciona nada (0 criadas).
+- **Sem Dispatcharr:** o comando escreve apenas no catálogo; **não** há HTTP de
+  escrita no Dispatcharr.
 
 ### Pending Country Approvals
 
@@ -1198,6 +1284,14 @@ autenticação humana e não é necessário numa instalação nova.
 A página autenticada do Dashboard recebe o token CSRF apenas **em memória
 JavaScript** (nunca em URL, query, `localStorage` ou logs) e envia-o
 automaticamente em métodos mutantes através de um helper de `fetch`.
+
+As respostas HTML do Dashboard (`/`, `/next`, `/bootstrap` e login) são servidas
+com `Cache-Control: no-store, no-cache, must-revalidate`, `Pragma: no-cache` e
+`Expires: 0` — evita que o browser reutilize uma página antiga com um token CSRF
+desactualizado (`403 csrf-invalid`). Na UI `/next` existe ainda uma rede de
+segurança no cliente: ao observar um `403` com `{error:"csrf-invalid"}`, recarrega
+a página **uma única vez por sessão** (`sessionStorage['m3u_csrf_reload']`) para
+obter um token fresco.
 
 Se a inicialização do serviço de autenticação falhar, o Dashboard entra em
 **fail-closed** em `READY` (401, sem acesso administrativo anónimo) — nunca cai

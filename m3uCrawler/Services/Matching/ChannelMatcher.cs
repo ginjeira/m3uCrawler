@@ -481,6 +481,22 @@ namespace m3uCrawler.Services.Matching
                         isForeign);
                 }
 
+                // EPG tvg-id do canal: privilégio ao tvg-id curado do
+                // canal canónico (namespace `ExternalIdentityNamespaces.TvgId`,
+                // lido via CatalogResolver); fallback para o OriginalTvgId
+                // do stream representativo da fonte. `null` quando nenhum
+                // existe. Nunca é uma URL sanitizada.
+                string? bucketEpgTvgId = null;
+                if (_catalog != null && bucketCanonicalId.HasValue)
+                {
+                    bucketEpgTvgId = CleanOptional(
+                        await _catalog.GetCanonicalTvgIdAsync(bucketCanonicalId.Value));
+                }
+                if (bucketEpgTvgId == null && representative != null)
+                {
+                    bucketEpgTvgId = CleanOptional(representative.OriginalTvgId);
+                }
+
                 bool ambiguous = false;
                 bool skipNoMatchRecord = false;
                 DispatcharrChannel? matched = null;
@@ -555,6 +571,7 @@ namespace m3uCrawler.Services.Matching
                             ExistingChannelId = null,
                             ChannelGroupName = null,
                             OutputGroup = outputGroup,
+                            EpgTvgId = bucketEpgTvgId,
                             MatchReason = $"ambiguous:{top.Name}|{second.Name}",
                             MatchScore = matchScore,
                             Streams = streamDecisions,
@@ -601,7 +618,7 @@ namespace m3uCrawler.Services.Matching
                         bucket.Value, matched, isCurated, outputGroup,
                         matchReason!, matchScore, bucketCatalogDisplayName,
                         bucketCanonicalKey, bucketCanonicalId,
-                        bucketCanonicalGroupName,
+                        bucketCanonicalGroupName, bucketEpgTvgId,
                         ordering, existing.Streams,
                         existingStreamsById, streamsByChannel, ownershipByStreamId, counts) });
                     continue;
@@ -652,6 +669,7 @@ namespace m3uCrawler.Services.Matching
                     ExistingChannelId = null,
                     ChannelGroupName = newGroupName,
                     OutputGroup = outputGroup,
+                    EpgTvgId = bucketEpgTvgId,
                     MatchReason = "no-match",
                     MatchScore = 0,
                     Streams = newStreamDecisions,
@@ -1000,7 +1018,7 @@ namespace m3uCrawler.Services.Matching
         {
             return BuildExistingDecision(
                 bucket, matched, isCurated, outputGroup, matchReason, matchScore,
-                null, null, null, null, ordering, allExistingStreams, existingStreamsById,
+                null, null, null, null, null, ordering, allExistingStreams, existingStreamsById,
                 streamsByChannel, ownershipByStreamId, counts);
         }
 
@@ -1015,6 +1033,7 @@ namespace m3uCrawler.Services.Matching
             string? canonicalChannelKey,
             long? canonicalChannelId,
             string? canonicalGroupName,
+            string? epgTvgId,
             IStreamOrderingPolicy ordering,
             IReadOnlyList<DispatcharrStream> allExistingStreams,
             IReadOnlyDictionary<long, DispatcharrStream> existingStreamsById,
@@ -1059,6 +1078,8 @@ namespace m3uCrawler.Services.Matching
                         OrderReason = "not-working",
                         IsWorking = false,
                         GroupName = stream.Group,
+                        TvgId = CleanOptional(stream.OriginalTvgId),
+                        LogoUrl = CleanOptional(stream.Original.Logo),
                     });
                     counts.Skipped = counts.Skipped + 1;
                     continue;
@@ -1080,6 +1101,8 @@ namespace m3uCrawler.Services.Matching
                     OrderReason = reason,
                     IsWorking = stream.IsWorking,
                     GroupName = stream.Group,
+                    TvgId = CleanOptional(stream.OriginalTvgId),
+                    LogoUrl = CleanOptional(stream.Original.Logo),
                 });
                 if (isNew) counts.NewStreams = counts.NewStreams + 1;
                 order++;
@@ -1120,6 +1143,8 @@ namespace m3uCrawler.Services.Matching
                             OrderReason = "protected-by-ownership",
                             IsWorking = es.IsWorking,
                             GroupName = es.GroupName,
+                            TvgId = CleanOptional(es.TvgId),
+                            LogoUrl = CleanOptional(es.LogoUrl),
                         });
                         counts.ProtectedExternalStreams = counts.ProtectedExternalStreams + 1;
                         continue;
@@ -1135,6 +1160,8 @@ namespace m3uCrawler.Services.Matching
                         OrderReason = "missing-from-current-playlist",
                         IsWorking = es.IsWorking,
                         GroupName = es.GroupName,
+                        TvgId = CleanOptional(es.TvgId),
+                        LogoUrl = CleanOptional(es.LogoUrl),
                     });
                     counts.RemovedStreams = counts.RemovedStreams + 1;
                 }
@@ -1162,6 +1189,7 @@ namespace m3uCrawler.Services.Matching
                     ? matched.GroupName
                     : canonicalGroupName,
                 OutputGroup = outputGroup,
+                EpgTvgId = epgTvgId,
                 MatchReason = matchReason,
                 MatchScore = matchScore,
                 Streams = streamDecisions,
@@ -1344,6 +1372,8 @@ namespace m3uCrawler.Services.Matching
                     OrderReason = s.OrderReason,
                     IsWorking = s.IsWorking,
                     GroupName = s.GroupName,
+                    TvgId = s.TvgId,
+                    LogoUrl = s.LogoUrl,
                 });
                 if (s.Outcome == SyncOutcome.NewStream) order++;
             }
@@ -1369,6 +1399,8 @@ namespace m3uCrawler.Services.Matching
                     OrderReason = rep.OrderReason ?? "merged-keep",
                     IsWorking = rep.IsWorking,
                     GroupName = rep.GroupName,
+                    TvgId = rep.TvgId,
+                    LogoUrl = rep.LogoUrl,
                 });
             }
 
@@ -1400,6 +1432,9 @@ namespace m3uCrawler.Services.Matching
                 ExistingChannelId = existingChannelId,
                 ChannelGroupName = first.ChannelGroupName,
                 OutputGroup = first.OutputGroup,
+                EpgTvgId = list
+                    .Select(d => d.EpgTvgId)
+                    .FirstOrDefault(v => !string.IsNullOrWhiteSpace(v)),
                 MatchReason = matchReasons.Count == 1
                     ? matchReasons.First()
                     : "merged:" + string.Join("|", matchReasons),
@@ -1432,6 +1467,9 @@ namespace m3uCrawler.Services.Matching
                 ExistingChannelId = null,
                 ChannelGroupName = first.ChannelGroupName,
                 OutputGroup = first.OutputGroup,
+                EpgTvgId = list
+                    .Select(d => d.EpgTvgId)
+                    .FirstOrDefault(v => !string.IsNullOrWhiteSpace(v)),
                 MatchReason = "merged:" + string.Join("|", list.Select(d => d.MatchReason)),
                 MatchScore = 0,
                 Streams = streams,
@@ -1457,6 +1495,8 @@ namespace m3uCrawler.Services.Matching
                     OrderReason = "not-working",
                     IsWorking = false,
                     GroupName = s.Group,
+                    TvgId = CleanOptional(s.OriginalTvgId),
+                    LogoUrl = CleanOptional(s.Original.Logo),
                 };
             }
 
@@ -1471,8 +1511,19 @@ namespace m3uCrawler.Services.Matching
                 OrderReason = "new-channel-initial",
                 IsWorking = true,
                 GroupName = s.Group,
+                TvgId = CleanOptional(s.OriginalTvgId),
+                LogoUrl = CleanOptional(s.Original.Logo),
             };
         }
+
+        /// <summary>
+        /// Normaliza um valor opcional de metadados (tvg-id, logo) para
+        /// <c>null</c> quando vazio/whitespace. Nunca usa
+        /// <see cref="CredentialSanitizer.SanitizeUrl"/>: tvg-id/logo não
+        /// são credenciais e não são representações sanitizadas.
+        /// </summary>
+        private static string? CleanOptional(string? value) =>
+            string.IsNullOrWhiteSpace(value) ? null : value;
 
         private string ResolveIdentity(string? title)
         {

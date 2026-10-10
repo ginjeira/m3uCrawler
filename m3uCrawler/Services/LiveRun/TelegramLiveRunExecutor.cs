@@ -9,9 +9,13 @@ namespace m3uCrawler.Services.LiveRun;
 
 /// <summary>
 /// Resultado da discovery Telegram entregue ao executor: streams
-/// funcionais e o <see cref="RunReport"/> autoritativo.
+/// funcionais, streams adquiridos (playlists funcionais para o país) e o
+/// <see cref="RunReport"/> autoritativo.
 /// </summary>
-public sealed record TelegramDiscoveryResult(List<M3uStream> Streams, RunReport Report);
+public sealed record TelegramDiscoveryResult(
+    List<M3uStream> Streams,
+    RunReport Report,
+    List<M3uStream>? AcquiredStreams = null);
 
 /// <summary>
 /// Executa a discovery Telegram. Na produção é o
@@ -110,6 +114,7 @@ public sealed class TelegramLiveRunExecutor : IRunPipeline, ILiveRunProgressAwar
             new RunPublicationRequest
             {
                 Streams = result.Streams,
+                AcquiredStreams = result.AcquiredStreams,
                 Report = result.Report,
                 Keyword = discovery.Keyword,
                 HistoryHours = discovery.HistoryHours,

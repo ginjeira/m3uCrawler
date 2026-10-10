@@ -102,6 +102,18 @@ namespace m3uCrawler.Models
 
         [JsonPropertyName("outcome")] public SyncOutcome Outcome { get; init; }
         [JsonPropertyName("existingChannelId")] public long? ExistingChannelId { get; init; }
+
+        /// <summary>
+        /// tvg-id EPG do canal canónico, usado para <c>tvg_id</c> na
+        /// criação e no PATCH de canais <c>CrawlerManaged</c>. Resolvido
+        /// a partir do tvg-id curado do canal canónico
+        /// (namespace <c>ExternalIdentityNamespaces.TvgId</c>); quando
+        /// não existe identidade curada cai para o <c>OriginalTvgId</c>
+        /// do stream representativo da fonte. <c>null</c> quando nenhum
+        /// dos dois existe.
+        /// </summary>
+        [JsonPropertyName("epgTvgId")] public string? EpgTvgId { get; init; }
+
         [JsonPropertyName("proposedChannelNumber")] public double? ProposedChannelNumber { get; set; }
         [JsonPropertyName("channelGroupName")] public string? ChannelGroupName { get; init; }
         [JsonPropertyName("matchReason")] public string MatchReason { get; init; } = string.Empty;
@@ -137,6 +149,22 @@ namespace m3uCrawler.Models
         [JsonPropertyName("orderReason")] public string OrderReason { get; init; } = string.Empty;
         [JsonPropertyName("isWorking")] public bool IsWorking { get; init; }
         [JsonPropertyName("groupName")] public string? GroupName { get; init; }
+
+        /// <summary>
+        /// tvg-id EPG transportado da fonte (<see cref="DiscoveredStream.OriginalTvgId"/>).
+        /// Usado para <c>tvg_id</c> na criação/PATCH da stream no
+        /// Dispatcharr. <c>null</c> quando a fonte não fornece tvg-id.
+        /// Não é credencial, logo não é sanitizado.
+        /// </summary>
+        [JsonPropertyName("tvgId")] public string? TvgId { get; init; }
+
+        /// <summary>
+        /// URL do logo transportada da fonte (<c>M3uStream.Logo</c>).
+        /// Usada para <c>logo_url</c> na criação/PATCH da stream no
+        /// Dispatcharr. <c>null</c> quando a fonte não fornece logo.
+        /// Não é credencial, logo não é sanitizado.
+        /// </summary>
+        [JsonPropertyName("logoUrl")] public string? LogoUrl { get; init; }
     }
 
     public sealed class AmbiguousCandidate
@@ -159,6 +187,24 @@ namespace m3uCrawler.Models
         [JsonPropertyName("failed")] public int Failed { get; set; }
         [JsonPropertyName("ambiguousGroups")] public int AmbiguousGroups { get; set; }
         [JsonPropertyName("protectedExternalStreams")] public int ProtectedExternalStreams { get; set; }
+
+        /// <summary>
+        /// Número de canais <c>CrawlerManaged</c> existentes cujo
+        /// <c>tvg_id</c> foi corrigido por PATCH nesta run (o valor no
+        /// Dispatcharr diferia do <see cref="ChannelDecision.EpgTvgId"/>).
+        /// Aditivo: <c>0</c> quando nada foi alterado.
+        /// </summary>
+        [JsonPropertyName("channelTvgIdsPatched")] public int ChannelTvgIdsPatched { get; set; }
+
+        /// <summary>
+        /// Número de escritas de metadados (<c>tvg_id</c> e/ou
+        /// <c>logo_url</c>) aplicadas por PATCH a streams
+        /// <c>CrawlerManaged</c> existentes nesta run. Cada campo
+        /// corrigido conta uma escrita. Aditivo: <c>0</c> quando nada
+        /// foi alterado.
+        /// </summary>
+        [JsonPropertyName("streamMetadataPatched")] public int StreamMetadataPatched { get; set; }
+
         [JsonPropertyName("totalChannels")] public int TotalChannels => Matched + NewChannels + Unchanged + Ambiguous + Failed + Skipped;
 
         /// <summary>

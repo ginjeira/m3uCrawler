@@ -56,6 +56,13 @@ public sealed class DiscoverySettings
     public const string DefaultKeyword = "portugal";
 
     /// <summary>
+    /// Default do fallback canónico na aquisição: aceitar um stream que
+    /// resolve para um canal canónico existente mesmo sem token de país
+    /// no título. Default: <c>true</c>.
+    /// </summary>
+    public const bool DefaultFeedCanonicalFallback = true;
+
+    /// <summary>
     /// Limite superior (Max) da janela de pesquisa Telegram, em horas.
     /// Default: 24.
     /// </summary>
@@ -74,12 +81,23 @@ public sealed class DiscoverySettings
     /// <summary>Termo de pesquisa no Telegram. Default: <c>portugal</c>.</summary>
     public string Keyword { get; set; } = DefaultKeyword;
 
+    /// <summary>
+    /// Fallback canónico na aquisição (default <c>true</c>). Quando activo,
+    /// dentro de uma playlist que passou o filtro de país, um stream que
+    /// não apresenta token de país no título é ainda aceite se resolver
+    /// para um canal canónico existente (<c>canonical_channels.Key</c> ou
+    /// <c>channel_aliases.NormalizedAlias</c>). Nunca auto-cria canais e
+    /// não sobrepõe a negative evidence de prefixo estrangeiro.
+    /// </summary>
+    public bool FeedCanonicalFallback { get; set; } = DefaultFeedCanonicalFallback;
+
     public DiscoverySettings Clone() => new()
     {
         HistoryHours = HistoryHours,
         MinHistoryHours = MinHistoryHours,
         MaxStreams = MaxStreams,
         Keyword = Keyword,
+        FeedCanonicalFallback = FeedCanonicalFallback,
     };
 
     /// <summary>

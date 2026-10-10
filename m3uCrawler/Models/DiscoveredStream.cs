@@ -44,7 +44,15 @@ namespace m3uCrawler.Models
         string? M3uAccountName,
         bool IsCustom,
         bool IsWorking,
-        double? ResponseTimeMs);
+        double? ResponseTimeMs)
+    {
+        /// <summary>
+        /// URL do logo da stream no Dispatcharr (<c>logo_url</c>).
+        /// Aditivo e opcional: <c>null</c> mantém o comportamento
+        /// histórico (sem PATCH de logo). Não é credencial.
+        /// </summary>
+        public string? LogoUrl { get; init; }
+    }
 
     public sealed record DispatcharrChannelGroup(long Id, string Name);
 

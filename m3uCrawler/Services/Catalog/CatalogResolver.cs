@@ -395,6 +395,52 @@ public sealed class CatalogResolver
     }
 
     /// <summary>
+    /// Fallback canónico na aquisição: verifica se uma identidade
+    /// normalizada (produzida por <see cref="ChannelNormalizer.Normalize"/>)
+    /// corresponde a um canal canónico <b>activo</b> existente, por
+    /// <c>canonical_channels.Key</c> (normalizada) ou por
+    /// <c>channel_aliases.NormalizedAlias</c>.
+    ///
+    /// <para>
+    /// Consulta read-only e <b>nunca</b> cria identidade nem canal — é um
+    /// predicado de pertença. Não substitui <see cref="ResolveAsync"/>: o
+    /// pipeline usa-o apenas para aceitar um stream cujo título não tem
+    /// token de país mas resolve para um canal já conhecido.
+    /// </para>
+    /// </summary>
+    public async Task<bool> CanonicalChannelExistsByNormalizedIdentityAsync(
+        string normalizedIdentity, CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(normalizedIdentity))
+        {
+            return false;
+        }
+
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+
+        // canonical_channels.Key (normalizada). A projecção evita carregar
+        // entidades completas; a normalização é feita em memória porque o
+        // índice é sobre a Key crua, não sobre a forma normalizada.
+        var enabledKeys = await context.CanonicalChannels
+            .AsNoTracking()
+            .Where(c => c.IsEnabled)
+            .Select(c => c.Key)
+            .ToListAsync(cancellationToken);
+        if (enabledKeys.Any(k => ChannelNormalizer.Normalize(k) == normalizedIdentity))
+        {
+            return true;
+        }
+
+        // channel_aliases.NormalizedAlias de canais activos.
+        return await context.ChannelAliases
+            .AsNoTracking()
+            .AnyAsync(
+                a => a.NormalizedAlias == normalizedIdentity
+                     && a.CanonicalChannel!.IsEnabled,
+                cancellationToken);
+    }
+
+    /// <summary>
     /// Regista uma <see cref="ExternalIdentityEntity"/> de forma
     /// idempotente: o par canónico (Namespace, Value) é único.
     ///
@@ -831,6 +877,34 @@ public sealed class CatalogResolver
             result[r.DispatcharrStreamId] = r.Ownership;
         }
         return result;
+    }
+
+    /// <summary>
+    /// Devolve o <c>tvg-id</c> curado de um canal canónico (namespace
+    /// <see cref="ExternalIdentityNamespaces.TvgId"/>), na forma
+    /// canónica persistida (<see cref="ExternalIdentityNormalizer"/>).
+    ///
+    /// <para>
+    /// É evidência de identidade externa (passo 1/2 da ordem de
+    /// reconhecimento) e serve de EPG id para o <c>tvg_id</c> publicado
+    /// no Dispatcharr. Quando o canal tem várias identidades no
+    /// namespace <c>tvg-id</c>, devolve a de menor <c>Id</c> (ordem de
+    /// inserção determinística); <c>null</c> quando não existe nenhuma.
+    /// </para>
+    /// </summary>
+    public async Task<string?> GetCanonicalTvgIdAsync(
+        long canonicalChannelId,
+        CancellationToken cancellationToken = default)
+    {
+        if (canonicalChannelId <= 0) return null;
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.ExternalIdentities
+            .AsNoTracking()
+            .Where(e => e.CanonicalChannelId == canonicalChannelId
+                        && e.Namespace == ExternalIdentityNamespaces.TvgId)
+            .OrderBy(e => e.Id)
+            .Select(e => e.Value)
+            .FirstOrDefaultAsync(cancellationToken);
     }
 
     /// <summary>

@@ -22,6 +22,14 @@ public sealed class RunPublicationRequest
 {
     public IReadOnlyList<M3uStream> Streams { get; init; } = Array.Empty<M3uStream>();
 
+    /// <summary>
+    /// W-ACQUIRED (2026-10-10) — streams parseados (todos, não só do país) das
+    /// playlists que foram funcionais para o país neste run. Quando presente e
+    /// não vazio, é materializado em <c>playlist_acquired.m3u</c>. Dedup por
+    /// URL (OrdinalIgnoreCase, primeira ocorrência), igual ao intermédio.
+    /// </summary>
+    public List<M3uStream>? AcquiredStreams { get; init; }
+
     public RunReport Report { get; init; } = new();
 
     public string Keyword { get; init; } = string.Empty;
@@ -95,6 +103,8 @@ public sealed class RunPublicationRequest
 /// intermédio normalizado/deduplicado (<c>playlist_temp.m3u</c>).
 /// <see cref="HistoricalPlaylistPath"/> é o artefacto histórico/técnico
 /// (ex.: <c>telegram_playlist_&lt;timestamp&gt;.m3u</c>).
+/// <see cref="AcquiredPlaylistPath"/> é a playlist de aquisição
+/// (<c>playlist_acquired.m3u</c>), quando foi escrita neste run.
 /// </summary>
 public sealed record RunPublicationResult(
     IReadOnlyList<M3uStream> Published,
@@ -104,7 +114,8 @@ public sealed record RunPublicationResult(
     string RunReportPath,
     DispatcharrSyncOutcome Dispatcharr,
     string IntermediatePlaylistPath,
-    string HistoricalPlaylistPath);
+    string HistoricalPlaylistPath,
+    string? AcquiredPlaylistPath = null);
 
 /// <summary>
 /// Contrato do serviço de publicação única de um ciclo Telegram.
@@ -205,6 +216,18 @@ public sealed class RunPublicationService : IRunPublicationService
         var tempPath = ResolveArtifactPath(request.PlaylistTempFileName, "playlist_temp.m3u");
         await _playlistManager.SaveToM3uPlaylistAtomic(streams, tempPath, generatedAt).ConfigureAwait(false);
 
+        // ---- W-ACQUIRED (2026-10-10) — playlist de aquisição ----
+        // Registra TODOS os streams parseados das playlists funcionais para
+        // o país. Só é escrita quando o request traz streams adquiridos
+        // (não nulo e não vazio); dedup por URL idêntica ao intermédio.
+        string? acquiredPath = null;
+        if (request.AcquiredStreams is { Count: > 0 } acquiredStreams)
+        {
+            var acquired = DeduplicateByUrl(acquiredStreams);
+            acquiredPath = Path.Combine(_outputDir, "playlist_acquired.m3u");
+            await _playlistManager.SaveToM3uPlaylistAtomic(acquired, acquiredPath, generatedAt).ConfigureAwait(false);
+        }
+
         // ---- Filtro de domínio (pré-country gate) ----
         if (!string.IsNullOrWhiteSpace(request.DomainFilter))
         {
@@ -285,6 +308,10 @@ public sealed class RunPublicationService : IRunPublicationService
             Console.WriteLine($"   • Histórico:           {historicalPath}");
             Console.WriteLine($"   • Relatório: {jsonReportPath}");
             Console.WriteLine($"   • Relatório de execução: {runReportPath}");
+            if (acquiredPath is not null)
+            {
+                Console.WriteLine($"   • Playlist de aquisição: {acquiredPath}");
+            }
             Console.WriteLine(
                 $"   • Streams: intermédio={intermediateCount} final={streams.Count} " +
                 $"removidos={intermediateCount - streams.Count}");
@@ -321,7 +348,8 @@ public sealed class RunPublicationService : IRunPublicationService
             RunReportPath: runReportPath,
             Dispatcharr: dispatcharrOutcome,
             IntermediatePlaylistPath: tempPath,
-            HistoricalPlaylistPath: historicalPath);
+            HistoricalPlaylistPath: historicalPath,
+            AcquiredPlaylistPath: acquiredPath);
     }
 
     /// <summary>

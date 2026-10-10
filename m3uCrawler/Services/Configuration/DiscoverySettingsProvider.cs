@@ -24,6 +24,13 @@ public sealed class DiscoverySettingsProvider
     public DiscoverySettings Load() => _store.Load().Discovery;
 
     /// <summary>
+    /// Valor efectivo do fallback canónico na aquisição
+    /// (<see cref="DiscoverySettings.FeedCanonicalFallback"/>). Lido a cada
+    /// execução, tal como os restantes parâmetros de discovery.
+    /// </summary>
+    public bool ResolveFeedCanonicalFallback() => Load().FeedCanonicalFallback;
+
+    /// <summary>
     /// Resolve os valores efectivos para uma execução, aplicando os
     /// overrides explícitos sobre os valores persistidos.
     /// </summary>

@@ -23,6 +23,11 @@ services:
       # Default do binário é 503 web-allow-trigger-disabled; sem esta
       # flag o trigger manual fica inacessível pela Web UI.
       - --web-allow-trigger
+      # Token do dashboard via ambiente (nunca literal aqui): o valor vive
+      # no .env do servidor (M3UCRAWLER_WEB_TOKEN). Se ausente, o compose
+      # substitui por vazio e o dashboard trata como "sem token".
+      - --web-token
+      - ${M3UCRAWLER_WEB_TOKEN}
     ports:
       - "5000:5000"
     volumes:

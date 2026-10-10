@@ -3,7 +3,9 @@ using System.Text;
 using System.Text.RegularExpressions;
 using m3uCrawler.Models;
 using m3uCrawler.Services.Catalog;
+using m3uCrawler.Services.Configuration;
 using m3uCrawler.Services.LiveRun;
+using m3uCrawler.Services.Matching;
 using m3uCrawler.Services.Recognition;
 using m3uCrawler.Services.Telegram;
 using m3uCrawler.Services.Validation;
@@ -330,8 +332,14 @@ namespace m3uCrawler.Services
         }
 
         // Pipeline principal: descobre candidatos, obtém conteúdo, valida país e
-        // testa os streams. Devolve os streams funcionais E o relatório detalhado.
-        public async Task<(List<M3uStream> Working, RunReport Report)> SearchAndTestM3UInTelegramAsync(
+        // testa os streams. Devolve os streams funcionais, os streams
+        // adquiridos (playlists funcionais para o país) e o relatório detalhado.
+        //
+        // `feedCanonicalFallback` (W-FEED): quando activo, dentro de uma
+        // playlist que passou o filtro de país, um stream rejeitado por falta
+        // de token de país é ainda aceite se resolver para um canal canónico
+        // existente. Quando não há resolvedor de catálogo, é no-op.
+        public async Task<(List<M3uStream> Working, List<M3uStream> Acquired, RunReport Report)> SearchAndTestM3UInTelegramAsync(
             string keyword,
             int limit = 200,
             int maxConcurrency = 5,
@@ -344,7 +352,8 @@ namespace m3uCrawler.Services
             string? pipelineSourceKey = null,
             ILiveRunProgress? liveRunProgress = null,
             CancellationToken cancellationToken = default,
-            int minHistoryHours = 0)
+            int minHistoryHours = 0,
+            bool feedCanonicalFallback = DiscoverySettings.DefaultFeedCanonicalFallback)
         {
             var rep = report ?? new RunReport();
             rep.StartedAt = DateTime.UtcNow;
@@ -464,6 +473,13 @@ namespace m3uCrawler.Services
 
             var working = new List<M3uStream>();
             var workingLock = new object();
+            // W-ACQUIRED (2026-10-10): streams parseados das playlists
+            // funcionais para o país (passaram o gate e têm >=1 working).
+            // Dedup por URL (OrdinalIgnoreCase, primeira ocorrência). A lista
+            // e o índice de dedup são partilhados pelos workers.
+            var acquiredStreams = new List<M3uStream>();
+            var acquiredSeen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var acquiredLock = new object();
             var processingDone = new TaskCompletionSource();
 
             // Consumer/worker: le do canal e processa com maxConcurrency.
@@ -504,6 +520,8 @@ namespace m3uCrawler.Services
                                     c, tester, parser, validator, countryCode, rep,
                                     maxUrlsToTest, accountValidator, accountGateCoordinator,
                                     candidateChannel.Writer, working, workingLock,
+                                    acquiredStreams, acquiredSeen, acquiredLock,
+                                    feedCanonicalFallback,
                                     liveRunProgress,
                                     cancellationToken);
                             }
@@ -745,14 +763,14 @@ namespace m3uCrawler.Services
                     LiveRunActivityLevel.Info,
                     $"run completed: {rep.StreamsWorking} working / {rep.StreamsTested} tested / {rep.StreamsSkippedAlreadyValidated} reused-dedup");
             }
-            return (working, rep);
+            return (working, acquiredStreams, rep);
         }
 
         // Wrapper que preserva a assinatura pública anterior (devolve só os streams funcionais).
         public async Task<List<M3uStream>> SearchAndTestM3UInTelegram(
             string keyword, int limit = 200, int maxConcurrency = 5, int maxUrlsToTest = 500, int historyHours = 24)
         {
-            var (working, _) = await SearchAndTestM3UInTelegramAsync(
+            var (working, _, _) = await SearchAndTestM3UInTelegramAsync(
                 keyword, limit, maxConcurrency, maxUrlsToTest, historyHours, "pt", null, null);
             return working;
         }
@@ -775,6 +793,10 @@ namespace m3uCrawler.Services
             System.Threading.Channels.ChannelWriter<CandidatePlaylist> writer,
             List<M3uStream> working,
             object workingLock,
+            List<M3uStream> acquiredStreams,
+            HashSet<string> acquiredSeen,
+            object acquiredLock,
+            bool feedCanonicalFallback,
             ILiveRunProgress? liveRunProgress,
             CancellationToken cancellationToken)
         {
@@ -1066,11 +1088,24 @@ namespace m3uCrawler.Services
             // AnalyzePlaylist actua apenas como fast-reject acima; a aprovacao final
             // dos streams exige que cada um seja individualmente validado contra os
             // aliases do pais. Streams rejeitados aqui nunca chegam a TestStreamsAsync.
-            var (countryStreams, countryRejected) = FilterStreamsByCountry(
-                validator, streams, countryCode);
+            //
+            // W-FEED (2026-10-10): o fallback canónico é aplicado aqui — os
+            // streams rejeitados por falta de token de país que resolvem para
+            // um canal canónico existente são aceites (nunca auto-criando
+            // canais). A ordem do teste físico não muda: continua a ser só
+            // dos streams do país (incluindo os aceites pelo fallback).
+            var (countryStreams, countryRejected, canonicalFallbackCount) =
+                await FilterStreamsByCountryAsync(
+                    validator, streams, countryCode,
+                    _catalogResolver, feedCanonicalFallback, cancellationToken)
+                .ConfigureAwait(false);
             discovered.StreamsAfterCountryFilter = countryStreams.Count;
             Interlocked.Add(ref rep._StreamsAfterCountryFilter, countryStreams.Count);
             Interlocked.Add(ref rep._StreamsRejectedByCountry, countryRejected);
+            if (canonicalFallbackCount > 0)
+            {
+                Interlocked.Add(ref rep._StreamsMatchedViaCanonicalFallback, canonicalFallbackCount);
+            }
 
             if (countryStreams.Count == 0)
             {
@@ -1097,6 +1132,15 @@ namespace m3uCrawler.Services
             {
                 working.AddRange(tested.Where(s => s.IsWorking));
             }
+
+            // W-ACQUIRED (2026-10-10): a playlist é funcional para o país
+            // (passou o gate e tem >=1 stream working). Registam-se TODOS os
+            // streams parseados desta playlist, dedup por URL
+            // (OrdinalIgnoreCase, primeira ocorrência). Playlists sem nenhum
+            // working não contribuem (o return acima cobre count==0).
+            AccumulateAcquiredStreams(
+                acquiredStreams, acquiredSeen, acquiredLock, streams, discovered.WorkingStreams);
+
             // discovered precisa de ser adicionado ao RunReport sob lock
             // (lista partilhada).
             AddDiscovered(rep, discovered);
@@ -2208,6 +2252,108 @@ namespace m3uCrawler.Services
     int rejected = streams.Count - accepted.Count;
     return (accepted, rejected);
 }
+
+        /// <summary>
+        /// W-FEED (2026-10-10) — filtro per-stream com fallback canónico na
+        /// aquisição. Depois de <see cref="CountryChannelValidator.ValidateStreams"/>,
+        /// os streams <b>rejeitados por falta de token de país</b> são ainda
+        /// aceites quando: (a) o setting está ON, (b) existe um
+        /// <see cref="CatalogResolver"/>, (c) o título não tem prefixo
+        /// estrangeiro (negative evidence preservada) e (d) a identidade
+        /// normalizada (<see cref="ChannelNormalizer.Normalize"/>) resolve
+        /// para um canal canónico existente. Nunca auto-cria canais.
+        ///
+        /// <para>
+        /// <see cref="Rejected"/> é o valor pós-fallback, de modo a manter o
+        /// invariante <c>Rejected == streams.Count - Accepted.Count</c>.
+        /// <see cref="MatchedViaCanonicalFallback"/> conta apenas os aceites
+        /// por este caminho (subconjunto de <see cref="Accepted"/>).
+        /// </para>
+        /// </summary>
+        internal static async Task<(List<M3uStream> Accepted, int Rejected, int MatchedViaCanonicalFallback)>
+            FilterStreamsByCountryAsync(
+                CountryChannelValidator validator,
+                List<M3uStream> streams,
+                string countryCode,
+                CatalogResolver? catalogResolver,
+                bool feedCanonicalFallback,
+                CancellationToken cancellationToken = default)
+        {
+            var matches = validator.ValidateStreams(streams, countryCode);
+            var accepted = matches.Select(m => m.Stream).ToList();
+            var matched = new HashSet<M3uStream>(accepted, ReferenceEqualityComparer.Instance);
+            int matchedViaFallback = 0;
+
+            if (feedCanonicalFallback && catalogResolver is not null)
+            {
+                foreach (var stream in streams)
+                {
+                    if (matched.Contains(stream))
+                    {
+                        continue;
+                    }
+
+                    // Negative evidence (Opção C): um título com prefixo de
+                    // país estrangeiro continua rejeitado, mesmo que resolva
+                    // para um canal canónico.
+                    if (CountryChannelValidator.HasForeignCountryPrefix(stream.Title, countryCode))
+                    {
+                        continue;
+                    }
+
+                    var normalized = ChannelNormalizer.Normalize(stream.Title);
+                    if (string.IsNullOrWhiteSpace(normalized))
+                    {
+                        continue;
+                    }
+
+                    if (await catalogResolver
+                        .CanonicalChannelExistsByNormalizedIdentityAsync(normalized, cancellationToken)
+                        .ConfigureAwait(false))
+                    {
+                        accepted.Add(stream);
+                        matched.Add(stream);
+                        matchedViaFallback++;
+                    }
+                }
+            }
+
+            int rejected = streams.Count - accepted.Count;
+            return (accepted, rejected, matchedViaFallback);
+        }
+
+        /// <summary>
+        /// W-ACQUIRED (2026-10-10) — acumula, por run, os streams parseados
+        /// de uma playlist <b>funcional para o país</b> na lista de aquisição.
+        /// Só contribui quando <paramref name="workingStreams"/> &gt; 0 (a
+        /// playlist passou o gate e tem pelo menos um stream a funcionar).
+        /// Dedup por URL (<see cref="StringComparer.OrdinalIgnoreCase"/>),
+        /// mantendo a primeira ocorrência. Thread-safe (lock interno), porque
+        /// os candidate workers correm em paralelo.
+        /// </summary>
+        internal static void AccumulateAcquiredStreams(
+            List<M3uStream> acquiredStreams,
+            HashSet<string> acquiredSeen,
+            object gate,
+            IReadOnlyList<M3uStream> parsedStreams,
+            int workingStreams)
+        {
+            if (workingStreams <= 0)
+            {
+                return;
+            }
+
+            lock (gate)
+            {
+                foreach (var parsed in parsedStreams)
+                {
+                    if (acquiredSeen.Add(parsed.Url))
+                    {
+                        acquiredStreams.Add(parsed);
+                    }
+                }
+            }
+        }
 
         /// <summary>
         /// W-DEDUP (2026-10-01): acumula contadores de validacao fisica a

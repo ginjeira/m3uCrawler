@@ -10,6 +10,20 @@ namespace m3uCrawler.Services.Dispatcharr
         Task<IReadOnlyList<DispatcharrStream>> ListAsync(CancellationToken ct);
         Task<long> CreateAsync(NewStreamRequest request, CancellationToken ct);
         Task DeleteAsync(long streamId, CancellationToken ct);
+
+        /// <summary>
+        /// Actualiza o <c>tvg_id</c> de uma stream existente
+        /// (<c>PATCH /api/channels/streams/{id}/</c>). Só CrawlerManaged.
+        /// Não é credencial, logo não é sanitizado.
+        /// </summary>
+        Task UpdateTvgIdAsync(long streamId, string? tvgId, CancellationToken ct);
+
+        /// <summary>
+        /// Actualiza o <c>logo_url</c> de uma stream existente
+        /// (<c>PATCH /api/channels/streams/{id}/</c>). Só CrawlerManaged.
+        /// Não é credencial, logo não é sanitizado.
+        /// </summary>
+        Task UpdateLogoAsync(long streamId, string? logoUrl, CancellationToken ct);
     }
 
     public sealed class DispatcharrStreamClient : IDispatcharrStreamClient
@@ -49,6 +63,22 @@ namespace m3uCrawler.Services.Dispatcharr
             if (!resp.IsSuccessStatusCode && resp.StatusCode != System.Net.HttpStatusCode.NotFound)
                 throw await DispatcharrErrorHelper.ToExceptionAsync(resp, $"/api/channels/streams/{streamId}/", HttpMethod.Delete, "delete-failed", ct);
         }
+
+        public async Task UpdateTvgIdAsync(long streamId, string? tvgId, CancellationToken ct)
+        {
+            using var resp = await _http.PatchAsync($"/api/channels/streams/{streamId}/",
+                JsonContent.Create(new { tvg_id = tvgId }), ct);
+            if (!resp.IsSuccessStatusCode)
+                throw await DispatcharrErrorHelper.ToExceptionAsync(resp, $"/api/channels/streams/{streamId}/", HttpMethod.Patch, "tvg-id-update-failed", ct);
+        }
+
+        public async Task UpdateLogoAsync(long streamId, string? logoUrl, CancellationToken ct)
+        {
+            using var resp = await _http.PatchAsync($"/api/channels/streams/{streamId}/",
+                JsonContent.Create(new { logo_url = logoUrl }), ct);
+            if (!resp.IsSuccessStatusCode)
+                throw await DispatcharrErrorHelper.ToExceptionAsync(resp, $"/api/channels/streams/{streamId}/", HttpMethod.Patch, "logo-update-failed", ct);
+        }
     }
 
     public sealed class NewStreamRequest
@@ -81,6 +111,7 @@ namespace m3uCrawler.Services.Dispatcharr
         [JsonPropertyName("name")] public string Name { get; set; } = string.Empty;
         [JsonPropertyName("url")] public string? Url { get; set; }
         [JsonPropertyName("tvg_id")] public string? TvgId { get; set; }
+        [JsonPropertyName("logo_url")] public string? LogoUrl { get; set; }
         [JsonPropertyName("channel_group")] public long? ChannelGroupId { get; set; }
         [JsonPropertyName("m3u_account")] public long? M3uAccountId { get; set; }
         [JsonPropertyName("m3u_account_name")] public string? M3uAccountName { get; set; }
@@ -95,6 +126,9 @@ namespace m3uCrawler.Services.Dispatcharr
             M3uAccountName: dto.M3uAccountName,
             IsCustom: dto.IsCustom,
             IsWorking: true,
-            ResponseTimeMs: null);
+            ResponseTimeMs: null)
+        {
+            LogoUrl = dto.LogoUrl,
+        };
     }
 }

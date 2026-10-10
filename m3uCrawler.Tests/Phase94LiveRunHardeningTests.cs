@@ -78,6 +78,9 @@ public class Phase94LiveRunHardeningTests : IAsyncLifetime
         "StreamsAfterCountryFilter",
         "StreamsExtracted",
         "StreamsFailed",
+        // W-FEED (2026-10-10) — extensão intencional do contrato: contador
+        // aditivo dos streams aceites via fallback canónico na aquisição.
+        "StreamsMatchedViaCanonicalFallback",
         "StreamsRejectedByCountry",
         // W-DEDUP (2026-10-01) — extensão intencional do contrato: contador
         // aditivo. StreamsTested passa a contar apenas validações FÍSICAS;
@@ -154,7 +157,8 @@ public class Phase94LiveRunHardeningTests : IAsyncLifetime
             .ToArray();
 
         // W-DEDUP (2026-10-01): 60 -> 61 (contador aditivo StreamsSkippedAlreadyValidated).
-        Assert.Equal(61, actual.Length);
+        // W-FEED (2026-10-10): 61 -> 62 (contador aditivo StreamsMatchedViaCanonicalFallback).
+        Assert.Equal(62, actual.Length);
         Assert.Equal(expected, actual);
     }
 

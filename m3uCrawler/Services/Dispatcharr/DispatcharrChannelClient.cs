@@ -20,6 +20,15 @@ namespace m3uCrawler.Services.Dispatcharr
         /// </summary>
         Task UpdateNameAsync(long channelId, string name, CancellationToken ct);
 
+        /// <summary>
+        /// Actualiza o <c>tvg_id</c> (EPG) de um canal existente via
+        /// PATCH parcial em <c>/api/channels/channels/{id}/</c>. Só deve
+        /// ser usado em canais CrawlerManaged; canais External/read-only
+        /// recusam a escrita do lado do Dispatcharr. <paramref name="tvgId"/>
+        /// não é credencial, logo não é sanitizado.
+        /// </summary>
+        Task UpdateTvgIdAsync(long channelId, string? tvgId, CancellationToken ct);
+
         Task<IReadOnlyList<long>> ListStreamIdsAsync(long channelId, CancellationToken ct);
     }
 
@@ -68,6 +77,14 @@ namespace m3uCrawler.Services.Dispatcharr
                 JsonContent.Create(new { name }), ct);
             if (!resp.IsSuccessStatusCode)
                 throw await DispatcharrErrorHelper.ToExceptionAsync(resp, $"/api/channels/channels/{channelId}/", HttpMethod.Patch, "rename-failed", ct);
+        }
+
+        public async Task UpdateTvgIdAsync(long channelId, string? tvgId, CancellationToken ct)
+        {
+            using var resp = await _http.PatchAsync($"/api/channels/channels/{channelId}/",
+                JsonContent.Create(new { tvg_id = tvgId }), ct);
+            if (!resp.IsSuccessStatusCode)
+                throw await DispatcharrErrorHelper.ToExceptionAsync(resp, $"/api/channels/channels/{channelId}/", HttpMethod.Patch, "tvg-id-update-failed", ct);
         }
 
         public async Task<IReadOnlyList<long>> ListStreamIdsAsync(long channelId, CancellationToken ct)

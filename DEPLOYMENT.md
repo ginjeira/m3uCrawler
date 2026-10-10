@@ -92,6 +92,9 @@ Notas:
 - **`restart: unless-stopped`** mantém o ciclo de manutenção a correr após reboot do host.
 - **`command`** é a forma long-form do mesmo comando que era passado ao `docker run` manual, **incluindo** `--history-hours 360`.
 - **`volumes`** usa caminhos absolutos no host (não `./m3uCrawler/runtime-data`). Isto torna o `docker-compose.yml` independente do CWD.
+- **`--web-token ${M3UCRAWLER_WEB_TOKEN}`** vem do ambiente. Define o segredo no ficheiro **`.env`** ao lado do `docker-compose.yml` no servidor (`M3UCRAWLER_WEB_TOKEN=<token>`); o `.env` é ignorado pelo git e **nunca** deve ser versionado. Se a variável não existir, o compose substitui-a por vazio e o dashboard arranca **sem token** (aberto — não é uma falha de arranque).
+
+Com o token definido, o acesso directo às playlists por URL passa a ser `http://<host>:5000/api/playlist?token=<T>`; o mesmo padrão (`?token=<T>` ou `Authorization: Bearer <T>`) aplica-se a `http://<host>:5000/api/playlist_acquired`, bem como ao resto das APIs.
 
 ---
 
@@ -280,6 +283,35 @@ docker inspect --format '{{.Image}}' m3ucrawler
 Compare o digest com `git rev-parse origin/main` — espera-se que a imagem tenha sido publicada nas últimas horas a partir desse commit. Se a imagem parecer muito antiga em relação ao commit, verificar os GitHub Actions de `docker-ghcr.yml` no commit correspondente antes de continuar (ver § 10).
 
 **Migrações no arranque.** A BD de catálogo (`/data/channel-catalog.db`) é migrada idempotentemente no arranque; havendo migrações pendentes, é criada primeiro uma cópia `.pre-migration-<ts>.db` ao lado da BD. Duas notas accionáveis para esta wave: a migração `AddScheduledJobDiscovery` (DC-9) é puramente aditiva (coluna nullable, sem acção); a migração `AddUniqueOrderingListCountry` (DC-11a) cria o índice parcial único `IX_ordering_lists_Country` (`Country` não nulo, colação NOCASE) e **faz falhar o arranque** se a BD tiver **duas Ordering Lists com o mesmo `Country`** (ex.: `PT` e `pt`). Nesse caso, restaurar o backup `.pre-migration-*` e corrigir o duplicado antes de voltar a subir. Ver `CHANGELOG.md` [Unreleased].
+
+### 8.1 Importar os `tvg-id` a partir de uma EPG (opcional)
+
+Depois de o catálogo canónico estar populado, dá-se aos canais o `tvg_id` da EPG
+para o Dispatcharr casar a grelha (e trazer logos). O comando é one-shot, escreve
+**apenas no catálogo** (sem HTTP de escrita no Dispatcharr) e é idempotente. Usa o
+`entrypoint` da imagem (o `command:` do compose é substituído pelos argumentos):
+
+```bash
+# A partir de uma URL (aceita .xml ou .xml.gz; gzip detetado por extensão/magic):
+docker compose run --rm m3ucrawler \
+  --import-epg-tvg-ids 'https://exemplo.pt/epg.xml.gz' --epg-country pt
+
+# A partir de um ficheiro colocado no bind mount (dentro do contentor: /data):
+docker compose run --rm m3ucrawler \
+  --import-epg-tvg-ids /data/epg.xml.gz
+
+# Se correres o binário fora do Docker (o catálogo é o mesmo SQLite):
+dotnet /app/m3uCrawler.dll --import-epg-tvg-ids /data/epg.xml.gz --catalog-db /data/channel-catalog.db
+```
+
+- O `--epg-country` é opcional (default: o país activo de `--country`, senão `pt`).
+- O comando imprime o sumário (mapeados / não casados / ambíguos / incertos e
+  criadas / inalteradas / conflitos) e sai com código `0`; catálogo indisponível
+  ou erros de rede/parse devolvem código ≠ `0`.
+- Uma segunda execução não adiciona nada e **nunca sobrepõe** uma associação já
+  existente (um conflito é reportado e ignorado). Ver
+  `m3uCrawler/README.md` § "Importação de tvg-id a partir de EPG" para a
+  estratégia de matching e a ressalva de case.
 
 ---
 

@@ -117,6 +117,7 @@ namespace m3uCrawler.Services.Sync
                 ExistingChannelId = c.ExistingChannelId,
                 ProposedChannelNumber = c.ProposedChannelNumber,
                 ChannelGroupName = c.ChannelGroupName,
+                EpgTvgId = c.EpgTvgId,
                 MatchReason = c.MatchReason,
                 MatchScore = c.MatchScore,
                 Streams = c.Streams.Select(SanitizeStream).ToList(),
@@ -139,6 +140,8 @@ namespace m3uCrawler.Services.Sync
                 OrderReason = s.OrderReason,
                 IsWorking = s.IsWorking,
                 GroupName = s.GroupName,
+                TvgId = s.TvgId,
+                LogoUrl = s.LogoUrl,
             };
         }
     }

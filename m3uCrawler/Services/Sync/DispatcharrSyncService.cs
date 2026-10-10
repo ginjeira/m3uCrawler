@@ -42,6 +42,20 @@ namespace m3uCrawler.Services.Sync
             public int StreamAssociations { get; set; }
             public int StreamsRemoved { get; set; }
             public int StreamsProtected { get; set; }
+
+            /// <summary>
+            /// Parte A — canais <c>CrawlerManaged</c> existentes cujo
+            /// <c>tvg_id</c> foi corrigido por PATCH nesta run.
+            /// </summary>
+            public int ChannelsTvgIdPatched { get; set; }
+
+            /// <summary>
+            /// Parte A — escritas de metadados (<c>tvg_id</c> e/ou
+            /// <c>logo_url</c>) aplicadas por PATCH a streams
+            /// <c>CrawlerManaged</c> existentes nesta run.
+            /// </summary>
+            public int StreamsMetadataPatched { get; set; }
+
             public int ChannelsFailed { get; set; }
             public List<string> Errors { get; } = new();
         }
@@ -281,6 +295,19 @@ namespace m3uCrawler.Services.Sync
                         runId, "apply-protected", applyStartedAt, applyFinishedAt,
                         itemsProcessed: recorder.StreamsProtected,
                         itemsSucceeded: recorder.StreamsProtected, itemsFailed: 0, result: "ok");
+
+                    // Parte A — evidência das correcções de metadados EPG
+                    // (tvg_id do canal + tvg_id/logo_url das streams) nos
+                    // canais/streams CrawlerManaged existentes.
+                    var metadataPatched = recorder.ChannelsTvgIdPatched + recorder.StreamsMetadataPatched;
+                    await RecordSyncRunStepSafeAsync(
+                        runId, "apply-metadata", applyStartedAt, applyFinishedAt,
+                        itemsProcessed: metadataPatched,
+                        itemsSucceeded: metadataPatched, itemsFailed: 0, result: "ok");
+
+                    preReport.Counts.ChannelTvgIdsPatched = recorder.ChannelsTvgIdPatched;
+                    preReport.Counts.StreamMetadataPatched = recorder.StreamsMetadataPatched;
+
                     if (recorder.ChannelsFailed > 0)
                     {
                         await RecordSyncRunStepSafeAsync(
@@ -307,6 +334,8 @@ namespace m3uCrawler.Services.Sync
                 Console.WriteLine($"   • New channels:    {finalReport.Counts.NewChannels}");
                 Console.WriteLine($"   • New streams:     {finalReport.Counts.NewStreams}");
                 Console.WriteLine($"   • Removed streams: {finalReport.Counts.RemovedStreams}");
+                Console.WriteLine($"   • tvg_id patched:  {finalReport.Counts.ChannelTvgIdsPatched}");
+                Console.WriteLine($"   • stream metadata: {finalReport.Counts.StreamMetadataPatched}");
                 Console.WriteLine($"   • Skipped:         {finalReport.Counts.Skipped}");
                 Console.WriteLine($"   • Ambiguous:       {finalReport.Counts.Ambiguous}");
                 Console.WriteLine($"   • Unchanged:       {finalReport.Counts.Unchanged}");
@@ -480,6 +509,25 @@ namespace m3uCrawler.Services.Sync
                 channelOwnershipById = await _catalog.GetChannelOwnershipMapAsync(existingChannelIds, ct);
             }
 
+            // Parte A — ownership de streams existentes, para só corrigir
+            // tvg_id/logo_url de streams comprovadamente CrawlerManaged.
+            // Sem catalog (legacy), o mapa fica vazio e o fallback trata
+            // as streams como CrawlerManaged (mesmo comportamento
+            // histórico do DELETE de Phase 4).
+            IReadOnlyDictionary<long, StreamOwnership> streamOwnershipById =
+                new Dictionary<long, StreamOwnership>();
+            if (_catalog != null)
+            {
+                var existingStreamIds = plan.Channels
+                    .SelectMany(c => c.Streams)
+                    .Where(s => s.ExistingStreamId.HasValue)
+                    .Select(s => s.ExistingStreamId!.Value)
+                    .Distinct()
+                    .ToList();
+                if (existingStreamIds.Count > 0)
+                    streamOwnershipById = await _catalog.GetStreamOwnershipMapAsync(existingStreamIds, ct);
+            }
+
             // Cross-channel stream ownership:
             //
             // Dispatcharr's data model is M2M (Channel.streams ↔ Stream), but DELETE on a
@@ -530,7 +578,8 @@ namespace m3uCrawler.Services.Sync
                     effectiveStreams: selection == null ? null : effectiveStreams,
                     selectionFiltered: selection != null,
                     failed: failed,
-                    recorder: recorder);
+                    recorder: recorder,
+                    streamOwnershipById: streamOwnershipById);
 
                 // PHASE W6b-2 — evidência por canal para os SyncRunStep.
                 if (recorder != null)
@@ -870,9 +919,11 @@ namespace m3uCrawler.Services.Sync
             IReadOnlyList<StreamMatchDecision>? effectiveStreams = null,
             bool selectionFiltered = false,
             List<FailedReportEntry>? failed = null,
-            DispatcharrApplyRecorder? recorder = null)
+            DispatcharrApplyRecorder? recorder = null,
+            IReadOnlyDictionary<long, StreamOwnership>? streamOwnershipById = null)
         {
             channelOwnershipById ??= new Dictionary<long, ChannelOwnership>();
+            streamOwnershipById ??= new Dictionary<long, StreamOwnership>();
             var streams = effectiveStreams ?? channel.Streams;
             var ctx = new ChannelApplyContext { GroupByName = groupByName };
 
@@ -917,6 +968,8 @@ namespace m3uCrawler.Services.Sync
                         Url = s.StreamUrl,
                         ChannelGroupId = groupId,
                         IsCustom = true,
+                        TvgId = CleanOptional(s.TvgId),
+                        LogoUrl = CleanOptional(s.LogoUrl),
                     }, ct);
                     ctx.NewStreamIds[s.StreamUrl] = newId;
                     if (recorder != null) recorder.StreamsCreated++;
@@ -975,6 +1028,7 @@ namespace m3uCrawler.Services.Sync
                         Name = channel.CanonicalName,
                         ChannelGroupId = groupId,
                         ChannelNumber = channelNumber,
+                        TvgId = CleanOptional(channel.EpgTvgId),
                         Streams = ctx.AllStreamIds.ToList(),
                     }, ct);
                     ctx.CreatedChannelId = createdId;
@@ -1015,6 +1069,65 @@ namespace m3uCrawler.Services.Sync
                             && !string.Equals(currentChannel.Name, channel.CanonicalName, StringComparison.Ordinal))
                         {
                             await _channels.UpdateNameAsync(channel.ExistingChannelId.Value, channel.CanonicalName, ct);
+                        }
+                    }
+
+                    // Parte A — corrige o tvg_id do canal existente quando
+                    // é comprovadamente CrawlerManaged e o valor actual
+                    // difere do EpgTvgId. External/Unknown nunca é tocado.
+                    // Um EpgTvgId nulo não limpa o valor existente (não se
+                    // destrói um tvg-id curado por ausência de evidência).
+                    if (channel.ExistingChannelId.HasValue
+                        && channelOwnershipById.TryGetValue(channel.ExistingChannelId.Value, out var tvgOwnership)
+                        && tvgOwnership == ChannelOwnership.CrawlerManaged)
+                    {
+                        var targetChannelTvgId = CleanOptional(channel.EpgTvgId);
+                        if (targetChannelTvgId != null)
+                        {
+                            var currentChannelForTvg = existing.Channels
+                                .FirstOrDefault(c => c.Id == channel.ExistingChannelId.Value);
+                            if (currentChannelForTvg != null
+                                && !string.Equals(currentChannelForTvg.TvgId, targetChannelTvgId, StringComparison.Ordinal))
+                            {
+                                await _channels.UpdateTvgIdAsync(channel.ExistingChannelId.Value, targetChannelTvgId, ct);
+                                if (recorder != null) recorder.ChannelsTvgIdPatched++;
+                            }
+                        }
+                    }
+
+                    // Parte A — corrige tvg_id/logo_url das streams
+                    // existentes quando são comprovadamente CrawlerManaged e
+                    // o valor actual difere da fonte. External/Unknown e
+                    // streams sem registo (com catálogo) nunca são tocadas.
+                    foreach (var s in orderedWorking)
+                    {
+                        if (!s.ExistingStreamId.HasValue) continue;
+                        var targetTvgId = CleanOptional(s.TvgId);
+                        var targetLogoUrl = CleanOptional(s.LogoUrl);
+                        if (targetTvgId == null && targetLogoUrl == null) continue;
+
+                        var streamOwnership = _catalog != null
+                            ? (streamOwnershipById.TryGetValue(s.ExistingStreamId.Value, out var own)
+                                ? own
+                                : StreamOwnership.Unknown)
+                            : StreamOwnership.CrawlerManaged;
+                        if (streamOwnership != StreamOwnership.CrawlerManaged) continue;
+
+                        var existingStream = existing.Streams
+                            .FirstOrDefault(x => x.Id == s.ExistingStreamId.Value);
+                        if (existingStream == null) continue;
+
+                        if (targetTvgId != null
+                            && !string.Equals(existingStream.TvgId, targetTvgId, StringComparison.Ordinal))
+                        {
+                            await _streams.UpdateTvgIdAsync(s.ExistingStreamId.Value, targetTvgId, ct);
+                            if (recorder != null) recorder.StreamsMetadataPatched++;
+                        }
+                        if (targetLogoUrl != null
+                            && !string.Equals(existingStream.LogoUrl, targetLogoUrl, StringComparison.Ordinal))
+                        {
+                            await _streams.UpdateLogoAsync(s.ExistingStreamId.Value, targetLogoUrl, ct);
+                            if (recorder != null) recorder.StreamsMetadataPatched++;
                         }
                     }
 
@@ -1196,6 +1309,15 @@ namespace m3uCrawler.Services.Sync
             var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             return dict;
         }
+
+        /// <summary>
+        /// Normaliza um valor opcional de metadados (tvg-id, logo) para
+        /// <c>null</c> quando vazio/whitespace. Nunca usa
+        /// <see cref="CredentialSanitizer.SanitizeUrl"/>: tvg-id/logo não
+        /// são credenciais.
+        /// </summary>
+        private static string? CleanOptional(string? value) =>
+            string.IsNullOrWhiteSpace(value) ? null : value;
 
         private sealed class ReportBuilder
         {
