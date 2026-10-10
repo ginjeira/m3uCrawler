@@ -77,6 +77,35 @@ public class WebDashboardServiceTests
         Assert.False(WebDashboardService.IsAuthorized(null, xtreamPassword, "dashboardToken"));
     }
 
+    // ---- IsMachinePlaylistPath (lógica pura) ----
+
+    [Theory]
+    [InlineData("/api/playlist")]
+    [InlineData("/api/playlist_temp")]
+    [InlineData("/api/playlist_acquired")]
+    [InlineData("/API/PLAYLIST")]
+    [InlineData("/Api/Playlist_Temp")]
+    public void IsMachinePlaylistPath_true_only_for_full_playlists(string path)
+    {
+        Assert.True(WebDashboardService.IsMachinePlaylistPath(path));
+    }
+
+    [Theory]
+    [InlineData("/")]
+    [InlineData("/next")]
+    [InlineData("/api/countries")]
+    [InlineData("/api/history")]
+    [InlineData("/api/playlist/preview")]
+    [InlineData("/api/playlist_temp/preview")]
+    [InlineData("/api/playlist_acquired/preview")]
+    [InlineData("/api/playlist/extra")]
+    [InlineData("/api/playlist_tempX")]
+    [InlineData("")]
+    public void IsMachinePlaylistPath_false_for_non_playlist_paths(string path)
+    {
+        Assert.False(WebDashboardService.IsMachinePlaylistPath(path));
+    }
+
     // ---- Contrato JSON dos endpoints do dashboard ----
     //
     // O JavaScript inlined em WebDashboardService.BuildHtmlPage() lê os campos em

@@ -282,7 +282,7 @@ namespace m3uCrawler.Services
                 Console.WriteLine($"🌐 Dashboard iniciado em {prefix}");
                 if (!string.IsNullOrWhiteSpace(webToken))
                 {
-                    Console.WriteLine($"🔐 Dashboard protegido por token partilhado (Authorization: Bearer <token> ou ?token=).");
+                    Console.WriteLine($"🔐 Playlists de máquina protegidas por token partilhado (Authorization: Bearer <token> ou ?token=). O dashboard mantém autenticação por utilizador/password.");
                 }
             }
             catch (Exception ex)
@@ -598,34 +598,22 @@ namespace m3uCrawler.Services
             try
             {
 
-            // Protecção opcional por token partilhado: se --web-token foi configurado,
-            // todos os endpoints exigem o token via header Authorization: Bearer
-            // ou query ?token=. Se não configurado, mantém-se o comportamento aberto
-            // (compatibilidade com deployments locais).
+            // Protecção opcional por token partilhado (--web-token): a credencial
+            // de MÁQUINA autoriza APENAS os endpoints de playlist completos
+            // (/api/playlist, /api/playlist_temp, /api/playlist_acquired) — ver
+            // IsMachinePlaylistPath. Fora desses endpoints o token é ignorado e
+            // aplica-se o fluxo normal do dashboard (bootstrap/login/sessão+CSRF);
+            // um token ausente ou inválido NÃO bloqueia globalmente o dashboard.
+            // Se não configurado, mantém-se o comportamento aberto (compatibilidade
+            // com deployments locais).
             //
-            // PHASE 9C.2 (B1) — O token é uma credencial de MÁQUINA. Quando válido,
-            // autoriza o pedido sem exigir sessão humana, incluindo em READY + admin
-            // (UserAuth). É distinto da autenticação humana e não cria utilizador
-            // nem sessão.
+            // PHASE 9C.2 (B1) — O token é uma credencial de MÁQUINA. Quando válido
+            // e o pedido é a uma playlist, autoriza o pedido sem exigir sessão
+            // humana, incluindo em READY + admin (UserAuth). É distinto da
+            // autenticação humana e não cria utilizador nem sessão.
             var tokenAuthorization = EvaluateTokenAuthorization(context.Request, webToken);
-            if (tokenAuthorization == TokenAuthorization.Rejected)
-            {
-                if (IsReviewApiPath(requestPath))
-                {
-                    // W5.5 (B2) — as novas Review APIs usam o envelope
-                    // {error,message,correlationId} também nos 401 do gate.
-                    await WriteReviewApiErrorAsync(
-                        context.Response, HttpStatusCode.Unauthorized,
-                        "authentication-required", "Autenticação necessária.",
-                        NewReviewCorrelationId());
-                }
-                else
-                {
-                    await WriteUnauthorizedAsync(context.Response);
-                }
-                return;
-            }
-            var machineAuthorized = tokenAuthorization == TokenAuthorization.Authorized;
+            var machineAuthorized = tokenAuthorization == TokenAuthorization.Authorized
+                && IsMachinePlaylistPath(requestPath);
 
             // === PHASE 9C.2 — Authentication / bootstrap ===
             // Gate único, avaliado antes de qualquer rota não pública.
@@ -11741,6 +11729,20 @@ const rows = Object.entries(inv).map(([k, v]) => {
         }
 
         /// <summary>
+        /// PHASE 9C.2 (B1) — Endpoint de playlist completa de máquina. O
+        /// <c>--web-token</c> autoriza apenas estes endpoints (acesso de
+        /// automação), com comparação exacta e <see cref="StringComparison.OrdinalIgnoreCase"/>.
+        /// Os endpoints de pré-visualização (<c>*/preview</c>) NÃO são
+        /// autorizáveis por token — continuam no fluxo de sessão humana.
+        /// </summary>
+        internal static bool IsMachinePlaylistPath(string requestPath)
+        {
+            return requestPath.Equals("/api/playlist", StringComparison.OrdinalIgnoreCase)
+                || requestPath.Equals("/api/playlist_temp", StringComparison.OrdinalIgnoreCase)
+                || requestPath.Equals("/api/playlist_acquired", StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
         /// Resultado da avaliação do token partilhado de máquina
         /// (<c>--web-token</c>).
         /// </summary>
@@ -13519,13 +13521,6 @@ fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
                 response,
                 new { error = "method-not-allowed" },
                 HttpStatusCode.MethodNotAllowed);
-        }
-
-        private static async Task WriteUnauthorizedAsync(HttpListenerResponse response)
-        {
-            response.StatusCode = (int)HttpStatusCode.Unauthorized;
-            response.Headers["WWW-Authenticate"] = "Bearer realm=\"m3uCrawler\"";
-            await WriteTextAsync(response, "Não autorizado. Forneça o token via 'Authorization: Bearer <token>' ou '?token=<token>'.", HttpStatusCode.Unauthorized);
         }
     }
 }

@@ -25,7 +25,8 @@ namespace m3uCrawler.Tests;
 /// Cobre:</para>
 /// <list type="bullet">
 ///   <item>GET em Bootstrap (não-standalone), Legacy (READY sem admin),
-///         UserAuth (com/sem sessão), machine (<c>--web-token</c>).</item>
+///         UserAuth (com/sem sessão). O <c>--web-token</c> autoriza apenas as
+///         playlists de máquina — é ignorado nestes endpoints.</item>
 ///   <item>POST nas mesmas condições, incluindo gate CSRF.</item>
 ///   <item>Contratos: 200/202/401/403/409/503 <c>pipeline-not-configured</c>
 ///         e 503 <c>web-allow-trigger-disabled</c>.</item>
@@ -188,17 +189,17 @@ public class Phase94LiveRunApiTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task Get_status_bootstrap_with_machine_token_returns_503()
+    public async Task Get_status_bootstrap_with_machine_token_is_ignored_returns_403()
     {
-        // Em bootstrap, machine token passa o gate; sem host configurado
-        // o handler responde 503 pipeline-not-configured.
+        // O token de máquina já não passa o gate global: em bootstrap o
+        // handler dos runs continua bloqueado (403 bootstrap-required).
         const string token = "bootstrap-machine-token";
         var harness = StartHarness(null, webAllowTrigger: false, webToken: token);
         var request = new HttpRequestMessage(HttpMethod.Get, "/api/run/status");
         request.Headers.Add("Authorization", $"Bearer {token}");
         var response = await harness.Client.SendAsync(request);
-        Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
-        Assert.Contains("pipeline-not-configured", await response.Content.ReadAsStringAsync());
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+        Assert.Contains("bootstrap-required", await response.Content.ReadAsStringAsync());
     }
 
     [Fact]
@@ -244,34 +245,34 @@ public class Phase94LiveRunApiTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task Get_status_machine_token_authorizes_when_no_user_session()
+    public async Task Get_status_machine_token_is_ignored_in_user_auth_returns_401()
     {
+        // O token de máquina autoriza apenas as playlists: em UserAuth, sem
+        // sessão, não dá acesso aos endpoints dos runs.
         const string token = "machine-liverun-token";
         var host = await BuildHostAsync(executor: _ => IdlePipeline());
         var harness = StartHarness(host, webAllowTrigger: true, webToken: token);
+        await ReachReadyAndLoginAsync(harness);
 
+        // Client novo, sem cookies de sessão, apresenta o token de máquina.
+        using var fresh = new HttpClient { BaseAddress = new Uri($"http://127.0.0.1:{harness.Port}") };
         var request = new HttpRequestMessage(HttpMethod.Get, "/api/run/status");
         request.Headers.Add("Authorization", $"Bearer {token}");
-        var response = await harness.Client.SendAsync(request);
-        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
-        Assert.True(doc.RootElement.GetProperty("webAllowTrigger").GetBoolean());
+        var response = await fresh.SendAsync(request);
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
     }
 
     [Fact]
     public async Task Get_status_reflects_web_allow_trigger_false()
     {
-        // W-PRE-FIRST-E2E: complementar Get_status_machine_token_authorizes_when_no_user_session
-        // (que valida o caminho true). Garante que o snapshot reflecte
-        // fielmente o estado da flag, para que o UI possa apresentar o
-        // diagnóstico accionável quando o admin não passou a flag.
-        const string token = "machine-liverun-trigger-off-token";
+        // W-PRE-FIRST-E2E: o snapshot reflecte fielmente o estado da flag, para
+        // que o UI possa apresentar o diagnóstico accionável quando o admin não
+        // passou a flag (agora via sessão humana, não via token de máquina).
         var host = await BuildHostAsync(executor: _ => IdlePipeline());
-        var harness = StartHarness(host, webAllowTrigger: false, webToken: token);
+        var harness = StartHarness(host, webAllowTrigger: false);
+        await ReachReadyAndLoginAsync(harness);
 
-        var request = new HttpRequestMessage(HttpMethod.Get, "/api/run/status");
-        request.Headers.Add("Authorization", $"Bearer {token}");
-        var response = await harness.Client.SendAsync(request);
+        var response = await harness.Client.GetAsync("/api/run/status");
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
         Assert.False(doc.RootElement.GetProperty("webAllowTrigger").GetBoolean());
@@ -348,19 +349,23 @@ public class Phase94LiveRunApiTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task Post_start_machine_token_authorizes_when_no_user_session()
+    public async Task Post_start_machine_token_is_ignored_without_session_returns_401()
     {
         const string token = "machine-start-token";
         var host = await BuildHostAsync(executor: _ => IdlePipeline());
         var harness = StartHarness(host, webAllowTrigger: true, webToken: token);
+        await ReachReadyAndLoginAsync(harness);
 
+        // Client novo, sem cookies de sessão: o token de máquina não autoriza
+        // o endpoint dos runs (apenas as playlists) → 401.
+        using var fresh = new HttpClient { BaseAddress = new Uri($"http://127.0.0.1:{harness.Port}") };
         var request = new HttpRequestMessage(HttpMethod.Post, "/api/run/start")
         {
             Content = EmptyJson(),
         };
         request.Headers.Add("Authorization", $"Bearer {token}");
-        var response = await harness.Client.SendAsync(request);
-        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        var response = await fresh.SendAsync(request);
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
     }
 
     [Fact]

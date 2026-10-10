@@ -446,21 +446,28 @@ public class DashboardBootstrapEndpointTests : IAsyncLifetime
 
     /// <summary>
     /// PHASE 9C.5 (revisão / decisão de scope) — READY + admin desactivado com
-    /// <c>--web-token</c>: a credencial de máquina continua a autorizar (acesso
-    /// operacional), mas não existe — nem é pretendido — endpoint que reactive
-    /// o administrador ou crie um substituto. O lockout humano é aceite como
-    /// estado não suportado, não como workflow de recuperação.
+    /// <c>--web-token</c>: a credencial de máquina autoriza <b>apenas</b> as
+    /// playlists de máquina (não as restantes APIs). O lockout humano continua a
+    /// ser um estado não suportado — não existe — nem é pretendido — endpoint que
+    /// reactive o administrador ou crie um substituto.
     /// </summary>
     [Fact]
-    public async Task Ready_with_disabled_admin_and_web_token_keeps_machine_access_only()
+    public async Task Ready_with_disabled_admin_and_web_token_grants_only_playlist_access()
     {
         await SeedReadyWithDisabledAdminAsync();
+        await SeedPlaylistsAsync();
 
         const string token = "machine-token-value";
         var harness = StartHarness(webToken: token);
 
-        var withToken = await harness.Client.SendAsync(WithBearer(HttpMethod.Get, "/api/history", token));
-        Assert.Equal(HttpStatusCode.OK, withToken.StatusCode);
+        // Playlist de máquina autorizada por token, mesmo em BOOTSTRAP_REQUIRED.
+        var playlist = await harness.Client.SendAsync(WithBearer(HttpMethod.Get, "/api/playlist", token));
+        Assert.Equal(HttpStatusCode.OK, playlist.StatusCode);
+
+        // As restantes APIs continuam bloqueadas pelo gate de bootstrap (o token
+        // já não autoriza endpoints fora das playlists).
+        var history = await harness.Client.SendAsync(WithBearer(HttpMethod.Get, "/api/history", token));
+        Assert.Equal(HttpStatusCode.Forbidden, history.StatusCode);
 
         var created = await harness.Client.SendAsync(WithBearerJson(
             HttpMethod.Post, "/api/bootstrap/admin", token,
@@ -530,33 +537,16 @@ public class DashboardBootstrapEndpointTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task Web_token_remains_required_for_machine_access()
+    public async Task Web_token_is_ignored_for_public_and_non_playlist_paths()
     {
         const string token = "machine-token-value";
         var harness = StartHarness(webToken: token);
 
-        // Sem token → 401 (mesmo em bootstrap).
-        Assert.Equal(HttpStatusCode.Unauthorized, (await harness.Client.GetAsync("/api/version")).StatusCode);
+        // Endpoint público: acessível sem token (já não existe 401 global do token).
+        Assert.Equal(HttpStatusCode.OK, (await harness.Client.GetAsync("/api/version")).StatusCode);
 
-        var request = new HttpRequestMessage(HttpMethod.Get, "/api/version");
-        request.Headers.Add("Authorization", $"Bearer {token}");
-        Assert.Equal(HttpStatusCode.OK, (await harness.Client.SendAsync(request)).StatusCode);
-    }
-
-    private async Task ReachReadyWithTokenAsync(DashboardHarness harness, string token)
-    {
-        var start = await harness.Client.SendAsync(
-            WithBearerJson(HttpMethod.Post, "/api/bootstrap/start", token, "{}"));
-        Assert.Equal(HttpStatusCode.OK, start.StatusCode);
-
-        var admin = await harness.Client.SendAsync(
-            WithBearerJson(HttpMethod.Post, "/api/bootstrap/admin", token,
-                JsonSerializer.Serialize(new { username = "admin", password = ValidPassword })));
-        Assert.Equal(HttpStatusCode.OK, admin.StatusCode);
-
-        var complete = await harness.Client.SendAsync(
-            WithBearerJson(HttpMethod.Post, "/api/bootstrap/complete", token, "{}"));
-        Assert.Equal(HttpStatusCode.OK, complete.StatusCode);
+        // Endpoints de bootstrap: acessíveis sem token (o token já não os protege).
+        Assert.Equal(HttpStatusCode.OK, (await harness.Client.GetAsync("/api/bootstrap/status")).StatusCode);
     }
 
     private static HttpRequestMessage WithBearerJson(HttpMethod method, string path, string token, string json)
@@ -566,25 +556,52 @@ public class DashboardBootstrapEndpointTests : IAsyncLifetime
         return request;
     }
 
+    private async Task SeedPlaylistsAsync()
+    {
+        await File.WriteAllTextAsync(Path.Combine(_outputDir, "playlist.m3u"), "#EXTM3U\n");
+        await File.WriteAllTextAsync(Path.Combine(_outputDir, "playlist_temp.m3u"), "#EXTM3U\n");
+        await File.WriteAllTextAsync(Path.Combine(_outputDir, "playlist_acquired.m3u"), "#EXTM3U\n");
+    }
+
     // === B1 / T2 — credencial de máquina em READY + admin ===
 
     [Fact]
-    public async Task Ready_with_valid_web_token_authorizes_machine_without_session()
+    public async Task Machine_token_authorizes_only_playlist_endpoints()
     {
         const string token = "machine-token-value";
         var harness = StartHarness(webToken: token);
-        await ReachReadyWithTokenAsync(harness, token);
+        await ReachReadyAsync(harness);
+        await SeedPlaylistsAsync();
 
-        // Token válido → autorizado, sem sessão humana.
-        var withToken = await harness.Client.SendAsync(WithBearer(HttpMethod.Get, "/api/history", token));
-        Assert.Equal(HttpStatusCode.OK, withToken.StatusCode);
+        // Token válido + sem sessão: as três playlists de máquina são servidas.
+        Assert.Equal(HttpStatusCode.OK,
+            (await harness.Client.SendAsync(WithBearer(HttpMethod.Get, "/api/playlist", token))).StatusCode);
+        Assert.Equal(HttpStatusCode.OK,
+            (await harness.Client.SendAsync(WithBearer(HttpMethod.Get, "/api/playlist_temp", token))).StatusCode);
+        Assert.Equal(HttpStatusCode.OK,
+            (await harness.Client.SendAsync(WithBearer(HttpMethod.Get, "/api/playlist_acquired", token))).StatusCode);
 
-        // Token inválido → recusado.
-        var invalid = await harness.Client.SendAsync(WithBearer(HttpMethod.Get, "/api/history", "wrong-token"));
-        Assert.Equal(HttpStatusCode.Unauthorized, invalid.StatusCode);
+        // Query ?token= é equivalente ao Bearer.
+        Assert.Equal(HttpStatusCode.OK,
+            (await harness.Client.GetAsync($"/api/playlist?token={token}")).StatusCode);
 
-        // Sem token → recusado (token configurado é exigido a todos).
-        Assert.Equal(HttpStatusCode.Unauthorized, (await harness.Client.GetAsync("/api/history")).StatusCode);
+        // Token inválido → não autoriza.
+        Assert.Equal(HttpStatusCode.Unauthorized,
+            (await harness.Client.SendAsync(WithBearer(HttpMethod.Get, "/api/playlist", "wrong-token"))).StatusCode);
+
+        // Sem token e sem sessão → 401 na playlist.
+        Assert.Equal(HttpStatusCode.Unauthorized, (await harness.Client.GetAsync("/api/playlist")).StatusCode);
+
+        // O token NÃO autoriza endpoints fora das playlists: cai no check de
+        // sessão humana → 401.
+        Assert.Equal(HttpStatusCode.Unauthorized,
+            (await harness.Client.SendAsync(WithBearer(HttpMethod.Get, "/api/history", token))).StatusCode);
+        Assert.Equal(HttpStatusCode.Unauthorized,
+            (await harness.Client.SendAsync(WithBearer(HttpMethod.Get, "/api/countries", token))).StatusCode);
+
+        // Os previews ficam no fluxo de sessão: o token não os autoriza.
+        Assert.Equal(HttpStatusCode.Unauthorized,
+            (await harness.Client.SendAsync(WithBearer(HttpMethod.Get, "/api/playlist/preview", token))).StatusCode);
 
         // A credencial de máquina não cria utilizador nem sessão humana.
         await using var context = _factory.CreateDbContext();
@@ -593,39 +610,57 @@ public class DashboardBootstrapEndpointTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task Ready_with_session_and_valid_token_is_deterministic()
+    public async Task User_session_authorizes_playlists_and_dashboard_without_token()
     {
         const string token = "machine-token-value";
         var harness = StartHarness(webToken: token);
-        await ReachReadyWithTokenAsync(harness, token);
+        await ReachReadyAsync(harness);
+        await SeedPlaylistsAsync();
 
-        // Login humano requer também o token quando --web-token está configurado.
-        var login = await harness.Client.SendAsync(
-            WithBearerJson(HttpMethod.Post, "/api/session", token,
-                JsonSerializer.Serialize(new { username = "admin", password = ValidPassword })));
+        // Login humano já não exige o token.
+        var login = await harness.Client.PostAsync(
+            "/api/session",
+            new StringContent(
+                JsonSerializer.Serialize(new { username = "admin", password = ValidPassword }),
+                Encoding.UTF8, "application/json"));
         Assert.Equal(HttpStatusCode.OK, login.StatusCode);
 
-        // Sessão (cookie) + token → autorizado.
-        var both = await harness.Client.SendAsync(WithBearer(HttpMethod.Get, "/api/history", token));
-        Assert.Equal(HttpStatusCode.OK, both.StatusCode);
+        // Sessão (cookie), sem token: as playlists e o dashboard são acessíveis.
+        Assert.Equal(HttpStatusCode.OK, (await harness.Client.GetAsync("/api/playlist")).StatusCode);
+        Assert.Equal(HttpStatusCode.OK, (await harness.Client.GetAsync("/api/history")).StatusCode);
+    }
 
-        // Sessão sem token → recusado (o token continua a ser exigido).
-        Assert.Equal(HttpStatusCode.Unauthorized, (await harness.Client.GetAsync("/api/history")).StatusCode);
+    [Fact]
+    public async Task Root_without_token_is_not_gated_by_web_token()
+    {
+        const string token = "machine-token-value";
+        var harness = StartHarness(webToken: token);
+        await ReachReadyAsync(harness);
+
+        // Com token configurado, GET / sem sessão segue o fluxo normal (login
+        // HTML), nunca o 401 global do token.
+        var root = await harness.Client.GetAsync("/");
+        Assert.Equal(HttpStatusCode.OK, root.StatusCode);
+        Assert.Contains("Entrar", await root.Content.ReadAsStringAsync());
     }
 
     // === T3 — legacy + credencial de máquina ===
 
     [Fact]
-    public async Task Legacy_with_web_token_keeps_machine_access()
+    public async Task Ready_without_admin_with_web_token_denies_non_playlist_access()
     {
         const string token = "machine-token-value";
         _lifecycle.SetState(ConfigurationLifecycleState.Ready, "legacy-adoption:sources");
+        await SeedPlaylistsAsync();
         var harness = StartHarness(webToken: token);
 
-        var withToken = await harness.Client.SendAsync(WithBearer(HttpMethod.Get, "/api/history", token));
-        Assert.Equal(HttpStatusCode.OK, withToken.StatusCode);
+        // Playlist de máquina autorizada por token.
+        Assert.Equal(HttpStatusCode.OK,
+            (await harness.Client.SendAsync(WithBearer(HttpMethod.Get, "/api/playlist", token))).StatusCode);
 
-        Assert.Equal(HttpStatusCode.Unauthorized, (await harness.Client.GetAsync("/api/history")).StatusCode);
+        // As restantes APIs ficam bloqueadas pelo gate de bootstrap, mesmo com token.
+        Assert.Equal(HttpStatusCode.Forbidden,
+            (await harness.Client.SendAsync(WithBearer(HttpMethod.Get, "/api/history", token))).StatusCode);
 
         await using var context = _factory.CreateDbContext();
         Assert.Empty(context.AdminUsers);

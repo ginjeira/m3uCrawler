@@ -113,7 +113,7 @@ As opções abaixo são as efectivamente reconhecidas pelo `Program.cs`. Opçõe
 | `--user` / `--pass` | Credenciais para autenticação no scan de domínio. |
 | `--web` | Inicia o dashboard web. |
 | `--web-port PORTA` | Porta do dashboard (padrão: 5000). |
-| `--web-token TOKEN` | Token partilhado para proteger o dashboard (ver secção "Modelo de segurança do dashboard"). Opcional. |
+| `--web-token TOKEN` | Token partilhado de **máquina**: autoriza **apenas** os endpoints de playlist (`/api/playlist`, `/api/playlist_temp`, `/api/playlist_acquired`). O dashboard mantém o fluxo de sessão user/password (ver secção "Modelo de segurança do dashboard"). Opcional. |
 | `--web-allow-trigger` | Opt-in: permite `POST /api/run/start` (trigger manual) no dashboard. Default: desactivado ⇒ `503 web-allow-trigger-disabled`. |
 | `--admin-reset-password USERNAME` | Recuperação **host-only** da password de administrador: a password é lida interactivamente do stdin, **nunca** de argv. Ver secção "Alterar/recuperar password de administrador". |
 | `--import-epg-tvg-ids FONTE` | Importa uma EPG XMLTV (`.xml`/`.xml.gz`, URL ou ficheiro) e grava os `id` dos `<channel>` como identidade externa `tvg-id` dos canais canónicos do país. Requer catálogo. Ver secção "Importação de tvg-id a partir de EPG". |
@@ -1075,16 +1075,18 @@ ser exclusivamente o resultado do matching).
 
 O dashboard é servido por um `HttpListener` que, por defeito, escuta em **todas as interfaces** (`http://+:<porta>/`) sem autenticação. Isto significa que, se o porto for exposto na rede (LAN, Docker com `ports: ["5000:5000"]`, IP público), qualquer pessoa com acesso à rede pode `GET /api/playlist` e obter a playlist M3U funcional com **URLs Xtream reais** (contendo `USER/PASSWORD`).
 
-Para deployments em rede não confiável, **recomenda-se vivamente** proteger o dashboard com um token partilhado usando `--web-token <TOKEN>`:
+Para deployments em rede não confiável, **recomenda-se vivamente** proteger o acesso com credenciais. Há duas camadas distintas:
 
-- Quando o token está configurado, **todos os endpoints** (incluindo `/api/playlist` e `/api/playlist_temp` que servem a playlist Xtream funcional) exigem autenticação via:
+- **Dashboard (humanos):** autenticação por **utilizador/password** com sessão e CSRF (ver "Modelo de autenticação"). É o fluxo da UI, do bootstrap e de todas as APIs de administração.
+- **Playlists de máquina (automação):** o token partilhado `--web-token <TOKEN>` autoriza **apenas** os endpoints de playlist completos — `/api/playlist`, `/api/playlist_temp` e `/api/playlist_acquired` — que servem a playlist Xtream funcional (com URLs reais). Aceita-se via:
   - Header: `Authorization: Bearer <TOKEN>`, ou
   - Query string: `?token=<TOKEN>`.
 - A comparação é feita em **tempo constante** (`CryptographicOperations.FixedTimeEquals`) para evitar timing attacks.
-- Pedidos sem credencial válida recebem `401 Unauthorized` com `WWW-Authenticate: Bearer`.
-- **Sem token configurado**, o comportamento mantém-se aberto (compatibilidade com uso local).
+- **Fora desses três endpoints o token é ignorado**: não bloqueia nem autoriza o dashboard/restantes APIs, que seguem o fluxo normal (bootstrap/login/sessão+CSRF). Um pedido a uma playlist sem token válido **e** sem sessão recebe `401 Unauthorized`.
+- Os endpoints de **pré-visualização** (`/api/playlist/preview`, `/api/playlist_temp/preview`, `/api/playlist_acquired/preview`) **não** são autorizáveis por token — ficam no fluxo de sessão humana (o seu conteúdo já é sanitizado).
+- **Sem token configurado**, o comportamento das playlists mantém-se aberto (compatibilidade com uso local).
 
-A playlist M3U funcional (`/api/playlist`) continua a devolver as URLs Xtream reais — a protecção do token controla **quem** pode aceder, não **o quê**.
+A playlist M3U funcional (`/api/playlist`) continua a devolver as URLs Xtream reais — o token de máquina controla **quem** pode aceder, não **o quê**.
 
 ## Ciclo de vida de configuração (PHASE 9C.1)
 
@@ -1152,8 +1154,8 @@ introduz tabela nem base de dados nova. A escrita é atómica.
 
 `GET /api/configuration/lifecycle` devolve o estado, a marca de adopção legacy,
 a razão (não sensível) e a avaliação **advisory** dos requisitos da PHASE 9C
-§5. O endpoint é de leitura apenas, respeita o token do dashboard
-(`--web-token`) e não expõe operações destrutivas.
+§5. O endpoint é de leitura apenas, **sempre público** (não exige token nem
+sessão) e não expõe operações destrutivas.
 
 Os requisitos da PHASE 9C §32.18 §5 (ordering list, import policies, grupos,
 sources activas, source priority, etc.) são **advisory** nesta wave: informam,
@@ -1270,16 +1272,18 @@ administrador".
 
 | Modo | Condição | Efeito |
 |---|---|---|
-| Bootstrap | `NOT_CONFIGURED`/`CONFIGURING`, **ou** `READY` sem administrador (`BOOTSTRAP_REQUIRED`) | Só bootstrap/sessão/lifecycle/version; restantes endpoints → 403 |
-| UserAuth | `READY` + administrador | Endpoints normais exigem sessão humana **ou** credencial de máquina válida; mutantes exigem CSRF |
-| Legacy | contexto explicitamente standalone/testes (lifecycle e auth não ligados) | Mantém o comportamento aberto de `--web-token`; não cria administrador. Deixou de ser o modo de `READY` sem administrador na PHASE 9C.5 |
+| Bootstrap | `NOT_CONFIGURED`/`CONFIGURING`, **ou** `READY` sem administrador (`BOOTSTRAP_REQUIRED`) | Só bootstrap/sessão/lifecycle/version/playlists de máquina; restantes endpoints → 403 |
+| UserAuth | `READY` + administrador | Endpoints normais exigem sessão humana; as playlists de máquina (`/api/playlist*`) aceitam sessão **ou** token válido; mutantes exigem CSRF |
+| Legacy | contexto explicitamente standalone/testes (lifecycle e auth não ligados) | Comportamento aberto; não cria administrador. Deixou de ser o modo de `READY` sem administrador na PHASE 9C.5 |
 
-`--web-token` mantém-se como **credencial de máquina/automação** em todos os
-modos (quando configurado). Precedência: o token é avaliado primeiro e, quando
-válido, **autoriza o pedido sem exigir sessão humana** (inclusive em `READY` +
-administrador), sem criar utilizador nem sessão. Sem `--web-token`, em `READY` o
-acesso exige sessão humana (e CSRF nos métodos mutantes). Não substitui a
-autenticação humana e não é necessário numa instalação nova.
+`--web-token` é uma **credencial de máquina** que autoriza **apenas** os
+endpoints de playlist completos (`/api/playlist`, `/api/playlist_temp`,
+`/api/playlist_acquired`), mesmo em `Bootstrap` (para automação de leitura das
+playlists), sem criar utilizador nem sessão. **Fora desses endpoints o token é
+ignorado**: o dashboard e as restantes APIs seguem sempre o fluxo
+bootstrap/login/sessão+CSRF e o token não substitui a autenticação humana. Sem
+`--web-token`, as playlists continuam acessíveis por sessão (e abertas em
+contexto local sem autenticação).
 
 A página autenticada do Dashboard recebe o token CSRF apenas **em memória
 JavaScript** (nunca em URL, query, `localStorage` ou logs) e envia-o
@@ -1449,9 +1453,10 @@ do Dispatcharr é sinal independente, exposto separadamente em
 `/api/dispatcharr/state`.
 
 A autorização reutiliza o gate da 9C.2/9C.5 (sessão + CSRF em `UserAuth`,
-`--web-token` como credencial de máquina, Bootstrap bloqueado; `READY` sem
-administrador é `BOOTSTRAP_REQUIRED` e também bloqueia). **Não existe
-autenticação dedicada.** O trigger manual exige `--web-allow-trigger`
+Bootstrap bloqueado; `READY` sem administrador é `BOOTSTRAP_REQUIRED` e também
+bloqueia). O `--web-token` **não** autoriza estes endpoints — é uma credencial de
+máquina limitada às playlists, pelo que os runs exigem sessão humana. **Não
+existe autenticação dedicada.** O trigger manual exige `--web-allow-trigger`
 (opt-in, default desactivado).
 
 Em **standalone** (`--web` sem `--telegram`) ambos os endpoints devolvem
