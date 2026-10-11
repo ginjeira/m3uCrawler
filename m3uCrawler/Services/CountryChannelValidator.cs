@@ -276,17 +276,19 @@ namespace m3uCrawler.Services
 
                 var titleTokens = Tokenize(NormalizeText(stream.Title ?? string.Empty));
 
-                // Negative evidence (Opção C): foreign ISO country code as the first
-                // token of the title. Only active when validating for the
-                // "pt" target country — other countries' ISO codes do not
-                // necessarily indicate a foreign stream (e.g. "la" is a
-                // valid token in Spanish channel names like "La 1").
+                // Negative evidence: rejeita títulos com prefixo explícito de
+                // região/país estrangeiro. Duas regras complementares:
+                //  - Opção C (ISO, separador "-"): primeiro token é um código
+                //    ISO estrangeiro curado (activo só para "pt", ver
+                //    ForeignCountryPrefixes);
+                //  - prefixo genérico "<TOKEN>:" (ex.: "CAR:", "EX-YU:",
+                //    "XXX:") cujo TOKEN não é um token do país-alvo. Correm
+                //    ANTES do match por aliases/tokens para que um alias bare
+                //    (ex.: "CANAL 11", "SPORT TV 1") não contorne o gate.
                 //
                 // See `.kilo/plans/1788214551330-country-validator-investigation.md`
                 // for the rationale and the list of resolved cases.
-                if (string.Equals(countryCode, "pt", StringComparison.OrdinalIgnoreCase)
-                    && titleTokens.Count > 0
-                    && ForeignCountryPrefixes.Contains(titleTokens[0]))
+                if (IsForeignPrefixedTitle(stream.Title, countryCode, titleTokens, aliases, groupTokens))
                 {
                     continue;
                 }
@@ -367,13 +369,150 @@ namespace m3uCrawler.Services
                 return false;
             }
 
-            if (!string.Equals(countryCode, "pt", StringComparison.OrdinalIgnoreCase))
+            var tokens = Tokenize(NormalizeText(title));
+            // Sem acesso aos aliases carregados (método estático): o prefixo
+            // genérico "<TOKEN>:" é avaliado só contra os tokens de grupo do
+            // país, que são estáticos. No caminho de validação
+            // (ValidateStreams) usa-se a mesma regra com os aliases.
+            return IsForeignPrefixedTitle(
+                title,
+                countryCode,
+                tokens,
+                Array.Empty<string>(),
+                LoadCountryGroupTokens(countryCode));
+        }
+
+        /// <summary>
+        /// Negative evidence combinada: verdadeiro quando o título traz um
+        /// prefixo explícito de região/país estrangeiro. Não depende de
+        /// qualquer lista fixa de países no caminho genérico — decide com os
+        /// tokens do país-alvo (grupo + aliases).
+        /// </summary>
+        private static bool IsForeignPrefixedTitle(
+            string? title,
+            string countryCode,
+            List<string> titleTokens,
+            IReadOnlyCollection<string> aliases,
+            IReadOnlyCollection<string> groupTokens)
+        {
+            // Opção C (ISO, separador "-"): código ISO estrangeiro curado como
+            // primeiro token. Mantém-se restrito a "pt" por retrocompatibilidade
+            // (outros países têm tokens curtos legítimos, ex.: "la" para ES).
+            if (string.Equals(countryCode, "pt", StringComparison.OrdinalIgnoreCase)
+                && titleTokens.Count > 0
+                && ForeignCountryPrefixes.Contains(titleTokens[0]))
+            {
+                return true;
+            }
+
+            return HasForeignRegionPrefix(title, countryCode, aliases, groupTokens);
+        }
+
+        /// <summary>
+        /// Negative evidence genérica: o título começa por <c>&lt;TOKEN&gt;:</c>
+        /// (ex.: <c>CAR:</c>, <c>EX-YU:</c>, <c>XXX:</c>), onde o TOKEN tem
+        /// forma de código de região/país e <b>não</b> é um token do país-alvo.
+        ///
+        /// É deliberadamente conservadora para não criar falsos positivos:
+        /// <list type="bullet">
+        /// <item>só actua quando há um ":" no início (não a meio do título);</item>
+        /// <item>o prefixo tem de ser uma única palavra (sem espaços), logo
+        /// títulos como <c>"Sport TV 1: FHD"</c> ou <c>"... PPV 1 :"</c> ficam
+        /// intactos;</item>
+        /// <item>o prefixo tem de ter forma de código: 1-2 tokens
+        /// alfabéticos de 2-3 letras (cobre <c>CAR</c>, <c>EX-YU</c>,
+        /// <c>XXX</c>), o que exclui palavras longas como <c>"Hollywood:"</c>;</item>
+        /// <item>é aceite quando o prefixo contém um token de grupo do país
+        /// (<c>PT</c>, <c>PORTUGAL</c>, <c>🇵🇹</c>) ou quando coincide com um
+        /// alias de canal do país (<c>SIC</c>, <c>TVI</c>, <c>BTV</c>) ou com a
+        /// primeira palavra de um alias (<c>RTP</c> em <c>"RTP 1"</c>).</item>
+        /// </list>
+        /// </summary>
+        private static bool HasForeignRegionPrefix(
+            string? title,
+            string countryCode,
+            IReadOnlyCollection<string> aliases,
+            IReadOnlyCollection<string> groupTokens)
+        {
+            if (string.IsNullOrWhiteSpace(title))
             {
                 return false;
             }
 
-            var tokens = Tokenize(NormalizeText(title));
-            return tokens.Count > 0 && ForeignCountryPrefixes.Contains(tokens[0]);
+            var colon = title.IndexOf(':');
+            if (colon <= 0)
+            {
+                return false;
+            }
+
+            var prefixRaw = title.Substring(0, colon).Trim();
+            if (prefixRaw.Length == 0)
+            {
+                return false;
+            }
+
+            // Só um prefixo "tag" de uma palavra: evita ":" a meio de títulos
+            // legítimos (ex.: "Sport TV 1: FHD").
+            var parts = prefixRaw.Split(new[] { ' ', '\t', '\r', '\n' },
+                StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length != 1)
+            {
+                return false;
+            }
+
+            var prefixTokens = Tokenize(NormalizeText(prefixRaw));
+            if (prefixTokens.Count == 0 || prefixTokens.Count > 2)
+            {
+                // 0: prefixo não-alfanumérico (ex.: "🇵🇹:"); >2: só via
+                // separadores (ex.: "A-B-C"). Nenhum é código de região.
+                return false;
+            }
+
+            foreach (var token in prefixTokens)
+            {
+                if (token.Length < 2 || token.Length > 3)
+                {
+                    return false;
+                }
+
+                foreach (var ch in token)
+                {
+                    if (!char.IsLetter(ch))
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            // Prefixo do país-alvo? (a) token de grupo ("pt", "portugal"); ou
+            // (b) alias de canal do país ("SIC", "TVI", "BTV") — inteiro ou a
+            // primeira palavra ("RTP" em "RTP 1").
+            if (prefixTokens.Any(t => groupTokens.Contains(t, StringComparer.OrdinalIgnoreCase)))
+            {
+                return false;
+            }
+
+            var prefixSet = new HashSet<string>(prefixTokens, StringComparer.OrdinalIgnoreCase);
+            foreach (var alias in aliases)
+            {
+                var aliasTokens = Tokenize(NormalizeText(alias));
+                if (aliasTokens.Count == 0)
+                {
+                    continue;
+                }
+
+                if (aliasTokens.All(t => prefixSet.Contains(t)))
+                {
+                    return false;
+                }
+
+                if (aliasTokens.Count > 1 && prefixSet.Contains(aliasTokens[0]))
+                {
+                    return false;
+                }
+            }
+
+            return true;
         }
 
         /// <summary>

@@ -165,7 +165,7 @@ Dentro de uma playlist que **passou o filtro de país** (`AnalyzePlaylist`), um 
 - **Setting:** `feedCanonicalFallback` (bool, default `true`), persistido na mesma SSOT `runtime-data/app_settings.json`, secção `discovery`. `GET /api/discovery/settings` devolve a flag; `POST /api/discovery/settings` aceita-a opcionalmente (patch semantics, `DiscoverySettingsPayload.feedCanonicalFallback`). Na UI do dashboard, o card "Configuração de discovery predefinida" expõe o checkbox "Fallback canónico na aquisição".
 - **Como resolve:** para os streams **rejeitados pela falta de token de país**, o pipeline normaliza o título (`ChannelNormalizer.Normalize`) e consulta `CatalogResolver.CanonicalChannelExistsByNormalizedIdentityAsync` — pertença por `canonical_channels.Key` (normalizada) e/ou `channel_aliases.NormalizedAlias`, apenas em canais canónicos **activos**.
 - **Nunca auto-cria canais.** É um predicado read-only de pertença; canais novos continuam a exigir o caminho normal de reconhecimento/publicação.
-- **Preserva a negative evidence de prefixo estrangeiro:** um título como `BE - RTL TVI` continua rejeitado, mesmo que resolva para um canal canónico (`CountryChannelValidator.HasForeignCountryPrefix`, activo para o país-alvo `pt`).
+- **Preserva a negative evidence de prefixo estrangeiro:** um título como `BE - RTL TVI` continua rejeitado, mesmo que resolva para um canal canónico (`CountryChannelValidator.HasForeignCountryPrefix`; a regra ISO `-` é activa para o país-alvo `pt`). A partir de 2026-10-11 o predicado cobre também o prefixo genérico `<TOKEN>:` (ex.: `CAR: CANAL 11`, `EX-YU: SPORT TV 1`), decidido com o `countryCode` — ver "Negative evidence: prefixo de região/país estrangeiro".
 - **País é parâmetro:** `FilterStreamsByCountryAsync(..., countryCode, catalogResolver, feedCanonicalFallback)` — o mecanismo não está preso a `pt`; o `countryCode` continua a ser o mesmo parâmetro do pipeline.
 - **Diagnóstico:** os aceites por este caminho contam em `RunReport.StreamsMatchedViaCanonicalFallback` (subconjunto de `StreamsAfterCountryFilter`). O modo de aquisição física não muda: o teste continua a ser só dos streams do país (incluindo os aceites pelo fallback).
 
@@ -473,6 +473,12 @@ No caminho de descoberta Telegram, os streams aceites por `ValidateStreams` entr
 
 Detalhe normativo em `docs/Reestructure/08-VALIDATION.md §6`.
 
+### Concorrência: downloads paralelos, serialização por conta só no teste de streams (2026-10-11)
+
+Os **downloads** de conteúdo (playlist/anexo, incluindo candidatos promovidos de publicações Xtream) são executados **em paralelo** pelos workers de candidates. A única serialização é a **legítima por `AccountId`**, aplicada a jusante no **teste de streams**: `TestStreamsAsync` → `AccountGateCoordinator` (slot global `MaxConcurrentAccounts` + gate `SemaphoreSlim(1,1)` por `AccountId`) → `AccountValidator.ValidateAccountAsync` (canais da mesma conta sempre 1 de cada vez). Contas diferentes correm em paralelo.
+
+**Experiência revertida.** Existia em `main` uma experiência de diagnóstico (`experiment/serial-per-xtream-account`, doc `docs/EXPERIMENT-serial-per-xtream-account.md`) que **serializava o download por conta `(URL, username)`** através de `XtreamAccountLockManager`, com logs `[DIAG_EXPERIMENT_SERIAL_PER_XTREAM]`. Isso não fora validado em produção e tornava os runs patologicamente lentos; foi **removido em 2026-10-11** (classe, wiring em `ProcessCandidateAsync` e helpers). O invariante de concorrência preservado é o do `AccountGateCoordinator` (nunca dois streams da mesma conta em paralelo; contas diferentes em paralelo).
+
 ## Validação por país (`CountryChannelValidator`)
 
 A validação do pipeline é feita por `CountryChannelValidator.AnalyzePlaylist(content, countryCode, threshold: 3)`. A classificação:
@@ -495,6 +501,17 @@ O pipeline aplica dois níveis de validação por país:
 2. **`ValidateStreams`** como aprovação final por stream — depois do parse, cada stream é validado individualmente pelo título (e em fallback pelo `group-title`). Apenas os streams aceites chegam a `TestStreamsAsync`. Streams rejeitados nunca tocam a rede.
 
 Recomendação: código novo que precise de uma decisão de país por playlist deve usar `AnalyzePlaylist`; decisões por stream devem usar `ValidateStreams`.
+
+#### Negative evidence: prefixo de região/país estrangeiro (2026-10-11)
+
+Antes de avaliar os aliases do país, `ValidateStreams` rejeita títulos que comecem por um **prefixo explícito de região/país estrangeiro**. Duas regras complementares, ambas correm **antes** do match por tokens (um alias *bare* como `CANAL 11` ou `SPORT TV 1` não contorna o gate):
+
+1. **Opção C (ISO, separador `-`).** O **primeiro** token do título é um código ISO estrangeiro curado (`ForeignCountryPrefixes`), ex.: `BE - RTL TVI`, `BG - BTV HD`. Activa apenas para o país-alvo `pt` (para outros países há tokens curtos legítimos, ex.: `la` para ES).
+2. **Prefixo genérico `<TOKEN>:` (2026-10-11).** O título começa por `<TOKEN>:` (ex.: `CAR: CANAL 11`, `EX-YU: SPORT TV 1`, `XXX: RTP 1`) e o `TOKEN` **não** é um token do país-alvo. É genérico: decide com o `countryCode` e os tokens já carregados (`LoadCountryGroupTokens` + aliases do país), sem qualquer lista fixa de países. É aceite quando o prefixo é do país (`PT:`, `PORTUGAL:`, `🇵🇹:`) ou quando coincide com um canal do país (`SIC:`, `TVI:`, `RTP:`).
+
+A regra 2 é conservadora para não introduzir falsos positivos: só actua com `:` no início, exige um prefixo de **uma só palavra** (títulos como `Sport TV 1: FHD` ou `... PPV 1 :` ficam intactos) com **forma de código** (1-2 tokens alfabéticos de 2-3 letras, cobrindo `CAR`, `EX-YU`, `XXX` mas excluindo palavras longas como `Hollywood:`).
+
+O predicado estático `CountryChannelValidator.HasForeignCountryPrefix(title, countryCode)` aplica a mesma evidência negativa no **fallback canónico na aquisição** (`feedCanonicalFallback`): um título com prefixo estrangeiro continua rejeitado mesmo que resolva para um canal canónico.
 
 ### Gestão de listas por país
 
@@ -562,15 +579,17 @@ O ciclo de manutenção (`Program.cs` → `RunTelegramMaintenanceCycle`) delega 
 
 1. Corre o pipeline (`SearchAndTestM3UInTelegramAsync`) e obtém os novos streams funcionais (`freshStreams`).
 2. Carrega `output/playlist.m3u` existente e **retesta** cada stream (`M3uTesterService`).
-3. Faz o merge de `stillWorkingMain` (retestados e ainda funcionais) com `freshStreams` via `TelegramScraperService.MergeStreams` (deduplicação por URL; prioriza working).
-4. Passa o resultado a `RunPublicationService.PublishAsync` (com `PlaylistFileName="playlist.m3u"`): o serviço deduplica por URL, escreve o intermédio `output/playlist_temp.m3u` (estado normalizado/deduplicado, **antes** da selecção) e o canónico `output/playlist.m3u`, e grava o relatório de manutenção em `output/telegram_maintain_report.json`.
-5. Actualiza o histórico (`ImportHistoryService.RecordImportAsync`).
-6. Grava o `RunReport` em `output/telegram_run_report.json`.
+3. Filtra os retestados com `TelegramScraperService.FilterRetainedStreams`: preserva os `IsWorking` **e** os que falharam com erro **retryable** (timeout/rede/429/5xx), marcando-os `Retained=true`; remove apenas falhas **terminais**.
+4. Faz o merge de `stillWorkingMain` (retestados e preservados) com `freshStreams` via `TelegramScraperService.MergeStreams` (deduplicação por URL; prioriza working).
+5. Passa o resultado a `RunPublicationService.PublishAsync` (com `PlaylistFileName="playlist.m3u"`): o serviço deduplica por URL, escreve o intermédio `output/playlist_temp.m3u` (estado normalizado/deduplicado, **antes** da selecção) e o canónico `output/playlist.m3u`, e grava o relatório de manutenção em `output/telegram_maintain_report.json`.
+6. Actualiza o histórico (`ImportHistoryService.RecordImportAsync`).
+7. Grava o `RunReport` em `output/telegram_run_report.json`.
 
 Regras importantes:
 
 - **Sem novos candidatos** (`CandidatesFound == 0`) → `MergeStreams(stillWorkingMain, [])` devolve `stillWorkingMain`, pelo que **`playlist.m3u` mantém os streams anteriores**. A ausência de novas descobertas **não** é interpretada como ausência de streams válidos.
 - **Candidatos sem playlists válidas** (todas rejeitadas por país/ formato) → o mesmo: streams existentes preservados; `playlist_temp.m3u` reflecte o merge preservado (não fica vazia enquanto houver streams existentes).
+- **Falhas transitórias não encolhem a playlist.** Um stream existente re-testado com falha **retryable** (timeout/rede/429/5xx) é **retido** (`M3uStream.Retained=true`) apesar de `IsWorking=false`: na **selecção de fontes**, um candidato retido é **elegível** independentemente de `IsWorking`/Availability, e o writer M3U (`PlaylistManagerService`) escreve `IsWorking || Retained`. Só falhas **terminais** (404/401/403/TLS/segurança) removem. O gate "tem de estar working" aplica-se **apenas a candidatos novos** (descoberta) — um canal/stream novo continua a exigir validação física. Regressão coberta por `m3uCrawler.Tests/MaintenancePublicationRetentionTests.cs`.
 - **Novos streams** → adicionados, dedup por URL, sem duplicar.
 - `playlist.m3u` e `playlist_temp.m3u` são sempre produzidos no fim do ciclo, pelo `RunPublicationService` (dono único de ambos).
 - **Não existe nenhum caminho** no ciclo em que uma execução vazia apague uma playlist funcional existente: a escrita canónica recebe `finalStreams`, que inclui sempre `stillWorkingMain`.

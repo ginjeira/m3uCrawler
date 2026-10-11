@@ -1,5 +1,13 @@
 # EXPERIMENT — SERIALIZAÇÃO POR CONTA XTREAM
 
+> **REVERTIDO (2026-10-11).** A experiência foi removida de `main`: o
+> download volta a ser **paralelo**. A classe `XtreamAccountLockManager`,
+> o wiring em `TelegramScraperService.ProcessCandidateAsync` e os helpers
+> `TryExtractXtreamIdentity`/`StripPasswordFromQuery` foram
+> eliminados. O invariante de concorrência preservado é o do
+> `AccountGateCoordinator` (teste de streams). Este documento fica como
+> registo histórico; **não** descreve o estado actual do código.
+
 > **EXPERIMENTAL — NÃO VALIDADO EM PRODUÇÃO.**
 > Esta feature existe apenas na branch `experiment/serial-per-xtream-account`.
 > NÃO está em `main`. Não foi submetida a uma execução controlada em produção.

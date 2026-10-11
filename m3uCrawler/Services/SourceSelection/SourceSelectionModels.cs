@@ -70,6 +70,15 @@ public readonly record struct ProviderIdentity(string Key)
 /// são <c>Unknown</c> no catálogo actual) são suportados pelo contrato
 /// e tratados como "desconhecido" pelo ranking.
 /// </para>
+///
+/// <para>
+/// <b>Retenção de manutenção (<see cref="IsRetained"/>).</b> Quando
+/// <c>true</c>, o candidato provém de uma stream retida da playlist
+/// anterior (preservada por falha retryable) e <b>não</b> está sujeito ao
+/// gate de elegibilidade "tem de estar working" — ver
+/// <see cref="ChannelSourceSelector"/>. Candidatos novos
+/// (descoberta) têm sempre <c>false</c> e continuam sujeitos ao gate.
+/// </para>
 /// </summary>
 public sealed record SelectionCandidate(
     string StreamUrl,
@@ -83,7 +92,8 @@ public sealed record SelectionCandidate(
     ProviderIdentity Provider,
     bool IsWorking = true,
     string? StreamFingerprint = null,
-    DateTime? LastSuccessfulValidationUtc = null);
+    DateTime? LastSuccessfulValidationUtc = null,
+    bool IsRetained = false);
 
 /// <summary>
 /// PHASE W4a — Override explícito do canal (critério 1 de DL-101).

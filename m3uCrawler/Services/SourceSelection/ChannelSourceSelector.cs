@@ -82,6 +82,15 @@ public interface IChannelSourceSelector
 /// não terminal (Dead/Unreachable). Qualquer outra combinação é
 /// elegível (desconhecidos não são excluídos).
 /// </para>
+///
+/// <para>
+/// <b>Excepção de retenção.</b> Um candidato com
+/// <see cref="SelectionCandidate.IsRetained"/> verdadeiro (stream retido
+/// da playlist anterior pela manutenção, preservado por falha retryable)
+/// é elegível independentemente de <see cref="SelectionCandidate.IsWorking"/>
+/// e da Availability — o gate "tem de estar working" só se aplica a
+/// candidatos <b>novos</b> (descoberta).
+/// </para>
 /// </summary>
 public sealed class ChannelSourceSelector : IChannelSourceSelector
 {
@@ -382,6 +391,14 @@ public sealed class ChannelSourceSelector : IChannelSourceSelector
         private static string? ComputeIneligibility(SelectionCandidate candidate, string? normalizedUrl)
         {
             if (normalizedUrl == null) return SelectionReasons.InvalidUrl;
+
+            // Manutenção: um candidato retido da playlist anterior
+            // (preservado por falha retryable) não está sujeito ao gate
+            // "tem de estar working". A manutenção não pode encolher a
+            // playlist por instabilidade transitória das fontes. O gate
+            // continua a aplicar-se integralmente a candidatos novos.
+            if (candidate.IsRetained) return null;
+
             if (!candidate.IsWorking) return SelectionReasons.NotWorking;
             if (candidate.Availability is AvailabilityState.Dead or AvailabilityState.Unreachable)
             {

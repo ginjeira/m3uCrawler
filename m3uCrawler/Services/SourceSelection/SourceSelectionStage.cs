@@ -365,7 +365,8 @@ public sealed class SourceSelectionStage : ISourceSelectionStage
                 Provider: ProviderIdentity.Normalize(NormalizeProviderHost(stream.Url)),
                 IsWorking: stream.IsWorking,
                 StreamFingerprint: channelSource.Fingerprint,
-                LastSuccessfulValidationUtc: ResolveSuccessfulValidationUtc(stream, channelSource));
+                LastSuccessfulValidationUtc: ResolveSuccessfulValidationUtc(stream, channelSource),
+                IsRetained: stream.Retained);
         }
 
         public M3uStream Stream { get; }

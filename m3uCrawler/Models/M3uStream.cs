@@ -38,6 +38,20 @@ namespace m3uCrawler.Models
         [JsonPropertyName("originalExtInf")]
         public string OriginalExtInf { get; set; } = string.Empty;
 
+        /// <summary>
+        /// Marca um stream que veio de uma playlist anterior e foi
+        /// <b>retido</b> pela manutenção após um re-teste com falha
+        /// <b>retryable</b> (timeout/rede/429/5xx). É um flag de runtime
+        /// (nunca persistido/artifact), por isso <see cref="JsonIgnoreAttribute"/>.
+        /// Um stream retido não está sujeito ao gate "tem de estar working"
+        /// da selecção de fontes nem ao filtro de escrita da playlist M3U:
+        /// a manutenção não pode encolher a playlist por instabilidade
+        /// transitória das fontes. Candidatos <b>novos</b> têm sempre
+        /// <c>Retained=false</c> e continuam sujeitos ao gate.
+        /// </summary>
+        [JsonIgnore]
+        public bool Retained { get; set; }
+
         public override string ToString()
         {
             if (!string.IsNullOrWhiteSpace(OriginalExtInf))

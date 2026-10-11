@@ -63,7 +63,11 @@ namespace m3uCrawler.Services
 
         private static string BuildM3uPlaylistContent(IEnumerable<M3uStream> streams, DateTime? generatedAt = null)
         {
-            var workingStreams = streams.Where(s => s.IsWorking).ToList();
+            // Streams working OU retidos da manutenção. Um stream retido é
+            // preservado apesar de IsWorking=false (falha retryable), pelo
+            // que tem de continuar a ser escrito: a manutenção não pode
+            // encolher a playlist por instabilidade transitória.
+            var publishableStreams = streams.Where(s => s.IsWorking || s.Retained).ToList();
             var generated = generatedAt ?? DateTime.Now;
 
             var m3uContent = new StringBuilder();
@@ -71,7 +75,7 @@ namespace m3uCrawler.Services
             m3uContent.AppendLine($"#PLAYLIST:m3uCrawler - Generated on {generated:yyyy-MM-dd HH:mm:ss}");
             m3uContent.AppendLine();
 
-            foreach (var stream in workingStreams)
+            foreach (var stream in publishableStreams)
             {
                 m3uContent.AppendLine(stream.ToString());
                 m3uContent.AppendLine();
