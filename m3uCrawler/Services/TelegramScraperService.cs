@@ -1616,6 +1616,11 @@ namespace m3uCrawler.Services
                 report: report,
                 messageId: m.ID);
 
+            // Cartões Stalker Portal ignorados por inteiro (só contabiliza
+            // mensagens Stalker sem candidatos válidos; um candidato válido no
+            // mesmo texto mantém-se).
+            CountIgnoredStalkerCard(_detector, text, found, report);
+
             // PHASE 9C.4 — Discovering: reportado ANTES de enfileirar os
             // candidatos, garantindo que a ordem monotónica do timeline
             // (ReadingTelegram -> Discovering -> Downloading) se mantém
@@ -2555,6 +2560,10 @@ namespace m3uCrawler.Services
 
             var result = new List<string>();
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            // Cartões Stalker Portal não são publicações Xtream: não devem gerar
+            // candidatos de publicação (evita download/teste do portal). O detector
+            // é o mesmo usado na descoberta de candidatos.
+            var stalkerDetector = new M3uCandidateDetector();
             foreach (Match m in _httpUrlRegexPublication.Matches(text))
             {
                 var url = m.Value.TrimEnd('.', ',', ')', ']', ';');
@@ -2565,10 +2574,34 @@ namespace m3uCrawler.Services
                 // Ja detetada indirectamente (xtream server: o Url do candidato e'
                 // a playlist resolvida, mas a URL original ja foi consumida).
                 if (_xtreamServerUrlForPublication.IsMatch(url)) continue;
+                // Stalker Portal: ignorado por completo.
+                if (stalkerDetector.IsStalkerPortalUrl(url)) continue;
                 seen.Add(url);
                 result.Add(url);
             }
             return result;
+        }
+
+        /// <summary>
+        /// Contabiliza uma mensagem identificada como cartão Stalker Portal e
+        /// ignorada por inteiro (não produziu candidatos válidos). Um candidato
+        /// válido no mesmo texto (Xtream/M3U/anexo) impede a contagem — o válido
+        /// não é descartado. Nunca implica aquisição Stalker.
+        /// </summary>
+        internal static void CountIgnoredStalkerCard(
+            M3uCandidateDetector detector,
+            string? text,
+            IReadOnlyList<CandidatePlaylist> candidates,
+            RunReport? report)
+        {
+            if (report is null) return;
+            if (!detector.LooksLikeStalkerCard(text)) return;
+
+            // Existe um candidato válido (URL não-Stalker ou anexo): a mensagem
+            // não foi ignorada por inteiro.
+            if (candidates.Any(c => !detector.IsStalkerPortalUrl(c.Url))) return;
+
+            report.StalkerCandidatesSkipped++;
         }
 
         /// <summary>

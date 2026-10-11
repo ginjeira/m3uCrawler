@@ -195,6 +195,12 @@ namespace m3uCrawler.Models
         // DetectedFrom == "html attachment" ou "attachment filename".
         public int HtmlCandidatesCreated { get; set; }
 
+        // Cartões Stalker Portal (portal.php, /c//c/, MAC + Serial/Device_Id,
+        // play_token=, type=stb) identificados e ignorados por inteiro: a
+        // mensagem não produziu candidatos válidos. Contador aditivo, escrito
+        // por-mensagem (single-thread). Nunca implica aquisição Stalker.
+        public int StalkerCandidatesSkipped { get; set; }
+
         // Downloads de anexos que terminaram sem exceccao.
         public int DocumentDownloadSuccesses { get; set; }
 

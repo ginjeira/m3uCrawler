@@ -8,6 +8,13 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 ## [Unreleased]
 
 ### ✨ Adicionado
+- **Deteção de cartões Stalker Portal e skip explícito (2026-10-11).**
+  - `M3uCandidateDetector` ganha `IsStalkerPortalUrl(url)` — `true` para `portal.php`, `/stb.php`, `/load.php`, `/portalstb/`, o caminho de portal `/c/`/`/c//c/`, e URLs com `play_token=` ou `type=stb` (case-insensitive; só `http(s)`).
+  - `M3uCandidateDetector` ganha `LooksLikeStalkerCard(text)` — `true` com MAC (`([0-9a-f]{2}:){5}[0-9a-f]{2}`), `play_token=`, `stb_lang`/`type=stb`, ou o par `Serial` **e** `Device_Id`.
+  - `DetectFromMessage` **não** cria candidato para URLs Stalker (o skip é por URL) e ignora o cartão por inteiro quando não há candidatos válidos; se o mesmo texto trouxer uma URL Xtream/M3U válida, essa **é devolvida normalmente**. `TelegramScraperService.ExtractRemainingHttpUrls` também exclui URLs Stalker (não as promove a `xtream publication url`).
+  - Novo contador aditivo `RunReport.StalkerCandidatesSkipped`, incrementado por mensagem Stalker sem candidatos válidos. **Não** há aquisição Stalker (sem download de portal, sem login MAC).
+  - **Testes:** novo `StalkerPortalDetectionTests` (cartão canónico → 0 candidatos; variantes de portal; MAC válido/inválido; Stalker + URL válida → só o válido; regressão de mensagem normal; filtro em `ExtractRemainingHttpUrls`; contador). `Phase94LiveRunHardeningTests` estendido (contrato `RunReport` 62→63).
+  - **Documentação:** `m3uCrawler/README.md` § "Cartões Stalker Portal (detetados e ignorados)".
 - **`tvg_id` e `logo_url` no sync do Dispatcharr (Parte A, 2026-10-10).**
   - **Plano:** `StreamMatchDecision` passa a transportar `tvgId` (de `DiscoveredStream.OriginalTvgId`) e `logoUrl` (de `M3uStream.Logo`); `ChannelDecision` transporta `epgTvgId`, resolvido a partir do tvg-id curado do canal canónico (`CatalogResolver.GetCanonicalTvgIdAsync`, namespace `ExternalIdentityNamespaces.TvgId`) com fallback para o `OriginalTvgId` do stream representativo da fonte, senão `null`. Decisões `Ambiguous`/`Skipped` e a ownership/remoção de streams ficam inalteradas; os campos são aditivos/nulos.
   - **Sync:** a criação de stream envia `tvg_id`/`logo_url` (quando não vazios) e a criação de canal envia `tvg_id` = `epgTvgId`; canais e streams **existentes** `CrawlerManaged` cujo valor actual difere são corrigidos por `PATCH` parcial (`UpdateTvgIdAsync` no canal; `UpdateTvgIdAsync`/`UpdateLogoAsync` na stream). `External`/`Unknown` nunca são tocados; um alvo nulo nunca limpa o valor existente. `StreamDto`/`DispatcharrStream` passam a ler `logo_url`.

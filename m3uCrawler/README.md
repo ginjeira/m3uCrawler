@@ -146,6 +146,18 @@ O pipeline reconhece candidatos Xtream Codes sem depender de keyword:
 
 Estes candidatos são tratados exactamente como os outros: passam pelo mesmo gate de verificação de conteúdo (`#EXTM3U`), validação por país, extracção e teste de streams — **não há uma segunda pipeline paralela**. A descoberta permanece independente de keyword.
 
+### Cartões Stalker Portal (detetados e ignorados)
+
+Cartões **Stalker Portal** (ex.: portal `http://103.176.90.27:80/c//c/` ou `.../portal.php`, com MAC `00:1A:79:85:CC:47`, `Serial`/`Device_Id` e URLs de reprodução com `play_token=` e `type=m3u_plus`/`type=stb`) **não são Xtream nem M3U**. Para não gastar tempo a descarregar/testar, são **detetados e ignorados**:
+
+- `M3uCandidateDetector.IsStalkerPortalUrl(url)` reconhece URLs de portal: `portal.php`, `/stb.php`, `/load.php`, `/portalstb/`, o caminho `/c/`/`/c//c/`, e URLs com `play_token=` ou `type=stb`. Case-insensitive; apenas `http(s)`.
+- `M3uCandidateDetector.LooksLikeStalkerCard(text)` reconhece sinais de cartão no texto: MAC (`([0-9a-f]{2}:){5}[0-9a-f]{2}`), `play_token=`, `stb_lang`/`type=stb`, ou o par `Serial` **e** `Device_Id`.
+- Em `DetectFromMessage`, uma URL que passe `IsStalkerPortalUrl` **não** cria candidato (o skip é por URL; cobre os ramos "m3u url", "xtream" e "url (inspect)"). O mesmo se aplica a `TelegramScraperService.ExtractRemainingHttpUrls`, que não promove a URL do portal a `xtream publication url`.
+- Se a mensagem for um cartão Stalker e **não** produzir candidatos válidos, é ignorada por inteiro. Se o mesmo texto trouxer também uma URL Xtream/M3U válida, essa **é devolvida normalmente** — o candidato válido nunca é descartado.
+- Cada cartão Stalker ignorado é contabilizado em `RunReport.StalkerCandidatesSkipped` (visível em `telegram_run_report.json` e no dashboard).
+
+**Não** é implementada aquisição Stalker (sem download de portal, sem login MAC): a funcionalidade é apenas deteção + skip.
+
 ### Janela de histórico da pesquisa Telegram (Min/Max)
 
 A pesquisa no Telegram considera apenas mensagens cuja idade satisfaz `MinHistoryHours <= idade da mensagem <= MaxHistoryHours`, onde `MaxHistoryHours` é o parâmetro/settings `HistoryHours` **já existente** e `MinHistoryHours` é o novo limite inferior (default `0`). Os dois limites são **inclusivos**: idade igual ao mínimo ou ao máximo é aceite.
@@ -383,9 +395,10 @@ M3uCandidateDetector.DetectFromMessage
    ├─ "url (inspect)" → CandidatePlaylist com RequiresContentVerification
    ├─ .html / .htm attachment → CandidatePlaylist { DetectedFrom="html attachment",
    │                                                    RequiresContentVerification=true }
+   └─ Stalker Portal URL → SKIP (não cria candidato; URL ignorada)
    ↓
 TelegramScraperService.ExtractRemainingHttpUrls
-(URLs HTTP genéricas -> candidatas a publicação HTML)
+(URLs HTTP genéricas -> candidatas a publicação HTML; Stalker Portal URLs excluídas)
    ↓
 TelegramPublicationDiscovery.DiscoverFromText
    ├─ https://t.me/c/<channel>/<message> → TelegramPublicationRef
@@ -541,7 +554,7 @@ O parsing está **centralizado** em `M3uParserService`. O antigo `ExtractM3u8Fro
 ## `CandidatePlaylist` / `M3uCandidateDetector`
 
 - `CandidatePlaylist` (`Models/CandidatePlaylist.cs`) representa um candidato: `Id`, `Kind` (`Url`/`Attachment`/`Inline`), `Source` (chat/título), `Url?`, `FileName?`, `SourceText?` (caption), `Content?` (corpo já descarregado), `DetectedFrom` (origem da detecção) e `RequiresContentVerification` (verdadeiro para URLs sem extensão `.m3u`/`.m3u8` que precisam de confirmação de conteúdo).
-- `M3uCandidateDetector` (`Services/M3uCandidateDetector.cs`) é a lógica pura e testável que produz candidatos a partir de `(text, filename, attachmentContent?)`. Expõe `IsM3uUrl`, `IsM3uFilename`, `LooksLikePlaylistContent` e `IsPlausiblePlaylistUrl`.
+- `M3uCandidateDetector` (`Services/M3uCandidateDetector.cs`) é a lógica pura e testável que produz candidatos a partir de `(text, filename, attachmentContent?)`. Expõe `IsM3uUrl`, `IsM3uFilename`, `LooksLikePlaylistContent`, `IsPlausiblePlaylistUrl`, `IsStalkerPortalUrl` e `LooksLikeStalkerCard` (deteção + skip de cartões Stalker Portal).
 
 Porque é que URLs sem extensão **não** são todas descarregadas indiscriminadamente: o método `IsPlausiblePlaylistUrl` só considera plausível um URL sem extensão quando o caminho/query contém uma das dicas de playlist (`playlist`, `m3u`, `iptv`, `list`, `xtream`, `channel`, `canal`, `live`, `getplaylist`). A descoberta mantém-se eficiente e não classifica URLs HTTP arbitrários como playlist apenas por serem HTTP.
 
@@ -555,6 +568,7 @@ Cada execução preenche um `RunReport` (em `Models/RunReport.cs`) com os seguin
 | `Status` | `pending` / `running` / `completed`. |
 | `MessagesAnalyzed` | Mensagens do Telegram dentro da janela de histórico (entre `MinHistoryHours` e `HistoryHours`). |
 | `CandidatesFound` | Candidatos a playlist detectados. |
+| `StalkerCandidatesSkipped` | Cartões Stalker Portal detetados e ignorados por inteiro (nenhum candidato válido). Aditivo; nunca implica aquisição Stalker. |
 | `PlaylistsDownloaded` | Playlists cujo conteúdo foi obtido com sucesso. |
 | `PlaylistsInvalid` | Playlists indisponíveis, vazias ou cujo conteúdo não é `#EXTM3U` (para candidatos "inspect"). |
 | `CountryMatches` | Playlists classificadas como país alvo. |

@@ -35,6 +35,19 @@ namespace m3uCrawler.Services
             @"https?://[^/\s]+/get\.php(\?|$)",
             RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
+        // Stalker Portal: endereço MAC de cartão (ex.: 00:1A:79:85:CC:47). O `\b`
+        // reduz falsos positivos dentro de sequências hexadecimais mais longas.
+        private static readonly Regex _macAddressRegex = new(
+            @"\b(?:[0-9a-f]{2}:){5}[0-9a-f]{2}\b",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+        // Stalker Portal: indicadores de cartão em texto (MAC, play_token=,
+        // stb_lang, type=stb e o par Serial + Device_Id).
+        private static readonly string[] _stalkerCardHints =
+        {
+            "play_token=", "stb_lang", "type=stb"
+        };
+
         public bool IsM3uUrl(string? url)
         {
             if (string.IsNullOrWhiteSpace(url)) return false;
@@ -105,6 +118,70 @@ namespace m3uCrawler.Services
         }
 
         /// <summary>
+        /// Reconhece URLs de portal Stalker (não Xtream/M3U). Cobre os endpoints
+        /// clássicos (portal.php, /stb.php, /load.php, /portalstb/), o caminho de
+        /// portal /c/ (ex.: http://host/c//c/) e URLs de reprodução com
+        /// play_token= ou type=stb. Case-insensitive; apenas http(s).
+        /// </summary>
+        public bool IsStalkerPortalUrl(string? url)
+        {
+            if (string.IsNullOrWhiteSpace(url)) return false;
+            if (!url.StartsWith("http://", StringComparison.OrdinalIgnoreCase) &&
+                !url.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            var lower = url.ToLowerInvariant();
+
+            // Endpoints clássicos de portal Stalker.
+            if (lower.Contains("portal.php") || lower.Contains("/stb.php") ||
+                lower.Contains("/load.php") || lower.Contains("/portalstb/"))
+            {
+                return true;
+            }
+
+            // URLs de reprodução Stalker.
+            if (lower.Contains("play_token=") || lower.Contains("type=stb"))
+            {
+                return true;
+            }
+
+            // Caminho de portal /c/ ou /c//c/ — apenas segmentos 'c'.
+            if (Uri.TryCreate(url, UriKind.Absolute, out var uri))
+            {
+                var segments = uri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+                if (segments.Length > 0 && segments.All(s => s == "c"))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Reconhece sinais de um cartão Stalker Portal no texto de uma mensagem:
+        /// MAC válido, play_token=, stb_lang/type=stb, ou o par Serial + Device_Id.
+        /// Não implica aquisição: serve para identificar cartões Stalker e ignorá-los.
+        /// </summary>
+        public bool LooksLikeStalkerCard(string? text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return false;
+
+            if (_macAddressRegex.IsMatch(text)) return true;
+
+            var lower = text.ToLowerInvariant();
+
+            if (_stalkerCardHints.Any(hint => lower.Contains(hint))) return true;
+
+            // Identidade dupla típica de cartão Stalker (Serial + Device_Id).
+            if (lower.Contains("serial") && lower.Contains("device_id")) return true;
+
+            return false;
+        }
+
+        /// <summary>
         /// Resolve uma URL de servidor Xtream para a URL da playlist correspondente
         /// (get.php?username=...&amp;password=...&amp;type=m3u_plus). Devolve null se não for Xtream.
         /// </summary>
@@ -136,6 +213,12 @@ namespace m3uCrawler.Services
             {
                 foreach (Match m in _httpUrlRegex.Matches(text))
                 {
+                    // Cartões Stalker Portal (portal.php, /c//c/, play_token=,
+                    // type=stb, ...) não são Xtream/M3U: saltar por completo para
+                    // não gastar tempo a descarregar/testar. O skip é por URL —
+                    // um URL válido no mesmo texto continua a produzir candidato.
+                    if (IsStalkerPortalUrl(m.Value)) continue;
+
                     if (IsM3uUrl(m.Value))
                     {
                         candidates.Add(new CandidatePlaylist
@@ -238,6 +321,14 @@ namespace m3uCrawler.Services
                         DetectedFrom = "#EXTM3U content"
                     });
                 }
+            }
+
+            // Cartão Stalker detetado sem qualquer candidato válido: ignorado por
+            // inteiro (devolve lista vazia). Se houver candidatos válidos no
+            // mesmo texto (Xtream/M3U/HTML), devolve-os normalmente.
+            if (candidates.Count == 0 && LooksLikeStalkerCard(text))
+            {
+                return candidates;
             }
 
             return candidates;

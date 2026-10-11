@@ -73,6 +73,9 @@ public class Phase94LiveRunHardeningTests : IAsyncLifetime
         "PublicationsUnsupported",
         "RejectionReasons",
         "SourceSelection",
+        // Stalker Portal (2026-10-11) — extensão intencional do contrato:
+        // contador aditivo de cartões Stalker detetados e ignorados.
+        "StalkerCandidatesSkipped",
         "StartedAt",
         "Status",
         "StreamsAfterCountryFilter",
@@ -158,7 +161,8 @@ public class Phase94LiveRunHardeningTests : IAsyncLifetime
 
         // W-DEDUP (2026-10-01): 60 -> 61 (contador aditivo StreamsSkippedAlreadyValidated).
         // W-FEED (2026-10-10): 61 -> 62 (contador aditivo StreamsMatchedViaCanonicalFallback).
-        Assert.Equal(62, actual.Length);
+        // Stalker Portal (2026-10-11): 62 -> 63 (contador aditivo StalkerCandidatesSkipped).
+        Assert.Equal(63, actual.Length);
         Assert.Equal(expected, actual);
     }
 
