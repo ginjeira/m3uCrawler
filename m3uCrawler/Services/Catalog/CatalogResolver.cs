@@ -852,6 +852,85 @@ public sealed class CatalogResolver
     }
 
     /// <summary>
+    /// Wave B — leitura inversa da ownership de canais: dado um conjunto
+    /// de <see cref="CanonicalChannelEntity.Id"/>, devolve o
+    /// <c>DispatcharrChannelId</c> associado a cada canónico.
+    ///
+    /// <para>
+    /// É a identidade estável usada pelo matcher (ownership-first): um
+    /// canónico que já foi criado pelo crawler tem a sua associação
+    /// <c>CanonicalChannelId ↔ DispatcharrChannelId</c> persistida em
+    /// <c>dispatcharr_channel_ownerships</c> (ver
+    /// <see cref="EnsureChannelOwnershipAsync"/>). Reconhecer por esta
+    /// chave evita duplicados que o matching por nome (fuzzy) não
+    /// deteta (ex.: key <c>rtpnoticias</c> vs nome "RTP Notícias").
+    /// </para>
+    ///
+    /// <para>
+    /// <b>Vários canais por canónico (duplicados já existentes em
+    /// produção).</b> Quando um canónico tem mais do que um
+    /// <c>DispatcharrChannelId</c>, devolvem-se <b>todos</b> os ids
+    /// ordenados por id ascendente em
+    /// <see cref="CanonicalChannelOwnershipMap.OwnedDispatcharrChannelIdsByCanonical"/>;
+    /// o matcher escolhe, de entre eles, o primeiro que exista no
+    /// estado actual (evita recriar um canal novo quando o mais antigo
+    /// foi apagado manualmente mas outro owned continua presente). Os
+    /// ids extra (para além do reutilizado) são reportados em
+    /// <see cref="CanonicalChannelOwnershipMap.DuplicateDispatcharrChannelIdsByCanonical"/>
+    /// (para log/relatório) mas <b>nunca</b> apagados — não existe
+    /// DELETE de canais no Dispatcharr; a limpeza é manual.
+    /// </para>
+    /// </summary>
+    public async Task<CanonicalChannelOwnershipMap> GetCanonicalChannelOwnershipMapAsync(
+        IEnumerable<long> canonicalChannelIds,
+        CancellationToken cancellationToken = default)
+    {
+        var owned = new Dictionary<long, IReadOnlyList<long>>();
+        var duplicates = new Dictionary<long, IReadOnlyList<long>>();
+        if (canonicalChannelIds == null)
+        {
+            return new CanonicalChannelOwnershipMap(owned, duplicates);
+        }
+        var distinctIds = canonicalChannelIds
+            .Where(id => id > 0)
+            .Distinct()
+            .ToList();
+        if (distinctIds.Count == 0)
+        {
+            return new CanonicalChannelOwnershipMap(owned, duplicates);
+        }
+
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var rows = await context.DispatcharrChannelOwnerships
+            .AsNoTracking()
+            .Where(o => o.CanonicalChannelId != null
+                && distinctIds.Contains(o.CanonicalChannelId.Value))
+            .Select(o => new { o.CanonicalChannelId, o.DispatcharrChannelId })
+            .ToListAsync(cancellationToken);
+
+        foreach (var group in rows
+            .GroupBy(r => r.CanonicalChannelId!.Value)
+            .OrderBy(g => g.Key))
+        {
+            // Ordem determinística: id ascendente (o mais antigo
+            // primeiro). A escolha do id efectivamente reutilizado é
+            // feita pelo matcher, consoante o que existe no estado.
+            var ordered = group
+                .Select(r => r.DispatcharrChannelId)
+                .Distinct()
+                .OrderBy(id => id)
+                .ToList();
+            owned[group.Key] = ordered;
+            if (ordered.Count > 1)
+            {
+                duplicates[group.Key] = ordered.Skip(1).ToList();
+            }
+        }
+
+        return new CanonicalChannelOwnershipMap(owned, duplicates);
+    }
+
+    /// <summary>
     /// Devolve um mapa de ownership por stream id para os ids
     /// pedidos. Streams sem registo prévio ficam
     /// <see cref="StreamOwnership.Unknown"/> (bootstrap default).
@@ -2539,93 +2618,6 @@ public sealed class CatalogResolver
         context.CanonicalChannels.Remove(channel);
         await context.SaveChangesAsync(cancellationToken);
         return true;
-    }
-
-    /// <summary>
-    /// Faz upsert idempotente de um <see cref="CanonicalChannelEntity"/>
-    /// identificado por <paramref name="key"/>. Se já existir, devolve
-    /// o existente (sem mexer em campos). Se não existir, cria um novo
-    /// canal com os parâmetros fornecidos, e adiciona
-    /// <paramref name="normalizedAlias"/> (normalizado via
-    /// <see cref="ChannelNormalizer.Normalize"/>) como alias se for
-    /// não-vazio e não colidir com nenhum alias já existente noutro
-    /// canal.
-    ///
-    /// <para>
-    /// <b>Não é a pipeline de ingestão.</b> A ingestão
-    /// (<see cref="PipelineIngestionService"/>) não cria canais: usa
-    /// apenas <see cref="ResolveAsync"/>. Este método permanece para
-    /// chamadas administrativas/explícitas que já tenham decidido a
-    /// identidade canónica.
-    /// </para>
-    /// </summary>
-    public async Task<(CanonicalChannelEntity Channel, bool Created)> EnsureCanonicalChannelAsync(
-        string key,
-        string displayName,
-        EditorialCategory editorialCategory,
-        string? groupKey,
-        PublicationPolicy publicationPolicy,
-        bool isEnabled,
-        string? normalizedAlias,
-        CancellationToken cancellationToken = default)
-    {
-        ValidateKey(key);
-        if (string.IsNullOrWhiteSpace(displayName))
-            throw new ArgumentException("DisplayName obrigatório.", nameof(displayName));
-
-        var normalizedKey = key.Trim();
-
-        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
-        var existing = await context.CanonicalChannels
-            .FirstOrDefaultAsync(c => c.Key == normalizedKey, cancellationToken);
-        if (existing != null)
-        {
-            return (existing, false);
-        }
-
-        // Conflicto de alias com outro canal? Ignorar silenciosamente
-        // (o alias será mantido no canal existente; este canal
-        // desconhecido fica sem o alias, mas é criado).
-        var now = DateTime.UtcNow;
-        // Wave D2 — o grupo é identificado apenas pela Key/FK. A key
-        // ausente ou desconhecida cai no grupo "other".
-        var groupId = await ResolveGroupIdOrDefaultAsync(context, groupKey, cancellationToken);
-
-        var channel = new CanonicalChannelEntity
-        {
-            Key = normalizedKey,
-            DisplayName = displayName.Trim(),
-            EditorialCategory = editorialCategory,
-            GroupId = groupId,
-            PublicationPolicy = publicationPolicy,
-            IsEnabled = isEnabled,
-            CreatedAtUtc = now,
-            UpdatedAtUtc = now,
-        };
-        context.CanonicalChannels.Add(channel);
-        await context.SaveChangesAsync(cancellationToken);
-
-        if (!string.IsNullOrWhiteSpace(normalizedAlias))
-        {
-            var alias = ChannelNormalizer.Normalize(normalizedAlias);
-            if (alias.Length == 0)
-            {
-                return (channel, true);
-            }
-            var aliasConflict = await context.ChannelAliases
-                .AnyAsync(a => a.NormalizedAlias == alias, cancellationToken);
-            if (!aliasConflict)
-            {
-                context.ChannelAliases.Add(new ChannelAliasEntity
-                {
-                    NormalizedAlias = alias,
-                    CanonicalChannelId = channel.Id,
-                    CreatedAtUtc = now,
-                });
-                await context.SaveChangesAsync(cancellationToken);
-            }
-        }
-        return (channel, true);
     }
 
     /// <summary>
@@ -5064,6 +5056,24 @@ public sealed class CatalogStats
     public int ScheduledJobs { get; set; }
     public string DbPath { get; set; } = string.Empty;
     public DateTime GeneratedAtUtc { get; set; }
+}
+
+/// <summary>
+/// Wave B — resultado de <see cref="CatalogResolver.GetCanonicalChannelOwnershipMapAsync"/>.
+/// Mapa <c>CanonicalChannelId → todos os DispatcharrChannelId owned</c>
+/// (identidade estável), ordenados por id ascendente. O matcher escolhe
+/// o primeiro que exista no estado actual, pelo que apagar o canal de
+/// menor id (limpeza manual) não força a criação de um novo duplicado.
+/// Acompanhado dos canais extra (para além do mais antigo), que
+/// <b>não</b> são apagados.
+/// </summary>
+public sealed record CanonicalChannelOwnershipMap(
+    IReadOnlyDictionary<long, IReadOnlyList<long>> OwnedDispatcharrChannelIdsByCanonical,
+    IReadOnlyDictionary<long, IReadOnlyList<long>> DuplicateDispatcharrChannelIdsByCanonical)
+{
+    public static CanonicalChannelOwnershipMap Empty { get; } = new(
+        new Dictionary<long, IReadOnlyList<long>>(),
+        new Dictionary<long, IReadOnlyList<long>>());
 }
 
 /// <summary>

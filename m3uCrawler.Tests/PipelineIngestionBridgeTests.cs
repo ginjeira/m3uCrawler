@@ -44,6 +44,7 @@ public class PipelineIngestionBridgeTests : IAsyncLifetime
         _factory = new TestDbContextFactory(_dbPath);
         _bootstrapper = new ChannelCatalogBootstrapper(_dbPath);
         var ctx = await _bootstrapper.InitializeAsync();
+        await TestCatalogSeed.ApplyDefaultsAsync(ctx);
         await ctx.DisposeAsync();
         _resolver = new CatalogResolver(_factory, _dbPath);
     }

@@ -416,6 +416,69 @@ namespace m3uCrawler.Services.Matching
                     .ToDictionary(kv => kv.Key, kv => kv.Value);
             }
 
+            // Wave B — ownership-first: mapa de identidade estável
+            // CanonicalChannelId → DispatcharrChannelId, carregado em
+            // batch uma vez por run (análogo a ownershipByStreamId).
+            // Só os canais canónicos efectivamente resolvidos por
+            // stream entram no pedido. Um canónico já criado pelo
+            // crawler tem a sua associação persistida; reconhecê-lo
+            // por identidade evita N `NewChannel` duplicados que o
+            // matching por nome (fuzzy) não deteta.
+            var ownershipByCanonicalId = new Dictionary<long, long>();
+            // M4 — duplicados owned detetados: ids owned além do
+            // reutilizado/presente. Contados (report) e amostrados
+            // (log limitado), nunca apagados.
+            var ownedDuplicatesRemaining = 0;
+            var ownedDuplicateDetails = new List<(long CanonicalId, IReadOnlyList<long> ExtraIds)>();
+            if (_catalog != null && canonicalByKey.Count > 0)
+            {
+                var canonicalIdsForOwnership = canonicalByKey.Values
+                    .Where(v => v.Id.HasValue && v.Id.Value > 0)
+                    .Select(v => v.Id!.Value)
+                    .Distinct()
+                    .ToList();
+                if (canonicalIdsForOwnership.Count > 0)
+                {
+                    var ownership = await _catalog.GetCanonicalChannelOwnershipMapAsync(
+                        canonicalIdsForOwnership);
+                    foreach (var pair in ownership.OwnedDispatcharrChannelIdsByCanonical)
+                    {
+                        var ownedIds = pair.Value;
+                        if (ownedIds.Count == 0) continue;
+
+                        // M3 — escolher o primeiro id owned que EXISTE no
+                        // estado actual (não apenas o de menor id). Isto
+                        // garante que, mesmo apagando o canal de menor id
+                        // (limpeza manual), a run seguinte reutiliza outro
+                        // canal owned do mesmo canónico em vez de criar um
+                        // novo duplicado. Sem nenhum presente mantém-se o
+                        // de menor id como fallback (o lookup por
+                        // existingById não encontra e cai no fuzzy →
+                        // NewChannel, comportamento actual).
+                        long chosen = ownedIds[0];
+                        foreach (var candidate in ownedIds)
+                        {
+                            if (existingById.ContainsKey(candidate))
+                            {
+                                chosen = candidate;
+                                break;
+                            }
+                        }
+                        ownershipByCanonicalId[pair.Key] = chosen;
+
+                        if (ownedIds.Count > 1)
+                        {
+                            var extras = ownedIds.Where(id => id != chosen).ToList();
+                            if (extras.Count > 0)
+                            {
+                                ownedDuplicatesRemaining += extras.Count;
+                                ownedDuplicateDetails.Add((pair.Key, extras));
+                            }
+                        }
+                    }
+                }
+            }
+
             var newChannelIdSeed = -1L;
             var decisions = new List<ChannelDecision>();
             var counts = new SyncReportCounts
@@ -424,7 +487,24 @@ namespace m3uCrawler.Services.Matching
                 Skipped = excluded.Count,
                 Classification = classificationCounts,
                 MatchingDisposition = dispositionCounts,
+                OwnedChannelDuplicatesRemaining = ownedDuplicatesRemaining,
             };
+
+            // M4 — reportar (log limitado) os duplicados owned detetados
+            // nesta run. A lista é truncada para não inundar o log.
+            if (ownedDuplicateDetails.Count > 0)
+            {
+                const int maxListed = 10;
+                var listed = string.Join(", ", ownedDuplicateDetails
+                    .Take(maxListed)
+                    .Select(d => $"{d.CanonicalId}:[{string.Join(",", d.ExtraIds)}]"));
+                var suffix = ownedDuplicateDetails.Count > maxListed
+                    ? $" (+{ownedDuplicateDetails.Count - maxListed} mais)"
+                    : string.Empty;
+                Console.WriteLine(
+                    $"♻️  Ownership: {ownedDuplicatesRemaining} canal(is) duplicado(s) legado(s) " +
+                    $"para canónicos com identidade estável (não apagados) — {listed}{suffix}");
+            }
 
             // Iterate buckets in deterministic order: by tier, then
             // identity. Curated first, then Unknown (so the
@@ -502,8 +582,34 @@ namespace m3uCrawler.Services.Matching
                 DispatcharrChannel? matched = null;
                 string? matchReason = null;
                 int matchScore = 0;
-                if (tier == BucketTier.Curated)
+
+                // Wave B — ownership-first (L6: aplica-se a TODOS os
+                // tiers, não só Curated). Se o canal canónico desta
+                // bucket já tem uma associação estável registada
+                // (CanonicalChannelId ↔ DispatcharrChannelId) e esse
+                // canal existe no estado actual, esse é o match
+                // autoritativo: saltamos por completo o fuzzy/exact
+                // (nome é apenas apresentação, nunca identidade). Isto
+                // evita que um canónico já existente (mesmo
+                // MergeOnly/ReviewOnly) caia em review/unknown.
+                //
+                // Canónicos SEM canal owned presente no estado mantêm,
+                // inalterada, a semântica do tier: Curado → fuzzy +
+                // threshold; Unknown/ReviewOnly/MergeOnly → igualdade
+                // exacta ou alias (e ambiguidade) apenas.
+                if (bucketCanonicalId is long ownershipCanonicalId
+                    && ownershipByCanonicalId.TryGetValue(ownershipCanonicalId, out var ownedChannelId)
+                    && existingById.TryGetValue(ownedChannelId, out var ownershipMatch))
                 {
+                    matched = ownershipMatch;
+                    matchReason = "ownership";
+                    matchScore = 100;
+                }
+                else if (tier == BucketTier.Curated)
+                {
+                    // Sem ownership, mantém-se o caminho fuzzy histórico
+                    // (canal manual pré-existente, primeira criação
+                    // legítima).
                     (matched, matchReason, matchScore, ambiguous) = FindCuratedMatch(
                         identity, existing.Channels, threshold);
                 }
@@ -1197,7 +1303,7 @@ namespace m3uCrawler.Services.Matching
             };
         }
 
-        private static MatchPlan ReconcileByExistingChannelId(MatchPlan plan)
+        internal static MatchPlan ReconcileByExistingChannelId(MatchPlan plan)
         {
             // Group decisions by their resolved Dispatcharr channel id.
             //   - ExistingReassigned / ExistingUnchanged: keyed by ExistingChannelId.
@@ -1222,7 +1328,7 @@ namespace m3uCrawler.Services.Matching
                 }
                 else if (ch.Outcome == SyncOutcome.NewChannel)
                 {
-                    var key = NormalizeIdentityForDedup(ch.CanonicalName);
+                    var key = NewChannelDedupKey(ch);
                     if (!newChannelGroups.TryGetValue(key, out var list))
                     {
                         list = new List<ChannelDecision>();
@@ -1248,7 +1354,7 @@ namespace m3uCrawler.Services.Matching
                 }
                 else if (ch.Outcome == SyncOutcome.NewChannel)
                 {
-                    var key = NormalizeIdentityForDedup(ch.CanonicalName);
+                    var key = NewChannelDedupKey(ch);
                     if (!seenNewKeys.Add(key)) continue;
                     var list = newChannelGroups[key];
                     reconciled.Add(MergeNewChannelDecisions(list));
@@ -1258,6 +1364,18 @@ namespace m3uCrawler.Services.Matching
                     reconciled.Add(ch);
                 }
             }
+
+            // Wave B — contagem aditiva de canais reconhecidos por
+            // identidade estável (ownership-first). Calculada sobre as
+            // decisões já reconciliadas, para não contar duplicados
+            // colapsados. Usa Contains (e não StartsWith) porque o
+            // reconcile pode reescrever o motivo para "merged:..." quando
+            // o mesmo canal reúne várias buckets — o ownership pode
+            // deixar de estar no início mas continua a ser uma decisão
+            // resolvida por ownership.
+            plan.Counts.ChannelsMatchedByOwnership = reconciled.Count(c =>
+                !string.IsNullOrEmpty(c.MatchReason)
+                && c.MatchReason.Contains("ownership", StringComparison.Ordinal));
 
             plan.Counts.OutputGroups = reconciled
                 .Where(c => c.OutputGroup.HasValue)
@@ -1284,6 +1402,28 @@ namespace m3uCrawler.Services.Matching
         {
             if (string.IsNullOrWhiteSpace(name)) return string.Empty;
             return name.Trim().ToLowerInvariant();
+        }
+
+        /// <summary>
+        /// Wave B — chave de dedup de decisões <see cref="SyncOutcome.NewChannel"/>.
+        /// A identidade estável (<see cref="ChannelDecision.CanonicalChannelId"/>,
+        /// e em fallback <see cref="ChannelDecision.CanonicalChannelKey"/>) tem
+        /// prioridade sobre o <see cref="ChannelDecision.CanonicalName"/>. Isto
+        /// evita N canais novos para o mesmo canónico quando o nome normalizado
+        /// difere entre buckets (ou quando o nome seria ambíguo). Sem identidade
+        /// canónica mantém-se o comportamento histórico (nome normalizado).
+        /// </summary>
+        private static string NewChannelDedupKey(ChannelDecision ch)
+        {
+            if (ch.CanonicalChannelId is long id && id > 0)
+            {
+                return $"id:{id}";
+            }
+            if (!string.IsNullOrWhiteSpace(ch.CanonicalChannelKey))
+            {
+                return $"key:{ch.CanonicalChannelKey.Trim().ToLowerInvariant()}";
+            }
+            return "name:" + NormalizeIdentityForDedup(ch.CanonicalName);
         }
 
         private static ChannelDecision MergeExistingChannelDecisions(List<ChannelDecision> list)

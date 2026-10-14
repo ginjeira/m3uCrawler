@@ -64,7 +64,9 @@ public class DropGroupMappingsMigrationTests
             // migration (a remoção da coluna editorial é a Wave D2).
             Assert.True(await TableExistsAsync(ctx, "canonical_groups"));
             Assert.Contains("GroupId", await ColumnsAsync(ctx, "canonical_channels"));
-            Assert.Equal(9, await CountAsync(ctx, "SELECT COUNT(*) AS Value FROM canonical_groups"));
+            // Wave A/H1 — AddCanonicalChannelGroupFk já não semeia grupos:
+            // a tabela existe mas está vazia.
+            Assert.Equal(0, await CountAsync(ctx, "SELECT COUNT(*) AS Value FROM canonical_groups"));
         }
 
         TestTempDb.Cleanup(dbPath);

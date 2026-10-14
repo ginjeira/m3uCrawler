@@ -189,6 +189,26 @@ namespace m3uCrawler.Models
         [JsonPropertyName("protectedExternalStreams")] public int ProtectedExternalStreams { get; set; }
 
         /// <summary>
+        /// Wave B — número de decisões de canal resolvidas por
+        /// <b>ownership-first</b> (identidade estável
+        /// <c>CanonicalChannelId ↔ DispatcharrChannelId</c>), i.e. cujo
+        /// <see cref="ChannelDecision.MatchReason"/> começa por
+        /// <c>ownership</c>. Aditivo: <c>0</c> quando nenhum canal foi
+        /// reconhecido por essa via.
+        /// </summary>
+        [JsonPropertyName("channelsMatchedByOwnership")] public int ChannelsMatchedByOwnership { get; set; }
+
+        /// <summary>
+        /// Wave B — número de canais owned <b>duplicados</b> detetados
+        /// para canónicos com identidade estável, i.e. ids owned que
+        /// <b>não</b> foram reutilizados nesta run (para além do canal
+        /// escolhido/presente no estado). Estes canais <b>não</b> são
+        /// apagados (não há DELETE de canais no Dispatcharr); a limpeza
+        /// é manual. Aditivo: <c>0</c> quando não há duplicados.
+        /// </summary>
+        [JsonPropertyName("ownedChannelDuplicatesRemaining")] public int OwnedChannelDuplicatesRemaining { get; set; }
+
+        /// <summary>
         /// Número de canais <c>CrawlerManaged</c> existentes cujo
         /// <c>tvg_id</c> foi corrigido por PATCH nesta run (o valor no
         /// Dispatcharr diferia do <see cref="ChannelDecision.EpgTvgId"/>).

@@ -22,10 +22,11 @@ namespace m3uCrawler.Services.Catalog;
 ///     migrar em paralelo é bloqueado por um lock de ficheiro).
 ///
 /// <para>
-/// A primeira migration cria o schema + popula o seed (canais
-/// canónicos, aliases, identity rules). Migrations futuras
-/// adicionadas via <c>dotnet ef migrations add</c> são aplicadas
-/// na ordem em que o EF Core as descobriu.
+/// A primeira migration cria apenas o schema. Wave A: o arranque não semeia
+/// canais, aliases nem grupos — as listas são do utilizador ou de um import
+/// explícito. Migrations futuras adicionadas via
+/// <c>dotnet ef migrations add</c> são aplicadas na ordem em que o EF Core
+/// as descobriu.
 /// </para>
 /// </summary>
 public sealed class ChannelCatalogBootstrapper
@@ -41,9 +42,9 @@ public sealed class ChannelCatalogBootstrapper
 
     /// <summary>
     /// Inicializa a BD (cria directório, abre lock exclusivo,
-    /// copia de segurança se a versão do schema mudar, aplica
-    /// migrations, popula seed idempotentemente). Idempotente:
-    /// pode ser chamado em cada arranque.
+    /// copia de segurança se a versão do schema mudar e aplica as
+    /// migrations de schema). Wave A: não semeia canais, aliases nem
+    /// grupos. Idempotente: pode ser chamado em cada arranque.
     /// </summary>
     public async Task<ChannelCatalogDbContext> InitializeAsync(CancellationToken cancellationToken = default)
     {
@@ -91,8 +92,9 @@ public sealed class ChannelCatalogBootstrapper
         try
         {
             // EnsureCreated vs Migrate: usamos Migrate para suportar
-            // migrations futuras. Para a primeira execução, a
-            // migration inicial cria o schema e o seed.
+            // migrations futuras. Na primeira execução a migration inicial
+            // cria apenas o schema — Wave A: sem seed de canais, aliases
+            // ou grupos.
             await context.Database.MigrateAsync(cancellationToken);
         }
         catch (Exception ex)
@@ -112,82 +114,20 @@ public sealed class ChannelCatalogBootstrapper
             lockStream?.Dispose();
         }
 
-        // O seed é parte da migration inicial (IdempotentSeed) —
-        // não precisa de ser aplicado fora dela. Mas o método
-        // SeedAsync fica aqui para suportar migrações manuais
-        // (futuras) sem ter de criar nova migration.
-        await SeedAsync(context, cancellationToken);
-
-        // Baseline JSON versionado: se existir em docs/catalog/,
-        // importa-o idempotentemente sobre o seed programático.
-        // Este passo adiciona os canais e aliases da baseline
-        // canónica portuguesa sem remover nada do seed legacy.
-        await TryImportBaselineAsync(context, cancellationToken);
-
-        // Wave B — normalização de aliases legacy. As instalações
-        // pré-existentes podem ter aliases gravados em bruto (com
-        // tokens de país/qualidade, maiúsculas, diacríticos). Sem
-        // normalização esses aliases nunca são encontrados pelo
-        // matcher. A operação é idempotente e collision-safe.
-        await NormalizeExistingAliasesAsync(context, _logger, cancellationToken);
-
+        // Wave A — as listas canónicas (canais, aliases, grupos) são
+        // geridas exclusivamente pelo utilizador. O arranque aplica
+        // apenas as migrations de schema; NÃO semeia canais do seed
+        // programático, NÃO importa a baseline e NÃO cria grupos
+        // canónicos por omissão. A provisão é explícita, uma única vez,
+        // por acção do utilizador:
+        //   • --import-canonical-baseline <ficheiro.json>
+        //   • --import-country-config <ficheiro.json>
+        //   • --normalize-canonical-aliases (manutenção explícita)
+        // SeedAsync e NormalizeExistingAliasesAsync permanecem
+        // disponíveis para uso explícito (CLI/testes) e nunca são
+        // invocados no arranque.
         lockStream?.Dispose();
         return context;
-    }
-
-    /// <summary>
-    /// Importa o baseline canónico a partir do ficheiro resolvido; se
-    /// não existir ficheiro, usa o recurso embutido na assembly. Esta
-    /// segunda via garante que uma instalação fresca (imagem sem
-    /// <c>docs/catalog/</c> no disco) continua a popular os canais PT
-    /// generalistas. A operação é idempotente e aditiva — não remove
-    /// nem duplica o que já existe.
-    /// </summary>
-    private async Task TryImportBaselineAsync(ChannelCatalogDbContext context, CancellationToken cancellationToken)
-    {
-        var baselinePath = ResolveBaselinePath();
-
-        if (baselinePath is null)
-        {
-            // Antes: LogDebug (invisível em produção). Agora LogWarning
-            // para o operador perceber que a baseline veio do recurso
-            // embutido e não do ficheiro empacotado — mas nunca falha,
-            // porque o recurso embutido está sempre disponível.
-            _logger.LogWarning(
-                "No baseline canonical catalog file found (checked M3U_BASELINE_PATH, " +
-                "CWD/docs/catalog and AppContext.BaseDirectory/docs/catalog); " +
-                "falling back to the embedded baseline resource.");
-        }
-
-        try
-        {
-            var baseline = await LoadBaselineAsync(baselinePath, cancellationToken);
-            var report = await CatalogBaselineImporter.ImportAsync(context, baseline, cancellationToken);
-            _logger.LogInformation(
-                "Baseline import: source={Source} catalogId={CatalogId} version={Version} " +
-                "channelsCreated={Created} channelsUpdated={Updated} aliasesAdded={AliasesAdded} " +
-                "aliasesSkipped={AliasesSkipped} externalIdentitiesAdded={ExternalIdentitiesAdded} " +
-                "externalIdentitiesSkipped={ExternalIdentitiesSkipped} externalIdentityConflicts={ExternalIdentityConflicts}",
-                baselinePath ?? ("embedded:" + CatalogBaselineImporter.EmbeddedBaselineResourceName),
-                report.CatalogId, report.Version, report.ChannelsCreated,
-                report.ChannelsUpdated, report.AliasesAdded, report.AliasesSkipped,
-                report.ExternalIdentitiesAdded, report.ExternalIdentitiesSkipped,
-                report.ExternalIdentityConflicts);
-            foreach (var warning in report.Warnings)
-            {
-                _logger.LogWarning("Baseline import warning: {Warning}", warning);
-            }
-        }
-        catch (Exception ex)
-        {
-            // A baseline embutida deve estar sempre presente; uma falha
-            // aqui é anómala e fica visível, mas não aborta o arranque
-            // (o seed programático continua activo).
-            _logger.LogWarning(ex,
-                "Failed to load/import the baseline canonical catalog (path={Path}). " +
-                "The programmed seed is still active.",
-                baselinePath ?? "<embedded>");
-        }
     }
 
     /// <summary>
@@ -195,7 +135,7 @@ public sealed class ChannelCatalogBootstrapper
     /// <paramref name="resolvedPath"/> é não-nulo (precedência), caso
     /// contrário o recurso embutido. Interno para permitir testes
     /// determinísticos da precedência sem depender do filesystem do
-    /// repositório.
+    /// repositório. Não é invocado no arranque (Wave A).
     /// </summary>
     internal static Task<CatalogBaseline> LoadBaselineAsync(string? resolvedPath, CancellationToken cancellationToken = default)
         => resolvedPath is null
@@ -203,22 +143,11 @@ public sealed class ChannelCatalogBootstrapper
             : CatalogBaselineImporter.LoadFromFileAsync(resolvedPath, cancellationToken);
 
     /// <summary>
-    /// Resolve o caminho do ficheiro baseline usando o ambiente real
-    /// (CWD, directório da assembly, env var).
-    /// </summary>
-    private string? ResolveBaselinePath()
-        => ResolveBaselinePathFor(
-            Directory.GetCurrentDirectory(),
-            AppContext.BaseDirectory,
-            Environment.GetEnvironmentVariable("M3U_BASELINE_PATH"));
-
-    /// <summary>
     /// Resolve o caminho do ficheiro baseline com entradas
     /// explícitas. Ordem de resolução (maior precedência primeiro):
     /// <list type="number">
     ///   <item>Override via variável de ambiente
-    ///         <c>M3U_BASELINE_PATH</c> (usado em produção no
-    ///         Dockerfile).</item>
+    ///         <c>M3U_BASELINE_PATH</c>.</item>
     ///   <item><c>&lt;CWD&gt;/docs/catalog/m3ucrawler_pt_canonical_catalog.json</c>.</item>
     ///   <item><c>&lt;AppContext.BaseDirectory&gt;/docs/catalog/…</c>
     ///         (ficheiro empacotado em <c>/app/docs/catalog</c>).</item>
@@ -226,8 +155,8 @@ public sealed class ChannelCatalogBootstrapper
     ///         <c>BaseDirectory</c> (5 e 4 níveis acima), para
     ///         desenvolvimento/testes.</item>
     /// </list>
-    /// Devolve <c>null</c> quando nenhum existe; nesse caso o caller
-    /// usa o recurso embutido.
+    /// Devolve <c>null</c> quando nenhum existe. Wave A: já não é uma via de
+    /// arranque — mantido apenas para testes determinísticos da resolução.
     /// </summary>
     internal static string? ResolveBaselinePathFor(
         string currentDirectory,
@@ -298,9 +227,11 @@ public sealed class ChannelCatalogBootstrapper
     }
 
     /// <summary>
-    /// Aplica o seed de forma idempotente. Em condições normais a
-    /// migration inicial já popula o seed, mas este método
-    /// suporta cenários em que o seed é reaplicado manualmente.
+    /// Aplica o seed programático de forma idempotente. Wave A: <b>não</b>
+    /// é invocado no arranque — só corre quando chamado explicitamente
+    /// (testes/ferramentas). Cria os 9 grupos por omissão e os canais de
+    /// <see cref="CatalogSeed"/>; a criação de listas é do utilizador ou de
+    /// um import explícito.
     ///
     /// <para>
     /// Os aliases do seed são normalizados via
@@ -433,8 +364,15 @@ public sealed class ChannelCatalogBootstrapper
     /// Garante que os 9 grupos canónicos por omissão existem
     /// (idempotente, por <see cref="CanonicalGroupEntity.Key"/>) e
     /// devolve o mapa <c>Key → Id</c>. É a única implementação C# de
-    /// garantia de grupos; o mapeamento em si vive em
+    /// garantia de grupos por omissão; o mapeamento em si vive em
     /// <see cref="CanonicalGroupDefaults"/>.
+    ///
+    /// <para>
+    /// Wave A: sem caller de arranque — usada apenas pelo
+    /// <see cref="SeedAsync"/> explícito (testes/ferramentas). O import de
+    /// baseline <b>não</b> a usa: só cria os grupos que o ficheiro
+    /// declarar.
+    /// </para>
     /// </summary>
     internal static async Task<System.Collections.Generic.Dictionary<string, long>> EnsureCanonicalGroupsAsync(
         ChannelCatalogDbContext context,

@@ -24,6 +24,16 @@ namespace m3uCrawler.Services
     {
         private static readonly JsonSerializerOptions ReadOptions = new() { PropertyNameCaseInsensitive = true };
 
+        /// <summary>
+        /// Padrão seguro para códigos de país usados como nome de ficheiro
+        /// (<c>&lt;code&gt;.json</c>): 1 a 10 caracteres alfanuméricos
+        /// minúsculos, com hífens interiores. Rejeita <c>/</c>, <c>\</c>,
+        /// <c>..</c>, espaços e qualquer caminho (L11).
+        /// </summary>
+        private static readonly System.Text.RegularExpressions.Regex CountryCodePattern =
+            new(@"^[a-z0-9]([a-z0-9-]{0,8}[a-z0-9])?$",
+                System.Text.RegularExpressions.RegexOptions.Compiled);
+
         private readonly string _rootDirectory;
 
         public CountryChannelListService(string? rootDirectory = null)
@@ -32,6 +42,14 @@ namespace m3uCrawler.Services
                 ? Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries")
                 : rootDirectory;
         }
+
+        /// <summary>
+        /// <c>true</c> quando <paramref name="countryCode"/> é um código
+        /// seguro para usar como nome de ficheiro. Nunca permite caminhos
+        /// (<c>/</c>, <c>\</c>, <c>..</c>), pelo que impede path traversal.
+        /// </summary>
+        public static bool IsValidCountryCode(string? countryCode)
+            => countryCode is not null && CountryCodePattern.IsMatch(countryCode);
 
         public List<CountryChannelList> GetAllCountries()
         {
@@ -68,15 +86,22 @@ namespace m3uCrawler.Services
                 }
             }
 
-            // Leitura pura: nunca cria nem sobrepõe ficheiros. A baseline é
-            // provisionada no arranque (CountryConfigProvisioner) e gravações
-            // são explícitas via SaveCountry (POST /api/country/save).
+            // Leitura pura: nunca cria nem sobrepõe ficheiros. Wave A — as
+            // listas de país são 100% do utilizador: não há provisionamento
+            // automático no arranque; gravações são explícitas via SaveCountry
+            // (POST /api/country/save) ou --import-country-config.
             return items;
         }
 
         public CountryChannelList GetCountry(string countryCode)
         {
             var normalized = NormalizeCountryCode(countryCode);
+            if (!IsValidCountryCode(normalized))
+            {
+                throw new ArgumentException(
+                    "Código de país inválido.", nameof(countryCode));
+            }
+
             var config = GetAllCountries().FirstOrDefault(x => NormalizeCountryCode(x.Country) == normalized);
             if (config is not null)
             {
@@ -98,6 +123,11 @@ namespace m3uCrawler.Services
             if (string.IsNullOrWhiteSpace(normalizedCountry))
             {
                 throw new ArgumentException("Country is required.");
+            }
+
+            if (!IsValidCountryCode(normalizedCountry))
+            {
+                throw new ArgumentException("Country code is invalid.", nameof(country));
             }
 
             country.Country = normalizedCountry;
@@ -126,7 +156,7 @@ namespace m3uCrawler.Services
         public bool DeleteCountry(string countryCode)
         {
             var normalized = NormalizeCountryCode(countryCode);
-            if (string.IsNullOrWhiteSpace(normalized))
+            if (string.IsNullOrWhiteSpace(normalized) || !IsValidCountryCode(normalized))
             {
                 return false;
             }

@@ -91,11 +91,14 @@ public sealed class CountryConfigProvisionerTests : IDisposable
     }
 
     [Fact]
-    public void IsCountryDataAvailable_true_for_builtin_baseline_when_file_missing()
+    public void IsCountryDataAvailable_false_for_builtin_baseline_when_file_missing()
     {
+        // Wave A — a baseline embutida PT já NÃO conta para a prontidão.
+        // Só ficheiros reais <code>.json</code> fornecidos pelo utilizador
+        // contam; uma instalação nova sem ficheiro fica indisponível.
         var missingDir = Path.Combine(_root, "does-not-exist");
 
-        Assert.True(CountryConfigProvisioner.IsCountryDataAvailable(missingDir, "pt"));
+        Assert.False(CountryConfigProvisioner.IsCountryDataAvailable(missingDir, "pt"));
         Assert.False(Directory.Exists(missingDir));
     }
 

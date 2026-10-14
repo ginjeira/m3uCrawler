@@ -50,6 +50,7 @@ public class MaintenancePublicationRetentionTests : IAsyncLifetime
         var bootstrapper = new ChannelCatalogBootstrapper(_dbPath);
         await using (var ctx = await bootstrapper.InitializeAsync())
         {
+            await TestCatalogSeed.ApplyDefaultsAsync(ctx);
         }
         _resolver = new CatalogResolver(_factory, _dbPath);
         _channels = (await _resolver.ListCanonicalChannelsAsync()).Take(3).ToList();

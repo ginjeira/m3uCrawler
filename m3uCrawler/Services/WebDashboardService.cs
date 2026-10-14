@@ -839,7 +839,17 @@ namespace m3uCrawler.Services
                     return;
                 }
 
-                await WriteJsonAsync(context.Response, service.GetCountry(countryCode));
+                try
+                {
+                    await WriteJsonAsync(context.Response, service.GetCountry(countryCode));
+                }
+                catch (ArgumentException)
+                {
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = "Código de país inválido." },
+                        HttpStatusCode.BadRequest);
+                }
                 return;
             }
 
@@ -851,6 +861,14 @@ namespace m3uCrawler.Services
                     return;
                 }
                 var countryCode = context.Request.QueryString["country"] ?? "pt";
+                if (!CountryChannelListService.IsValidCountryCode(countryCode.Trim().ToLowerInvariant()))
+                {
+                    await WriteJsonAsync(
+                        context.Response,
+                        new { error = "Código de país inválido." },
+                        HttpStatusCode.BadRequest);
+                    return;
+                }
                 var countryList = new CountryChannelListService(ResolveCountriesDir());
                 var affinityMembers = await LoadCountryAffinityMembersAsync();
                 var validator = new CountryChannelValidator(
@@ -899,6 +917,13 @@ namespace m3uCrawler.Services
                     var service = new CountryChannelListService(ResolveCountriesDir());
                     service.SaveCountry(country);
                     await WriteJsonAsync(context.Response, country);
+                    return;
+                }
+                catch (ArgumentException)
+                {
+                    // L11 — código de país inválido (path traversal, etc.).
+                    await WriteTextAsync(
+                        context.Response, "Código de país inválido.", HttpStatusCode.BadRequest);
                     return;
                 }
                 catch (Exception ex)

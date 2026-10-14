@@ -53,6 +53,7 @@ public class ChannelCatalogIntegrationTests : IAsyncLifetime
         // file handle is released — the next factory.CreateDbContext()
         // call inside each test will open a fresh handle.
         var ctx = await _bootstrapper.InitializeAsync();
+        await TestCatalogSeed.ApplyDefaultsAsync(ctx);
         await ctx.DisposeAsync();
         // Also reset the bootstrapper's own connection by disposing
         // its in-process state via reflection. The bootstrapper holds

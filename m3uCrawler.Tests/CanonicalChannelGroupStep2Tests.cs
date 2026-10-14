@@ -15,7 +15,7 @@ namespace m3uCrawler.Tests;
 /// apenas pela <c>Key</c> do <see cref="CanonicalGroupEntity"/> e pela FK
 /// <c>GroupId</c>.
 /// <list type="bullet">
-///   <item>Create/Update/Ensure/ReviewApproval resolvem <c>GroupId</c> a
+///   <item>Create/Update/ReviewApproval resolvem <c>GroupId</c> a
 ///         partir da <c>groupKey</c>;</item>
 ///   <item><see cref="CatalogResolution"/> transporta o grupo
 ///         (<c>GroupId</c>/<c>GroupKey</c>/<c>GroupName</c>);</item>
@@ -37,6 +37,10 @@ public class CanonicalChannelGroupStep2Tests
         var bootstrapper = new ChannelCatalogBootstrapper(dbPath);
         await using (var ctx = await bootstrapper.InitializeAsync())
         {
+            // Wave A/H1 — a migration já não semeia grupos. Estes testes
+            // exercitam o mapeamento por groupKey, pelo que provisionam os
+            // grupos por omissão explicitamente (como um utilizador faria).
+            await ChannelCatalogBootstrapper.EnsureCanonicalGroupsAsync(ctx, DateTime.UtcNow);
         }
 
         var factory = new TestDbContextFactory(dbPath);
@@ -50,7 +54,7 @@ public class CanonicalChannelGroupStep2Tests
         return await ctx.CanonicalGroups.Where(g => g.Key == key).Select(g => g.Id).SingleAsync();
     }
 
-    // ================= Create / Update / Ensure =================
+    // ================= Create / Update =================
 
     [Fact]
     public async Task CreateCanonicalChannelAsync_sets_GroupId_from_groupKey()
@@ -70,26 +74,6 @@ public class CanonicalChannelGroupStep2Tests
             await using var ctx = factory.CreateDbContext();
             var persisted = await ctx.CanonicalChannels.SingleAsync(c => c.Id == channel.Id);
             Assert.Equal(expected, persisted.GroupId);
-        }
-        finally
-        {
-            TestTempDb.Cleanup(dbPath);
-        }
-    }
-
-    [Fact]
-    public async Task EnsureCanonicalChannelAsync_sets_GroupId_from_groupKey()
-    {
-        var (factory, resolver, dbPath) = await InitializeAsync();
-        try
-        {
-            var (channel, created) = await resolver.EnsureCanonicalChannelAsync(
-                "wavea-ensured", "Garantido",
-                EditorialCategory.Infantil, CanonicalGroupKeys.PortugalInfantil,
-                PublicationPolicy.CreateEligible, isEnabled: true, normalizedAlias: null);
-
-            Assert.True(created);
-            Assert.Equal(await GroupIdAsync(factory, "pt-infantil"), channel.GroupId);
         }
         finally
         {

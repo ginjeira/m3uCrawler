@@ -4,10 +4,18 @@ using System.Text.Json;
 namespace m3uCrawler.Services.Configuration;
 
 /// <summary>
-/// Provisiona os ficheiros de configuração de país (<c>*.json</c>) no
-/// arranque, para que uma instalação nova tenha a baseline disponível
-/// mesmo antes do bind mount de <c>runtime-data</c> ser populado.
-/// Nunca sobrepõe ficheiros existentes.
+/// Utilitário de provisionamento de ficheiros de configuração de país
+/// (<c>*.json</c>) a partir de recursos embutidos/baselines.
+///
+/// <para>
+/// <b>Wave A — não é invocado no arranque.</b> As listas de país são geridas
+/// exclusivamente pelo utilizador e nenhum processo automático as cria. A
+/// provisão é explícita, por acção do utilizador, via
+/// <c>--import-country-config</c> (que grava com
+/// <see cref="CountryChannelListService.SaveCountry"/>). Este utilitário
+/// permanece apenas para uso manual/testes e nunca sobrepõe ficheiros
+/// existentes.
+/// </para>
 /// </summary>
 public static class CountryConfigProvisioner
 {
@@ -88,10 +96,18 @@ public static class CountryConfigProvisioner
     /// <summary>
     /// Indica se existem dados de país utilizáveis para
     /// <paramref name="countryCode"/>: um ficheiro
-    /// <c>&lt;code&gt;.json</c> já provisionado com pelo menos um canal, ou a
-    /// baseline embutida (PT). É uma <b>leitura pura</b>: nunca cria nem
+    /// <c>&lt;code&gt;.json</c> real, sob <paramref name="countriesDirectory"/>,
+    /// com pelo menos um canal. É uma <b>leitura pura</b>: nunca cria nem
     /// altera ficheiros. Usada pela prontidão operacional
     /// (<c>countryDataOk</c>).
+    ///
+    /// <para>
+    /// Wave A — a baseline embutida (PT) <b>não</b> conta como disponível:
+    /// só ficheiros reais fornecidos pelo utilizador o fazem. Uma
+    /// instalação nova sem <c>&lt;code&gt;.json</c> fica com
+    /// <c>countryDataOk = false</c> até o utilizador criar/importar a
+    /// configuração de país.
+    /// </para>
     /// </summary>
     public static bool IsCountryDataAvailable(string? countriesDirectory, string? countryCode)
     {
@@ -106,12 +122,19 @@ public static class CountryConfigProvisioner
                 return true;
         }
 
-        return HasBuiltInBaseline(normalized);
+        // Wave A — HasBuiltInBaseline já não influencia a prontidão.
+        return false;
     }
 
     /// <summary>
     /// <c>true</c> quando existe uma baseline embutida no assembly para o
     /// país indicado (actualmente apenas PT).
+    ///
+    /// <para>
+    /// Wave A — informativo apenas: <b>já não</b> influencia a prontidão
+    /// (<see cref="IsCountryDataAvailable"/>) nem qualquer provisionamento
+    /// automático.
+    /// </para>
     /// </summary>
     public static bool HasBuiltInBaseline(string? countryCode)
         => string.Equals(

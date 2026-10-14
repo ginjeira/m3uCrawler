@@ -29,11 +29,15 @@ channels exist; auxiliary recognition data is not another source of truth
 (`05-CATALOGUE.md:23-27`).
 
 Current implementation (evidence): a versioned JSON baseline
-(`docs/catalog/m3ucrawler_pt_canonical_catalog.json`) plus an embedded fallback is
-imported by `CatalogBaselineImporter.ImportAsync`, which is idempotent, additive and
-never deletes (`CatalogBaselineImporter.cs:18-30`, `:275-431`); source precedence is
-`M3U_BASELINE_PATH` → `CWD/docs/catalog` → `BaseDirectory/docs/catalog` → embedded
-(`ChannelCatalogBootstrapper.cs:212-257`).
+(`docs/catalog/m3ucrawler_pt_canonical_catalog.json`) plus an embedded fallback can
+be imported by `CatalogBaselineImporter.ImportAsync`, which is idempotent, additive
+and never deletes (`CatalogBaselineImporter.cs`). **Wave A:** import is no longer a
+startup side effect — it runs only via the explicit one-shot CLI
+`--import-canonical-baseline <ficheiro.json>`, and it creates only the canonical
+groups the imported file itself declares (never the default groups automatically).
+The file/embedded resolution helper (`M3U_BASELINE_PATH` → `CWD/docs/catalog` →
+`BaseDirectory/docs/catalog` → embedded) is retained for testable resolution
+(`ChannelCatalogBootstrapper.ResolveBaselinePathFor`).
 
 ## Decision
 

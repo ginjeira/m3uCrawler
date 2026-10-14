@@ -10,11 +10,11 @@ namespace m3uCrawler.Services.Catalog;
 ///
 /// <para>
 /// Esta é a <b>única fonte C#</b> do mapeamento
-/// <c>(Key/DisplayName/Order/IsDefault)</c>. A migration
-/// <c>AddCanonicalChannelGroupFk</c> duplica o mesmo mapeamento em SQL
-/// bruto (uma data migration SQLite não pode chamar C#) — manter os
-/// dois em sincronia. Ver
-/// <c>Migrations/20261007150000_AddCanonicalChannelGroupFk.cs</c>.
+/// <c>(Key/DisplayName/Order/IsDefault)</c>. É usada apenas pelo
+/// <c>SeedAsync</c> explícito (seed programático; sem caller de arranque,
+/// Wave A) para criar os grupos por omissão quando o operador o corre. Não
+/// é aplicada automaticamente e o import de baseline <b>não</b> a usa: só
+/// cria os grupos que o ficheiro importado declarar.
 /// </para>
 /// </summary>
 public static class CanonicalGroupDefaults

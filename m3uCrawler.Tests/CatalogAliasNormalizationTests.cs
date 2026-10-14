@@ -33,6 +33,7 @@ public class CatalogAliasNormalizationTests : IAsyncLifetime
         _factory = new TestDbContextFactory(_dbPath);
         _bootstrapper = new ChannelCatalogBootstrapper(_dbPath);
         var ctx = await _bootstrapper.InitializeAsync();
+        await TestCatalogSeed.ApplyDefaultsAsync(ctx);
         await ctx.DisposeAsync();
         _resolver = new CatalogResolver(_factory, _dbPath);
     }
@@ -175,7 +176,7 @@ public class CatalogAliasNormalizationTests : IAsyncLifetime
     // ════════════════════════════════════════════════════════════════
 
     [Fact]
-    public async Task Existing_raw_alias_becomes_matchable_after_bootstrap_and_is_idempotent()
+    public async Task Existing_raw_alias_becomes_matchable_after_normalization_and_is_idempotent()
     {
         long channelId;
         await using (var ctx = await _factory.CreateDbContextAsync())
@@ -214,8 +215,13 @@ public class CatalogAliasNormalizationTests : IAsyncLifetime
         var before = await _resolver.ResolveAsync("legacy alternativa");
         Assert.Equal(CatalogResolutionKind.Unknown, before.Kind);
 
-        var ctx2 = await _bootstrapper.InitializeAsync();
-        await ctx2.DisposeAsync();
+        // O arranque já não normaliza aliases automaticamente (Wave A):
+        // a normalização legacy é aplicada EXPLICITAMENTE, como qualquer
+        // outra manutenção do catálogo.
+        await using (var ctx2 = await _bootstrapper.InitializeAsync())
+        {
+            await ChannelCatalogBootstrapper.NormalizeExistingAliasesAsync(ctx2, logger: null);
+        }
 
         var after = await _resolver.ResolveAsync("legacy alternativa");
         Assert.Equal(CatalogResolutionKind.Canonical, after.Kind);
@@ -225,9 +231,11 @@ public class CatalogAliasNormalizationTests : IAsyncLifetime
         Assert.Contains("legacy alternativa", aliases);
         Assert.DoesNotContain("LEGACY ALTERNATIVA HD", aliases);
 
-        // Segundo arranque é idempotente.
-        var ctx3 = await _bootstrapper.InitializeAsync();
-        await ctx3.DisposeAsync();
+        // Segunda normalização é idempotente.
+        await using (var ctx3 = await _bootstrapper.InitializeAsync())
+        {
+            await ChannelCatalogBootstrapper.NormalizeExistingAliasesAsync(ctx3, logger: null);
+        }
         Assert.Equal(aliases.OrderBy(a => a), (await AliasesOfAsync(channelId)).OrderBy(a => a));
     }
 
@@ -284,8 +292,10 @@ public class CatalogAliasNormalizationTests : IAsyncLifetime
         }
 
         // Não deve lançar.
-        var ctx2 = await _bootstrapper.InitializeAsync();
-        await ctx2.DisposeAsync();
+        await using (var ctx2 = await _bootstrapper.InitializeAsync())
+        {
+            await ChannelCatalogBootstrapper.NormalizeExistingAliasesAsync(ctx2, logger: null);
+        }
 
         var bAliases = await AliasesOfAsync(channelBId);
         Assert.Contains("zzunique 1", bAliases);

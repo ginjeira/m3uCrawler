@@ -37,8 +37,12 @@ public sealed class WaveW4ChannelAdminHttpTests : IAsyncLifetime
 
         var factory = new TestDbContextFactory(_dbPath);
         var bootstrapper = new ChannelCatalogBootstrapper(_dbPath);
-        var ctx = await bootstrapper.InitializeAsync();
-        await ctx.DisposeAsync();
+        await using (var ctx = await bootstrapper.InitializeAsync())
+        {
+            // Wave A/H1 — a migration já não semeia grupos. Provisiona os
+            // grupos por omissão explicitamente (como um utilizador faria).
+            await ChannelCatalogBootstrapper.EnsureCanonicalGroupsAsync(ctx, DateTime.UtcNow);
+        }
 
         var resolver = new CatalogResolver(factory, _dbPath);
         var composer = new PlaylistComposerService(factory);

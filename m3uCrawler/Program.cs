@@ -962,6 +962,27 @@ namespace m3uCrawler
                 return;
             }
 
+            // Wave A — provisão EXPLÍCITA das listas geridas pelo
+            // utilizador. One-shot, nunca invocada no arranque normal.
+            if (args.Contains("--import-canonical-baseline"))
+            {
+                Environment.ExitCode = await RunImportCanonicalBaselineAsync(args);
+                return;
+            }
+
+            if (args.Contains("--import-country-config"))
+            {
+                Environment.ExitCode = await RunImportCountryConfigAsync(args);
+                return;
+            }
+
+            // Wave A/L9 — manutenção EXPLÍCITA do catálogo (one-shot).
+            if (args.Contains("--normalize-canonical-aliases"))
+            {
+                Environment.ExitCode = await RunNormalizeCanonicalAliasesAsync(args);
+                return;
+            }
+
             // Check for help
             if (args.Contains("--help") || args.Contains("-h"))
             {
@@ -1239,6 +1260,10 @@ namespace m3uCrawler
             Console.WriteLine("  --playlist PATH    Caminho da playlist a sincronizar (default: <output-dir>/playlist.m3u)");
             Console.WriteLine("  --import-epg-tvg-ids URL|PATH  Importa uma EPG XMLTV (.xml/.xml.gz) e grava os ids dos canais como tvg-id curado dos canais canónicos do país");
             Console.WriteLine("  --epg-country CODE  País da EPG a importar (default: o país activo de --country, senão pt)");
+            Console.WriteLine("  --import-canonical-baseline FICHEIRO  Provisão EXPLÍCITA: importa um baseline canónico fornecido pelo utilizador (nunca no arranque)");
+            Console.WriteLine("  --import-country-config FICHEIRO      Provisão EXPLÍCITA: grava a configuração de país fornecida pelo utilizador em runtime-data/countries/<code>.json");
+            Console.WriteLine("  --normalize-canonical-aliases  Manutenção EXPLÍCITA: normaliza os aliases legacy do catálogo canónico (one-shot; nunca no arranque)");
+            Console.WriteLine("  --country-dir DIR      Directório de configuração de países usado por --import-country-config (padrão: runtime-data/countries)");
             Console.WriteLine("  --admin-reset-password USERNAME  Recupera a password do administrador (host-only; password lida do stdin, nunca de argv)");
             Console.WriteLine("  --help, -h        Mostra esta ajuda");
             Console.WriteLine("  --version, -V     Mostra versão (SemVer + commit SHA + build number + data) e sai");
@@ -1752,12 +1777,11 @@ namespace m3uCrawler
         {
             Console.WriteLine($"📦 Inicializando catálogo persistente: {dbPath}");
 
-            // Provisiona a baseline de países antes de qualquer
-            // CountryChannelValidator/CountryChannelListService ser
-            // construído (vale para --web e --telegram).
-            CountryConfigProvisioner.EnsureProvisioned(
-                Path.Combine(Directory.GetCurrentDirectory(), "runtime-data", "countries"));
-
+            // Wave A — as listas de país e os canais canónicos são
+            // geridos exclusivamente pelo utilizador. O arranque só
+            // aplica migrations de schema; NÃO provisiona ficheiros de
+            // país nem semeia canais/grupos. A provisão é explícita
+            // (--import-canonical-baseline / --import-country-config).
             var bootstrapper = new ChannelCatalogBootstrapper(dbPath);
             await using var context = await bootstrapper.InitializeAsync(ct);
             await context.DisposeAsync();
@@ -1895,6 +1919,226 @@ namespace m3uCrawler
 
             Console.WriteLine();
             Console.WriteLine($"✅ Importação de EPG concluída: {created} nova(s) identidade(s) tvg-id.");
+            return 0;
+        }
+
+        /// <summary>
+        /// Wave A — provisão EXPLÍCITA do catálogo canónico. Lê um baseline
+        /// fornecido pelo utilizador (<paramref name="args"/> via
+        /// <c>--import-canonical-baseline &lt;ficheiro.json&gt;</c>) e corre
+        /// <see cref="CatalogBaselineImporter.ImportAsync"/>. Nunca é
+        /// invocado no arranque normal e nunca usa a baseline embutida por
+        /// omissão. Idempotente. Código de saída: 0 em sucesso; 2 em
+        /// invocação inválida; 3 em catálogo indisponível; 4 em ficheiro
+        /// em falta/ilegível.
+        /// </summary>
+        internal static async Task<int> RunImportCanonicalBaselineAsync(string[] args)
+        {
+            var source = GetOptionValue(args, "--import-canonical-baseline");
+            if (string.IsNullOrWhiteSpace(source))
+            {
+                Console.Error.WriteLine(
+                    "❌ Indica o ficheiro: --import-canonical-baseline <ficheiro.json>");
+                return 2;
+            }
+
+            if (!File.Exists(source))
+            {
+                Console.Error.WriteLine($"❌ Ficheiro de baseline não encontrado: {source}");
+                return 4;
+            }
+
+            CatalogBaseline baseline;
+            try
+            {
+                baseline = await CatalogBaselineImporter.LoadFromFileAsync(source, CancellationToken.None);
+            }
+            catch (Exception ex) when (ex is IOException or InvalidDataException
+                or UnauthorizedAccessException or ArgumentException or NotSupportedException
+                or System.Text.Json.JsonException)
+            {
+                // Sem eco do conteúdo do ficheiro nem de ex.Message (pode
+                // conter dados do utilizador). Mensagem genérica.
+                Console.Error.WriteLine(
+                    "❌ Falha ao ler o baseline (ficheiro inválido ou ilegível).");
+                return 4;
+            }
+
+            CatalogResolver catalog;
+            try
+            {
+                catalog = await InitializeCatalogAsync(ResolveCatalogDbPath(args), CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine(
+                    $"❌ Catálogo indisponível. Importação do baseline abortada. Erro: {ex.GetType().Name}");
+                return 3;
+            }
+
+            CatalogBaselineImportReport report;
+            try
+            {
+                await using var context = await catalog.GetFactory().CreateDbContextAsync();
+                report = await CatalogBaselineImporter.ImportAsync(context, baseline, CancellationToken.None);
+            }
+            catch (Exception)
+            {
+                // Mensagem genérica: nunca ecoar ex.Message (pode conter
+                // dados do ficheiro/BD).
+                Console.Error.WriteLine("❌ Falha ao importar o baseline.");
+                return 4;
+            }
+
+            Console.WriteLine();
+            Console.WriteLine($"📚 Importação de baseline canónico: {source}");
+            Console.WriteLine(
+                $"  catálogo={report.CatalogId} versão={report.Version} país={report.Country}");
+            Console.WriteLine(
+                $"  Canais: {report.ChannelsCreated} criado(s), {report.ChannelsUpdated} actualizado(s), " +
+                $"{report.SkippedChannels} ignorado(s)");
+            Console.WriteLine(
+                $"  Aliases: {report.AliasesAdded} adicionado(s), {report.AliasesSkipped} já existente(s)");
+            Console.WriteLine(
+                $"  Identidades externas: {report.ExternalIdentitiesAdded} adicionada(s), " +
+                $"{report.ExternalIdentitiesSkipped} já existente(s), " +
+                $"{report.ExternalIdentityConflicts} conflito(s)");
+            foreach (var warning in report.Warnings)
+            {
+                Console.WriteLine($"  ⚠️  {warning}");
+            }
+
+            Console.WriteLine();
+            Console.WriteLine(
+                $"✅ Baseline importado: {report.ChannelsCreated} novo(s) canal(ais) canónico(s).");
+            return 0;
+        }
+
+        /// <summary>
+        /// Wave A — provisão EXPLÍCITA da configuração de país. Lê o ficheiro
+        /// fornecido pelo utilizador (<paramref name="args"/> via
+        /// <c>--import-country-config &lt;ficheiro.json&gt;</c>) e grava-o via
+        /// <see cref="CountryChannelListService.SaveCountry"/>. Nunca é
+        /// invocado no arranque normal. Idempotente (overwrite normalizado).
+        /// Código de saída: 0 em sucesso; 2 em invocação inválida; 4 em
+        /// ficheiro em falta/ilegível.
+        /// </summary>
+        internal static async Task<int> RunImportCountryConfigAsync(string[] args)
+        {
+            var source = GetOptionValue(args, "--import-country-config");
+            // Directório opcional: por omissão o serviço usa
+            // runtime-data/countries sob o CWD. Existe para testes
+            // determinísticos que não tocam no runtime-data real.
+            var countryDirectory = GetOptionValue(args, "--country-dir");
+            return await RunImportCountryConfigAsync(source, countryDirectory);
+        }
+
+        /// <summary>
+        /// Núcleo testável de <c>--import-country-config</c>: lê
+        /// <paramref name="source"/> e grava via
+        /// <see cref="CountryChannelListService.SaveCountry"/>.
+        /// </summary>
+        internal static async Task<int> RunImportCountryConfigAsync(
+            string? source, string? countryDirectory)
+        {
+            if (string.IsNullOrWhiteSpace(source))
+            {
+                Console.Error.WriteLine(
+                    "❌ Indica o ficheiro: --import-country-config <ficheiro.json>");
+                return 2;
+            }
+
+            if (!File.Exists(source))
+            {
+                Console.Error.WriteLine($"❌ Ficheiro de configuração de país não encontrado: {source}");
+                return 4;
+            }
+
+            CountryChannelList? config;
+            try
+            {
+                var json = await File.ReadAllTextAsync(source, CancellationToken.None);
+                config = System.Text.Json.JsonSerializer.Deserialize<CountryChannelList>(
+                    json, new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
+                or System.Text.Json.JsonException)
+            {
+                // Sem eco do conteúdo do ficheiro nem de ex.Message (pode
+                // conter dados do utilizador). Mensagem genérica.
+                Console.Error.WriteLine(
+                    "❌ Falha ao ler a configuração de país (JSON inválido ou ilegível).");
+                return 4;
+            }
+
+            if (config is null || string.IsNullOrWhiteSpace(config.Country))
+            {
+                Console.Error.WriteLine(
+                    "❌ Ficheiro de país inválido: campo 'country' obrigatório.");
+                return 4;
+            }
+
+            var service = new CountryChannelListService(countryDirectory);
+            try
+            {
+                service.SaveCountry(config);
+            }
+            catch (Exception ex) when (ex is ArgumentException or IOException
+                or UnauthorizedAccessException or NotSupportedException)
+            {
+                // Mensagem genérica: nunca ecoar ex.Message. ArgumentException
+                // inclui a validação do código de país (L11).
+                Console.Error.WriteLine("❌ Falha ao gravar a configuração de país.");
+                return 4;
+            }
+
+            var savedPath = Path.Combine(
+                service.GetCountryDirectory(), $"{config.Country.ToLowerInvariant()}.json");
+            Console.WriteLine();
+            Console.WriteLine(
+                $"✅ Configuração de país gravada: {savedPath} " +
+                $"({config.Channels.Count} canal(ais)).");
+            return 0;
+        }
+
+        /// <summary>
+        /// Wave A/L9 — manutenção EXPLÍCITA do catálogo canónico: normaliza
+        /// in-place os <c>NormalizedAlias</c> legacy para a forma matchable
+        /// do <see cref="ChannelNormalizer.Normalize"/>. One-shot, nunca no
+        /// arranque. Idempotente. Usa <c>--catalog-db</c> quando indicado
+        /// (caso contrário o caminho por omissão). Código de saída: 0 em
+        /// sucesso; 3 em catálogo indisponível; 4 em falha de manutenção.
+        /// </summary>
+        internal static async Task<int> RunNormalizeCanonicalAliasesAsync(string[] args)
+        {
+            CatalogResolver catalog;
+            try
+            {
+                catalog = await InitializeCatalogAsync(ResolveCatalogDbPath(args), CancellationToken.None);
+            }
+            catch (Exception)
+            {
+                Console.Error.WriteLine(
+                    "❌ Catálogo indisponível. Normalização de aliases abortada.");
+                return 3;
+            }
+
+            int changed;
+            try
+            {
+                await using var context = await catalog.GetFactory().CreateDbContextAsync();
+                changed = await ChannelCatalogBootstrapper.NormalizeExistingAliasesAsync(
+                    context, logger: null, CancellationToken.None);
+            }
+            catch (Exception)
+            {
+                Console.Error.WriteLine("❌ Falha ao normalizar os aliases do catálogo.");
+                return 4;
+            }
+
+            Console.WriteLine();
+            Console.WriteLine(
+                $"✅ Normalização de aliases concluída: {changed} alias(es) alterado(s).");
             return 0;
         }
 

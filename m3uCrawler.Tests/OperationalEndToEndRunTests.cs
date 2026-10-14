@@ -117,6 +117,7 @@ public class OperationalEndToEndRunTests : IAsyncLifetime
         var bootstrapper = new ChannelCatalogBootstrapper(_dbPath);
         await using (var ctx = await bootstrapper.InitializeAsync())
         {
+            await TestCatalogSeed.ApplyDefaultsAsync(ctx);
         }
         _catalog = new CatalogResolver(_factory, _dbPath);
         _policyResolver = new RecognitionPolicyResolver(_catalog);

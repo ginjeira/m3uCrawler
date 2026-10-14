@@ -35,6 +35,7 @@ public class CatalogR2ConsistencyTests : IAsyncLifetime
         _factory = new TestDbContextFactory(_dbPath);
         _bootstrapper = new ChannelCatalogBootstrapper(_dbPath);
         var ctx = await _bootstrapper.InitializeAsync();
+        await TestCatalogSeed.ApplyDefaultsAsync(ctx);
         await ctx.DisposeAsync();
     }
 
@@ -43,6 +44,7 @@ public class CatalogR2ConsistencyTests : IAsyncLifetime
     private async Task<CatalogResolver> NewResolverAsync()
     {
         var ctx = await _bootstrapper.InitializeAsync();
+        await TestCatalogSeed.ApplyDefaultsAsync(ctx);
         await ctx.DisposeAsync();
         return new CatalogResolver(_factory, _dbPath);
     }

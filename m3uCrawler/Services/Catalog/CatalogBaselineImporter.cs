@@ -295,11 +295,13 @@ public static class CatalogBaselineImporter
 
         var now = DateTime.UtcNow;
 
-        // Wave A — garantir os grupos canónicos por omissão e obter o
-        // mapa Key → Id para que os canais criados pelo baseline fiquem
-        // já com GroupId. Aditivo: não altera qualquer comportamento
-        // observável (o campo não é lido nesta wave).
-        var groupIds = await ChannelCatalogBootstrapper.EnsureCanonicalGroupsAsync(context, now, ct);
+        // Wave A — os grupos canónicos deixaram de ser impostos. O import
+        // cria APENAS os grupos declarados no próprio ficheiro baseline
+        // (CatalogBaseline.Groups) e mapeia o GroupId dos canais pelas
+        // chaves declaradas. Se o ficheiro não declarar grupos, nenhum
+        // grupo é criado e os canais ficam com GroupId = null. Nunca cria
+        // os grupos por omissão PT (CanonicalGroupDefaults).
+        var groupIds = await UpsertDeclaredGroupsAsync(context, baseline, now, ct);
 
         // Indexar canais existentes por Key.
         var existingChannels = await context.CanonicalChannels
@@ -510,6 +512,83 @@ public static class CatalogBaselineImporter
 
         await context.SaveChangesAsync(ct);
         return report;
+    }
+
+    /// <summary>
+    /// Cria, de forma aditiva e idempotente, apenas os grupos canónicos
+    /// <b>declarados</b> em <see cref="CatalogBaseline.Groups"/> e devolve o
+    /// mapa <c>chave declarada → Id</c>. Grupos já existentes (criados pelo
+    /// operador ou por um import anterior) são preservados sem
+    /// sobreposição. Um baseline sem grupos declarados não cria nenhum
+    /// grupo — nunca se recorre aos grupos por omissão
+    /// (<see cref="CanonicalGroupDefaults"/>).
+    /// </summary>
+    private static async Task<Dictionary<string, long>> UpsertDeclaredGroupsAsync(
+        ChannelCatalogDbContext context,
+        CatalogBaseline baseline,
+        DateTime now,
+        CancellationToken ct)
+    {
+        var idsByKey = new Dictionary<string, long>(StringComparer.Ordinal);
+
+        var declared = (baseline.Groups ?? new List<GroupBaseline>())
+            .Where(g => !string.IsNullOrWhiteSpace(g.Id))
+            .Select(g => (Key: g.Id.Trim().ToLowerInvariant(), g.Name))
+            .GroupBy(x => x.Key, StringComparer.Ordinal)
+            .Select(x => x.First())
+            .ToList();
+
+        if (declared.Count == 0)
+        {
+            return idsByKey;
+        }
+
+        var existing = await context.CanonicalGroups
+            .AsNoTracking()
+            .Select(g => new { g.Id, g.Key })
+            .ToListAsync(ct);
+        foreach (var g in existing)
+        {
+            idsByKey[g.Key] = g.Id;
+        }
+
+        var order = 0;
+        var added = false;
+        foreach (var (key, name) in declared)
+        {
+            if (!idsByKey.ContainsKey(key))
+            {
+                context.CanonicalGroups.Add(new CanonicalGroupEntity
+                {
+                    Key = key,
+                    DisplayName = string.IsNullOrWhiteSpace(name) ? key : name.Trim(),
+                    Order = order,
+                    IsEnabled = true,
+                    IsDefault = order == 0,
+                    CreatedAtUtc = now,
+                    UpdatedAtUtc = now,
+                });
+                added = true;
+            }
+
+            order++;
+        }
+
+        if (added)
+        {
+            await context.SaveChangesAsync(ct);
+            idsByKey.Clear();
+            var refreshed = await context.CanonicalGroups
+                .AsNoTracking()
+                .Select(g => new { g.Id, g.Key })
+                .ToListAsync(ct);
+            foreach (var g in refreshed)
+            {
+                idsByKey[g.Key] = g.Id;
+            }
+        }
+
+        return idsByKey;
     }
 
     /// <summary>

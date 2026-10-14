@@ -35,8 +35,12 @@ public class ChannelMatcherCanonicalGroupNameTests
     {
         var dbPath = NewDbPath();
         var bootstrapper = new ChannelCatalogBootstrapper(dbPath);
-        var ctx = await bootstrapper.InitializeAsync();
-        await ctx.DisposeAsync();
+        await using (var ctx = await bootstrapper.InitializeAsync())
+        {
+            // Wave A/H1 — a migration já não semeia grupos. Provisiona os
+            // grupos por omissão explicitamente (como um utilizador faria).
+            await ChannelCatalogBootstrapper.EnsureCanonicalGroupsAsync(ctx, DateTime.UtcNow);
+        }
         return (dbPath, new CatalogResolver(new TestDbContextFactory(dbPath), dbPath));
     }
 

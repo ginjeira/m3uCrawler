@@ -336,6 +336,7 @@ namespace m3uCrawler.Services.Sync
                 Console.WriteLine($"   • Removed streams: {finalReport.Counts.RemovedStreams}");
                 Console.WriteLine($"   • tvg_id patched:  {finalReport.Counts.ChannelTvgIdsPatched}");
                 Console.WriteLine($"   • stream metadata: {finalReport.Counts.StreamMetadataPatched}");
+                Console.WriteLine($"   • owned dup:       {finalReport.Counts.OwnedChannelDuplicatesRemaining}");
                 Console.WriteLine($"   • Skipped:         {finalReport.Counts.Skipped}");
                 Console.WriteLine($"   • Ambiguous:       {finalReport.Counts.Ambiguous}");
                 Console.WriteLine($"   • Unchanged:       {finalReport.Counts.Unchanged}");
@@ -1131,7 +1132,21 @@ namespace m3uCrawler.Services.Sync
                         }
                     }
 
-                    if (channel.ExistingChannelId.HasValue && ctx.AllStreamIds.Count > 0)
+                    // L7 — ownership guard no update de streams. Tal como o
+                    // rename e o tvg-id acima, um canal explicitamente
+                    // External/Unknown (do utilizador) nunca vê a sua
+                    // associação de streams alterada. Sem catálogo (legacy)
+                    // mantém-se o comportamento histórico; e um canal sem
+                    // row de ownership (legacy/absent) é tratado como
+                    // CrawlerManaged para não regredir os canais já geridos
+                    // antes da introdução da ownership persistida.
+                    var canManageStreams = _catalog == null
+                        || !channel.ExistingChannelId.HasValue
+                        || !channelOwnershipById.TryGetValue(
+                            channel.ExistingChannelId.Value, out var streamsOwnership)
+                        || streamsOwnership == ChannelOwnership.CrawlerManaged;
+
+                    if (canManageStreams && channel.ExistingChannelId.HasValue && ctx.AllStreamIds.Count > 0)
                     {
                         var currentIds = await _channels.ListStreamIdsAsync(channel.ExistingChannelId.Value, ct);
                         if (!currentIds.SequenceEqual(ctx.AllStreamIds))
@@ -1140,7 +1155,7 @@ namespace m3uCrawler.Services.Sync
                             if (recorder != null) recorder.StreamAssociations += ctx.AllStreamIds.Count;
                         }
                     }
-                    else if (channel.ExistingChannelId.HasValue && selectionFiltered)
+                    else if (canManageStreams && channel.ExistingChannelId.HasValue && selectionFiltered)
                     {
                         // PHASE 13 (Wave 13-6 part 2) — canal existente sem streams
                         // efectivas: PATCH streams=[] APENAS se tiver streams
@@ -1152,7 +1167,7 @@ namespace m3uCrawler.Services.Sync
                             await _channels.UpdateStreamsAsync(channel.ExistingChannelId.Value, Array.Empty<long>(), ct);
                         }
                     }
-                    else if (channel.ExistingChannelId.HasValue && channel.StreamsEmptied)
+                    else if (canManageStreams && channel.ExistingChannelId.HasValue && channel.StreamsEmptied)
                     {
                         // Scenario B (legacy, selection == null): channel should be left
                         // with streams=[] on Dispatcharr. PATCH unconditionally — even if
@@ -1160,7 +1175,7 @@ namespace m3uCrawler.Services.Sync
                         // operator intent in the plan and is idempotent.
                         await _channels.UpdateStreamsAsync(channel.ExistingChannelId.Value, Array.Empty<long>(), ct);
                     }
-                    // else (scenario C): no PATCH, channel left untouched.
+                    // else (scenario C ou canal não-CrawlerManaged): no PATCH, channel left untouched.
                 }
             }
             catch (Exception ex)

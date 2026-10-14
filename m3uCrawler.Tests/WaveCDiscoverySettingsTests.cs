@@ -62,6 +62,7 @@ public class WaveCDiscoverySettingsTests : IAsyncLifetime
         var bootstrapper = new ChannelCatalogBootstrapper(_dbPath);
         await using (var ctx = await bootstrapper.InitializeAsync())
         {
+            await TestCatalogSeed.ApplyDefaultsAsync(ctx);
             // Bootstrap fecha o contexto.
         }
         _resolver = new CatalogResolver(_factory, _dbPath);

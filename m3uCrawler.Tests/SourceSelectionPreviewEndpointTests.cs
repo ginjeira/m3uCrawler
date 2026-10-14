@@ -60,6 +60,7 @@ public class SourceSelectionPreviewEndpointTests : IAsyncLifetime
         _factory = new TestDbContextFactory(_dbPath);
         var bootstrapper = new ChannelCatalogBootstrapper(_dbPath);
         var ctx = await bootstrapper.InitializeAsync();
+        await TestCatalogSeed.ApplyDefaultsAsync(ctx);
         await ctx.DisposeAsync();
 
         _resolver = new CatalogResolver(_factory, _dbPath);

@@ -118,6 +118,10 @@ As opções abaixo são as efectivamente reconhecidas pelo `Program.cs`. Opçõe
 | `--admin-reset-password USERNAME` | Recuperação **host-only** da password de administrador: a password é lida interactivamente do stdin, **nunca** de argv. Ver secção "Alterar/recuperar password de administrador". |
 | `--import-epg-tvg-ids FONTE` | Importa uma EPG XMLTV (`.xml`/`.xml.gz`, URL ou ficheiro) e grava os `id` dos `<channel>` como identidade externa `tvg-id` dos canais canónicos do país. Requer catálogo. Ver secção "Importação de tvg-id a partir de EPG". |
 | `--epg-country CODIGO` | País da EPG a importar (padrão: o país activo de `--country`, senão `pt`). |
+| `--import-canonical-baseline FICHEIRO` | **Provisão explícita** (one-shot, nunca no arranque): importa um baseline canónico fornecido pelo utilizador e grava-o no catálogo de forma idempotente/aditiva. Cria **apenas** os grupos canónicos declarados no ficheiro (nunca os grupos por omissão). Ex.: `--import-canonical-baseline docs/catalog/m3ucrawler_pt_canonical_catalog.json`. |
+| `--import-country-config FICHEIRO` | **Provisão explícita** (one-shot, nunca no arranque): lê um ficheiro de país fornecido pelo utilizador (`{ "country", "displayName", "channels" }`) e grava-o via `CountryChannelListService.SaveCountry` em `runtime-data/countries/<code>.json`. O código de país é validado (sem path traversal). |
+| `--normalize-canonical-aliases` | **Manutenção explícita** (one-shot, nunca no arranque): normaliza in-place os aliases legacy do catálogo canónico para a forma matchable. Idempotente; usa `--catalog-db` quando indicado. |
+| `--country-dir DIR` | Directório de configuração de países usado por `--import-country-config` (padrão: `runtime-data/countries`). |
 | `--output-dir DIR` | Directório de saída (padrão: `output`). |
 | `--bot` | Modo bot Telegram. |
 | `--fast` / `--high-performance` | Aumenta a concorrência (modo de pesquisa web). |
@@ -532,6 +536,19 @@ A gestão dos ficheiros de aliases por país é feita por `CountryChannelListSer
 
 **W6 — decisão de âmbito:** o país é **configuração/validação**, não uma entidade de domínio (não existe entidade `Country`). O separador **Canais / Países** permite criar/editar/eliminar a configuração (`POST /api/country/save`, `DELETE /api/country`) e validar a playlist actual; não é um CRUD de entidade. O `DeleteCountry(string code)` elimina `<code>.json` e devolve `bool` (`true` se existia). O `displayName` amigável é preservado no save da UI (não é sobrescrito por `code.toUpperCase()`).
 
+**Wave A — ownership das listas.** As duas listas abaixo são **100% geridas pelo utilizador** e **nenhum processo automático as cria/edita/apaga**:
+
+- a configuração de canais por país (`runtime-data/countries/<code>.json`);
+- a lista de canais canónicos (`canonical_channels` + `channel_aliases` + grupos canónicos).
+
+O **arranque** aplica apenas migrations de schema: já **não** provisiona ficheiros de país, **não** semeia canais canónicos e **não** cria grupos por omissão (a migration deixou de semear os 9 grupos). Apagar um ficheiro de país ou um canal canónico **persiste** após reiniciar. A criação de listas/grupos é sempre explícita, uma única vez:
+
+- `--import-country-config <ficheiro.json>` para a configuração de país (código validado contra path traversal);
+- `--import-canonical-baseline <ficheiro.json>` para os canais canónicos — cria **apenas** os grupos declarados no ficheiro (sem grupos declarados, nenhum é criado);
+- `--normalize-canonical-aliases` para manutenção explícita dos aliases legacy do catálogo.
+
+A prontidão operacional só considera os dados de país disponíveis quando existe um **ficheiro real** `<code>.json` com canais — a baseline embutida PT deixou de contar para a prontidão (`countryDataOk`).
+
 ## Parser M3U (`M3uParserService`)
 
 `M3uParserService.Parse(string content)` devolve `List<M3uStream>` e preserva:
@@ -805,6 +822,66 @@ continua a ser sanitizado em todas as saídas de apresentação).
   As decisões `Ambiguous`/`Skipped` e a ownership/remoção de streams ficam
   inalteradas.
 
+#### Reconhecimento por identidade estável / ownership-first (Wave B, 2026-10-14)
+
+O sync passou a reconhecer um canal já criado **pela sua identidade
+canónica estável**, não pelo nome. A associação `CanonicalChannelId ↔
+DispatcharrChannelId` é persistida em `dispatcharr_channel_ownerships`
+quando o crawler cria o canal (`EnsureChannelOwnershipAsync`,
+`CrawlerManaged`) e é lida em batch, **uma vez por run**, por
+`CatalogResolver.GetCanonicalChannelOwnershipMapAsync` (leitura
+inversa). Se um canónico tiver **vários** canais (duplicados já
+existentes em produção), devolvem-se **todos** os ids owned ordenados
+por id ascendente; o matcher escolhe o **primeiro que exista no estado
+actual** e os restantes (para além do reutilizado) são reportados como
+duplicados — **nunca apagados**.
+
+- **Ownership-first (`ChannelMatcher.BuildPlanCoreInternalAsync`).**
+  Sempre que uma bucket (de **qualquer** tier — curado, `MergeOnly`,
+  `ReviewOnly`) cujo `CatalogResolution.CanonicalChannelId` tem um
+  canal owned **e presente no estado actual de canais**, o match é
+  directo (`MatchReason` = `ownership`), saltando por completo o
+  fuzzy/exact. Isto evita que um canónico já existente caia em
+  review/unknown. O nome é apenas apresentação; a identidade é o
+  `CanonicalChannelId`/`CanonicalChannelKey`.
+- **Escolha do id presente (M3).** Entre vários ids owned do mesmo
+  canónico escolhe-se o **primeiro presente no estado** (não
+  necessariamente o de menor id): apagar manualmente o canal mais
+  antigo não força a criação de um novo duplicado — a run reutiliza
+  outro canal owned do mesmo canónico.
+- **Fuzzy como fallback.** Sem ownership (canal manual pré-existente ou
+  primeira criação legítima) mantém-se o caminho histórico: fuzzy +
+  threshold para o tier curado; igualdade exacta/alias (com ambiguidade
+  preservada) para os tiers `Unknown`/`MergeOnly`/`ReviewOnly`.
+- **Recriação legítima.** Ownership presente mas **nenhum** canal owned
+  presente no estado (todos apagados manualmente) → `NewChannel`; o
+  crawler volta a criar.
+- **Dedup por identidade.** `ReconcileByExistingChannelId` deduplica
+  decisões `NewChannel` por `CanonicalChannelId` (fallback
+  `CanonicalChannelKey`, depois `CanonicalName`), evitando N canais
+  novos para o mesmo canónico.
+- **Observabilidade (aditivo).** `SyncReportCounts.ChannelsMatchedByOwnership`
+  conta as decisões de canal resolvidas por ownership (incluindo as que
+  o reconcile reescreve para `merged:...`); `SyncReportCounts.OwnedChannelDuplicatesRemaining`
+  conta os canais owned duplicados (para além do reutilizado) detetados
+  na run, e os canónicos/ids extra são amostrados num log limitado.
+- **Guarda de ownership no apply (L7).** O update da associação de
+  streams de canais existentes só é aplicado a canais
+  `CrawlerManaged`; o rename e o `tvg_id` já tinham a mesma guarda.
+  Canais `External`/do utilizador nunca são tocados.
+- **Limpeza de duplicados.** Não existe `DELETE` de canais no
+  Dispatcharr: os duplicados **já existentes** têm de ser removidos
+  **manualmente**; este fix apenas impede a criação de novos e
+  reporta-os.
+- **Testes.** `WaveBOwnershipFirstMatchingTests` (run 2 reutiliza por
+  ownership; regressão sem ownership → `NewChannel`; fallback de
+  primeira criação; recriação após apagamento manual; precedência do
+  ownership sobre o fuzzy; escolha do id presente em [100,200];
+  ownership-first fora do tier curado para `MergeOnly`/`ReviewOnly`;
+  contagem com motivo `merged:...`; dedup por identidade canónica) e
+  `WaveBOwnershipApplyGuardTests` (guarda L7: `External` e canais sem
+  row de ownership não sofrem update de streams; `CrawlerManaged` sim).
+
 #### Importação de tvg-id a partir de EPG (`--import-epg-tvg-ids`, Parte B, 2026-10-10)
 
 Para que o Dispatcharr case a EPG (e traga logos), o `tvg_id` dos canais precisa
@@ -864,22 +941,27 @@ Quando um stream tem indicadores de país (e.g. "PT" no título ou group-title) 
 ### Baseline canónico PT
 
 O catálogo canónico PT (`docs/catalog/m3ucrawler_pt_canonical_catalog.json`,
-`catalog_id=pt-canonical-tv`) é importado de forma idempotente e aditiva em cada
-arranque por `ChannelCatalogBootstrapper.TryImportBaselineAsync`, depois do
-`CatalogSeed`. A origem é resolvida por esta ordem de precedência:
+`catalog_id=pt-canonical-tv`) é um **ficheiro de referência fornecido pelo
+utilizador**. O arranque **não** o importa automaticamente: o ficheiro só é
+aplicado quando o utilizador corre explicitamente
 
-1. `M3U_BASELINE_PATH` (override; definido na imagem Docker).
-2. `<CWD>/docs/catalog/m3ucrawler_pt_canonical_catalog.json`.
-3. `<AppContext.BaseDirectory>/docs/catalog/m3ucrawler_pt_canonical_catalog.json`
-   (ficheiro empacotado em `/app/docs/catalog`).
-4. Raiz do repositório (5 e 4 níveis acima do `BaseDirectory`), para
-   desenvolvimento e testes.
+```bash
+dotnet run -- --import-canonical-baseline docs/catalog/m3ucrawler_pt_canonical_catalog.json
+```
 
-Quando não existe ficheiro em nenhum destes caminhos, o baseline é lido do
-**recurso embutido** na assembly (`EmbeddedResource`), garantindo que uma
-instalação fresca tem na mesma os canais PT generalistas (RTP 1/2, SIC, TVI,
-CNN Portugal, CMTV, …). A ausência do ficheiro é registada como warning, mas
-não aborta o arranque.
+A importação é **idempotente e aditiva** (`CatalogBaselineImporter.ImportAsync`):
+re-importar não duplica canais nem aliases e nunca elimina canais existentes. Os
+**grupos canónicos** seguem a mesma regra: o import cria **apenas** os grupos que
+o próprio ficheiro declarar (mapeando o `GroupId` dos canais pelas chaves
+declaradas) e **nunca** impõe os grupos por omissão — sem grupos declarados,
+nenhum é criado e os canais ficam sem grupo. A origem **tem** de ser indicada pelo
+utilizador — não há fallback para a baseline embutida nem leitura de caminhos
+implícitos (`M3U_BASELINE_PATH`/`docs/catalog`) no arranque. O recurso embutido
+continua a existir apenas como conveniência de empacotamento/testes, não como
+provisão automática.
+
+Para outros provedores de configuração, ver `--import-country-config` na
+secção "Gestão de listas por país".
 
 ### Afinidades e catálogo canónico por país (PHASE 9C.3)
 
@@ -1412,8 +1494,11 @@ grupo do canal canónico. Não é enviado no POST.
 - O scheduler/discovery exige `READY` **e** `SetupComplete`; jobs bloqueados
   mantêm `NextRunAtUtc` inalterado e são registados.
 - Instalações adoptadas como legacy (`adoptedFromLegacy`) ficam grandfathered.
-- O provisionamento inicial de país (`runtime-data/countries/*.json`, nunca
-  sobreposto) corre no arranque em `--web` e `--telegram`.
+- O país (`countryDataOk`) só fica satisfeito quando existe um ficheiro real
+  `runtime-data/countries/<code>.json` com canais. O arranque **não** provisiona
+  ficheiros de país nem canais canónicos (Wave A): a provisão é explícita, via
+  `--import-country-config` / `--import-canonical-baseline`, e a manutenção de
+  aliases via `--normalize-canonical-aliases`.
 
 Regras completas, componentes obrigatórios e a dívida do baseline de país em
 `docs/architecture/configuration-lifecycle.md` §"Operational Readiness

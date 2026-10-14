@@ -45,6 +45,7 @@ public sealed class CountryAttributeConsistencyTests : IAsyncLifetime
     {
         var bootstrapper = new ChannelCatalogBootstrapper(_dbPath);
         var ctx = await bootstrapper.InitializeAsync();
+        await TestCatalogSeed.ApplyDefaultsAsync(ctx);
         await ctx.DisposeAsync();
     }
 

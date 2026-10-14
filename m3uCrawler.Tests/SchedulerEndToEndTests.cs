@@ -201,9 +201,9 @@ public class SchedulerEndToEndTests : IAsyncLifetime
         var host = BuildHost();
         try
         {
-            // Keys únicas para evitar colisão com canais seedados pelo
-            // baseline JSON (e.g. "rtp1", "sic"). O bootstrap já
-            // importa o seed antes deste teste correr.
+            // Keys únicas para não colidir com canais criados pelo
+            // operador/import. Wave A: o bootstrap já NÃO importa o seed
+            // nem a baseline automaticamente.
             var unique = Guid.NewGuid().ToString("N")[..6];
             var srcId = await CreateSourceAsync($"e2e-src-{unique}", "https://x.example/list.m3u");
             var ch1 = await CreateCanonicalChannelAsync($"e2e-ch1-{unique}", "E2E Channel 1");

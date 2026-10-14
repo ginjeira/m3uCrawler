@@ -386,18 +386,23 @@ chaves novas no fim e escreve de forma atómica (temp + move). Em Unix aplica
 `UserRead|UserWrite` (600). `api_hash`, passwords e API keys nunca são
 devolvidos, registados nem incluídos em `Detail`.
 
-### Config de país no arranque
+### Config de país — provisão explícita (Wave A)
 
-`CountryConfigProvisioner.EnsureProvisioned` corre no arranque, em ambos os
-caminhos (`--web` e `--telegram`), a partir de `InitializeCatalogAsync`: semeia
-`runtime-data/countries/*.json` a partir de EmbeddedResources e de uma baseline
-PT embutida, **nunca sobrepondo** ficheiros existentes, com escrita atómica.
+**Nenhum processo automático cria listas de país.** O arranque (`--web` e
+`--telegram`, via `InitializeCatalogAsync`) aplica apenas migrations de schema e
+**não** chama `CountryConfigProvisioner.EnsureProvisioned`: deixou de provisionar
+`runtime-data/countries/*.json` a partir de EmbeddedResources e da baseline PT
+embutida. A provisão é explícita, por acção do utilizador, via
+`--import-country-config <ficheiro.json>` (grava com
+`CountryChannelListService.SaveCountry`, que valida o código de país) ou
+`SaveCountry` (POST `/api/country/save`). `EnsureProvisioned` permanece apenas
+para uso manual/testes e nunca sobrepõe ficheiros existentes.
 
 > **Dívida conhecida.** `m3uCrawler/runtime-data/countries/pt.json` não está
 > versionado (`.gitignore` ignora `m3uCrawler/runtime-data/*` excepto
 > `.gitkeep`/`channel-indicators.json`) e `.dockerignore` exclui
-> `runtime-data/`, pelo que o EmbeddedResource compilado é inerte em CI/Docker
-> e a baseline C# é a fonte efectiva. Alinhar o tracking do ficheiro (ou
+> `runtime-data/`, pelo que o EmbeddedResource compilado só é relevante quando
+> `EnsureProvisioned` é invocado manualmente. Alinhar o tracking do ficheiro (ou
 > remover o EmbeddedResource) é dívida a tratar.
 
 ### Wave W3s — reads puros, prontidão de país e afinidades com escopo
@@ -405,9 +410,9 @@ PT embutida, **nunca sobrepondo** ficheiros existentes, com escrita atómica.
 - **Leituras de país não escrevem.** `CountryChannelListService.GetAllCountries`
   e `GetCountry` (GET `/api/countries` e `/api/country`) deixam de auto-criar
   `countries/<code>.json`. Sem ficheiro devolvem um resultado vazio; a
-  persistência só acontece no arranque (`CountryConfigProvisioner`) ou via
-  `SaveCountry` (POST `/api/country/save`). O construtor deixou de criar o
-  directório.
+  persistência só acontece via `SaveCountry` (POST `/api/country/save`) ou
+  `--import-country-config` (Wave A: já não no arranque). O construtor deixou de
+  criar o directório.
 - **Prontidão inclui `countryDataOk`.** `OperationalReadinessService` passa a
   avaliar um requisito obrigatório `countryData`, satisfeito quando existem
   dados de país utilizáveis para o país configurado: um ficheiro

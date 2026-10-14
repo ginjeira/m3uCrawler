@@ -11,18 +11,17 @@ using Xunit;
 namespace m3uCrawler.Tests;
 
 /// <summary>
-/// Wave A, step 1 — migration <c>AddCanonicalChannelGroupFk</c>:
-/// FK <c>canonical_channels.GroupId</c> → <c>canonical_groups.Id</c>,
-/// seed idempotente dos 9 grupos canónicos, backfill por enum
-/// (<c>EditorialGroup</c> inteiro), guard contra <c>NULL</c> e
-/// reversibilidade do <c>Down</c>. A Wave D2
-/// (<c>DropEditorialGroupColumn</c>) remove a coluna editorial legada;
-/// ao latest o schema tem apenas <c>GroupId</c>.
+/// Wave A, step 1 — migration <c>AddCanonicalChannelGroupFk</c>: adiciona a
+/// FK <c>canonical_channels.GroupId</c> → <c>canonical_groups.Id</c>, o
+/// índice e a reversibilidade do <c>Down</c>. <b>Wave A/H1:</b> a migration
+/// deixou de semear os 9 grupos canónicos e de fazer o backfill por enum —
+/// nenhum grupo é criado automaticamente. A Wave D2
+/// (<c>DropEditorialGroupColumn</c>) remove a coluna editorial legada; ao
+/// latest o schema tem apenas <c>GroupId</c>.
 /// </summary>
 public class CanonicalChannelGroupMigrationTests
 {
     private const string PreviousMigration = "20260921220000_AddChannelSourceUniqueOnFingerprint";
-    private const string LatestMigration = "20261007180000_DropEditorialGroupColumn";
 
     private static string NewDbPath() =>
         TestTempDb.SuitePath($"channel-catalog-tests-wavea-{Guid.NewGuid():N}.db");
@@ -63,7 +62,7 @@ public class CanonicalChannelGroupMigrationTests
         StringsAsync(ctx, "SELECT name AS Value FROM pragma_table_info({0})", table);
 
     [Fact]
-    public async Task Fresh_DB_migrated_to_latest_seeds_nine_canonical_groups()
+    public async Task Fresh_DB_migrated_to_latest_creates_no_canonical_groups()
     {
         var dbPath = NewDbPath();
         var options = OptionsFor(dbPath);
@@ -72,11 +71,9 @@ public class CanonicalChannelGroupMigrationTests
         {
             await ctx.Database.MigrateAsync();
 
-            Assert.Equal(9, await CountAsync(ctx, "SELECT COUNT(*) AS Value FROM canonical_groups"));
-            Assert.Equal(
-                "international,other,pt-desporto,pt-documentarios,pt-entretenimento,pt-filmes-series,pt-generalistas,pt-infantil,pt-ppv",
-                string.Join(",", await StringsAsync(
-                    ctx, "SELECT Key AS Value FROM canonical_groups ORDER BY Key")));
+            // Wave A/H1 — a migration deixou de semear os 9 grupos.
+            Assert.Equal(0, await CountAsync(
+                ctx, "SELECT COUNT(*) AS Value FROM canonical_groups"));
 
             // A coluna editorial legada foi removida na Wave D2.
             Assert.DoesNotContain("EditorialGroup", await ColumnsAsync(ctx, "canonical_channels"));
@@ -88,12 +85,12 @@ public class CanonicalChannelGroupMigrationTests
     }
 
     [Fact]
-    public async Task Up_backfills_channel_group_id_from_enum_and_leaves_no_null()
+    public async Task Up_no_longer_backfills_group_id_from_enum()
     {
         var dbPath = NewDbPath();
         var options = OptionsFor(dbPath);
 
-        // EditorialGroup 3 == PortugalDesporto.
+        // EditorialGroup 3 == PortugalDesporto (valor histórico do enum).
         long desportoChannelId;
         await using (var ctx = await MigrateToPreviousAsync(options))
         {
@@ -104,33 +101,21 @@ public class CanonicalChannelGroupMigrationTests
         {
             await ctx.Database.MigrateAsync();
 
-            var desportoGroupId = await NullableLongAsync(
-                ctx, "SELECT Id AS Value FROM canonical_groups WHERE Key='pt-desporto'");
-            Assert.True(desportoGroupId.HasValue);
-            Assert.Equal(
-                desportoGroupId,
-                await NullableLongAsync(
-                    ctx, "SELECT GroupId AS Value FROM canonical_channels WHERE Id={0}", desportoChannelId));
-
-            // O guard/backfill garante zero canais com GroupId NULL.
+            // Wave A/H1 — sem grupos semeados, não há backfill: GroupId fica NULL.
             Assert.Equal(0, await CountAsync(
-                ctx, "SELECT COUNT(*) AS Value FROM canonical_channels WHERE GroupId IS NULL"));
+                ctx, "SELECT COUNT(*) AS Value FROM canonical_groups"));
+            Assert.Null(await NullableLongAsync(
+                ctx, "SELECT GroupId AS Value FROM canonical_channels WHERE Id={0}", desportoChannelId));
         }
 
         TestTempDb.Cleanup(dbPath);
     }
 
     [Fact]
-    public async Task Up_maps_every_enum_value_to_the_expected_group_key()
+    public async Task Up_does_not_map_enum_values_to_group_keys()
     {
         var dbPath = NewDbPath();
         var options = OptionsFor(dbPath);
-
-        var expectedKeys = new[]
-        {
-            "pt-generalistas", "pt-filmes-series", "pt-entretenimento", "pt-desporto",
-            "pt-infantil", "pt-documentarios", "pt-ppv", "international", "other",
-        };
 
         await using (var ctx = await MigrateToPreviousAsync(options))
         {
@@ -144,22 +129,10 @@ public class CanonicalChannelGroupMigrationTests
         {
             await ctx.Database.MigrateAsync();
 
-            for (var enumValue = 0; enumValue <= 8; enumValue++)
-            {
-                var key = await ctx.Database
-                    .SqlQueryRaw<string>(
-                        """
-                        SELECT g.Key AS Value
-                        FROM canonical_channels c
-                        JOIN canonical_groups g ON g.Id = c.GroupId
-                        WHERE c.Key = {0}
-                        """,
-                        $"wavea-enum-{enumValue}")
-                    .SingleAsync();
-                Assert.Equal(expectedKeys[enumValue], key);
-            }
-
+            // Wave A/H1 — nenhum grupo é semeado e nenhum canal é mapeado.
             Assert.Equal(0, await CountAsync(
+                ctx, "SELECT COUNT(*) AS Value FROM canonical_groups"));
+            Assert.Equal(9, await CountAsync(
                 ctx, "SELECT COUNT(*) AS Value FROM canonical_channels WHERE GroupId IS NULL"));
         }
 
@@ -167,7 +140,7 @@ public class CanonicalChannelGroupMigrationTests
     }
 
     [Fact]
-    public async Task Down_removes_group_id_column_without_error_and_keeps_seeded_groups()
+    public async Task Down_removes_group_id_column_without_error_and_creates_no_groups()
     {
         var dbPath = NewDbPath();
         var options = OptionsFor(dbPath);
@@ -189,9 +162,8 @@ public class CanonicalChannelGroupMigrationTests
 
             Assert.DoesNotContain("GroupId", await ColumnsAsync(ctx, "canonical_channels"));
             Assert.Contains("EditorialGroup", await ColumnsAsync(ctx, "canonical_channels"));
-            // Down é apenas de schema: os grupos semeados persistem
-            // (podem ter sido editados/adoptados pelo operador).
-            Assert.Equal(9, await CountAsync(ctx, "SELECT COUNT(*) AS Value FROM canonical_groups"));
+            // Down é apenas de schema: nenhum grupo foi criado (Wave A/H1).
+            Assert.Equal(0, await CountAsync(ctx, "SELECT COUNT(*) AS Value FROM canonical_groups"));
         }
 
         TestTempDb.Cleanup(dbPath);

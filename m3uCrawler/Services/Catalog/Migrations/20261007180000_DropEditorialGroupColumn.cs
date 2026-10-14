@@ -13,12 +13,12 @@ namespace m3uCrawler.Services.Catalog.Migrations
     ///
     /// <para>
     /// <b>Backfill defensivo.</b> A migration anterior
-    /// (<c>AddCanonicalChannelGroupFk</c>) já semeou os 9 grupos e fez
-    /// backfill de <c>GroupId</c> a partir do enum, com guard contra
-    /// <c>NULL</c>. Aqui repete-se o mapeamento por precaução (bases que
-    /// possam ter ficado num estado intermédio) antes de remover a coluna.
+    /// (<c>AddCanonicalChannelGroupFk</c>) já não semeia grupos (Wave A);
+    /// ainda assim, aqui mapeia-se <c>GroupId</c> a partir do enum legado
+    /// para bases que possam ter ficado num estado intermédio (o
+    /// subselect é vazio sem grupos, deixando <c>GroupId</c> como está).
     /// O mapeamento duplica (necessariamente, em SQL) o de
-    /// <c>CanonicalGroupDefaults</c> — manter os dois em sincronia.
+    /// <c>CanonicalGroupDefaults</c>. Antes de remover a coluna.
     /// </para>
     ///
     /// <para>

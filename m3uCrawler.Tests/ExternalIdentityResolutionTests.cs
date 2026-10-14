@@ -91,6 +91,7 @@ public class ExternalIdentityResolutionTests : IDisposable
     {
         var bootstrapper = new ChannelCatalogBootstrapper(dbPath);
         var ctx = await bootstrapper.InitializeAsync();
+        await TestCatalogSeed.ApplyDefaultsAsync(ctx);
         await ctx.DisposeAsync();
         return new CatalogResolver(new TestDbContextFactory(dbPath), dbPath);
     }

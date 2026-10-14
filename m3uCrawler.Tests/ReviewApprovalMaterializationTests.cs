@@ -59,6 +59,7 @@ public class ReviewApprovalMaterializationTests : IAsyncLifetime
         var bootstrapper = new ChannelCatalogBootstrapper(_dbPath);
         await using (var ctx = await bootstrapper.InitializeAsync())
         {
+            await TestCatalogSeed.ApplyDefaultsAsync(ctx);
         }
         _resolver = new CatalogResolver(_factory, _dbPath);
         _ingestor = new PipelineIngestionService(
