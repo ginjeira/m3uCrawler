@@ -697,6 +697,18 @@ O catálogo (`ChannelCatalogDbContext`, SQLite em `/data/channel-catalog.db`) ge
 | **Sources** | Sources de ingestão e *channel sources* associados. Cada linha de *channel source* tem a acção **Observações** (DC-5c) que abre o histórico de observações (`GET /api/catalog/channel-sources/{id}/observations?limit=200`) e permite registar uma nova amostra (`POST` no mesmo caminho com `quality`/`epg`/`availability`/`responseTimeMs`) via `apiRequest`. |
 | **Scheduled Jobs** | Jobs agendados persistentes (tabela SQLite `scheduled_jobs`): cron de 5 campos, acção, activo, último/próximo tick e último resultado. Ver secção "Scheduler / Scheduled Jobs". |
 
+#### Eliminação de canais canónicos com ownership
+
+`DELETE /api/catalog/channels/{id}` elimina um canal canónico. Se existirem registos em
+`dispatcharr_channel_ownerships` associados ao canal, a operação é **bloqueada por omissão**
+com `409` e `kind = "HasOwnership"` (o payload inclui a contagem e os **ids dos canais
+Dispatcharr** owned). Nesse caso a UI mostra uma confirmação e, se confirmada, reenvia o
+pedido com `?force=true`; o canal é então eliminado e o FK `OnDelete(SetNull)` passa o
+`CanonicalChannelId` desses registos a `NULL` — os registos de ownership **mantêm-se**.
+
+Os canais/streams no Dispatcharr **não** são apagados (não existe `DELETE` de canal no
+cliente Dispatcharr): ficam **órfãos** e a limpeza é manual.
+
 ### Grupos canónicos e atribuição por canal
 
 O grupo de publicação é uma **propriedade do canal canónico** (`CanonicalChannel.GroupId`

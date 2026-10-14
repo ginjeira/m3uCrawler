@@ -143,4 +143,19 @@ public class WaveW5UiHtmlTests
         Assert.Contains("window.closeReviewApproveModal = closeReviewApproveModal;", html);
         Assert.Contains("window.showCreateChannelFormForReview = showCreateChannelFormForReview;", html);
     }
+
+    [Fact]
+    public void Channel_delete_resends_with_force_on_has_ownership_conflict()
+    {
+        var html = BuildDashboardHtml();
+        var body = Slice(html, "async function deleteChannel(", "async function showCreateChannelForm(");
+
+        // 409 com kind=HasOwnership → confirmação e reenvio com force=true.
+        Assert.Contains("res.json.kind === 'HasOwnership'", body);
+        Assert.Contains("?force=true", body);
+        Assert.Contains("NÃO são apagados", body);
+        // Mantém o padrão do ficheiro: confirm() nativo, sem prompt().
+        Assert.Contains("confirm(", body);
+        Assert.DoesNotContain("prompt(", body);
+    }
 }

@@ -3501,7 +3501,10 @@ namespace m3uCrawler.Services
                         try
                         {
                             var beforeChannel = await _catalogResolver.GetCanonicalChannelAsync(channelId);
-                            var deleted = await _catalogResolver.DeleteCanonicalChannelAsync(channelId);
+                            var force = string.Equals(
+                                context.Request.QueryString["force"], "true",
+                                StringComparison.OrdinalIgnoreCase);
+                            var deleted = await _catalogResolver.DeleteCanonicalChannelAsync(channelId, force);
                             if (!deleted)
                             {
                                 await RecordAuditAsync(auditActor, "catalog.channel.delete", "canonical-channel",
@@ -3906,7 +3909,15 @@ namespace m3uCrawler.Services
             };
             // Nota: WriteJsonAsync repõe sempre o status; o código tem de
             // ser passado explicitamente (senão o erro sairia como 200).
-            await WriteJsonAsync(response, new { error = ex.Message, code = ex.Error.ToString() }, status);
+            // `kind` é o discriminador legível por máquina para a UI
+            // (ex.: distinguir `HasOwnership` de outros 409); `code` é
+            // mantido por compatibilidade.
+            await WriteJsonAsync(response, new
+            {
+                error = ex.Message,
+                code = ex.Error.ToString(),
+                kind = ex.Error.ToString(),
+            }, status);
         }
 
         // ────────────────────────────────────────────────────────────────
@@ -8087,7 +8098,12 @@ const rows = Object.entries(inv).map(([k, v]) => {
       const c = _channelsCache.find(x => x.id === channelId);
       if (!c) return;
       if (!confirm('Eliminar o canal "' + (c.displayName || c.key) + '" (#' + channelId + ')? Esta operação remove também os aliases.')) return;
-      const res = await apiRequest('/api/catalog/channels/' + channelId, { method: 'DELETE' });
+      var res = await apiRequest('/api/catalog/channels/' + channelId, { method: 'DELETE' });
+      if (!res.ok && res.status === 409 && res.json && res.json.kind === 'HasOwnership') {
+        var detail = res.json.error ? res.json.error + ' ' : 'Este canal tem canais no Dispatcharr que ficarão órfãos. ';
+        if (!confirm(detail + 'Eles NÃO são apagados — limpa-os manualmente. Eliminar o canal canónico mesmo assim?')) return;
+        res = await apiRequest('/api/catalog/channels/' + channelId + '?force=true', { method: 'DELETE' });
+      }
       if (res.ok) {
         _selectedChannelId = null;
         await loadCatalogChannels();

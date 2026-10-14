@@ -2597,8 +2597,21 @@ public sealed class CatalogResolver
         return channel;
     }
 
+    /// <summary>
+    /// Elimina um canal canónico. Por omissão (sem <paramref name="force"/>
+    /// a <c>false</c>), se existirem registos de
+    /// <see cref="DispatcharrChannelOwnershipEntity"/> associados ao canal,
+    /// lança <see cref="ChannelAdministrationException"/> com
+    /// <see cref="ChannelAdministrationError.HasOwnership"/> (traduzido em
+    /// HTTP 409). Com <paramref name="force"/> a <c>true</c> o canal é
+    /// eliminado e o FK <c>OnDelete(SetNull)</c> passa o
+    /// <c>CanonicalChannelId</c> desses registos a NULL (os registos de
+    /// ownership mantêm-se). Os canais/streams no Dispatcharr
+    /// <b>não</b> são apagados (não existe DELETE de canal): ficam órfãos
+    /// e a limpeza é manual.
+    /// </summary>
     public async Task<bool> DeleteCanonicalChannelAsync(
-        long id, CancellationToken cancellationToken = default)
+        long id, bool force = false, CancellationToken cancellationToken = default)
     {
         await using var context = await _factory.CreateDbContextAsync(cancellationToken);
         var channel = await context.CanonicalChannels
@@ -2606,13 +2619,17 @@ public sealed class CatalogResolver
             .FirstOrDefaultAsync(c => c.Id == id, cancellationToken);
         if (channel == null) return false;
 
-        var ownershipCount = await context.DispatcharrChannelOwnerships
-            .CountAsync(o => o.CanonicalChannelId == id, cancellationToken);
-        if (ownershipCount > 0)
+        var ownedDispatcharrChannelIds = await context.DispatcharrChannelOwnerships
+            .Where(o => o.CanonicalChannelId == id)
+            .Select(o => o.DispatcharrChannelId)
+            .ToListAsync(cancellationToken);
+        if (ownedDispatcharrChannelIds.Count > 0 && !force)
         {
             throw new ChannelAdministrationException(
                 ChannelAdministrationError.HasOwnership,
-                $"Não é possível eliminar o canal #{id}: existem {ownershipCount} registos de ownership do Dispatcharr.");
+                $"Não é possível eliminar o canal #{id}: existem {ownedDispatcharrChannelIds.Count} registos de ownership do Dispatcharr " +
+                $"(canais Dispatcharr: {string.Join(", ", ownedDispatcharrChannelIds)}). " +
+                "Reenvie com force=true para eliminar o canal canónico; os canais no Dispatcharr NÃO são apagados e ficarão órfãos (limpeza manual).");
         }
 
         context.CanonicalChannels.Remove(channel);

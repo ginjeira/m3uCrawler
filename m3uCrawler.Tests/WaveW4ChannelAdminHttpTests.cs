@@ -9,6 +9,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using m3uCrawler.Services;
 using m3uCrawler.Services.Catalog;
+using Microsoft.EntityFrameworkCore;
 using Xunit;
 
 namespace m3uCrawler.Tests;
@@ -77,6 +78,24 @@ public sealed class WaveW4ChannelAdminHttpTests : IAsyncLifetime
         Assert.Equal(HttpStatusCode.Created, created.StatusCode);
         using var doc = JsonDocument.Parse(await created.Content.ReadAsStringAsync());
         return doc.RootElement.GetProperty("id").GetInt64();
+    }
+
+    private async Task AddChannelOwnershipAsync(long canonicalChannelId, long dispatcharrChannelId)
+    {
+        await using var ctx = new TestDbContextFactory(_dbPath).CreateDbContext();
+        var now = DateTime.UtcNow;
+        ctx.DispatcharrChannelOwnerships.Add(new DispatcharrChannelOwnershipEntity
+        {
+            DispatcharrChannelId = dispatcharrChannelId,
+            Ownership = ChannelOwnership.CrawlerManaged,
+            CanonicalChannelId = canonicalChannelId,
+            FirstObservedAtUtc = now,
+            LastObservedAtUtc = now,
+            Evidence = "test",
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+        });
+        await ctx.SaveChangesAsync();
     }
 
     [Fact]
@@ -154,5 +173,52 @@ public sealed class WaveW4ChannelAdminHttpTests : IAsyncLifetime
         Assert.DoesNotContain(
             listDoc.RootElement.EnumerateArray(),
             c => c.GetProperty("id").GetInt64() == id);
+    }
+
+    [Fact]
+    public async Task Channel_delete_with_ownership_returns_409_kind_and_force_deletes()
+    {
+        var key = $"w4-chan-own-{Guid.NewGuid():N}";
+        var id = await CreateChannelAsync(Client, key);
+        await AddChannelOwnershipAsync(id, 7001);
+
+        // Sem `force` mantém-se o 409 com o discriminador HasOwnership.
+        var blocked = await Client.DeleteAsync($"/api/catalog/channels/{id}", ShortToken());
+        Assert.Equal(HttpStatusCode.Conflict, blocked.StatusCode);
+        using (var doc = JsonDocument.Parse(await blocked.Content.ReadAsStringAsync()))
+        {
+            Assert.Equal("HasOwnership", doc.RootElement.GetProperty("kind").GetString());
+        }
+
+        // O canal ainda existe após o 409.
+        var list = await Client.GetAsync("/api/catalog/channels", ShortToken());
+        using (var listDoc = JsonDocument.Parse(await list.Content.ReadAsStringAsync()))
+        {
+            Assert.Contains(
+                listDoc.RootElement.EnumerateArray(),
+                c => c.GetProperty("id").GetInt64() == id);
+        }
+
+        // Com `?force=true` o canal desaparece (200/deleted:true).
+        var forced = await Client.DeleteAsync($"/api/catalog/channels/{id}?force=true", ShortToken());
+        Assert.Equal(HttpStatusCode.OK, forced.StatusCode);
+        using (var forcedDoc = JsonDocument.Parse(await forced.Content.ReadAsStringAsync()))
+        {
+            Assert.True(forcedDoc.RootElement.GetProperty("deleted").GetBoolean());
+        }
+
+        var after = await Client.GetAsync("/api/catalog/channels", ShortToken());
+        using (var afterDoc = JsonDocument.Parse(await after.Content.ReadAsStringAsync()))
+        {
+            Assert.DoesNotContain(
+                afterDoc.RootElement.EnumerateArray(),
+                c => c.GetProperty("id").GetInt64() == id);
+        }
+
+        // O registo de ownership mantém-se, com CanonicalChannelId NULL.
+        await using var ctx = new TestDbContextFactory(_dbPath).CreateDbContext();
+        var ownership = await ctx.DispatcharrChannelOwnerships
+            .SingleAsync(o => o.DispatcharrChannelId == 7001);
+        Assert.Null(ownership.CanonicalChannelId);
     }
 }
