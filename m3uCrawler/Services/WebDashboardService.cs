@@ -10190,6 +10190,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
       _pendingReviewIdentity = row.normalizedIdentity || '';
       _pendingReviewGroup = row.sourceGroup || '';
       _reviewRowsById[String(id)] = row;
+      resetReviewApproveForm();
       document.getElementById('reviewApproveTitle').textContent = 'Aprovar Review';
       document.getElementById('reviewApproveSubject').textContent = _pendingReviewIdentity || String(id);
       document.getElementById('reviewApproveStatus').textContent = '';
@@ -10205,11 +10206,9 @@ const rows = Object.entries(inv).map(([k, v]) => {
       const channels = await safeFetchJson('/api/catalog/channels', []);
       const sel = document.getElementById('reviewAliasChannel');
       if (!sel) return;
-      const current = sel.value;
       sel.innerHTML = '<option value="">— escolher canal —</option>' + (Array.isArray(channels) ? channels : [])
         .map(c => `<option value="${escapeAttr(c.key)}">${escapeHtml(c.displayName || c.key)} (${escapeHtml(c.key)})</option>`)
         .join('');
-      if (current) sel.value = current;
     }
 
     function selectReviewAction(action) {
@@ -10226,9 +10225,8 @@ const rows = Object.entries(inv).map(([k, v]) => {
       if (action === 'add-alias') {
         document.getElementById('reviewApproveTitle').textContent = 'Add Alias';
         const aliasInput = document.getElementById('reviewAliasValue');
-        if (aliasInput && !aliasInput.value) aliasInput.value = _pendingReviewIdentity || '';
+        if (aliasInput) aliasInput.value = _pendingReviewIdentity || '';
         addAliasEl.hidden = false;
-        loadReviewAliasChannels();
       } else if (action === 'exclude') {
         document.getElementById('reviewApproveTitle').textContent = 'Excluir Review';
         const reasonEl = document.getElementById('reviewExcludeReason');
@@ -10328,10 +10326,22 @@ const rows = Object.entries(inv).map(([k, v]) => {
       openModalPanel('createChannelForm');
     }
 
+    function resetReviewApproveForm() {
+      const aliasValueEl = document.getElementById('reviewAliasValue');
+      if (aliasValueEl) aliasValueEl.value = '';
+      const aliasChannelEl = document.getElementById('reviewAliasChannel');
+      if (aliasChannelEl) aliasChannelEl.value = '';
+      const excludeReasonEl = document.getElementById('reviewExcludeReason');
+      if (excludeReasonEl) excludeReasonEl.value = '';
+      const reopenReasonEl = document.getElementById('reviewReopenReason');
+      if (reopenReasonEl) reopenReasonEl.value = '';
+    }
+
     function closeReviewApproveModal() {
       _pendingReviewId = null;
       _pendingReviewIdentity = '';
       _pendingReviewGroup = '';
+      resetReviewApproveForm();
       document.getElementById('reviewApproveStatus').textContent = '';
       document.getElementById('reviewApproveActions').hidden = false;
       document.getElementById('reviewApproveAddAlias').hidden = true;

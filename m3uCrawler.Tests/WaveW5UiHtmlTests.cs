@@ -145,6 +145,27 @@ public class WaveW5UiHtmlTests
     }
 
     [Fact]
+    public void Add_alias_identity_is_rebound_per_review_and_not_sticky()
+    {
+        var html = BuildDashboardHtml();
+
+        // selectReviewAction rebind incondicional da identidade pendente.
+        var selectBody = Slice(html, "function selectReviewAction(", "async function submitReviewAliasApproval(");
+        Assert.Contains("aliasInput.value = _pendingReviewIdentity", selectBody);
+        Assert.DoesNotContain("!aliasInput.value", selectBody);
+
+        // O fecho do modal limpa o formulário para a próxima abertura.
+        var closeBody = Slice(html, "function closeReviewApproveModal(", "function excludeReview(");
+        Assert.Contains("resetReviewApproveForm", closeBody);
+
+        // O dropdown de canais não transporta a selecção anterior.
+        var channelsBody = Slice(html, "async function loadReviewAliasChannels(", "function selectReviewAction(");
+        Assert.DoesNotContain("const current = sel.value", channelsBody);
+
+        Assert.Contains("function resetReviewApproveForm(", html);
+    }
+
+    [Fact]
     public void Channel_delete_resends_with_force_on_has_ownership_conflict()
     {
         var html = BuildDashboardHtml();
