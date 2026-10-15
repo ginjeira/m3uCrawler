@@ -554,7 +554,13 @@ public sealed class CatalogResolver
         long? sourceId = null,
         string? streamFingerprint = null,
         string? streamFingerprintVersion = null,
-        string? runId = null)
+        string? runId = null,
+        // W-REVIEW-04 (Fase 3 Parte A) — metadados de apresentação do
+        // candidato acumulado. Aditivos e opcionais: callers que não os
+        // forneçam continuam a criar candidatos sem Title/Logo/TvgId.
+        string? candidateTitle = null,
+        string? candidateLogo = null,
+        string? candidateTvgId = null)
     {
         if (string.IsNullOrWhiteSpace(normalizedIdentity))
         {
@@ -580,13 +586,32 @@ public sealed class CatalogResolver
                 if (streamFingerprintVersion != null) existing.StreamFingerprintVersion = streamFingerprintVersion;
                 if (runId != null) existing.RunId = runId;
                 existing.UpdatedAtUtc = DateTime.UtcNow;
+
+                // W-REVIEW-04 — acumula a observação como candidato
+                // (aditivo; só enquanto a Review não foi decidida).
+                if (streamUrl != null)
+                {
+                    await UpsertReviewCandidateAsync(
+                        context,
+                        existing.Id,
+                        streamUrl,
+                        sourceId,
+                        streamFingerprint,
+                        sourceGroup,
+                        candidateTitle,
+                        candidateLogo,
+                        candidateTvgId,
+                        cancellationToken);
+                }
+
                 await context.SaveChangesAsync(cancellationToken);
                 return existing;
             }
             // Resolved/Ignored: uma decisão humana NÃO é revertida
             // silenciosamente por uma nova observação. Registamos a
             // nova evidência actualizando o timestamp, sem resetar o
-            // estado nem apagar a nota/decisão.
+            // estado nem apagar a nota/decisão. NÃO acumulamos
+            // candidatos (a decisão humana fica intocada).
             existing.UpdatedAtUtc = DateTime.UtcNow;
             await context.SaveChangesAsync(cancellationToken);
             return existing;
@@ -611,8 +636,81 @@ public sealed class CatalogResolver
             RunId = runId,
         };
         context.ReviewItems.Add(entry);
+
+        // W-REVIEW-04 — primeira observação: acumula também o candidato.
+        if (streamUrl != null)
+        {
+            context.ReviewCandidates.Add(new ReviewCandidateEntity
+            {
+                ReviewItem = entry,
+                SourceId = sourceId,
+                StreamUrl = streamUrl,
+                Title = candidateTitle,
+                Group = sourceGroup,
+                Logo = candidateLogo,
+                TvgId = candidateTvgId,
+                StreamFingerprint = streamFingerprint,
+                StreamFingerprintVersion = streamFingerprint != null ? StreamFingerprint.Version : null,
+                CreatedAtUtc = now,
+            });
+        }
+
         await context.SaveChangesAsync(cancellationToken);
         return entry;
+    }
+
+    /// <summary>
+    /// W-REVIEW-04 (Fase 3 Parte A) — upsert de um candidato de stream
+    /// para uma Review <c>Open</c>/<c>InReview</c>. Dedup por
+    /// <c>(ReviewItemId, StreamFingerprint)</c> quando existe fingerprint;
+    /// caso contrário, por <c>(ReviewItemId, StreamUrl)</c> exacto. No
+    /// refresh actualiza <c>Title/Logo/TvgId</c> e <c>SourceId</c> (quando
+    /// fornecido), preservando <c>CreatedAtUtc</c>.
+    /// </summary>
+    private static async Task UpsertReviewCandidateAsync(
+        ChannelCatalogDbContext context,
+        long reviewItemId,
+        string streamUrl,
+        long? sourceId,
+        string? streamFingerprint,
+        string? sourceGroup,
+        string? title,
+        string? logo,
+        string? tvgId,
+        CancellationToken cancellationToken)
+    {
+        ReviewCandidateEntity? candidate = streamFingerprint != null
+            ? await context.ReviewCandidates.FirstOrDefaultAsync(
+                c => c.ReviewItemId == reviewItemId && c.StreamFingerprint == streamFingerprint,
+                cancellationToken)
+            : await context.ReviewCandidates.FirstOrDefaultAsync(
+                c => c.ReviewItemId == reviewItemId && c.StreamUrl == streamUrl,
+                cancellationToken);
+
+        if (candidate == null)
+        {
+            context.ReviewCandidates.Add(new ReviewCandidateEntity
+            {
+                ReviewItemId = reviewItemId,
+                SourceId = sourceId,
+                StreamUrl = streamUrl,
+                Title = title,
+                Group = sourceGroup,
+                Logo = logo,
+                TvgId = tvgId,
+                StreamFingerprint = streamFingerprint,
+                StreamFingerprintVersion = streamFingerprint != null ? StreamFingerprint.Version : null,
+                CreatedAtUtc = DateTime.UtcNow,
+            });
+            return;
+        }
+
+        // Refresh de apresentação; nunca mexer em CreatedAtUtc nem na
+        // identidade (StreamUrl/fingerprint) já registada.
+        candidate.Title = title;
+        candidate.Logo = logo;
+        candidate.TvgId = tvgId;
+        if (sourceId != null) candidate.SourceId = sourceId;
     }
 
     /// <summary>
@@ -790,6 +888,81 @@ public sealed class CatalogResolver
         return await context.ReviewItems
             .AsNoTracking()
             .FirstOrDefaultAsync(r => r.Id == id, cancellationToken);
+    }
+
+    /// <summary>
+    /// W-REVIEW-04 / W-PREVIEW — lê um candidato de stream acumulado
+    /// (<see cref="ReviewCandidateEntity"/>) pela sua identidade persistida.
+    /// Usado pelo preview <c>review:&lt;id&gt;:&lt;candidateId&gt;</c>. Devolve
+    /// <c>null</c> quando o id não existe. <see cref="ReviewCandidateEntity.StreamUrl"/>
+    /// é raw: nunca registar nem expor.
+    /// </summary>
+    public async Task<ReviewCandidateEntity?> GetReviewCandidateAsync(
+        long id, CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        return await context.ReviewCandidates
+            .AsNoTracking()
+            .FirstOrDefaultAsync(c => c.Id == id, cancellationToken);
+    }
+
+    /// <summary>
+    /// W-REVIEW-04 / W-PREVIEW — lê um <see cref="ReviewItemEntity"/> com a
+    /// navegação <see cref="ReviewItemEntity.Candidates"/> carregada (eager),
+    /// ordenada por <c>CreatedAtUtc</c> e depois <c>Id</c>. Método novo e
+    /// aditivo: <see cref="GetReviewItemAsync"/> permanece inalterado para os
+    /// restantes callers (que não querem o custo do join).
+    /// </summary>
+    public async Task<ReviewItemEntity?> GetReviewItemWithCandidatesAsync(
+        long id, CancellationToken cancellationToken = default)
+    {
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var item = await context.ReviewItems
+            .AsNoTracking()
+            .Include(r => r.Candidates)
+            .FirstOrDefaultAsync(r => r.Id == id, cancellationToken);
+        if (item is null)
+        {
+            return null;
+        }
+
+        // O Include não garante ordem: normaliza-a in-place para o contrato
+        // (CreatedAtUtc, depois Id).
+        if (item.Candidates.Count > 1)
+        {
+            var ordered = item.Candidates
+                .OrderBy(c => c.CreatedAtUtc)
+                .ThenBy(c => c.Id)
+                .ToList();
+            item.Candidates.Clear();
+            item.Candidates.AddRange(ordered);
+        }
+
+        return item;
+    }
+
+    /// <summary>
+    /// W-PREVIEW — contagem de candidatos por <c>ReviewItemId</c>, numa única
+    /// passagem agrupada. Usada pela lista de Reviews para expor
+    /// <c>candidateCount</c> sem N+1 queries. Ids sem candidatos não aparecem.
+    /// </summary>
+    public async Task<IReadOnlyDictionary<long, int>> GetReviewCandidateCountsAsync(
+        IReadOnlyCollection<long> reviewItemIds, CancellationToken cancellationToken = default)
+    {
+        if (reviewItemIds.Count == 0)
+        {
+            return new Dictionary<long, int>();
+        }
+
+        await using var context = await _factory.CreateDbContextAsync(cancellationToken);
+        var rows = await context.ReviewCandidates
+            .AsNoTracking()
+            .Where(c => reviewItemIds.Contains(c.ReviewItemId))
+            .GroupBy(c => c.ReviewItemId)
+            .Select(g => new { ReviewItemId = g.Key, Count = g.Count() })
+            .ToListAsync(cancellationToken);
+
+        return rows.ToDictionary(r => r.ReviewItemId, r => r.Count);
     }
 
     /// <summary>

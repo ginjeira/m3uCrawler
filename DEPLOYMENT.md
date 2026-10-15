@@ -393,8 +393,25 @@ Lista das flags que afectam o comportamento do container, com referência ao hel
 | `--user USER` | `Program.cs:317` | Credenciais Xtream para `--scan-domain`. |
 | `--pass PASS` | `Program.cs:318` | Password Xtream para `--scan-domain`. |
 | `--fast`, `--high-performance` | `Program.cs:431` | Legacy M3U8-search (não aplicável ao pipeline Telegram). |
+| `--ffmpeg-path PATH` | `Program.cs` | Executável `ffmpeg` do motor de preview (padrão: `ffmpeg`; já presente na imagem). |
+| `--preview-max-concurrent N` | `Program.cs` | Máximo de sessões de preview simultâneas (padrão: `2`; inteiro > 0). |
+| `--preview-idle-seconds N` | `Program.cs` | Inactividade (segundos) que termina uma sessão de preview (padrão: `20`). |
+| `--preview-max-duration-seconds N` | `Program.cs` | TTL máximo (segundos) de uma sessão de preview (padrão: `300`). |
+| `--preview-transcode` | `Program.cs` | Opt-in: transcodifica H.264/AAC codecs não suportados em vez de *snapshot* (default: off; CPU intensivo). |
 
 > A string `--max-results` aparece **apenas** na lista interna `skipWithValue` em `Program.cs:398` (para ser ignorada como search term no legacy M3U8-search). **Não** é uma flag funcional actualmente.
+
+### Preview de streams (`ffmpeg`) — recursos e ajuste
+
+A imagem inclui **`ffmpeg`/`ffprobe`** (instalados no *runtime stage* Debian), o que acrescenta **~dezenas de MB** ao tamanho da imagem. Estas ferramentas servem o motor de **pré-visualização de canais** (botão *Pré-visualizar* nas Reviews e separador **Player** no dashboard), que é **sessão-only** e **efémero** (ver `m3uCrawler/README.md` § "Pré-visualização de canais e player de playlists").
+
+Orientação operacional:
+
+- **Começar sem `--preview-transcode`.** Por omissão, streams cujos codecs o browser não suporta (ex.: HEVC/H.265, AC-3) degradam para **snapshot** (um frame) + download da entrada; é a opção mais barata. Ligar `--preview-transcode` passa a transcodificar para H.264/AAC, com **CPU significativamente maior**.
+- **Ajustar `--preview-max-concurrent` (padrão `2`) conforme a CPU disponível.** É o teto de sessões simultâneas; sessões a mais competem com o pipeline Telegram.
+- **Os previews consomem ligações do provedor Xtream** (cada sessão abre o stream). São on-demand e limitados por `--preview-idle-seconds` (o normal) e `--preview-max-duration-seconds` (o máximo absoluto), pelo que a exposição é curta.
+- Sem `ffmpeg` acessível no `PATH`, as sessões falham na execução (preview degradado), **sem** impedir o arranque do container.
+- As flags de preview são **opcionais**; o `command:` do `docker-compose.yml` pode acrescentá-las quando se quiser afinar o comportamento.
 
 ### Dashboard em modo standalone (`--web` sem `--telegram`)
 

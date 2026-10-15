@@ -8,6 +8,7 @@ using m3uCrawler.Services.Configuration;
 using m3uCrawler.Services.Dispatcharr;
 using m3uCrawler.Services.LiveRun;
 using m3uCrawler.Services.Matching;
+using m3uCrawler.Services.Preview;
 using m3uCrawler.Services.SourceOrdering;
 using m3uCrawler.Services.SourceSelection;
 using m3uCrawler.Services.Sync;
@@ -77,6 +78,43 @@ namespace m3uCrawler
             // 503 web-allow-trigger-disabled (regra congelada).
             bool webAllowTrigger = webEnabled && args.Contains("--web-allow-trigger");
 
+            // Fase 1b — Configuração do motor de preview de streams.
+            // --ffmpeg-path (default: ffmpeg), --preview-max-concurrent
+            // (default: 2; tem de ser inteiro > 0), --preview-idle-seconds
+            // (default: 20), --preview-max-duration-seconds (default: 300) e
+            // --preview-transcode (opt-in para transcodificar codecs não
+            // suportados). Nunca imprimimos URLs.
+            var ffmpegPathArg = GetOptionValue(args, "--ffmpeg-path");
+            string ffmpegPath = string.IsNullOrWhiteSpace(ffmpegPathArg) ? "ffmpeg" : ffmpegPathArg;
+            int previewMaxConcurrent = 2;
+            var previewMaxConcurrentArg = GetOptionValue(args, "--preview-max-concurrent");
+            if (!string.IsNullOrWhiteSpace(previewMaxConcurrentArg)
+                && (!int.TryParse(previewMaxConcurrentArg, out previewMaxConcurrent) || previewMaxConcurrent <= 0))
+            {
+                Console.WriteLine("❌ --preview-max-concurrent deve ser um inteiro > 0.");
+                return;
+            }
+
+            int previewIdleSeconds = 20;
+            var previewIdleArg = GetOptionValue(args, "--preview-idle-seconds");
+            if (!string.IsNullOrWhiteSpace(previewIdleArg)
+                && (!int.TryParse(previewIdleArg, out previewIdleSeconds) || previewIdleSeconds <= 0))
+            {
+                Console.WriteLine("❌ --preview-idle-seconds deve ser um inteiro > 0.");
+                return;
+            }
+
+            int previewMaxDurationSeconds = 300;
+            var previewMaxDurationArg = GetOptionValue(args, "--preview-max-duration-seconds");
+            if (!string.IsNullOrWhiteSpace(previewMaxDurationArg)
+                && (!int.TryParse(previewMaxDurationArg, out previewMaxDurationSeconds) || previewMaxDurationSeconds <= 0))
+            {
+                Console.WriteLine("❌ --preview-max-duration-seconds deve ser um inteiro > 0.");
+                return;
+            }
+
+            bool previewTranscode = args.Contains("--preview-transcode");
+
             // Lifecycle do processo residente: token partilhado entre
             // Dashboard, Scheduler e mecanismo de shutdown (Ctrl+C / SIGTERM).
             var processCts = new System.Threading.CancellationTokenSource();
@@ -84,6 +122,9 @@ namespace m3uCrawler
             Task? webTask = null;
             CatalogResolver? webCatalogResolver = null;
             ScheduledAutomationHost? automationHost = null;
+            // Fase 1b — motor de preview de streams (construído com --web).
+            // Terminado no shutdown ordenado, junto do dashboard.
+            PreviewSessionManager? previewSessionManager = null;
             // PHASE 9C.4 — Host que detém o RunCoordinator único. Construído
             // quando o catálogo está disponível (i.e. --web foi passado
             // e o InitializeCatalogAsync foi bem-sucedido). O executor da
@@ -105,6 +146,36 @@ namespace m3uCrawler
                     webCatalogResolver = await InitializeCatalogAsync(
                         ResolveCatalogDbPath(args), CancellationToken.None);
                     WebDashboardService.SetCatalogResolver(webCatalogResolver);
+
+                    // Fase 1b — Motor de preview de streams. O resolver traduz
+                    // referências da UI (`review:<id>` / `playlist:<which>:<id>`)
+                    // em URLs server-side; o URL nunca é exposto ao cliente nem
+                    // registado em log. Sem ffmpeg o preview degrada (as sessões
+                    // falham por processo), mas o arranque nunca rebenta por isso.
+                    var previewOptions = new PreviewOptions
+                    {
+                        FfmpegPath = ffmpegPath,
+                        MaxConcurrentSessions = previewMaxConcurrent,
+                        IdleTimeout = TimeSpan.FromSeconds(previewIdleSeconds),
+                        MaxDuration = TimeSpan.FromSeconds(previewMaxDurationSeconds),
+                        TranscodeNonPlayable = previewTranscode,
+                    };
+                    var previewRunner = new ProcessRunner();
+                    var previewProbe = new StreamProbeService(previewRunner, previewOptions);
+                    var previewResolver = new StreamReferenceResolver(
+                        webCatalogResolver, dashboardOutputDir, new M3uParserService());
+                    previewSessionManager = new PreviewSessionManager(
+                        previewOptions,
+                        previewRunner,
+                        previewProbe,
+                        previewResolver.ResolveAsync,
+                        Path.Combine(appSettingsRuntimeDataDir, "preview"));
+                    WebDashboardService.SetPreviewSessionManager(previewSessionManager);
+                    var transcodeNote = previewTranscode ? "; transcode activo" : string.Empty;
+                    Console.WriteLine(
+                        ExecutableOnPath(ffmpegPath)
+                            ? $"🎬 Preview de streams activo (máx {previewMaxConcurrent} sessões{transcodeNote})."
+                            : $"⚠️ ffmpeg não encontrado ('{ffmpegPath}'); preview de streams degradado.");
 
                     // DL-130 (Phase 5) — Cursores de publicação do catálogo.
                     // Construído a partir da mesma factory que o resolver
@@ -366,6 +437,26 @@ namespace m3uCrawler
                 catch (Exception ex)
                 {
                     Console.WriteLine($"⚠️ Erro ao parar listener do dashboard: {ex.Message}");
+                }
+
+                // 6) Terminar as sessões de preview (mata processos ffmpeg e
+                //    remove os directórios temporários). CoherentShutdown é
+                //    síncrono, logo fazemos join ao DisposeAsync com um limite.
+                if (previewSessionManager is not null)
+                {
+                    try
+                    {
+                        previewSessionManager.DisposeAsync().AsTask().Wait(TimeSpan.FromSeconds(5));
+                        Console.WriteLine("🛑 Sessões de preview terminadas.");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"⚠️ Erro ao terminar sessões de preview: {ex.GetType().Name}");
+                    }
+                    finally
+                    {
+                        WebDashboardService.SetPreviewSessionManager(null);
+                    }
                 }
 
                 Console.WriteLine("🛑 Shutdown: cleanup orquestrado concluído; Main vai terminar.");
@@ -1118,7 +1209,7 @@ namespace m3uCrawler
                 
                 // Filter out known options from args to get search term
                 var searchArgs = new List<string>();
-                var skipWithValue = new HashSet<string> { "--max-streams", "--domain", "--web-port", "--web-token", "--bot-token", "--loop-hours", "--history-hours", "--min-history-hours", "--max-results", "--user", "--pass" };
+                var skipWithValue = new HashSet<string> { "--max-streams", "--domain", "--web-port", "--web-token", "--bot-token", "--loop-hours", "--history-hours", "--min-history-hours", "--max-results", "--user", "--pass", "--ffmpeg-path", "--preview-max-concurrent", "--preview-idle-seconds", "--preview-max-duration-seconds" };
                 for (int i = 0; i < args.Length; i++)
                 {
                     if (skipWithValue.Contains(args[i]))
@@ -1271,6 +1362,11 @@ namespace m3uCrawler
             Console.WriteLine("  --web-port N      Porta do servidor web (padrão: 5000)");
             Console.WriteLine("  --web-token TOKEN Token de máquina que autoriza apenas os endpoints de playlist; agora opcional, pois pode ser gerido/rotacionado na vista Setup do dashboard");
             Console.WriteLine("  --web-allow-trigger   Permite POST /api/run/start a partir do dashboard (opt-in; default: 503)");
+            Console.WriteLine("  --ffmpeg-path PATH  Executável ffmpeg usado no preview de streams (padrão: ffmpeg)");
+            Console.WriteLine("  --preview-max-concurrent N  Máximo de sessões de preview simultâneas (padrão: 2; inteiro > 0)");
+            Console.WriteLine("  --preview-idle-seconds N  Inactividade (segundos) após a qual a sessão de preview é terminada (padrão: 20; inteiro > 0)");
+            Console.WriteLine("  --preview-max-duration-seconds N  Duração máxima (segundos) de uma sessão de preview (padrão: 300; inteiro > 0)");
+            Console.WriteLine("  --preview-transcode  Transcodifica streams de codecs não suportados (H.264/AAC) em vez de snapshot (opt-in; default: off)");
             Console.WriteLine("  --bot             Modo bot Telegram (legacy M3U8-search)");
             Console.WriteLine("  --bot-token TOKEN Token do bot Telegram (também via M3U_BOT_TOKEN); obrigatorio com --bot");
             Console.WriteLine("  --scan-domain D   Faz scan direto ao domínio para procurar playlists (sem Telegram)");
@@ -1316,6 +1412,58 @@ namespace m3uCrawler
             }
 
             return null;
+        }
+
+        /// <summary>
+        /// Fase 1b — Verifica (best-effort) se um executável está disponível
+        /// no filesystem ou no <c>PATH</c>. Usado apenas para log informativo
+        /// do preview; nunca lança e nunca imprime segredos/URLs.
+        /// </summary>
+        static bool ExecutableOnPath(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                return false;
+            }
+
+            try
+            {
+                if (path.IndexOf(Path.DirectorySeparatorChar) >= 0
+                    || path.IndexOf(Path.AltDirectorySeparatorChar) >= 0)
+                {
+                    return File.Exists(path);
+                }
+
+                var pathVariable = Environment.GetEnvironmentVariable("PATH");
+                if (string.IsNullOrEmpty(pathVariable))
+                {
+                    return false;
+                }
+
+                foreach (var dir in pathVariable.Split(Path.PathSeparator))
+                {
+                    if (string.IsNullOrWhiteSpace(dir))
+                    {
+                        continue;
+                    }
+
+                    var candidate = Path.Combine(dir, path);
+                    if (File.Exists(candidate))
+                    {
+                        return true;
+                    }
+                    if (OperatingSystem.IsWindows() && File.Exists(candidate + ".exe"))
+                    {
+                        return true;
+                    }
+                }
+            }
+            catch
+            {
+                // best effort: nunca bloqueia o arranque
+            }
+
+            return false;
         }
 
         /// <summary>

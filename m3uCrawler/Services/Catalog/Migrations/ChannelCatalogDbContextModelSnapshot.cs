@@ -1198,6 +1198,66 @@ namespace m3uCrawler.Services.Catalog.Migrations
                     b.ToTable("recognition_policy_snapshots", (string)null);
                 });
 
+            modelBuilder.Entity("m3uCrawler.Services.Catalog.ReviewCandidateEntity", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime>("CreatedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Group")
+                        .HasMaxLength(200)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Logo")
+                        .HasMaxLength(500)
+                        .HasColumnType("TEXT");
+
+                    b.Property<long>("ReviewItemId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long?>("SourceId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("StreamFingerprint")
+                        .HasMaxLength(64)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("StreamFingerprintVersion")
+                        .HasMaxLength(16)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("StreamUrl")
+                        .IsRequired()
+                        .HasMaxLength(1000)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Title")
+                        .HasMaxLength(300)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("TvgId")
+                        .HasMaxLength(200)
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("ReviewItemId")
+                        .HasDatabaseName("IX_review_candidates_ReviewItemId");
+
+                    b.HasIndex("ReviewItemId", "StreamFingerprint")
+                        .IsUnique()
+                        .HasDatabaseName("IX_review_candidates_ReviewItemId_StreamFingerprint")
+                        .HasFilter("\"StreamFingerprint\" IS NOT NULL");
+
+                    b.HasIndex("ReviewItemId", "StreamUrl")
+                        .HasDatabaseName("IX_review_candidates_ReviewItemId_StreamUrl");
+
+                    b.ToTable("review_candidates", (string)null);
+                });
+
             modelBuilder.Entity("m3uCrawler.Services.Catalog.ReviewItemEntity", b =>
                 {
                     b.Property<long>("Id")
@@ -1722,6 +1782,17 @@ namespace m3uCrawler.Services.Catalog.Migrations
                     b.Navigation("Provider");
                 });
 
+            modelBuilder.Entity("m3uCrawler.Services.Catalog.ReviewCandidateEntity", b =>
+                {
+                    b.HasOne("m3uCrawler.Services.Catalog.ReviewItemEntity", "ReviewItem")
+                        .WithMany("Candidates")
+                        .HasForeignKey("ReviewItemId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("ReviewItem");
+                });
+
             modelBuilder.Entity("m3uCrawler.Services.Catalog.ReviewItemEntity", b =>
                 {
                     b.HasOne("m3uCrawler.Services.Catalog.CanonicalChannelEntity", "ApprovedCanonicalChannel")
@@ -1776,6 +1847,11 @@ namespace m3uCrawler.Services.Catalog.Migrations
             modelBuilder.Entity("m3uCrawler.Services.Catalog.ProviderEntity", b =>
                 {
                     b.Navigation("Accounts");
+                });
+
+            modelBuilder.Entity("m3uCrawler.Services.Catalog.ReviewItemEntity", b =>
+                {
+                    b.Navigation("Candidates");
                 });
 
             modelBuilder.Entity("m3uCrawler.Services.Catalog.SourceEntity", b =>

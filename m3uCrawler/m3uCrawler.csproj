@@ -13,6 +13,13 @@
 
   <ItemGroup>
     <EmbeddedResource Include="runtime-data/countries/*.json" />
+    <!-- hls.js vendorizado (Apache-2.0, versão pinada). Embutido para o
+         dashboard o servir em /assets/hls.min.js sem dependência de CDN em
+         runtime. LogicalName explícito para o loader o resolver sem depender
+         da derivação automática do nome lógico. -->
+    <EmbeddedResource Include="Assets/hls.min.js">
+      <LogicalName>m3uCrawler.Assets.hls.min.js</LogicalName>
+    </EmbeddedResource>
     <!-- Baseline canónico PT. Vive em docs/catalog/ (fora do projecto) mas é
          embutido como recurso para garantir que uma instalação fresca tem os
          canais generalistas mesmo quando o ficheiro não é empacotado. O

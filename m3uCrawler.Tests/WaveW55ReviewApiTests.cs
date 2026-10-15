@@ -325,6 +325,74 @@ public class WaveW55ReviewApiTests : IAsyncLifetime
         Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
     }
 
+    [Fact]
+    public async Task Detail_includes_candidates_metadata_without_url_and_coherent_count()
+    {
+        var harness = StartHarness();
+        await ReachReadyAsync(harness);
+        _ = await LoginAsync(harness);
+
+        const string url1 = "http://host.example.com:8080/live/usr/pwd/1.ts";
+        const string url2 = "http://host.example.com:8080/live/usr/pwd/2.ts";
+        var item = await _resolver.UpsertReviewItemAsync(
+            "w55-cand-obs", "grp", "sig", "nota", default,
+            streamUrl: url1, candidateTitle: "Candidato Um",
+            candidateLogo: "http://logo.example/a.png");
+        await _resolver.UpsertReviewItemAsync(
+            "w55-cand-obs", "grp", "sig", "nota", default,
+            streamUrl: url2, candidateTitle: "Candidato Dois");
+
+        var response = await harness.Client.GetAsync($"/api/review?id={item.Id}");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var body = await response.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(body);
+        var root = doc.RootElement;
+
+        Assert.Equal(2, root.GetProperty("candidateCount").GetInt32());
+        var candidates = root.GetProperty("candidates").EnumerateArray().ToList();
+        Assert.Equal(2, candidates.Count);
+        foreach (var c in candidates)
+        {
+            Assert.True(c.GetProperty("id").GetInt64() > 0);
+            Assert.False(string.IsNullOrWhiteSpace(c.GetProperty("title").GetString()));
+            Assert.True(c.GetProperty("hasUrl").GetBoolean());
+            Assert.False(c.TryGetProperty("url", out _));
+            Assert.False(c.TryGetProperty("streamUrl", out _));
+        }
+
+        Assert.Contains(candidates, c =>
+            c.GetProperty("title").GetString() == "Candidato Um"
+            && c.GetProperty("group").GetString() == "grp"
+            && c.GetProperty("logo").GetString() == "http://logo.example/a.png");
+        // A API nunca devolve a URL real do stream.
+        Assert.DoesNotContain(url1, body);
+        Assert.DoesNotContain(url2, body);
+    }
+
+    [Fact]
+    public async Task List_summary_includes_candidate_count()
+    {
+        var harness = StartHarness();
+        await ReachReadyAsync(harness);
+        _ = await LoginAsync(harness);
+
+        var item = await _resolver.UpsertReviewItemAsync(
+            "w55-count-obs", "grp", "sig", "nota", default,
+            streamUrl: "http://host.example.com:8080/live/usr/pwd/1.ts");
+        await _resolver.UpsertReviewItemAsync(
+            "w55-count-obs", "grp", "sig", "nota", default,
+            streamUrl: "http://host.example.com:8080/live/usr/pwd/2.ts");
+
+        var response = await harness.Client.GetAsync("/api/reviews");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        using var doc = await ReadJsonAsync(response);
+        var row = Assert.Single(
+            doc.RootElement.EnumerateArray(),
+            e => e.GetProperty("id").GetInt64() == item.Id);
+        Assert.Equal(2, row.GetProperty("candidateCount").GetInt32());
+    }
+
     // ════════════════════════════════════════════════════════════════
     // POST /api/review/ignore
     // ════════════════════════════════════════════════════════════════

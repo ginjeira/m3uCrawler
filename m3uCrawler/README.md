@@ -115,6 +115,11 @@ As opções abaixo são as efectivamente reconhecidas pelo `Program.cs`. Opçõe
 | `--web-port PORTA` | Porta do dashboard (padrão: 5000). |
 | `--web-token TOKEN` | Token partilhado de **máquina**: autoriza **apenas** os endpoints de playlist (`/api/playlist`, `/api/playlist_temp`, `/api/playlist_acquired`). **Fallback opcional**: pode ser gerido/rotacionado na vista Setup do dashboard, e o token aí definido sobrepõe-se a esta flag (ver secção "Modelo de segurança do dashboard"). O dashboard mantém o fluxo de sessão user/password. |
 | `--web-allow-trigger` | Opt-in: permite `POST /api/run/start` (trigger manual) no dashboard. Default: desactivado ⇒ `503 web-allow-trigger-disabled`. |
+| `--ffmpeg-path PATH` | Executável `ffmpeg` usado no preview de streams (padrão: `ffmpeg`). Ver secção "Pré-visualização de canais e player de playlists". |
+| `--preview-max-concurrent N` | Nº máximo de sessões de preview simultâneas (padrão: `2`; inteiro > 0). |
+| `--preview-idle-seconds N` | Inactividade (segundos) após a qual a sessão de preview é terminada (padrão: `20`; inteiro > 0). |
+| `--preview-max-duration-seconds N` | Duração máxima (segundos) de uma sessão de preview (padrão: `300`; inteiro > 0). |
+| `--preview-transcode` | Opt-in: transcodifica (H.264/AAC) streams de codecs não suportados em vez de *snapshot* (default: desligado). |
 | `--admin-reset-password USERNAME` | Recuperação **host-only** da password de administrador: a password é lida interactivamente do stdin, **nunca** de argv. Ver secção "Alterar/recuperar password de administrador". |
 | `--import-epg-tvg-ids FONTE` | Importa uma EPG XMLTV (`.xml`/`.xml.gz`, URL ou ficheiro) e grava os `id` dos `<channel>` como identidade externa `tvg-id` dos canais canónicos do país. Requer catálogo. Ver secção "Importação de tvg-id a partir de EPG". |
 | `--epg-country CODIGO` | País da EPG a importar (padrão: o país activo de `--country`, senão `pt`). |
@@ -650,6 +655,7 @@ O dashboard (`Services/WebDashboardService.cs`, `HttpListener`) serve a UI em `h
 | `/api/catalog/source-selection-policies/preview` (GET) | **Preview/dry-run read-only** da selecção de fontes: corre a mesma lógica da produção sobre o catálogo, sem publicar nem escrever. Ver secção seguinte. |
 | `/api/catalog/channel-sources/{id}/observations?limit={n}` (GET) | **DC-5c** — Histórico de observações de um *channel-source* (`quality`, `epg`, `availability`, `responseTimeMs`, `observedAtUtc`), mais recentes primeiro. `limit` default 200. Visualizador na UI em Catálogo → **Sources** (acção **Observações** por linha). |
 | `/api/catalog/channel-sources/{id}/observations` (POST) | **DC-5c** — Regista uma observação (`{ quality, epg, availability, responseTimeMs }`); enums (`StreamQuality`/`EpgState`/`AvailabilityState`) com parse tolerante (valor desconhecido → default sem falhar). Devolve `{ recorded: true }`. Usado pelo formulário da UI em Catálogo → **Sources**. |
+| `/api/playlist-entries`, `/api/playlist-entry`, `/api/preview/*`, `/assets/hls.min.js` | **Pré-visualização e Player** (sessão-only; o token de máquina **não** autoriza). Sem URLs/credenciais no browser. Ver secção "Pré-visualização de canais e player de playlists". |
 
 ### Semântica HTTP e erros
 
@@ -669,7 +675,8 @@ O dashboard tem os seguintes separadores principais:
 - **Execuções**: histórico detalhado das últimas 72h com métricas por execução.
 - **Descoberta**: card "Configuração de discovery predefinida" (keyword, janela Min/Max, `MaxStreams`, checkbox `feedCanonicalFallback`, via `/api/discovery/settings`) e playlists descobertas com filtros por estado, origem e país, incluindo colunas de proveniência MessageId / Data mensagem (UTC) / Candidato.
 - **Canais / Países**: validação da playlist actual por país e gestão das listas de aliases.
-- **Playlist**: visualização da playlist actual, da intermédia (`playlist_temp.m3u`) e da de aquisição (`playlist_acquired.m3u`) com pré-visualizações sanitizadas (`GET /api/playlist/preview`, `GET /api/playlist_temp/preview`, `GET /api/playlist_acquired/preview`), links para download funcional e lista dos ficheiros em `output/`.
+- **Playlist**: visualização da playlist actual, da intermédia (`playlist_temp.m3u`) e da de aquisição (`playlist_acquired.m3u`) com pré-visualizações sanitizadas (`GET /api/playlist/preview`, `GET /api/playlist_temp/preview`, `GET /api/playlist_acquired/preview`), links para download funcional, botões **Abrir no player** e lista dos ficheiros em `output/`.
+- **Player**: grelha das entradas das três playlists (logo/título/grupo) com busca por título/grupo, pré-visualização num leitor (`hls.js` ou *snapshot*) e download de uma entrada (`.m3u`). Ver secção "Pré-visualização de canais e player de playlists".
 - **Dispatcharr**: estado da última sincronização, card **Classificação (último MatchPlan)** (DC-5d, `GET /api/classification-summary`) e detalhes do plano/report.
 - **Catálogo**: gestão completa do catálogo de canais, incluindo o separador **Scheduled Jobs** (jobs cron persistentes; ver secção "Scheduler / Scheduled Jobs").
 - **Validação de Streams**: política operacional de teste de streams e dry-run de URLs.
@@ -678,6 +685,65 @@ O dashboard tem os seguintes separadores principais:
 - **Diagnóstico**: inventário de ficheiros, RunReport completo e glossário de métricas.
 
 Os editores inline do dashboard (Canais, Reviews, Regras, Afinidade, Ordering, Scheduler, Source selection e Import policies) passam a abrir num modal centrado, com fecho por `Cancelar`, clique fora ou `Escape` e gestão de foco: a abertura memoriza o elemento focado e o fecho restaura-o (sem lançar se o elemento tiver entretanto desaparecido). Não são usados diálogos nativos do browser para escolhas — por exemplo, **alterar a Política de publicação** de um canal (`channelPolicyForm` com `<select>` pré-selecionado) e **duplicar** uma Ordering List (`orderingDuplicateForm` com input pré-preenchido com `<key>-copy`) passam por painéis modais. No detalhe de uma Ordering List, cada item tem ainda um controlo **mover para posição N** (input numérico 1-based + botão *Mover*), que reutiliza `PUT /api/catalog/ordering-items/{id}` com `{ position }` 0-based (DC-12).
+
+### Pré-visualização de canais e player de playlists
+
+Duas funcionalidades de **confirmação visual**, sobre um motor de preview comum (server-side, efémero e autenticado por sessão):
+
+1. **Pré-visualização nas Reviews** — ver o(s) stream(s) candidato(s) de uma review antes de decidir, a partir do botão **Pré-visualizar** (só aparece quando a review tem evidência: `hasEvidence`). Quando a review tem **vários candidatos acumulados**, a modal mostra um selector (logo/título/grupo) e cada candidato arranca a sua própria sessão.
+2. **Player das playlists** — novo separador **Player** do dashboard: escolhe-se `playlist.m3u`, `playlist_temp.m3u` ou `playlist_acquired.m3u`, pesquisa-se por título/grupo na grelha (logo/título/grupo) e reproduz-se o canal. Os botões **Abrir no player** (nas vistas das playlists) entram directamente no Player já na playlist certa.
+
+A reprodução usa `hls.js` (HLS) ou um frame de *snapshot*. Para codecs que o browser não reproduz, a entrada pode ainda ser **descarregada como `.m3u` de uma só entrada** (abrir em VLC).
+
+#### Modelo de segurança
+
+- **Sessão-only**: todas as rotas de preview exigem **sessão humana** (login + CSRF). O **token de máquina** das playlists (`/api/playlist`, `/api/playlist_temp`, `/api/playlist_acquired`) **não** dá acesso a nenhuma rota de preview.
+- **O browser nunca recebe URLs nem credenciais no DOM/HTML**: o servidor resolve tudo a partir de **referências internas** — `review:<id>` (evidência do item), `review:<id>:<candidateId>` (candidato acumulado) e `playlist:<which>:<entryId>` (entrada de playlist; `entryId` = primeiros 16 caracteres hex do SHA-256 do URL). URLs enviadas pelo cliente são rejeitadas (anti-SSRF); nada de URL/credenciais no HTML, no DOM nem nos logs. **Excepção deliberada:** o download explícito de **uma** entrada (`GET /api/playlist-entry`) devolve a URL real num ficheiro `.m3u` ao administrador autenticado — equivalente a descarregar a playlist inteira — e nunca é registado em logs.
+- **Efémero**: as sessões são criadas on-demand, têm *idle timeout* e TTL máximo, e os processos/ficheiros temporários são limpos (o `ffmpeg` é morto no *stop*, na expiração e no *shutdown*).
+- **CSP** aplicada apenas às respostas HTML do dashboard (não às rotas de API/asset).
+
+#### Endpoints
+
+| Endpoint | Método | Descrição |
+|---|---|---|
+| `/api/playlist-entries?which=playlist\|playlist_temp\|playlist_acquired` | GET | Metadados das entradas da playlist — `[{ id, title, group, logo }]` **sem URL**. `400 invalid-which`; `404 playlist-not-found`. |
+| `/api/playlist-entry?which=…&id=…` | GET | Descarrega um `.m3u` com **1** entrada (`#EXTM3U` + `#EXTINF` + URL real), para codecs não suportados (abrir em VLC). `400 invalid-which`/`invalid-id`; `404 playlist-not-found`/`entry-not-found`. |
+| `/api/preview/start` | POST (`{ ref }`) | Arranca a sessão: `{ sessionId, kind: "hls"\|"snapshot", manifestUrl, thumbnailUrl, probe, playable, reason }`. `400 preview-ref-required`/`invalid-payload`; `404 preview-unknown-reference`; `429 preview-busy`; `503 preview-unavailable`. |
+| `/api/preview/<id>/index.m3u8` (+ segmentos) | GET | Manifest HLS e segmentos servidos localmente pela sessão. `404 preview-file-not-found`. |
+| `/api/preview/<id>/thumb.jpg` | GET | Frame de *snapshot* (JPEG). |
+| `/api/preview/<id>/stop` | POST | Termina a sessão (`204`). Idempotente. |
+| `/assets/hls.min.js` | GET | `hls.js` v1.5.20 **vendorizado e embutido** na assembly (sem CDN em runtime). `404 asset-not-found` quando o recurso não está empacotado. |
+
+#### Dependência `ffmpeg` e flags
+
+O motor usa **`ffmpeg`/`ffprobe`** (adicionados à imagem Docker no *runtime stage* Debian): o `ffprobe` sonda codecs/resolução e o `ffmpeg` remuxa ou transcodifica para HLS, ou captura o *snapshot*. Sem `ffmpeg` no `PATH`, as sessões falham na execução (preview degradado); o arranque nunca rebenta por isso.
+
+| Flag | Padrão | Efeito |
+|---|---|---|
+| `--ffmpeg-path PATH` | `ffmpeg` | Executável `ffmpeg` usado pelo motor. |
+| `--preview-max-concurrent N` | `2` | Nº máximo de sessões de preview simultâneas (inteiro > 0). |
+| `--preview-idle-seconds N` | `20` | Inactividade (segundos) após a qual a sessão é terminada (inteiro > 0). |
+| `--preview-max-duration-seconds N` | `300` | Duração máxima absoluta (segundos) de uma sessão (inteiro > 0). |
+| `--preview-transcode` | desligado | Transcodifica (H.264/AAC) os streams cujos codecs o browser não suporta, em vez de capturar um *snapshot*. **Opt-in** (CPU intensivo). |
+
+#### CSP (pragmática)
+
+As respostas HTML do dashboard incluem `Content-Security-Policy`:
+
+```
+default-src 'self'; img-src 'self' data: http: https:; media-src 'self' blob:; connect-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'self'; frame-ancestors 'self'
+```
+
+`img-src … http: https:` permite os logos externos (`tvg-logo`) e `media-src 'self' blob:` permite ao `hls.js` reproduzir os segmentos locais. **Limitação conhecida:** `'unsafe-inline'` é obrigatório porque a UI é um único `<script>` com handlers `onclick=` inline; migrar para um CSP com *nonce* exigiria um refactor massivo do HTML — fora do âmbito.
+
+#### Limitações
+
+- **Codecs que o browser não suporta** (ex.: HEVC/H.265, AC-3/E-AC-3): sem `--preview-transcode`, apenas **snapshot** + download da entrada (VLC). Com `--preview-transcode`, há transcode H.264/AAC, mas com custo de CPU.
+- **CPU e ligações**: o remux consome menos CPU que o transcode; ambos competem com o pipeline, sobretudo o transcode. Os previews consomem também **ligações do provedor Xtream** (abrem o stream), pelo que são on-demand, curtos e limitados por `--preview-max-concurrent`.
+- **Logos** (`tvg-logo`) são externos (`http`/`https`).
+- **Tamanho da imagem Docker** cresce ~dezenas de MB por causa do `ffmpeg`.
+
+O motor é descrito em detalhe (fluxo, ciclo de vida das sessões, limites e segurança) em [`docs/architecture/stream-preview.md`](../docs/architecture/stream-preview.md).
 
 ### Catálogo de Canais
 
@@ -690,7 +756,7 @@ O catálogo (`ChannelCatalogDbContext`, SQLite em `/data/channel-catalog.db`) ge
 | **Grupos** | Grupos canónicos de publicação, ordenados por `order` (ver "Grupos canónicos e atribuição por canal"). |
 | **Regras** | IdentityRules explícitas que sobrepõem o matching automático. Criar regra com `ReviewOnly` permite fuzzy matching futuro; `Excluded` bloqueia o canal permanentemente. |
 | **Afinidades** | Grupos com discriminator `Kind` (**Channel** ou **Country**). Uma Channel affinity liga variantes a um canal canónico (0..1 por `CanonicalChannelKey`); uma Country affinity liga variantes ao `CountryChannelValidator` para country-level targeting. As variantes são editadas num único campo separado pelo delimiter global (`/api/settings`, default `,`). |
-| **Reviews** | Itens de revisão do Dispatcharr (decisões ambíguas ou uncertainas pendentes de decisão humana). A lista usa `GET /api/reviews` com paginação e filtro de estado (activos por omissão; `Resolved`/`Ignored` no histórico); as acções usam `POST /api/review/resolve` (Add Alias → `change.type='channelAlias'`; Create Channel → `change.type='canonicalChannel'`), `POST /api/review/ignore` (excluir, com `reason` obrigatório) e `POST /api/review/reopen` (reabrir um item terminal, com `justification`). A identidade interna é o `id` numérico do `ReviewItem`. O formulário do modal é reinicializado a cada abertura, pelo que o campo de identidade reflecte sempre o item seleccionado e não retém o canal aprovado anteriormente. |
+| **Reviews** | Itens de revisão do Dispatcharr (decisões ambíguas ou uncertainas pendentes de decisão humana). A lista usa `GET /api/reviews` com paginação e filtro de estado (activos por omissão; `Resolved`/`Ignored` no histórico); as acções usam `POST /api/review/resolve` (Add Alias → `change.type='channelAlias'`; Create Channel → `change.type='canonicalChannel'`), `POST /api/review/ignore` (excluir, com `reason` obrigatório) e `POST /api/review/reopen` (reabrir um item terminal, com `justification`). A identidade interna é o `id` numérico do `ReviewItem`. O formulário do modal é reinicializado a cada abertura, pelo que o campo de identidade reflecte sempre o item seleccionado e não retém o canal aprovado anteriormente. Reviews com evidência (`hasEvidence`) têm o botão **Pré-visualizar**; o detalhe (`GET /api/review?id=`) expõe `candidateCount` e `candidates` `[{ id, title, group, logo, hasUrl }]` (**sem** URL), e a lista expõe `candidateCount`. Ver secção "Pré-visualização de canais e player de playlists". |
 | **Auditoria** | Visualizador (DC-5b) dos registos de auditoria via `GET /api/audit`, com filtros `objectType`/`objectId`/`limit` (default 100, cap 1000) e tabela de data/hora local, actor, operação, objecto, resultado, `before`/`after` (JSON sanitizado aberto num **modal de detalhe** `#auditJsonModal` — botão **Ver**, pretty-printed e como texto) e detalhe. `503 audit-unavailable` é apresentado como estado inline claro. Read-only. |
 | **Sync Runs** | Histórico de sincronizações Dispatcharr com contadores de created/merged/protected/removed. |
 | **Pending** | Canais que geraram dúvida no country-level targeting e aguardam decisão manual (ver secção seguinte). |
@@ -1211,6 +1277,7 @@ Para deployments em rede não confiável, **recomenda-se vivamente** proteger o 
 - A comparação é feita em **tempo constante** (`CryptographicOperations.FixedTimeEquals`) para evitar timing attacks.
 - **Fora desses três endpoints o token é ignorado**: não bloqueia nem autoriza o dashboard/restantes APIs, que seguem o fluxo normal (bootstrap/login/sessão+CSRF). Um pedido a uma playlist sem token válido **e** sem sessão recebe `401 Unauthorized`.
 - Os endpoints de **pré-visualização** (`/api/playlist/preview`, `/api/playlist_temp/preview`, `/api/playlist_acquired/preview`) **não** são autorizáveis por token — ficam no fluxo de sessão humana (o seu conteúdo já é sanitizado).
+- O **motor de preview** (`/api/playlist-entries`, `/api/playlist-entry`, `/api/preview/*`, `/assets/hls.min.js`) é também **sessão-only**: o token de máquina **não** autoriza nenhuma destas rotas. O browser recebe apenas referências internas e caminhos servidos localmente — nunca a URL/credenciais do stream. Ver secção "Pré-visualização de canais e player de playlists".
 - **Sem token configurado**, o comportamento depende do modo: em **legacy** (sem autenticação ligada — uso local/testes) as playlists mantêm-se **abertas** (compatibilidade); em **produção** (`UserAuth`, instalação `READY` com administrador) as playlists passam a exigir **sessão humana** — um pedido sem token **e** sem sessão recebe `401` e **não** fica público.
 
 #### Token de playlists gerido na vista Setup

@@ -20,6 +20,7 @@ public sealed class ChannelCatalogDbContext : DbContext
     public DbSet<DispatcharrChannelOwnershipEntity> DispatcharrChannelOwnerships => Set<DispatcharrChannelOwnershipEntity>();
     public DbSet<DispatcharrStreamOwnershipEntity> DispatcharrStreamOwnerships => Set<DispatcharrStreamOwnershipEntity>();
     public DbSet<ReviewItemEntity> ReviewItems => Set<ReviewItemEntity>();
+    public DbSet<ReviewCandidateEntity> ReviewCandidates => Set<ReviewCandidateEntity>();
     public DbSet<SyncRunEntity> SyncRuns => Set<SyncRunEntity>();
     public DbSet<PendingCountryApprovalEntity> PendingCountryApprovals => Set<PendingCountryApprovalEntity>();
     public DbSet<SourceEntity> Sources => Set<SourceEntity>();
@@ -235,6 +236,39 @@ public sealed class ChannelCatalogDbContext : DbContext
                 .WithMany()
                 .HasForeignKey(x => x.ApprovedCanonicalChannelId)
                 .OnDelete(DeleteBehavior.SetNull);
+        });
+
+        // W-REVIEW-04 (Fase 3 Parte A) — ReviewCandidate (candidatos de
+        // stream acumulados por Review). StreamUrl é raw; a dedup é por
+        // (ReviewItemId, StreamFingerprint) quando existe fingerprint
+        // (índice único filtrado) e por (ReviewItemId, StreamUrl) na sua
+        // ausência (índice não-único, consultado pelo método de upsert).
+        modelBuilder.Entity<ReviewCandidateEntity>(e =>
+        {
+            e.ToTable("review_candidates");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.Id).ValueGeneratedOnAdd();
+            e.Property(x => x.ReviewItemId).IsRequired();
+            e.Property(x => x.StreamUrl).IsRequired().HasMaxLength(1000);
+            e.Property(x => x.Title).HasMaxLength(300);
+            e.Property(x => x.Group).HasMaxLength(200);
+            e.Property(x => x.Logo).HasMaxLength(500);
+            e.Property(x => x.TvgId).HasMaxLength(200);
+            e.Property(x => x.StreamFingerprint).HasMaxLength(64);
+            e.Property(x => x.StreamFingerprintVersion).HasMaxLength(16);
+            e.Property(x => x.CreatedAtUtc).IsRequired();
+            e.HasIndex(x => x.ReviewItemId)
+                .HasDatabaseName("IX_review_candidates_ReviewItemId");
+            e.HasIndex(x => new { x.ReviewItemId, x.StreamFingerprint })
+                .IsUnique()
+                .HasDatabaseName("IX_review_candidates_ReviewItemId_StreamFingerprint")
+                .HasFilter("\"StreamFingerprint\" IS NOT NULL");
+            e.HasIndex(x => new { x.ReviewItemId, x.StreamUrl })
+                .HasDatabaseName("IX_review_candidates_ReviewItemId_StreamUrl");
+            e.HasOne(x => x.ReviewItem)
+                .WithMany(r => r.Candidates)
+                .HasForeignKey(x => x.ReviewItemId)
+                .OnDelete(DeleteBehavior.Cascade);
         });
 
         // SyncRun

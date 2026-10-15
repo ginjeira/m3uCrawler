@@ -429,7 +429,13 @@ public sealed class PipelineIngestionService
                         streamFingerprintVersion: streamFingerprint != null
                             ? m3uCrawler.Services.Matching.StreamFingerprint.Version
                             : null,
-                        runId: runId);
+                        runId: runId,
+                        // W-REVIEW-04 (Fase 3 Parte A) — metadados do
+                        // candidato acumulado (título/logo/tvg-id da
+                        // ocorrência actual).
+                        candidateTitle: stream.Title,
+                        candidateLogo: stream.Logo,
+                        candidateTvgId: stream.OriginalTvgId);
                 }
             }
         }

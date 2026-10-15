@@ -66,6 +66,10 @@ RUN M3uCrawlerShortSha=$(echo "${M3uCrawlerCommitSha}" | cut -c1-12) && \
 FROM mcr.microsoft.com/dotnet/runtime:9.0 AS runtime
 WORKDIR /data
 
+# Fase 1b — ffmpeg/ffprobe para o preview de streams (remux HLS e
+# snapshots). Instalado apenas no stage runtime.
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
+
 COPY --from=build /app/publish /app
 
 # Baseline canónico PT: fica também no filesystem da imagem (além do

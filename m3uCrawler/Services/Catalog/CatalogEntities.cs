@@ -453,6 +453,65 @@ public sealed class ReviewItemEntity
     /// caminhos como <c>ChannelMatcher</c> que não recebem RunId).
     /// </summary>
     public string? RunId { get; set; }
+
+    /// <summary>
+    /// W-REVIEW-04 (Fase 3 Parte A) — candidatos a stream acumulados
+    /// para esta Review. Aditivo: a evidência do item
+    /// (<see cref="StreamUrl"/>) mantém-se como "último vencedor" para
+    /// retro-compatibilidade do preview <c>review:&lt;id&gt;</c>. Não é
+    /// carregada por omissão.
+    /// </summary>
+    public List<ReviewCandidateEntity> Candidates { get; set; } = new();
+}
+
+/// <summary>
+/// W-REVIEW-04 (Fase 3 Parte A) — observação acumulada de um stream
+/// candidato associado a um <see cref="ReviewItemEntity"/>. Enquanto a
+/// Review está <c>Open</c>/<c>InReview</c>, cada stream distinto observado
+/// (identificado pelo fingerprint canónico <c>sfp1</c> ou, na sua ausência,
+/// pelo URL exacto) acrescenta/refresca uma row. A evidência do item
+/// (<see cref="ReviewItemEntity.StreamUrl"/>) continua a ser sobrescrita
+/// pelo último observado.
+///
+/// <para>
+/// <see cref="StreamUrl"/> é <b>raw</b> (preservado verbatim, como em
+/// <see cref="ReviewItemEntity.StreamUrl"/>); a sanitização acontece apenas
+/// na exposição via API/DTO. Nunca é adicionado/alterado após uma decisão
+/// humana (<c>Resolved</c>/<c>Ignored</c>).
+/// </para>
+/// </summary>
+public sealed class ReviewCandidateEntity
+{
+    public long Id { get; set; }
+
+    public long ReviewItemId { get; set; }
+    public ReviewItemEntity? ReviewItem { get; set; }
+
+    /// <summary>
+    /// <c>Source.Id</c> resolvido pelo ingestion. <c>null</c> quando o
+    /// caller não o fornece (e.g. <c>ChannelMatcher</c>).
+    /// </summary>
+    public long? SourceId { get; set; }
+
+    /// <summary>URL do stream observada, preservada verbatim (raw).</summary>
+    public string StreamUrl { get; set; } = string.Empty;
+
+    public string? Title { get; set; }
+    public string? Group { get; set; }
+    public string? Logo { get; set; }
+    public string? TvgId { get; set; }
+
+    /// <summary>
+    /// Fingerprint canónico do stream (versão <c>"sfp1"</c>). <c>null</c>
+    /// quando o URL não é <c>http(s)</c> fingerprintável; nesse caso a
+    /// dedup é feita por <see cref="StreamUrl"/> exacto.
+    /// </summary>
+    public string? StreamFingerprint { get; set; }
+
+    /// <summary>Sempre <c>"sfp1"</c> quando <see cref="StreamFingerprint"/> é não-nulo.</summary>
+    public string? StreamFingerprintVersion { get; set; }
+
+    public DateTime CreatedAtUtc { get; set; }
 }
 
 /// <summary>

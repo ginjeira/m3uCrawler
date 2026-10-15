@@ -7,6 +7,7 @@ using m3uCrawler.Services.Catalog;
 using m3uCrawler.Services.Configuration;
 using m3uCrawler.Services.Dispatcharr;
 using m3uCrawler.Services.LiveRun;
+using m3uCrawler.Services.Preview;
 using m3uCrawler.Services.Recognition;
 using m3uCrawler.Services.SourceSelection;
 using m3uCrawler.Services.Sync;
@@ -71,6 +72,12 @@ namespace m3uCrawler.Services
         // dispatcharr-unavailable.
         private static DispatcharrSyncCoordinator? _dispatcharrSyncCoordinator;
         private static DispatcharrConcurrencyGate? _dispatcharrConcurrencyGate;
+
+        // Fase 1b — Motor de sessões de preview de streams. Quando ausente
+        // (testes/arranque sem wiring), as rotas /api/preview/* respondem 503
+        // preview-unavailable. O resolver de referências vive dentro do
+        // manager (injectado); o dashboard só conhece o manager.
+        private static PreviewSessionManager? _previewSessionManager;
 
         // Lifecycle do processo residente — listener do dashboard
         // registado no arranque e parado no shutdown coerente (Ctrl+C /
@@ -235,6 +242,18 @@ namespace m3uCrawler.Services
         {
             _dispatcharrSyncCoordinator = coordinator;
             _dispatcharrConcurrencyGate = gate;
+        }
+
+        /// <summary>
+        /// Fase 1b — Regista o motor de sessões de preview. Passar
+        /// <c>null</c> repõe o comportamento "não ligado" (usado em testes):
+        /// as rotas <c>/api/preview/*</c> respondem 503
+        /// <c>preview-unavailable</c>. O dashboard nunca tem acesso ao
+        /// resolver nem às URLs — só ao manager.
+        /// </summary>
+        public static void SetPreviewSessionManager(PreviewSessionManager? manager)
+        {
+            _previewSessionManager = manager;
         }
 
         /// <summary>
@@ -1098,6 +1117,44 @@ namespace m3uCrawler.Services
                 var content = await File.ReadAllTextAsync(acquiredPath, Encoding.UTF8);
                 var sanitized = CredentialSanitizer.SanitizeM3uContent(content);
                 await WriteTextAsync(context.Response, sanitized, HttpStatusCode.OK, "audio/x-mpegurl");
+                return;
+            }
+
+            // Fase 1b — Entries de playlist (sessão-only). Devolve os
+            // metadados das entradas (id/title/group/logo) SEM URL, para que a
+            // UI possa pedir um preview sem conhecer credenciais. O `id` é
+            // exactamente o que o resolver aceita em `playlist:<which>:<id>`.
+            if (requestPath.Equals("/api/playlist-entries", StringComparison.OrdinalIgnoreCase))
+            {
+                await HandlePlaylistEntriesAsync(context, outputDir);
+                return;
+            }
+
+            // Player — download de UMA entrada (.m3u mínimo: #EXTM3U +
+            // #EXTINF + URL real). Sessão-only (o token de máquina não a
+            // autoriza), tal como /api/playlist-entries. A URL é exposta ao
+            // admin autenticado (equivalente a descarregar a playlist
+            // inteira); nunca é registada em logs.
+            if (requestPath.Equals("/api/playlist-entry", StringComparison.OrdinalIgnoreCase))
+            {
+                await HandlePlaylistEntryDownloadAsync(context, outputDir);
+                return;
+            }
+
+            // hls.js vendorizado (Apache-2.0, versão pinada), servido a partir
+            // do recurso embutido. Rota de sessão (mesmo gate do dashboard);
+            // 404 quando o recurso não está empacotado.
+            if (requestPath.Equals("/assets/hls.min.js", StringComparison.OrdinalIgnoreCase))
+            {
+                await HandleHlsAssetAsync(context);
+                return;
+            }
+
+            // Fase 1b — Preview de streams (sessão-only; o token de máquina
+            // NÃO autoriza estas rotas). start/serve/stop.
+            if (requestPath.StartsWith("/api/preview/", StringComparison.OrdinalIgnoreCase))
+            {
+                await HandlePreviewEndpointAsync(context, requestPath);
                 return;
             }
 
@@ -4127,12 +4184,21 @@ namespace m3uCrawler.Services
                     r.State != ReviewItemState.Resolved && r.State != ReviewItemState.Ignored);
             }
 
-            var page = filtered
+            var pageItems = filtered
                 .OrderByDescending(r => r.CreatedAtUtc)
                 .ThenByDescending(r => r.Id)
                 .Skip(offset)
                 .Take(limit)
-                .Select(ReviewSummaryJson)
+                .ToList();
+
+            // W-PREVIEW — contagem de candidatos por review (uma passagem
+            // agrupada, limitada aos ids da página).
+            var candidateCounts = await _catalogResolver!.GetReviewCandidateCountsAsync(
+                pageItems.Select(r => r.Id).ToList());
+
+            var page = pageItems
+                .Select(r => ReviewSummaryJson(
+                    r, candidateCounts.TryGetValue(r.Id, out var count) ? count : 0))
                 .ToList();
 
             await WriteJsonAsync(context.Response, page);
@@ -4150,7 +4216,7 @@ namespace m3uCrawler.Services
                 return;
             }
 
-            var item = await _catalogResolver!.GetReviewItemAsync(id);
+            var item = await _catalogResolver!.GetReviewItemWithCandidatesAsync(id);
             if (item is null)
             {
                 await WriteReviewApiErrorAsync(context.Response, HttpStatusCode.NotFound,
@@ -4458,7 +4524,7 @@ namespace m3uCrawler.Services
         // inalterada (DL-120/D5); esta é a superfície que a DC-5 pode usar
         // para migrar a UI sem drift de nomes. Todos os textos passam por
         // `SanitizeReviewText` (nunca credenciais em claro).
-        private static object ReviewSummaryJson(ReviewItemEntity r) => new
+        private static object ReviewSummaryJson(ReviewItemEntity r, int candidateCount) => new
         {
             id = r.Id,
             subject = SanitizeReviewText(r.NormalizedIdentity),
@@ -4475,6 +4541,11 @@ namespace m3uCrawler.Services
             reasonSignature = SanitizeReviewText(r.ReasonSignature),
             note = SanitizeReviewText(r.Note),
             approvedCanonicalChannelId = r.ApprovedCanonicalChannelId,
+            // W-PREVIEW-1b — sinaliza que existe evidência (URL de stream)
+            // persistida para esta review, sem expor o próprio URL.
+            hasEvidence = !string.IsNullOrWhiteSpace(r.StreamUrl),
+            // W-PREVIEW — nº de candidatos acumulados (contagem, sem URL).
+            candidateCount = candidateCount,
             createdAtUtc = r.CreatedAtUtc.ToString("o"),
             updatedAtUtc = r.UpdatedAtUtc.ToString("o"),
             resolvedAtUtc = r.ResolvedAtUtc?.ToString("o"),
@@ -4489,6 +4560,23 @@ namespace m3uCrawler.Services
             reason = SanitizeReviewText(r.ReasonSignature),
             note = SanitizeReviewText(r.Note),
             approvedCanonicalChannelId = r.ApprovedCanonicalChannelId,
+            // W-PREVIEW-1b — presença de evidência (não o URL).
+            hasEvidence = !string.IsNullOrWhiteSpace(r.StreamUrl),
+            // W-PREVIEW — candidatos acumulados (id/title/group/logo/hasUrl).
+            // NUNCA expõe StreamUrl; title/group/logo são sanitizados.
+            candidateCount = r.Candidates.Count,
+            candidates = r.Candidates
+                .OrderBy(c => c.CreatedAtUtc)
+                .ThenBy(c => c.Id)
+                .Select(c => new
+                {
+                    id = c.Id,
+                    title = SanitizeReviewText(c.Title),
+                    group = SanitizeReviewText(c.Group),
+                    logo = SanitizeReviewText(c.Logo),
+                    hasUrl = !string.IsNullOrWhiteSpace(c.StreamUrl),
+                })
+                .ToList(),
             createdAt = r.CreatedAtUtc.ToString("o"),
             updatedAt = r.UpdatedAtUtc.ToString("o"),
             resolvedAt = r.ResolvedAtUtc?.ToString("o"),
@@ -4732,9 +4820,431 @@ namespace m3uCrawler.Services
             response.Close();
         }
 
+        // Fase 1b — Resposta sem corpo (ex.: 204 stop). Fixa o status,
+        // fecha o pedido e marca-o como respondido para o `finally` do
+        // HandleRequestAsync não escrever um 404.
+        private static void WriteStatus(HttpListenerResponse response, HttpStatusCode statusCode)
+        {
+            response.StatusCode = (int)statusCode;
+            response.ContentLength64 = 0;
+            MarkResponseWritten(response);
+            response.Close();
+        }
+
+        // Fase 1b — Serve bytes de um ficheiro de sessão de preview (manifest
+        // HLS, segmento ou thumbnail). O `TryResolveFile` do manager já
+        // validou que o caminho está dentro do directório da sessão (sem path
+        // traversal) e devolveu o Content-Type. Nunca se serve de cache.
+        private static async Task WriteFileAsync(HttpListenerResponse response, string fullPath, string contentType)
+        {
+            var bytes = await File.ReadAllBytesAsync(fullPath);
+            response.StatusCode = (int)HttpStatusCode.OK;
+            response.ContentType = contentType;
+            response.Headers["Cache-Control"] = "no-store";
+            response.ContentLength64 = bytes.Length;
+            await response.OutputStream.WriteAsync(bytes, 0, bytes.Length);
+            MarkResponseWritten(response);
+            response.Close();
+        }
+
+        private static bool IsKnownPlaylistWhich(string which)
+            => which.Equals("playlist", StringComparison.Ordinal)
+                || which.Equals("playlist_temp", StringComparison.Ordinal)
+                || which.Equals("playlist_acquired", StringComparison.Ordinal);
+
+        /// <summary>
+        /// Fase 1b — <c>GET /api/playlist-entries?which=…</c>. Lê a playlist
+        /// correspondente em <c>outputDir</c>, parseia-a e devolve os
+        /// metadados das entradas (<c>id</c>/<c>title</c>/<c>group</c>/<c>logo</c>)
+        /// <b>sem URL</b>. O <c>id</c> é o mesmo que
+        /// <see cref="StreamReferenceResolver.PlaylistEntryId"/> usa
+        /// server-side, para que a UI possa pedir
+        /// <c>playlist:&lt;which&gt;:&lt;id&gt;</c> sem conhecer credenciais.
+        /// Rota de sessão (o token de máquina não a autoriza).
+        /// </summary>
+        private static async Task HandlePlaylistEntriesAsync(HttpListenerContext context, string outputDir)
+        {
+            if (!context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+            {
+                await WriteMethodNotAllowedAsync(context.Response, "GET");
+                return;
+            }
+
+            var which = context.Request.QueryString?["which"]?.Trim();
+            if (string.IsNullOrEmpty(which) || !IsKnownPlaylistWhich(which))
+            {
+                await WriteJsonAsync(
+                    context.Response, new { error = "invalid-which" }, HttpStatusCode.BadRequest);
+                return;
+            }
+
+            var path = Path.Combine(outputDir, which + ".m3u");
+            if (!File.Exists(path))
+            {
+                await WriteJsonAsync(
+                    context.Response, new { error = "playlist-not-found" }, HttpStatusCode.NotFound);
+                return;
+            }
+
+            string content;
+            try
+            {
+                content = await File.ReadAllTextAsync(path, Encoding.UTF8);
+            }
+            catch
+            {
+                await WriteJsonAsync(
+                    context.Response, new { error = "playlist-not-found" }, HttpStatusCode.NotFound);
+                return;
+            }
+
+            var parsed = new M3uParserService().ParseDetailed(content);
+            var entries = parsed.Streams
+                .Select(s => new
+                {
+                    id = StreamReferenceResolver.PlaylistEntryId(s.Url),
+                    title = s.Title,
+                    group = s.Group,
+                    logo = s.Logo,
+                })
+                .ToList();
+
+            await WriteJsonAsync(context.Response, entries);
+        }
+
+        /// <summary>
+        /// Player — <c>GET /api/playlist-entry?which=…&amp;id=…</c>. Lê a
+        /// playlist correspondente, encontra a entrada cujo id (SHA-256
+        /// truncado do URL, ver <see cref="StreamReferenceResolver.PlaylistEntryId"/>)
+        /// coincide e devolve um <c>.m3u</c> mínimo (<c>#EXTM3U</c> +
+        /// <c>#EXTINF</c> + URL real) como anexo. Sessão-only, tal como
+        /// <c>/api/playlist-entries</c>. A URL exposta ao admin autenticado
+        /// nunca é registada em logs.
+        /// </summary>
+        private static async Task HandlePlaylistEntryDownloadAsync(HttpListenerContext context, string outputDir)
+        {
+            if (!context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+            {
+                await WriteMethodNotAllowedAsync(context.Response, "GET");
+                return;
+            }
+
+            var which = context.Request.QueryString?["which"]?.Trim();
+            if (string.IsNullOrEmpty(which) || !IsKnownPlaylistWhich(which))
+            {
+                await WriteJsonAsync(
+                    context.Response, new { error = "invalid-which" }, HttpStatusCode.BadRequest);
+                return;
+            }
+
+            var entryId = context.Request.QueryString?["id"]?.Trim();
+            if (string.IsNullOrEmpty(entryId))
+            {
+                await WriteJsonAsync(
+                    context.Response, new { error = "invalid-id" }, HttpStatusCode.BadRequest);
+                return;
+            }
+
+            var path = Path.Combine(outputDir, which + ".m3u");
+            if (!File.Exists(path))
+            {
+                await WriteJsonAsync(
+                    context.Response, new { error = "playlist-not-found" }, HttpStatusCode.NotFound);
+                return;
+            }
+
+            string content;
+            try
+            {
+                content = await File.ReadAllTextAsync(path, Encoding.UTF8);
+            }
+            catch
+            {
+                await WriteJsonAsync(
+                    context.Response, new { error = "playlist-not-found" }, HttpStatusCode.NotFound);
+                return;
+            }
+
+            var parsed = new M3uParserService().ParseDetailed(content);
+            var entry = parsed.Streams.FirstOrDefault(s =>
+                string.Equals(
+                    StreamReferenceResolver.PlaylistEntryId(s.Url),
+                    entryId,
+                    StringComparison.OrdinalIgnoreCase));
+            if (entry is null || string.IsNullOrWhiteSpace(entry.Url))
+            {
+                await WriteJsonAsync(
+                    context.Response, new { error = "entry-not-found" }, HttpStatusCode.NotFound);
+                return;
+            }
+
+            var title = string.IsNullOrWhiteSpace(entry.Title) ? "canal" : entry.Title;
+            var body = new StringBuilder();
+            body.Append("#EXTM3U\n");
+            body.Append("#EXTINF:-1,");
+            body.Append(title);
+            body.Append('\n');
+            body.Append(entry.Url);
+            body.Append('\n');
+
+            var bytes = Encoding.UTF8.GetBytes(body.ToString());
+            context.Response.StatusCode = (int)HttpStatusCode.OK;
+            context.Response.ContentType = "audio/x-mpegurl";
+            context.Response.Headers["Content-Disposition"] =
+                $"attachment; filename=\"{which}-{entryId}.m3u\"";
+            context.Response.ContentLength64 = bytes.Length;
+            await context.Response.OutputStream.WriteAsync(bytes, 0, bytes.Length);
+            MarkResponseWritten(context.Response);
+            context.Response.Close();
+        }
+
+        /// <summary>Nome lógico do recurso embutido do hls.js vendorizado.</summary>
+        private const string HlsAssetResourceName = "m3uCrawler.Assets.hls.min.js";
+
+        /// <summary>Sufixo do ficheiro do hls.js vendorizado (fallback de resolução).</summary>
+        private const string HlsAssetFileName = "hls.min.js";
+
+        /// <summary>
+        /// Serve <c>GET /assets/hls.min.js</c> a partir do recurso embutido.
+        /// <c>text/javascript; charset=utf-8</c> e cache longo (o ficheiro é
+        /// imutável e pinado). 404 quando o recurso não existe na assembly.
+        /// </summary>
+        private static async Task HandleHlsAssetAsync(HttpListenerContext context)
+        {
+            if (!context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+            {
+                await WriteMethodNotAllowedAsync(context.Response, "GET");
+                return;
+            }
+
+            var bytes = ReadEmbeddedAsset(HlsAssetResourceName, HlsAssetFileName);
+            if (bytes is null)
+            {
+                await WriteJsonAsync(
+                    context.Response, new { error = "asset-not-found" }, HttpStatusCode.NotFound);
+                return;
+            }
+
+            context.Response.StatusCode = (int)HttpStatusCode.OK;
+            context.Response.ContentType = "text/javascript; charset=utf-8";
+            context.Response.Headers["Cache-Control"] = "public, max-age=31536000, immutable";
+            context.Response.ContentLength64 = bytes.Length;
+            await context.Response.OutputStream.WriteAsync(bytes, 0, bytes.Length);
+            MarkResponseWritten(context.Response);
+            context.Response.Close();
+        }
+
+        /// <summary>
+        /// Lê um recurso embutido do assembly, tolerando variações do nome
+        /// lógico (procura por nome exacto e, em fallback, por sufixo do
+        /// ficheiro). Devolve <c>null</c> quando ausente ou ilegível.
+        /// </summary>
+        private static byte[]? ReadEmbeddedAsset(string resourceName, string fileNameSuffix)
+        {
+            var assembly = typeof(WebDashboardService).Assembly;
+            var names = assembly.GetManifestResourceNames();
+            var resolved = names.FirstOrDefault(n => string.Equals(n, resourceName, StringComparison.Ordinal));
+            if (resolved is null)
+            {
+                var suffix = "." + fileNameSuffix;
+                resolved = names.FirstOrDefault(n =>
+                    n.EndsWith(suffix, StringComparison.Ordinal)
+                    || string.Equals(n, fileNameSuffix, StringComparison.Ordinal));
+            }
+
+            if (resolved is null)
+            {
+                return null;
+            }
+
+            try
+            {
+                using var stream = assembly.GetManifestResourceStream(resolved);
+                if (stream is null)
+                {
+                    return null;
+                }
+
+                using var ms = new MemoryStream();
+                stream.CopyTo(ms);
+                return ms.ToArray();
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Fase 1b — <c>/api/preview/*</c>:
+        /// <c>POST /api/preview/start</c>, <c>GET /api/preview/&lt;id&gt;/&lt;file&gt;</c>
+        /// e <c>POST /api/preview/&lt;id&gt;/stop</c>. Rotas exclusivas de sessão;
+        /// o token de máquina não as autoriza. Sem manager ligado,
+        /// todas respondem 503 <c>preview-unavailable</c>.
+        /// </summary>
+        private static async Task HandlePreviewEndpointAsync(HttpListenerContext context, string requestPath)
+        {
+            var tail = requestPath.Substring("/api/preview/".Length);
+            var segments = tail.Split('/', StringSplitOptions.None);
+
+            if (segments.Length == 1 && segments[0].Equals("start", StringComparison.OrdinalIgnoreCase))
+            {
+                await HandlePreviewStartAsync(context);
+                return;
+            }
+
+            if (segments.Length == 2 && segments[1].Equals("stop", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteMethodNotAllowedAsync(context.Response, "POST");
+                    return;
+                }
+
+                var manager = _previewSessionManager;
+                if (manager is null)
+                {
+                    await WriteJsonAsync(
+                        context.Response, new { error = "preview-unavailable" }, HttpStatusCode.ServiceUnavailable);
+                    return;
+                }
+
+                await manager.StopAsync(segments[0]);
+                WriteStatus(context.Response, HttpStatusCode.NoContent);
+                return;
+            }
+
+            if (segments.Length >= 2 && segments[0].Length > 0)
+            {
+                if (!context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteMethodNotAllowedAsync(context.Response, "GET");
+                    return;
+                }
+
+                var manager = _previewSessionManager;
+                if (manager is null)
+                {
+                    await WriteJsonAsync(
+                        context.Response, new { error = "preview-unavailable" }, HttpStatusCode.ServiceUnavailable);
+                    return;
+                }
+
+                var sessionId = segments[0];
+                var relative = string.Join('/', segments.Skip(1));
+                if (!manager.TryResolveFile(sessionId, relative, out var fullPath, out var contentType))
+                {
+                    await WriteJsonAsync(
+                        context.Response, new { error = "preview-file-not-found" }, HttpStatusCode.NotFound);
+                    return;
+                }
+
+                manager.Touch(sessionId);
+                await WriteFileAsync(context.Response, fullPath, contentType);
+                return;
+            }
+
+            await WriteJsonAsync(
+                context.Response, new { error = "not-found", path = requestPath }, HttpStatusCode.NotFound);
+        }
+
+        private static async Task HandlePreviewStartAsync(HttpListenerContext context)
+        {
+            if (!context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase))
+            {
+                await WriteMethodNotAllowedAsync(context.Response, "POST");
+                return;
+            }
+
+            string? reference = null;
+            try
+            {
+                using var reader = new StreamReader(
+                    context.Request.InputStream,
+                    context.Request.ContentEncoding ?? Encoding.UTF8);
+                var body = await reader.ReadToEndAsync();
+                if (!string.IsNullOrWhiteSpace(body))
+                {
+                    reference = JsonSerializer.Deserialize<PreviewStartPayload>(body, JsonOptions)?.Ref;
+                }
+            }
+            catch (JsonException)
+            {
+                await WriteJsonAsync(
+                    context.Response, new { error = "invalid-payload" }, HttpStatusCode.BadRequest);
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(reference))
+            {
+                await WriteJsonAsync(
+                    context.Response, new { error = "preview-ref-required" }, HttpStatusCode.BadRequest);
+                return;
+            }
+
+            var manager = _previewSessionManager;
+            if (manager is null)
+            {
+                await WriteJsonAsync(
+                    context.Response, new { error = "preview-unavailable" }, HttpStatusCode.ServiceUnavailable);
+                return;
+            }
+
+            PreviewSessionStartResult? result;
+            try
+            {
+                result = await manager.StartAsync(reference, CancellationToken.None);
+            }
+            catch (OperationCanceledException)
+            {
+                await WriteJsonAsync(
+                    context.Response, new { error = "preview-unavailable" }, HttpStatusCode.ServiceUnavailable);
+                return;
+            }
+
+            if (result is null)
+            {
+                await WriteJsonAsync(
+                    context.Response, new { error = "preview-unknown-reference" }, HttpStatusCode.NotFound);
+                return;
+            }
+
+            if (string.Equals(result.Reason, "busy", StringComparison.Ordinal))
+            {
+                await WriteJsonAsync(
+                    context.Response, new { error = "preview-busy" }, HttpStatusCode.TooManyRequests);
+                return;
+            }
+
+            await WriteJsonAsync(context.Response, result);
+        }
+
+        private sealed class PreviewStartPayload
+        {
+            [JsonPropertyName("ref")]
+            public string? Ref { get; set; }
+        }
+
         private static async Task WriteHtmlAsync(HttpListenerResponse response, string html)
         {
             response.ContentType = "text/html; charset=utf-8";
+            // CSP pragmática aplicada APENAS às respostas HTML (dashboard/login/
+            // bootstrap). As rotas de API/asset não passam por aqui e mantêm-se
+            // sem CSP.
+            //
+            // NOTA OBRIGATÓRIA: `script-src 'self' 'unsafe-inline'` é necessário
+            // porque a UI é um único <script> inline (e usa handlers `onclick=`
+            // inline). Migrar para um CSP com nonce exigiria um refactor massivo
+            // de todo o HTML inline — fora do âmbito desta alteração. NÃO
+            // adicionar nonce sem esse refactor, sob pena de partir a UI.
+            //
+            // `img-src ... http: https:` permite os logos externos (tvg-logo) e
+            // `media-src 'self' blob:` permite ao hls.js reproduzir os segmentos
+            // servidos localmente.
+            response.Headers["Content-Security-Policy"] =
+                "default-src 'self'; img-src 'self' data: http: https:; media-src 'self' blob:; " +
+                "connect-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; " +
+                "object-src 'none'; base-uri 'self'; frame-ancestors 'self'";
             // Páginas HTML nunca devem ser reutilizadas de cache (browsers
             // móveis/Android reutilizam uma `/next` antiga com o token CSRF
             // desactualizado → `403 csrf-invalid`). Cobre `/`, `/next`,
@@ -5758,6 +6268,7 @@ namespace m3uCrawler.Services
     <button data-view='discovery'>Descoberta</button>
     <button data-view='countries'>Canais / Países</button>
     <button data-view='playlist'>Playlist</button>
+    <button data-view='playlists'>Player</button>
     <button data-view='dispatcharr'>Dispatcharr</button>
     <button data-view='catalog'>Catálogo</button>
     <button data-view='validation'>Validação de Streams</button>
@@ -5869,6 +6380,11 @@ namespace m3uCrawler.Services
         <a href='/api/playlist_acquired' target='_blank'>playlist_acquired.m3u</a>
         <span class='muted' id='playlistInventory'></span>
       </div>
+      <div class='toolbar'>
+        <button class='secondary' onclick='openPlaylistPlayer("playlist")'>Abrir no player: playlist.m3u</button>
+        <button class='secondary' onclick='openPlaylistPlayer("playlist_temp")'>Abrir no player: playlist_temp.m3u</button>
+        <button class='secondary' onclick='openPlaylistPlayer("playlist_acquired")'>Abrir no player: playlist_acquired.m3u</button>
+      </div>
       <div class='card' style='margin-bottom:12px;'>
         <h3 style='font-size:14px;margin-top:0;'>Links prontos a copiar</h3>
         <p class='muted'>URLs de acesso às playlists de máquina. Quando existe token activo, o valor segue em <code>?token=</code>; o snippet <code>curl</code> usa sempre o literal <code>&lt;token&gt;</code> (nunca expõe o valor).</p>
@@ -5885,6 +6401,49 @@ namespace m3uCrawler.Services
       <pre id='playlistTempPreview'>a carregar…</pre>
       <h3 style='font-size:14px;margin-top:16px;'>Pré-visualização playlist_acquired.m3u (URLs sanitizadas — sem credenciais Xtream)</h3>
       <pre id='playlistAcquiredPreview'>a carregar…</pre>
+    </section>
+
+    <!-- PLAYER (pré-visualização de entradas de playlist) -->
+    <section id='view-playlists' hidden>
+      <h2 style='font-size:18px;margin-top:0;'>Player</h2>
+      <p class='muted'>Pré-visualização de entradas de playlist e download de uma entrada em <code>.m3u</code>. O browser só usa os caminhos servidos por este dashboard; as credenciais nunca chegam ao HTML.</p>
+      <div class='toolbar'>
+        <label class='muted' for='playerWhich'>Playlist:</label>
+        <select id='playerWhich' onchange='onPlayerWhichChange()' style='background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+          <option value='playlist'>playlist.m3u (final)</option>
+          <option value='playlist_temp'>playlist_temp.m3u</option>
+          <option value='playlist_acquired'>playlist_acquired.m3u (Telegram)</option>
+        </select>
+        <input id='playerSearch' type='text' placeholder='Pesquisar por título ou grupo…' oninput='renderPlaylistEntries()' style='flex:1;min-width:200px;background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+        <button class='secondary' onclick='loadPlaylistEntries()'>Recarregar</button>
+        <span class='muted' id='playerCount'></span>
+      </div>
+      <div id='playerStatus' class='muted' aria-live='polite' style='margin-bottom:8px;'></div>
+      <div id='playerGrid' class='grid'></div>
+      <div class='toolbar' id='playerActions' hidden>
+        <span class='muted' id='playerSelectedLabel'></span>
+        <button class='secondary' id='playerDownloadBtn' onclick='downloadSelectedEntry()' disabled>Descarregar entrada (.m3u)</button>
+      </div>
+
+      <!-- W-PREVIEW — modal partilhado (Reviews + Player). O player vive aqui
+           e é movido para #modalRoot por openModalPanel enquanto aberto. -->
+      <div id='reviewPreviewModal' hidden>
+        <div class='card'>
+          <h3 id='reviewPreviewTitle'>Pré-visualização</h3>
+          <p class='muted' id='reviewPreviewSubject'></p>
+          <!-- W-PREVIEW — selector de candidatos (só quando > 1). -->
+          <div id='reviewPreviewCandidates' hidden style='flex-direction:column;gap:6px;margin-bottom:8px;'></div>
+          <div style='background:#000;border-radius:8px;overflow:hidden;display:flex;justify-content:center;'>
+            <video id='reviewPreviewVideo' controls playsinline style='max-width:100%;display:none;'></video>
+            <img id='reviewPreviewThumb' alt='Miniatura' style='max-width:100%;display:none;'>
+          </div>
+          <div class='muted' id='reviewPreviewMeta' style='margin-top:8px;'></div>
+          <div style='display:flex;gap:8px;margin-top:10px;'>
+            <button class='secondary' onclick='stopReviewPreview()'>Parar</button>
+            <button class='secondary' onclick='closeReviewPreviewModal()'>Fechar</button>
+          </div>
+        </div>
+      </div>
     </section>
 
     <!-- DISPATCHARR -->
@@ -7051,6 +7610,7 @@ namespace m3uCrawler.Services
 
   <div id='modalRoot' hidden></div>
 
+  <script src='/assets/hls.min.js'></script>
   <script>
   (function(){
     const fmt = (v) => (v === undefined || v === null) ? '—' : v;
@@ -8494,11 +9054,16 @@ const rows = Object.entries(inv).map(([k, v]) => {
             : r.state === 'Resolved' ? '<span class="badge ok">Resolved</span>'
               : '<span class="badge err">Ignored</span>';
         const active = (r.state === 'Open' || r.state === 'InReview');
-        const actions = active
+        // W-PREVIEW — evidência (URL de stream) persistida: permite pedir uma
+        // pré-visualização sem expor credenciais ao browser.
+        const previewBtn = r.hasEvidence
+          ? `<button class='secondary' style='padding:4px 8px;' data-review-id='${r.id}' onclick='previewReview(${r.id})'>Pré-visualizar</button> `
+          : '';
+        const actions = previewBtn + (active
           ? `<button style='padding:4px 8px;' onclick='approveReview(${r.id})'>Approve</button>
              <button class='secondary' style='padding:4px 8px;' onclick='excludeReview(${r.id})'>Exclude</button>`
-          : `<button class='secondary' style='padding:4px 8px;' onclick='reopenReview(${r.id})'>Reabrir</button>`;
-        return `<tr data-review-id='${r.id}'>
+          : `<button class='secondary' style='padding:4px 8px;' onclick='reopenReview(${r.id})'>Reabrir</button>`);
+        return `<tr>
           <td><code title='${escapeAttr(r.fingerprint || '')}'>${escapeHtml((r.fingerprint || '').slice(0, 12))}…</code></td>
           <td><code>${escapeHtml(r.normalizedIdentity || '—')}</code></td>
           <td>${escapeHtml(r.sourceGroup || '—')}</td>
@@ -8530,6 +9095,279 @@ const rows = Object.entries(inv).map(([k, v]) => {
       if (res && res.json && res.json.message) return res.json.message;
       if (res && res.error) return res.error;
       return 'falha inesperada';
+    }
+
+    // === W-PREVIEW / Player — pré-visualização partilhada (Reviews + playlists) ===
+    // O browser só emite pedidos a caminhos NOSSOS (`manifestUrl`/`thumbnailUrl`
+    // devolvidos pelo servidor); a URL real do stream nunca chega ao DOM, ao
+    // console ou a um `src` visível. A sessão é iniciada/parada via
+    // `/api/preview/*` com o CSRF injectado por `apiRequest`.
+    var _previewSessionId = null;
+    var _previewHls = null;
+    var _playerWhich = 'playlist';
+    var _playerEntries = [];
+    var _playerSelectedId = null;
+    // W-PREVIEW — candidatos da review em pré-visualização (id/title/group/logo).
+    var _reviewPreviewCandidates = [];
+
+    function stopReviewPreview() {
+      if (_previewHls) { try { _previewHls.destroy(); } catch (e) {} _previewHls = null; }
+      var video = document.getElementById('reviewPreviewVideo');
+      if (video) {
+        try { video.pause(); } catch (e) {}
+        video.removeAttribute('src');
+        try { video.load(); } catch (e) {}
+        video.style.display = 'none';
+      }
+      var thumb = document.getElementById('reviewPreviewThumb');
+      if (thumb) { thumb.removeAttribute('src'); thumb.style.display = 'none'; }
+      // W-PREVIEW — limpa o selector de candidatos ao parar/fechar a modal.
+      clearReviewPreviewCandidates();
+      if (_previewSessionId) {
+        var sid = _previewSessionId;
+        _previewSessionId = null;
+        // Best-effort: ignora erros (a sessão expira sozinha por idle timeout).
+        apiRequest('/api/preview/' + encodeURIComponent(sid) + '/stop', { method: 'POST', body: {} });
+      }
+    }
+
+    function closeReviewPreviewModal() {
+      stopReviewPreview();
+      closeModalPanel();
+    }
+
+    function _renderPreviewProbeMeta(result) {
+      var meta = document.getElementById('reviewPreviewMeta');
+      if (!meta) return;
+      var p = (result && result.probe) ? result.probe : null;
+      var parts = [];
+      if (p) {
+        if (p.width && p.height) parts.push(p.width + '\u00d7' + p.height);
+        if (p.videoCodec) parts.push('v\u00eddeo: ' + p.videoCodec);
+        if (p.audioCodec) parts.push('\u00e1udio: ' + p.audioCodec);
+        if (p.formatName) parts.push('formato: ' + p.formatName);
+      }
+      parts.push('playable: ' + (result && result.playable ? 'sim' : 'n\u00e3o'));
+      meta.textContent = parts.join(' \u00b7 ');
+    }
+
+    // Núcleo comum a Reviews e playlists: arranca a sessão de preview para
+    // uma referência e liga-a ao player partilhado. `ui.subject` é o texto
+    // mostrado no modal.
+    async function startPreview(ref, ui) {
+      stopReviewPreview();
+      var video = document.getElementById('reviewPreviewVideo');
+      var thumb = document.getElementById('reviewPreviewThumb');
+      var meta = document.getElementById('reviewPreviewMeta');
+      var subject = document.getElementById('reviewPreviewSubject');
+      if (subject) subject.textContent = (ui && ui.subject) ? ui.subject : '';
+      if (meta) meta.textContent = 'a carregar\u2026';
+      if (video) video.style.display = 'none';
+      if (thumb) thumb.style.display = 'none';
+      openModalPanel('reviewPreviewModal');
+      _modalCloseHook = stopReviewPreview;
+
+      var res = await apiRequest('/api/preview/start', { method: 'POST', body: { ref: ref } });
+      if (!res.ok) {
+        var msg = res.status === 404 ? 'Referência desconhecida para pré-visualização.'
+          : res.status === 429 ? 'Servidor de pré-visualização ocupado (limite de sessões). Tente novamente.'
+            : res.status === 503 ? 'Pré-visualização indisponível (ffmpeg não configurado).'
+              : 'Falha ao iniciar pré-visualização: ' + (res.error || ('HTTP ' + res.status));
+        if (meta) meta.textContent = msg;
+        return res;
+      }
+
+      var result = res.json || {};
+      _previewSessionId = result.sessionId || null;
+      _renderPreviewProbeMeta(result);
+
+      if (result.kind === 'snapshot') {
+        if (thumb && result.thumbnailUrl) {
+          thumb.src = result.thumbnailUrl;
+          thumb.style.display = 'block';
+        }
+        return result;
+      }
+
+      // kind === 'hls'
+      var manifestUrl = result.manifestUrl;
+      if (!manifestUrl) {
+        if (meta) meta.textContent = 'Manifest indisponível.';
+        return result;
+      }
+      if (video) {
+        video.style.display = 'block';
+        if (window.Hls && window.Hls.isSupported()) {
+          _previewHls = new window.Hls();
+          _previewHls.loadSource(manifestUrl);
+          _previewHls.attachMedia(video);
+        } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+          video.src = manifestUrl;
+        } else if (meta) {
+          meta.textContent += ' \u00b7 HLS não suportado neste browser (use o download .m3u).';
+        }
+      }
+      return result;
+    }
+
+    // W-PREVIEW — limpa o selector de candidatos da modal de review.
+    function clearReviewPreviewCandidates() {
+      _reviewPreviewCandidates = [];
+      var box = document.getElementById('reviewPreviewCandidates');
+      if (box) { box.innerHTML = ''; box.hidden = true; box.style.display = 'none'; }
+    }
+
+    // W-PREVIEW — desenha o selector de candidatos (> 1) destacando o activo.
+    // Cada item (logo/title/group) reinicia a sessão para o candidato clicado.
+    function renderReviewPreviewCandidates(reviewId, candidates, activeId) {
+      var box = document.getElementById('reviewPreviewCandidates');
+      if (!box) return;
+      _reviewPreviewCandidates = candidates || [];
+      box.innerHTML = _reviewPreviewCandidates.map(function (c) {
+        var on = String(c.id) === String(activeId);
+        var border = on ? '2px solid var(--accent)' : '1px solid var(--border)';
+        var logo = c.logo
+          ? `<img src="${escapeAttr(c.logo)}" alt="" style="width:36px;height:36px;object-fit:contain;background:#000;border-radius:6px;" onerror="this.style.visibility='hidden'">`
+          : `<div style="width:36px;height:36px;background:#000;border-radius:6px;"></div>`;
+        return `<div class='card' data-candidate-id='${c.id}' style='cursor:pointer;display:flex;gap:10px;align-items:center;border:${border};padding:8px;' onclick='previewReviewCandidate(${reviewId}, ${c.id})'>
+          ${logo}
+          <div style='min-width:0;'>
+            <div style='font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'>${escapeHtml(c.title || '\u2014')}</div>
+            <div class='muted' style='font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'>${escapeHtml(c.group || '\u2014')}</div>
+          </div>
+        </div>`;
+      }).join('');
+      box.hidden = false;
+      box.style.display = 'flex';
+    }
+
+    async function previewReviewCandidate(reviewId, candidateId) {
+      // Copia antes de `startPreview` (que limpa o selector via stopReviewPreview).
+      var candidates = _reviewPreviewCandidates.slice();
+      var result = await startPreview(
+        'review:' + reviewId + ':' + candidateId, { subject: 'Review #' + reviewId });
+      if (candidates.length > 1) {
+        renderReviewPreviewCandidates(reviewId, candidates, candidateId);
+      }
+      return result;
+    }
+
+    async function previewReview(id) {
+      clearReviewPreviewCandidates();
+      var subject = 'Review #' + id;
+      // A UI nunca compõe a referência com a URL do stream: só o id (e,
+      // quando aplicável, o id do candidato).
+      var res = await apiRequest('/api/review?id=' + encodeURIComponent(id), {});
+      var candidates = (res.ok && res.json && Array.isArray(res.json.candidates))
+        ? res.json.candidates : [];
+
+      if (candidates.length === 0) {
+        // Sem candidatos/evidência: mantém o comportamento anterior.
+        return startPreview('review:' + id, { subject: subject });
+      }
+
+      var activeId = candidates[0].id;
+      var result = await startPreview(
+        'review:' + id + ':' + activeId, { subject: subject });
+      if (candidates.length > 1) {
+        renderReviewPreviewCandidates(id, candidates, activeId);
+      }
+      return result;
+    }
+
+    // === W-PLAYER — grelha das playlists ===
+    function onPlayerWhichChange() {
+      var sel = document.getElementById('playerWhich');
+      _playerWhich = sel ? sel.value : 'playlist';
+      stopReviewPreview();
+      loadPlaylistEntries();
+    }
+
+    async function loadPlaylistEntries() {
+      var sel = document.getElementById('playerWhich');
+      if (sel) _playerWhich = sel.value;
+      var status = document.getElementById('playerStatus');
+      var grid = document.getElementById('playerGrid');
+      if (status) status.textContent = 'a carregar\u2026';
+      var res = await apiRequest('/api/playlist-entries?which=' + encodeURIComponent(_playerWhich), {});
+      if (!res.ok || !Array.isArray(res.json)) {
+        _playerEntries = [];
+        if (status) status.textContent = 'Falha ao carregar entradas: ' + (res.error || ('HTTP ' + res.status));
+        if (grid) grid.innerHTML = '';
+        return;
+      }
+      _playerEntries = res.json;
+      if (status) status.textContent = _playerEntries.length + ' entrada(s).';
+      renderPlaylistEntries();
+    }
+
+    function _playerFiltered() {
+      var search = document.getElementById('playerSearch');
+      var q = search ? search.value.trim().toLowerCase() : '';
+      if (!q) return _playerEntries;
+      return _playerEntries.filter(function (e) {
+        var t = (e.title || '').toLowerCase();
+        var g = (e.group || '').toLowerCase();
+        return t.indexOf(q) >= 0 || g.indexOf(q) >= 0;
+      });
+    }
+
+    function renderPlaylistEntries() {
+      var grid = document.getElementById('playerGrid');
+      if (!grid) return;
+      var items = _playerFiltered();
+      if (!items.length) { grid.innerHTML = '<p class="muted">Nenhuma entrada para mostrar.</p>'; return; }
+      grid.innerHTML = items.map(function (e) {
+        const logo = e.logo
+          ? `<img src="${escapeAttr(e.logo)}" alt="" style="width:40px;height:40px;object-fit:contain;background:#000;border-radius:6px;" onerror="this.style.visibility='hidden'">`
+          : `<div style="width:40px;height:40px;background:#000;border-radius:6px;"></div>`;
+        return `<div class='card' style='cursor:pointer;display:flex;gap:10px;align-items:center;' onclick='previewPlaylistEntry("${escapeAttr(e.id)}")'>
+          ${logo}
+          <div style='min-width:0;'>
+            <div style='font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'>${escapeHtml(e.title || '—')}</div>
+            <div class='muted' style='font-size:12px;'>${escapeHtml(e.group || '—')}</div>
+          </div>
+        </div>`;
+      }).join('');
+    }
+
+    function _updatePlayerActions(entry) {
+      var actions = document.getElementById('playerActions');
+      var label = document.getElementById('playerSelectedLabel');
+      var btn = document.getElementById('playerDownloadBtn');
+      if (!actions || !btn) return;
+      if (!entry) { actions.hidden = true; btn.disabled = true; return; }
+      actions.hidden = false;
+      btn.disabled = false;
+      if (label) label.textContent = 'Selecionada: ' + (entry.title || '\u2014');
+    }
+
+    function previewPlaylistEntry(id) {
+      _playerSelectedId = id;
+      var entry = null;
+      for (var i = 0; i < _playerEntries.length; i++) {
+        if (_playerEntries[i].id === id) { entry = _playerEntries[i]; break; }
+      }
+      _updatePlayerActions(entry);
+      var subject = entry
+        ? ((entry.title || '\u2014') + (entry.group ? ' \u00b7 ' + entry.group : ''))
+        : ('Entrada ' + id);
+      return startPreview('playlist:' + _playerWhich + ':' + id, { subject: subject });
+    }
+
+    function downloadSelectedEntry() {
+      if (!_playerSelectedId) return;
+      var url = '/api/playlist-entry?which=' + encodeURIComponent(_playerWhich)
+        + '&id=' + encodeURIComponent(_playerSelectedId);
+      window.open(url, '_blank');
+    }
+
+    function openPlaylistPlayer(which) {
+      var sel = document.getElementById('playerWhich');
+      if (which && sel) sel.value = which;
+      if (sel) _playerWhich = sel.value;
+      showView('playlists');
+      loadPlaylistEntries();
     }
 
     // DC-5b — visualizador de auditoria. Consome `GET /api/audit` com os
@@ -10860,6 +11698,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
         case 'discovery': loadDiscovery(); loadDiscoverySettings(); break;
         case 'countries': loadCountries(); break;
         case 'playlist': loadPlaylist(); loadPlaylistLinks(); break;
+        case 'playlists': loadPlaylistEntries(); break;
         case 'dispatcharr': loadDispatcharr(); break;
         case 'catalog': loadCatalog(); break;
         case 'validation': loadValidationPolicy(); break;
@@ -10900,6 +11739,17 @@ const rows = Object.entries(inv).map(([k, v]) => {
     window.hideAddRuleForm = hideAddRuleForm;
     window.submitAddRule = submitAddRule;
     window.loadCatalogReviews = loadCatalogReviews;
+    // W-PREVIEW / Player — handlers inline (IIFE) re-exportados para window.
+    window.previewReview = previewReview;
+    window.previewReviewCandidate = previewReviewCandidate;
+    window.stopReviewPreview = stopReviewPreview;
+    window.closeReviewPreviewModal = closeReviewPreviewModal;
+    window.loadPlaylistEntries = loadPlaylistEntries;
+    window.renderPlaylistEntries = renderPlaylistEntries;
+    window.previewPlaylistEntry = previewPlaylistEntry;
+    window.downloadSelectedEntry = downloadSelectedEntry;
+    window.onPlayerWhichChange = onPlayerWhichChange;
+    window.openPlaylistPlayer = openPlaylistPlayer;
     window.loadCatalogAudits = loadCatalogAudits;
     window.showAuditJson = showAuditJson;
     window.loadCatalogSyncRuns = loadCatalogSyncRuns;
@@ -11253,6 +12103,9 @@ const rows = Object.entries(inv).map(([k, v]) => {
     // ocultas; openModalPanel adopta o elemento movendo-o para #modalRoot
     // enquanto aberto e devolve-o à posição original no fecho.
     var _modalEl = null, _modalParent = null, _modalAnchor = null, _modalPrevFocus = null;
+    // W-PREVIEW — hook opcional invocado em qualquer fecho do modal (Escape,
+    // backdrop ou closeModalPanel). Usado para parar a sessão de preview.
+    var _modalCloseHook = null;
     function openModalPanel(id) {
       var el = document.getElementById(id);
       if (!el || _modalEl === el) return;
@@ -11281,6 +12134,9 @@ const rows = Object.entries(inv).map(([k, v]) => {
       _modalEl = el;
     }
     function closeModalPanel() {
+      var hook = _modalCloseHook;
+      _modalCloseHook = null;
+      if (hook) { try { hook(); } catch (e) {} }
       if (_modalEl) {
         _modalEl.classList.remove('modal-panel');
         var x = _modalEl.querySelector('.modal-close');
@@ -11302,6 +12158,9 @@ const rows = Object.entries(inv).map(([k, v]) => {
       if (root) root.addEventListener('click', function (e) { if (e.target === root) closeModalPanel(); });
       document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && _modalEl) closeModalPanel(); });
     })();
+
+    // W-PREVIEW — paragem best-effort da sessão ao sair da página.
+    window.addEventListener('beforeunload', function () { stopReviewPreview(); });
 
     // W1 — Restauro de escopo dos handlers inline. O script principal está
     // dentro de uma IIFE, pelo que as funções declaradas aqui não são

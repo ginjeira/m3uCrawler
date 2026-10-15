@@ -297,11 +297,22 @@ namespace m3uCrawler.Services.Matching
                         if (catalogResolution.Value.RuleDisposition == RuleDisposition.ReviewOnly)
                         {
                             // Mark for review; never NewChannel.
+                            var reviewOnlyFingerprint = StreamFingerprint.TryComputeFingerprint(s.Url);
                             await _catalog.UpsertReviewItemAsync(
                                 normalized,
                                 s.Group ?? string.Empty,
                                 "not-approved-in-publication-catalog",
-                                catalogResolution.Value.RuleReason ?? string.Empty);
+                                catalogResolution.Value.RuleReason ?? string.Empty,
+                                streamUrl: s.Url,
+                                sourceId: null,
+                                streamFingerprint: reviewOnlyFingerprint,
+                                streamFingerprintVersion: reviewOnlyFingerprint != null
+                                    ? StreamFingerprint.Version
+                                    : null,
+                                runId: null,
+                                candidateTitle: s.Title,
+                                candidateLogo: s.Original.Logo,
+                                candidateTvgId: s.OriginalTvgId);
                             dispositionCounts["unknownReviewRequired"] =
                                 dispositionCounts["unknownReviewRequired"] + 1;
                             reviewRequired.Add(new ClassifiedExclusion
@@ -334,11 +345,22 @@ namespace m3uCrawler.Services.Matching
                         // Identidade externa ambígua (mesmo valor →
                         // canais distintos): nunca escolher, nunca
                         // criar. Vai para Review.
+                        var ambiguousFingerprint = StreamFingerprint.TryComputeFingerprint(s.Url);
                         await _catalog.UpsertReviewItemAsync(
                             normalized,
                             s.Group ?? string.Empty,
                             "ambiguous-external-identity",
-                            catalogResolution.Value.RuleReason ?? string.Empty);
+                            catalogResolution.Value.RuleReason ?? string.Empty,
+                            streamUrl: s.Url,
+                            sourceId: null,
+                            streamFingerprint: ambiguousFingerprint,
+                            streamFingerprintVersion: ambiguousFingerprint != null
+                                ? StreamFingerprint.Version
+                                : null,
+                            runId: null,
+                            candidateTitle: s.Title,
+                            candidateLogo: s.Original.Logo,
+                            candidateTvgId: s.OriginalTvgId);
                         dispositionCounts["unknownReviewRequired"] =
                             dispositionCounts["unknownReviewRequired"] + 1;
                         reviewRequired.Add(new ClassifiedExclusion
