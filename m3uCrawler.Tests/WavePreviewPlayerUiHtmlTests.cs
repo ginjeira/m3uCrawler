@@ -95,6 +95,13 @@ public class WavePreviewPlayerUiHtmlTests
         Assert.Contains("res.status === 502", body);
         Assert.Contains("res.status === 503", body);
 
+        // O 502 distingue stream inalcançável (rede) de timeout de arranque, lendo o
+        // código de erro do corpo e mostrando a mensagem específica — sem spinner infinito.
+        Assert.Contains("preview-stream-unreachable", body);
+        Assert.Contains("preview-start-timeout", body);
+        Assert.Contains("Stream inacessível (o provedor redireciona para um host que não responde).", body);
+        Assert.Contains("Não foi possível preparar o stream a tempo. Tente novamente.", body);
+
         // A referência nunca é composta com a URL do stream: só o id.
         Assert.Contains("'review:' + id", html);
         Assert.Contains("'playlist:' + _playerWhich + ':' + id", html);

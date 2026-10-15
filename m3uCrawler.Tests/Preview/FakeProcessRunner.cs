@@ -10,10 +10,12 @@ internal sealed class FakeProcessHandle : IProcessHandle
     private readonly object _gate = new();
     private bool _exited;
     private int? _exitCode;
+    private int _exitCodeOnExit = -1;
+    private string _stderr = string.Empty;
 
     public FakeProcessHandle(string stderrTail = "")
     {
-        StderrTail = stderrTail;
+        _stderr = stderrTail;
     }
 
     public bool HasExited
@@ -21,14 +23,21 @@ internal sealed class FakeProcessHandle : IProcessHandle
         get { lock (_gate) return _exited; }
     }
 
+    // Só devolve o código quando o processo já saiu: um processo vivo não tem exit code.
     public int? ExitCode
     {
-        get { lock (_gate) return _exitCode; }
+        get { lock (_gate) return _exited ? _exitCode : null; }
     }
 
     public bool Killed { get; private set; }
 
-    public string StderrTail { get; set; }
+    // Simula saída tardia: o stderr só fica visível depois de o processo sair. Ler antes
+    // do exit devolve vazio, tal como o Process real enquanto o pipe ainda está aberto.
+    public string StderrTail
+    {
+        get { lock (_gate) return _exited ? _stderr : string.Empty; }
+        set { lock (_gate) _stderr = value; }
+    }
 
     public Task<bool> WaitForExitAsync(TimeSpan timeout)
     {
@@ -41,7 +50,7 @@ internal sealed class FakeProcessHandle : IProcessHandle
         {
             Killed = true;
             _exited = true;
-            _exitCode ??= -1;
+            _exitCode ??= _exitCodeOnExit;
         }
     }
 
@@ -53,6 +62,20 @@ internal sealed class FakeProcessHandle : IProcessHandle
             _exited = true;
             _exitCode = exitCode;
         }
+    }
+
+    /// <summary>
+    /// Agenda uma saída espontânea após <paramref name="delay"/> (o stderr configurado só
+    /// passa a ser visível nesse momento), simulando um ffmpeg que falha sozinho.
+    /// </summary>
+    public void ScheduleExit(int exitCode, TimeSpan delay)
+    {
+        lock (_gate) _exitCodeOnExit = exitCode;
+        _ = Task.Run(async () =>
+        {
+            try { await Task.Delay(delay).ConfigureAwait(false); } catch { }
+            MarkExited(exitCode);
+        });
     }
 
     public void Dispose() { }
@@ -92,6 +115,12 @@ internal sealed class FakeProcessRunner : IProcessRunner
     /// </summary>
     public Func<IReadOnlyList<string>, string, Task>? ArtifactWriter { get; set; }
 
+    /// <summary>
+    /// Invocado em <see cref="Start"/> com os args e o handle acabado de criar (antes da
+    /// materialização do artefacto). Permite configurar stderr/saída tardia por processo.
+    /// </summary>
+    public Action<IReadOnlyList<string>, FakeProcessHandle>? HandleConfigurator { get; set; }
+
     public IProcessHandle Start(string exe, IReadOnlyList<string> args, string workingDir)
     {
         var handle = new FakeProcessHandle();
@@ -100,6 +129,8 @@ internal sealed class FakeProcessRunner : IProcessRunner
             Starts.Add((exe, args, workingDir));
             Handles.Add(handle);
         }
+
+        HandleConfigurator?.Invoke(args, handle);
 
         var writer = ArtifactWriter;
         if (writer is not null)

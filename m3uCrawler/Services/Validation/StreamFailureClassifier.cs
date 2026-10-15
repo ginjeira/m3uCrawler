@@ -21,6 +21,17 @@ public enum StreamFailureKind
     /// W2 — bloqueio da política SSRF (fail-closed). Nunca retryable.
     /// </summary>
     Security = 12,
+
+    /// <summary>
+    /// Resposta 2xx de um stream não-playlist SEM evidência mínima de mídia:
+    /// corpo vazio, HTML/erro sem <c>#EXTM3U</c>, ou bytes insuficientes para
+    /// validar. É terminal (determinística): nunca retryable, para que o
+    /// stream saia da playlist em vez de consumir retries. Distinta de
+    /// <see cref="Timeout"/> (leitura que estanca → retryable/retenção) e de
+    /// <see cref="Deterministic"/> (erros de protocolo/conteúdo no caminho de
+    /// aquisição).
+    /// </summary>
+    NoMedia = 13,
     Unknown = 99,
 }
 

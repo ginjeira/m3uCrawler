@@ -334,6 +334,22 @@ public class PlaylistRetentionRegressionTests
     }
 
     [Fact]
+    public void Retained_non_working_stream_is_preserved_but_not_counted_as_working()
+    {
+        // Um stream retido (falha retryable) é preservado (entra na playlist)
+        // mas NÃO é um "working" validado: PreservedWorking exclui-o e
+        // PreservedRetryable conta-o em separado.
+        var ret = TelegramScraperService.FilterRetainedStreams(
+            new[] { Item("http://a/retained", isWorking: false, StreamFailureKind.Timeout) });
+
+        Assert.Single(ret.Preserved);
+        Assert.True(ret.Preserved[0].Retained);
+        Assert.False(ret.Preserved[0].IsWorking);
+        Assert.Equal(0, ret.PreservedWorking);
+        Assert.Equal(1, ret.PreservedRetryable);
+    }
+
+    [Fact]
     public void FilterRetainedResult_categorizes_by_StreamFailureKind_name()
     {
         var items = new[]

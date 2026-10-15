@@ -45,6 +45,13 @@ public sealed class M3uTesterService : IDisposable
     private readonly HostFailureTracker _hostTracker;
     private readonly HttpClient _client;
     private readonly SsrfGuard _guard;
+
+    // Seam de teste: true apenas quando o _client foi injectado pelo
+    // construtor interno de testes. Nesse caso ProbeOnceAsync usa o _client
+    // injectado (handler scriptado); em produção resolve sempre o HttpClient
+    // partilhado via HttpClientFactory, preservando a semântica por options.
+    private readonly bool _useInjectedClient;
+
     private StreamValidationMetrics? _lastMetrics;
 
     // W2 (2026-09-19): hook de persistência de falhas de aquisição. Null por
@@ -112,6 +119,7 @@ public sealed class M3uTesterService : IDisposable
         _hostTracker = new HostFailureTracker();
         _guard = guard ?? SsrfGuard.Default;
         _client = client ?? throw new ArgumentNullException(nameof(client));
+        _useInjectedClient = true;
     }
 
     // PHASE-OBSERVABILITY (2026-09-15): permite associar um sink de tracing
@@ -549,8 +557,12 @@ public sealed class M3uTesterService : IDisposable
         {
             // Resolve (ou reusa) o HttpClient partilhado que corresponde
             // as options deste tester. Em producao isto devolve sempre
-            // o mesmo client para a mesma combinacao de timeouts.
-            var client = HttpClientFactory.ResolveClient(options.ConnectionTimeoutSeconds, options.OverallTimeoutSeconds, _guard).Client;
+            // o mesmo client para a mesma combinacao de timeouts. Em testes
+            // (construtor interno com HttpClient injectado) usa-se o client
+            // scriptado para exercitar redirect/body sem rede.
+            var client = _useInjectedClient
+                ? _client
+                : HttpClientFactory.ResolveClient(options.ConnectionTimeoutSeconds, options.OverallTimeoutSeconds, _guard).Client;
 
             // W2 — send com redirects manuais reclassificados pela política
             // SSRF. O ConnectCallback do handler valida/fixa o endereço
@@ -600,7 +612,17 @@ public sealed class M3uTesterService : IDisposable
                 return new StreamTestOutcome(url, false, (long)response.StatusCode, StreamFailureKind.Deterministic, sw.ElapsedMilliseconds, false, 0, false);
             }
 
-            return new StreamTestOutcome(url, true, (long)response.StatusCode, StreamFailureKind.None, sw.ElapsedMilliseconds, false, 0, false);
+            // Ramo NAO-PLAYLIST: um 2xx isolado nao prova que o stream
+            // transporta media (pode ser HTML de erro, corpo vazio, ou um
+            // corpo que estanca). Le apenas um prefixo limitado do corpo e so
+            // marca IsWorking=true com evidencia minima de media. Nao
+            // descarrega o corpo todo de um live.
+            var mediaKind = await ProbeNonPlaylistMediaEvidenceAsync(response, contentType, cancellationToken).ConfigureAwait(false);
+            if (mediaKind == StreamFailureKind.None)
+            {
+                return new StreamTestOutcome(url, true, (long)response.StatusCode, StreamFailureKind.None, sw.ElapsedMilliseconds, false, 0, false);
+            }
+            return new StreamTestOutcome(url, false, (long)response.StatusCode, mediaKind, sw.ElapsedMilliseconds, false, 0, false);
         }
         catch (Exception ex)
         {
@@ -608,6 +630,119 @@ public sealed class M3uTesterService : IDisposable
             var kind = StreamFailureClassifier.ClassifyException(ex);
             return new StreamTestOutcome(url, false, null, kind, sw.ElapsedMilliseconds, false, 0, false);
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Evidência mínima de mídia num stream não-playlist (2xx).
+    //
+    // Tecto do prefixo lido do corpo: ~4 KiB (>= 2 pacotes MPEG-TS). É um
+    // limite rígido — nunca se descarrega o corpo inteiro de um live.
+    // ─────────────────────────────────────────────────────────────────
+    private const int NonPlaylistProbePrefixBytes = 4096;
+
+    // Bytes mínimos aceites para validar um stream apenas pelo Content-Type
+    // de mídia (video/*, audio/*).
+    private const int NonPlaylistMediaMinimumBytes = 2048;
+
+    // Tamanho de um pacote MPEG-TS. O sincronismo exige 0x47 no offset 0 e
+    // no offset 188 (pacote seguinte).
+    private const int MpegTsPacketSize = 188;
+
+    /// <summary>
+    /// Lê um prefixo limitado do corpo de uma resposta 2xx não-playlist e
+    /// devolve <see cref="StreamFailureKind.None"/> apenas quando há
+    /// evidência mínima de mídia:
+    /// <list type="bullet">
+    ///   <item><c>#EXTM3U</c>/<c>#EXT-X-VERSION</c> no prefixo (playlist
+    ///         inline apesar do content-type não a anunciar); ou</item>
+    ///   <item>sincronismo MPEG-TS (<c>0x47</c> no offset 0 e no offset
+    ///         188); ou</item>
+    ///   <item><c>Content-Type</c> de mídia (<c>video/*</c>, <c>audio/*</c>)
+    ///         com pelo menos <see cref="NonPlaylistMediaMinimumBytes"/>
+    ///         bytes lidos com sucesso.</item>
+    /// </list>
+    /// Caso contrário devolve <see cref="StreamFailureKind.NoMedia"/>
+    /// (terminal, não retryable) para que o stream saia da playlist.
+    ///
+    /// Uma leitura que estanca propaga a <see cref="OperationCanceledException"/>
+    /// do token (OverallTimeout) para o caller, que a classifica como
+    /// <see cref="StreamFailureKind.Timeout"/> (retryable) — preservando o
+    /// comportamento de retenção de streams existentes.
+    ///
+    /// Bounded e cancelável: só lê até <see cref="NonPlaylistProbePrefixBytes"/>
+    /// e fecha o stream assim que encontra a evidência mínima.
+    /// </summary>
+    private static async Task<StreamFailureKind> ProbeNonPlaylistMediaEvidenceAsync(
+        HttpResponseMessage response,
+        string contentType,
+        CancellationToken cancellationToken)
+    {
+        var isMediaContentType = contentType.StartsWith("video/", StringComparison.OrdinalIgnoreCase)
+            || contentType.StartsWith("audio/", StringComparison.OrdinalIgnoreCase);
+
+        var prefix = new byte[NonPlaylistProbePrefixBytes];
+        var total = 0;
+
+        using (var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false))
+        {
+            while (total < prefix.Length)
+            {
+                var read = await stream
+                    .ReadAsync(prefix.AsMemory(total, prefix.Length - total), cancellationToken)
+                    .ConfigureAwait(false);
+                if (read == 0) break; // EOF: o corpo terminou antes do tecto.
+
+                total += read;
+
+                // Early-exit: assim que a evidência mínima está no prefixo já
+                // lido, não é preciso consumir mais do live.
+                if (HasInlinePlaylistMarker(prefix, total) || HasMpegTsSync(prefix, total))
+                {
+                    return StreamFailureKind.None;
+                }
+            }
+        }
+
+        if (HasInlinePlaylistMarker(prefix, total) || HasMpegTsSync(prefix, total))
+        {
+            return StreamFailureKind.None;
+        }
+
+        if (isMediaContentType && total >= NonPlaylistMediaMinimumBytes)
+        {
+            return StreamFailureKind.None;
+        }
+
+        return StreamFailureKind.NoMedia;
+    }
+
+    private static bool HasInlinePlaylistMarker(byte[] buffer, int length)
+        => IndexOfAscii(buffer, length, "#EXTM3U") >= 0
+           || IndexOfAscii(buffer, length, "#EXT-X-VERSION") >= 0;
+
+    private static bool HasMpegTsSync(byte[] buffer, int length)
+        => length >= MpegTsPacketSize + 1
+           && buffer[0] == 0x47
+           && buffer[MpegTsPacketSize] == 0x47;
+
+    private static int IndexOfAscii(byte[] buffer, int length, string ascii)
+    {
+        if (ascii.Length == 0 || length < ascii.Length) return -1;
+        var limit = length - ascii.Length;
+        for (var i = 0; i <= limit; i++)
+        {
+            var match = true;
+            for (var j = 0; j < ascii.Length; j++)
+            {
+                if (buffer[i + j] != (byte)ascii[j])
+                {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) return i;
+        }
+        return -1;
     }
 
     /// <summary>

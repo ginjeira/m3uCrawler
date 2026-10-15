@@ -15,7 +15,10 @@ namespace m3uCrawler.Services.Preview;
 /// <see cref="StartAsync"/> só devolve sucesso <b>depois</b> de o artefacto de arranque
 /// (<c>index.m3u8</c> para HLS, <c>thumb.jpg</c> para snapshot) existir com conteúdo —
 /// caso contrário o <c>hls.js</c> pede o manifest cedo demais e apanha 404. Em falha de HLS
-/// tenta degradar para snapshot; se também falhar devolve <c>Reason="preview-start-timeout"</c>.
+/// tenta degradar para snapshot; se também falhar, para o processo, espera pelo exit e só
+/// então lê o diagnóstico real (<c>ExitCode</c>/<c>StderrTail</c>), devolvendo
+/// <c>Reason="preview-stream-unreachable"</c> quando o stderr indica falha de rede e
+/// <c>Reason="preview-start-timeout"</c> caso contrário.
 /// </para>
 ///
 /// Nenhuma implementação regista o URL/credenciais: os args são passados ao
@@ -32,6 +35,24 @@ public sealed class PreviewSessionManager : IAsyncDisposable
 
     /// <summary>Limite de caracteres do stderr registado numa falha (defesa contra ruído).</summary>
     private const int StderrLogLimit = 512;
+
+    /// <summary>Tempo máximo de espera pelo exit do processo antes de ler o diagnóstico.</summary>
+    private static readonly TimeSpan ProcessExitWait = TimeSpan.FromSeconds(2);
+
+    /// <summary>
+    /// Marcadores (case-insensitive) no stderr de <c>ffmpeg</c> que indicam que o stream é
+    /// inalcançável (ex.: <c>302</c> para um host que não responde / <c>4xx</c> do provedor),
+    /// em vez de um simples timeout de arranque.
+    /// </summary>
+    private static readonly string[] UnreachableMarkers =
+    {
+        "Connection timed out",
+        "Connection refused",
+        "failed",
+        "Server returned 4",
+        "403",
+        "404",
+    };
 
     private readonly PreviewOptions _options;
     private readonly IProcessRunner _runner;
@@ -92,7 +113,9 @@ public sealed class PreviewSessionManager : IAsyncDisposable
     /// <para>
     /// Só devolve sucesso depois de o artefacto de arranque existir com conteúdo. Se o HLS
     /// falhar, tenta degradar para snapshot (<c>Reason="hls-failed-snapshot"</c>); se também
-    /// falhar, devolve <c>Reason="preview-start-timeout"</c> sem manifest/thumbnail.
+    /// falhar, classifica o motivo pelo stderr do processo já terminado:
+    /// <c>Reason="preview-stream-unreachable"</c> (falha de rede/4xx) ou
+    /// <c>Reason="preview-start-timeout"</c>, sem manifest/thumbnail.
     /// </para>
     /// </summary>
     public async Task<PreviewSessionStartResult?> StartAsync(string reference, CancellationToken ct)
@@ -149,14 +172,18 @@ public sealed class PreviewSessionManager : IAsyncDisposable
 
             var kind = primaryKind;
             string? reason = null;
+            var streamUnreachable = false;
 
             if (!ready && primaryKind == "hls")
             {
-                // O HLS não produziu o manifest: registar diagnóstico e tentar snapshot
-                // no mesmo directório antes de desistir.
-                LogFailure(id, handle);
-                await StopHandleAsync(handle).ConfigureAwait(false);
+                // O HLS não produziu o manifest: parar o processo, esperar pelo exit e só
+                // então ler o diagnóstico real (lê-lo antes do exit devolvia "(?)" e stderr
+                // vazio — o diagnóstico era mentiroso). Depois tentar snapshot no mesmo
+                // directório antes de desistir.
+                var hlsDiagnostics = await StopAndCaptureDiagnosticsAsync(handle).ConfigureAwait(false);
                 handle = null;
+                LogFailure(id, hlsDiagnostics);
+                streamUnreachable |= IndicatesStreamUnreachable(hlsDiagnostics.StderrTail);
 
                 kind = "snapshot";
                 handle = _runner.Start(
@@ -171,19 +198,32 @@ public sealed class PreviewSessionManager : IAsyncDisposable
                 {
                     reason = "hls-failed-snapshot";
                 }
+                else
+                {
+                    var snapshotDiagnostics = await StopAndCaptureDiagnosticsAsync(handle).ConfigureAwait(false);
+                    handle = null;
+                    LogFailure(id, snapshotDiagnostics);
+                    streamUnreachable |= IndicatesStreamUnreachable(snapshotDiagnostics.StderrTail);
+                }
+            }
+            else if (!ready)
+            {
+                // Caminho snapshot primário sem artefacto: parar, esperar o exit e ler o
+                // diagnóstico real antes de classificar o motivo.
+                var snapshotDiagnostics = await StopAndCaptureDiagnosticsAsync(handle).ConfigureAwait(false);
+                handle = null;
+                LogFailure(id, snapshotDiagnostics);
+                streamUnreachable |= IndicatesStreamUnreachable(snapshotDiagnostics.StderrTail);
             }
 
             if (!ready)
             {
-                if (kind == "snapshot")
-                {
-                    LogFailure(id, handle);
-                }
                 await CleanupProcessAndDirAsync(handle, dir).ConfigureAwait(false);
                 ReleaseSlot(null);
-                _log($"🎬 preview {id} terminada (preview-start-timeout)");
+                var failReason = streamUnreachable ? "preview-stream-unreachable" : "preview-start-timeout";
+                _log($"🎬 preview {id} terminada ({failReason})");
                 return new PreviewSessionStartResult(
-                    string.Empty, string.Empty, null, null, probe, playable, "preview-start-timeout");
+                    string.Empty, string.Empty, null, null, probe, playable, failReason);
             }
 
             var manifestUrl = kind == "hls" ? $"/api/preview/{id}/index.m3u8" : null;
@@ -490,16 +530,65 @@ public sealed class PreviewSessionManager : IAsyncDisposable
         catch { /* directório em uso — melhor esforço */ }
     }
 
-    private void LogFailure(string sessionId, IProcessHandle handle)
+    /// <summary>
+    /// Termina o processo (Kill), espera pelo exit (bounded) e só então lê o
+    /// <c>ExitCode</c> e a cauda de stderr sanitizada. Ler estes valores antes do exit
+    /// produzia <c>(?)</c> e stderr vazio, tornando o diagnóstico enganador. O handle é
+    /// sempre libertado; nunca lança.
+    /// </summary>
+    private static async Task<ProcessDiagnostics> StopAndCaptureDiagnosticsAsync(IProcessHandle? handle)
     {
+        if (handle is null)
+        {
+            return new ProcessDiagnostics("?", string.Empty);
+        }
+
+        try { handle.Kill(); } catch { /* processo já morto */ }
+        try { await handle.WaitForExitAsync(ProcessExitWait).ConfigureAwait(false); } catch { /* já morto */ }
+
+        // Só depois do exit é que o código de saída é significativo.
         var exit = handle.ExitCode?.ToString(CultureInfo.InvariantCulture) ?? "?";
+
+        // Dispose aguarda (bounded) o pump de stderr terminar, para não cortar a cauda.
+        try { handle.Dispose(); } catch { /* nunca propagar falhas de diagnóstico */ }
+
         var tail = CredentialSanitizer.SanitizeSensitiveText(handle.StderrTail).Trim();
         if (tail.Length > StderrLogLimit)
         {
             tail = tail[..StderrLogLimit];
         }
-        _log($"⚠️ preview {sessionId} falhou ({exit}) {tail}");
+
+        return new ProcessDiagnostics(exit, tail);
     }
+
+    /// <summary>
+    /// Heurística sobre o stderr de <c>ffmpeg</c>: <c>true</c> quando indica que o stream é
+    /// inalcançável (rede/4xx) em vez de um simples timeout de arranque do artefacto.
+    /// </summary>
+    private static bool IndicatesStreamUnreachable(string? stderrTail)
+    {
+        if (string.IsNullOrEmpty(stderrTail))
+        {
+            return false;
+        }
+
+        foreach (var marker in UnreachableMarkers)
+        {
+            if (stderrTail.Contains(marker, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void LogFailure(string sessionId, ProcessDiagnostics diagnostics)
+    {
+        _log($"⚠️ preview {sessionId} falhou ({diagnostics.ExitCode}) {diagnostics.StderrTail}");
+    }
+
+    /// <summary>Diagnóstico de um processo de preview já terminado (exit + stderr sanitizado).</summary>
+    private readonly record struct ProcessDiagnostics(string ExitCode, string StderrTail);
 
     private async Task TeardownAsync(SessionState session, string reason)
     {

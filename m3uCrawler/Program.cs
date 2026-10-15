@@ -1759,6 +1759,13 @@ namespace m3uCrawler
             Console.WriteLine($"📄 playlist.m3u atual: {existingMain.Count} stream(s) a retestar");
 
             List<M3uStream> stillWorkingMain;
+            // Contadores honestos da manutenção: "working" são os streams
+            // fisicamente validados (IsWorking=true); "retidos" são os
+            // preservados por falha retryable (IsWorking=false, Retained=true)
+            // e ainda NÃO reconfirmados. A playlist escreve ambos, mas o
+            // relatório não os pode confundir.
+            var existingStillWorkingCount = 0;
+            var existingRetainedCount = 0;
             if (existingMain.Count > 0)
             {
                 // 9A-PROD-WIRING: tester criado via factory, ligado a um
@@ -1799,10 +1806,12 @@ namespace m3uCrawler
                         retested.Select(x => (x.Stream, x.Outcome.FailureKind)));
 
                     stillWorkingMain = filterResult.Preserved;
+                    existingStillWorkingCount = filterResult.PreservedWorking;
+                    existingRetainedCount = filterResult.PreservedRetryable;
 
                     Console.WriteLine($"✅ Streams existentes preservados: {stillWorkingMain.Count}/{existingMain.Count}");
-                    Console.WriteLine($"   • Working: {filterResult.PreservedWorking}");
-                    Console.WriteLine($"   • Retryable (preservados): {filterResult.PreservedRetryable}");
+                    Console.WriteLine($"   • Working (validado): {filterResult.PreservedWorking}");
+                    Console.WriteLine($"   • Retidos (não confirmados): {filterResult.PreservedRetryable}");
                     Console.WriteLine($"   • Terminal (removidos): {filterResult.RemovedTerminal}");
                     if (filterResult.RemovedByKind.Count > 0)
                     {
@@ -1814,7 +1823,7 @@ namespace m3uCrawler
                                                     .Select(kv => $"{kv.Key}={kv.Value}"));
                     if (!string.IsNullOrEmpty(retryableBreakdown))
                     {
-                        Console.WriteLine($"   • Detalhe de preservações retryable: {retryableBreakdown}");
+                        Console.WriteLine($"   • Detalhe de retidos (não confirmados) por tipo de falha: {retryableBreakdown}");
                     }
                 }
                 finally
@@ -1859,7 +1868,7 @@ namespace m3uCrawler
                     Verbose = false,
                     NewFunctionalCountOverride = freshStreams.Count(s => s.IsWorking),
                     ExistingRetestedCount = existingMain.Count,
-                    ExistingStillWorkingCount = stillWorkingMain.Count,
+                    ExistingStillWorkingCount = existingStillWorkingCount,
                     TrackFinalPlaylistCount = true,
                 },
                 liveRunProgress,
@@ -1872,7 +1881,7 @@ namespace m3uCrawler
             });
 
             Console.WriteLine("✅ Ciclo concluído.");
-            Console.WriteLine($"   • Mantidas de playlist.m3u: {stillWorkingMain.Count}");
+            Console.WriteLine($"   • Mantidas de playlist.m3u: {stillWorkingMain.Count} (working validado: {existingStillWorkingCount}; retidos não confirmados: {existingRetainedCount})");
             Console.WriteLine($"   • Novas funcionais descobertas: {freshStreams.Count(s => s.IsWorking)}");
             Console.WriteLine($"   • Total final em playlist.m3u: {published.Published.Count}");
             Console.WriteLine($"   • playlist_temp.m3u: {published.IntermediatePlaylistPath}");

@@ -215,6 +215,81 @@ public sealed class PreviewSessionManagerTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Start_classifies_network_failure_as_stream_unreachable_and_logs_late_stderr()
+    {
+        var logs = new List<string>();
+        var gate = new object();
+        var runner = RunnerFor(H264AacJson);
+        runner.AutoCreateArtifacts = false;
+        // stderr configurado mas só visível após o exit (saída tardia): se o manager o
+        // lesse antes de parar o processo, viria vazio.
+        runner.HandleConfigurator = (_, handle) => handle.StderrTail = "Connection timed out";
+
+        await using var manager = CreateManager(
+            runner, ProbeFor(runner),
+            Options(ready: TimeSpan.FromMilliseconds(250)), ResolverFor(StreamUrl),
+            log: message => { lock (gate) logs.Add(message); });
+
+        var result = await manager.StartAsync("1", CancellationToken.None);
+
+        Assert.NotNull(result);
+        Assert.Equal("preview-stream-unreachable", result!.Reason);
+        Assert.Null(result.ManifestUrl);
+        Assert.Null(result.ThumbnailUrl);
+        Assert.Equal(string.Empty, result.SessionId);
+        Assert.Equal(2, runner.Starts.Count);
+
+        string joined;
+        lock (gate) joined = string.Join('\n', logs);
+        // ExitCode lido APÓS o exit (-1 do Kill) e stderr real presente no log.
+        Assert.Contains("falhou (-1) Connection timed out", joined);
+        Assert.Contains("preview-stream-unreachable", joined);
+        Assert.DoesNotContain("host.example.com", joined);
+    }
+
+    [Fact]
+    public async Task Start_classifies_non_network_failure_as_start_timeout()
+    {
+        var logs = new List<string>();
+        var gate = new object();
+        var runner = RunnerFor(H264AacJson);
+        runner.AutoCreateArtifacts = false;
+        runner.HandleConfigurator = (_, handle) => handle.StderrTail = "Invalid argument";
+
+        await using var manager = CreateManager(
+            runner, ProbeFor(runner),
+            Options(ready: TimeSpan.FromMilliseconds(250)), ResolverFor(StreamUrl),
+            log: message => { lock (gate) logs.Add(message); });
+
+        var result = await manager.StartAsync("1", CancellationToken.None);
+
+        Assert.NotNull(result);
+        Assert.Equal("preview-start-timeout", result!.Reason);
+        Assert.Null(result.ManifestUrl);
+        Assert.Null(result.ThumbnailUrl);
+
+        string joined;
+        lock (gate) joined = string.Join('\n', logs);
+        Assert.Contains("Invalid argument", joined);
+        Assert.Contains("preview-start-timeout", joined);
+    }
+
+    [Fact]
+    public void Fake_process_reveals_exit_code_and_stderr_only_after_exit()
+    {
+        var handle = new FakeProcessHandle("Connection refused");
+
+        // Processo vivo: sem exit code e sem stderr (saída tardia simulada).
+        Assert.Null(handle.ExitCode);
+        Assert.Equal(string.Empty, handle.StderrTail);
+
+        handle.MarkExited(9);
+
+        Assert.Equal(9, handle.ExitCode);
+        Assert.Equal("Connection refused", handle.StderrTail);
+    }
+
+    [Fact]
     public async Task Start_assumes_playable_and_starts_hls_when_probe_fails()
     {
         var runner = new FakeProcessRunner

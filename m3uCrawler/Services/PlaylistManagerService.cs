@@ -9,11 +9,9 @@ namespace m3uCrawler.Services
     {
         public async Task SaveToM3uPlaylist(List<M3uStream> streams, string filePath)
         {
-            var workingStreams = streams.Where(s => s.IsWorking).ToList();
-
             await File.WriteAllTextAsync(filePath, BuildM3uPlaylistContent(streams), Encoding.UTF8);
             Console.WriteLine($"Playlist M3U guardada em: {filePath}");
-            Console.WriteLine($"Total de streams funcionais: {workingStreams.Count}");
+            ReportStreamCounts(streams);
         }
 
         /// <summary>
@@ -58,7 +56,40 @@ namespace m3uCrawler.Services
             }
 
             Console.WriteLine($"Playlist M3U guardada em: {fullPath}");
-            Console.WriteLine($"Total de streams funcionais: {streams.Count(s => s.IsWorking)}");
+            ReportStreamCounts(streams);
+        }
+
+        /// <summary>
+        /// Contagem honesta dos streams publicáveis. "Working" são os validados
+        /// fisicamente (<c>IsWorking=true</c>); "retidos" são os preservados por
+        /// falha retryable (<c>IsWorking=false</c>, <c>Retained=true</c>) e ainda
+        /// NÃO reconfirmados. A playlist escreve working+retidos; o relatório
+        /// não os deve confundir.
+        /// </summary>
+        internal static (int Working, int Retained) CountPublishableStreams(IEnumerable<M3uStream> streams)
+        {
+            var working = 0;
+            var retained = 0;
+            foreach (var stream in streams)
+            {
+                if (stream.IsWorking)
+                {
+                    working++;
+                }
+                else if (stream.Retained)
+                {
+                    retained++;
+                }
+            }
+            return (working, retained);
+        }
+
+        private static void ReportStreamCounts(IEnumerable<M3uStream> streams)
+        {
+            var (working, retained) = CountPublishableStreams(streams);
+            Console.WriteLine($"Streams working (validado): {working}");
+            Console.WriteLine($"Streams retidos (não confirmado): {retained}");
+            Console.WriteLine($"Total de entradas na playlist: {working + retained}");
         }
 
         private static string BuildM3uPlaylistContent(IEnumerable<M3uStream> streams, DateTime? generatedAt = null)

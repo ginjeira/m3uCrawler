@@ -65,6 +65,46 @@ public class StreamProbeServiceTests
     }
 
     [Fact]
+    public async Task Failed_probe_is_not_cached_and_reexecutes_ffprobe()
+    {
+        var attempts = 0;
+        var runner = new FakeProcessRunner
+        {
+            RunHandler = _ => ++attempts == 1
+                ? new ProcessResult(1, string.Empty, "ffprobe: Connection timed out", false)
+                : new ProcessResult(0, H264AacJson, string.Empty, false),
+        };
+        var service = new StreamProbeService(
+            runner, new PreviewOptions { ProbeRetries = 0, ProbeCacheTtl = TimeSpan.FromMinutes(10) });
+
+        var first = await service.ProbeAsync("http://host/live/u/p/fail.ts", CancellationToken.None);
+        var second = await service.ProbeAsync("http://host/live/u/p/fail.ts", CancellationToken.None);
+
+        // A primeira falha não é memorizada: a segunda chamada volta a executar o ffprobe
+        // e apanha a recuperação transitória do upstream.
+        Assert.Null(first);
+        Assert.NotNull(second);
+        Assert.Equal(2, runner.RunCallCount);
+    }
+
+    [Fact]
+    public async Task Repeated_failures_are_never_cached()
+    {
+        var runner = new FakeProcessRunner
+        {
+            RunHandler = _ => new ProcessResult(1, string.Empty, "ffprobe: 403", false),
+        };
+        var service = new StreamProbeService(
+            runner, new PreviewOptions { ProbeRetries = 0, ProbeCacheTtl = TimeSpan.FromMinutes(10) });
+
+        Assert.Null(await service.ProbeAsync("http://host/live/u/p/always.ts", CancellationToken.None));
+        Assert.Null(await service.ProbeAsync("http://host/live/u/p/always.ts", CancellationToken.None));
+        Assert.Null(await service.ProbeAsync("http://host/live/u/p/always.ts", CancellationToken.None));
+
+        Assert.Equal(3, runner.RunCallCount);
+    }
+
+    [Fact]
     public async Task Expired_cache_entry_triggers_a_new_probe()
     {
         var runner = new FakeProcessRunner { RunHandler = _ => new ProcessResult(0, H264AacJson, string.Empty, false) };

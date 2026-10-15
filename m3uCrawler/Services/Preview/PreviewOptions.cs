@@ -53,9 +53,11 @@ public sealed class PreviewOptions
     /// Tempo máximo de espera pelo artefacto de arranque da sessão: <c>index.m3u8</c>
     /// (sessões HLS) ou <c>thumb.jpg</c> (snapshot). O ffmpeg cria o manifest apenas
     /// 1–1,4 s depois de arrancar, pelo que devolver a URL antes disso produz 404 no
-    /// <c>hls.js</c>. Default: 5 s.
+    /// <c>hls.js</c>. Default: 12 s — acima do timeout de TCP típico dos provedores
+    /// (~5,35 s), para dar tempo a que o <c>ffmpeg</c> reporte o erro de rede em vez
+    /// de ser classificado como um simples timeout de arranque.
     /// </summary>
-    public TimeSpan ReadyTimeout { get; init; } = TimeSpan.FromSeconds(5);
+    public TimeSpan ReadyTimeout { get; init; } = TimeSpan.FromSeconds(12);
 
     /// <summary>
     /// Número de retentativas de <c>ffprobe</c> após a primeira tentativa falhar

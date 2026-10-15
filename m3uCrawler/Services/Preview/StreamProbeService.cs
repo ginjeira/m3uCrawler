@@ -8,8 +8,10 @@ namespace m3uCrawler.Services.Preview;
 
 /// <summary>
 /// Executa <c>ffprobe</c> (via <see cref="IProcessRunner"/>) e traduz o JSON para
-/// <see cref="StreamProbe"/>. Resultados ficam em cache em memória, indexada pelo
-/// hash SHA-256 do URL — o URL em claro nunca é usado como chave de cache nem registado.
+/// <see cref="StreamProbe"/>. Apenas os resultados <b>bem-sucedidos</b> ficam em cache em
+/// memória, indexada pelo hash SHA-256 do URL — o URL em claro nunca é usado como chave de
+/// cache nem registado. Sondagens falhadas (<c>null</c>) não são memorizadas para não
+/// mascarar recuperações transitórias do upstream durante o TTL.
 /// </summary>
 public sealed class StreamProbeService
 {
@@ -75,7 +77,13 @@ public sealed class StreamProbeService
             }
         }
 
-        Store(key, probe);
+        // Não cachear resultados negativos: um `null` (ffprobe falhou) guardado durante todo
+        // o TTL mascararia uma recuperação transitória do upstream (ex.: 403 intermitente).
+        // Só sondagens bem-sucedidas são memorizadas.
+        if (probe is not null)
+        {
+            Store(key, probe);
+        }
         return probe;
     }
 
@@ -198,7 +206,7 @@ public sealed class StreamProbeService
         return false;
     }
 
-    private void Store(string key, StreamProbe? probe)
+    private void Store(string key, StreamProbe probe)
     {
         _cache[key] = new CacheEntry
         {
@@ -209,7 +217,7 @@ public sealed class StreamProbeService
 
     private sealed class CacheEntry
     {
-        public StreamProbe? Probe { get; init; }
+        public required StreamProbe Probe { get; init; }
         public DateTimeOffset ExpiresUtc { get; init; }
     }
 }

@@ -133,6 +133,38 @@ public class PlaylistManagerServiceTests
     }
 
     [Fact]
+    public async Task SaveToM3uPlaylist_includes_retained_but_counts_it_separately_from_working()
+    {
+        // A playlist mantém o comportamento actual (escreve working || retido),
+        // mas a contagem reportada distingue "working (validado)" de
+        // "retido (não confirmado)".
+        var service = new PlaylistManagerService();
+        var path = TempPath(".m3u");
+        try
+        {
+            var streams = new List<M3uStream>
+            {
+                new() { Url = "http://host.example.com/live/u/pw/1.ts", Title = "Working", Group = "PT", IsWorking = true },
+                new() { Url = "http://host.example.com/live/u/pw/2.ts", Title = "Retido", Group = "PT", IsWorking = false, Retained = true },
+            };
+
+            var (working, retained) = PlaylistManagerService.CountPublishableStreams(streams);
+            Assert.Equal(1, working);
+            Assert.Equal(1, retained);
+
+            await service.SaveToM3uPlaylistAtomic(streams, path);
+
+            var m3u = await File.ReadAllTextAsync(path);
+            Assert.Contains("1.ts", m3u); // working validado
+            Assert.Contains("2.ts", m3u); // retido (não confirmado) continua na playlist
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
     public async Task SaveToM3uPlaylist_preserves_real_xtream_urls_for_playback()
     {
         // A playlist M3U é o artefacto funcional: deve conter as URLs reais para que o

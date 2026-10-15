@@ -337,6 +337,54 @@ public sealed class PreviewEndpointTests : IAsyncLifetime
         }
     }
 
+    [Fact]
+    public async Task Start_when_stream_unreachable_returns_502_preview_stream_unreachable()
+    {
+        var harness = StartHarness();
+        await ReachReadyAsync(harness);
+        var csrf = await LoginAsync(harness);
+
+        // O processo nunca materializa o artefacto e o stderr (só visível após o exit)
+        // indica falha de rede: o manager classifica o motivo como stream inalcançável.
+        var unreachableRunner = new FakeProcessRunner
+        {
+            AutoCreateArtifacts = false,
+            RunHandler = _ => new ProcessResult(1, string.Empty, "ffprobe: Connection timed out", false),
+            HandleConfigurator = (_, handle) => handle.StderrTail = "Connection timed out",
+        };
+        var unreachableOptions = new PreviewOptions
+        {
+            MaxConcurrentSessions = 1,
+            IdleTimeout = TimeSpan.FromMinutes(5),
+            MaxDuration = TimeSpan.FromMinutes(5),
+            ReadyTimeout = TimeSpan.FromMilliseconds(50),
+        };
+        var unreachableProbe = new StreamProbeService(unreachableRunner, unreachableOptions);
+        Func<string, CancellationToken, Task<StreamReference?>> resolve = (_, _) =>
+            Task.FromResult<StreamReference?>(new StreamReference("review", "1", StreamUrl, "Canal"));
+        var unreachableManager = new PreviewSessionManager(
+            unreachableOptions, unreachableRunner, unreachableProbe, resolve, _previewRoot);
+
+        WebDashboardService.SetPreviewSessionManager(unreachableManager);
+        try
+        {
+            var response = await harness.Client.SendAsync(
+                WithCsrf(HttpMethod.Post, "/api/preview/start", csrf, "{\"ref\":\"known\"}"));
+
+            Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
+            var body = await response.Content.ReadAsStringAsync();
+            Assert.Contains("preview-stream-unreachable", body);
+            Assert.DoesNotContain("preview-start-timeout", body);
+            // Nem a URL do stream nem credenciais chegam ao cliente.
+            Assert.DoesNotContain(StreamUrl, body);
+        }
+        finally
+        {
+            WebDashboardService.SetPreviewSessionManager(_manager);
+            await unreachableManager.DisposeAsync();
+        }
+    }
+
     // ════════════════════════════════════════════════════════════════
     // GET /api/preview/<id>/<file> e POST /api/preview/<id>/stop
     // ════════════════════════════════════════════════════════════════

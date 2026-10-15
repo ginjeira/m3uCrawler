@@ -5217,8 +5217,17 @@ namespace m3uCrawler.Services
             }
 
             // O backend espera pelo artefacto de arranque (manifest/thumbnail) e degrada
-            // para snapshot; se nem isso produzir conteúdo devolve este motivo. A UI mostra
-            // uma mensagem clara em vez de um spinner infinito.
+            // para snapshot; se nem isso produzir conteúdo devolve um destes motivos. O
+            // stderr do ffmpeg distingue uma falha de rede (stream inalcançável, ex.: 302
+            // para um host que não responde) de um simples timeout de arranque. A UI mostra
+            // mensagens específicas em vez de um spinner infinito.
+            if (string.Equals(result.Reason, "preview-stream-unreachable", StringComparison.Ordinal))
+            {
+                await WriteJsonAsync(
+                    context.Response, new { error = "preview-stream-unreachable" }, HttpStatusCode.BadGateway);
+                return;
+            }
+
             if (string.Equals(result.Reason, "preview-start-timeout", StringComparison.Ordinal))
             {
                 await WriteJsonAsync(
@@ -9249,9 +9258,14 @@ const rows = Object.entries(inv).map(([k, v]) => {
 
       var res = await apiRequest('/api/preview/start', { method: 'POST', body: { ref: ref } });
       if (!res.ok) {
+        var previewError = (res.json && res.json.error) || null;
         var msg = res.status === 404 ? 'Referência desconhecida para pré-visualização.'
           : res.status === 429 ? 'Servidor de pré-visualização ocupado (limite de sessões). Tente novamente.'
-            : res.status === 502 ? 'Não foi possível preparar o stream (manifest a tempo). Tente novamente.'
+            : res.status === 502 ? (previewError === 'preview-stream-unreachable'
+              ? 'Stream inacessível (o provedor redireciona para um host que não responde).'
+              : previewError === 'preview-start-timeout'
+                ? 'Não foi possível preparar o stream a tempo. Tente novamente.'
+                : 'Não foi possível preparar o stream. Tente novamente.')
               : res.status === 503 ? 'Pré-visualização indisponível (ffmpeg não configurado).'
                 : 'Falha ao iniciar pré-visualização: ' + (res.error || ('HTTP ' + res.status));
         if (meta) meta.textContent = msg;
