@@ -294,6 +294,49 @@ public sealed class PreviewEndpointTests : IAsyncLifetime
         Assert.Contains("preview-busy", await second.Content.ReadAsStringAsync());
     }
 
+    [Fact]
+    public async Task Start_when_start_times_out_returns_502_preview_start_timeout()
+    {
+        var harness = StartHarness();
+        await ReachReadyAsync(harness);
+        var csrf = await LoginAsync(harness);
+
+        // Manager "fake" (motor real com runner falso): o processo nunca materializa o
+        // artefacto de arranque e o ReadyTimeout é curtíssimo, pelo que StartAsync
+        // degrada HLS → snapshot e devolve Reason="preview-start-timeout".
+        var timeoutRunner = new FakeProcessRunner { AutoCreateArtifacts = false };
+        var timeoutOptions = new PreviewOptions
+        {
+            MaxConcurrentSessions = 1,
+            IdleTimeout = TimeSpan.FromMinutes(5),
+            MaxDuration = TimeSpan.FromMinutes(5),
+            ReadyTimeout = TimeSpan.FromMilliseconds(50),
+        };
+        var timeoutProbe = new StreamProbeService(timeoutRunner, timeoutOptions);
+        Func<string, CancellationToken, Task<StreamReference?>> resolve = (_, _) =>
+            Task.FromResult<StreamReference?>(new StreamReference("review", "1", StreamUrl, "Canal"));
+        var timeoutManager = new PreviewSessionManager(
+            timeoutOptions, timeoutRunner, timeoutProbe, resolve, _previewRoot);
+
+        WebDashboardService.SetPreviewSessionManager(timeoutManager);
+        try
+        {
+            var response = await harness.Client.SendAsync(
+                WithCsrf(HttpMethod.Post, "/api/preview/start", csrf, "{\"ref\":\"known\"}"));
+
+            Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
+            var body = await response.Content.ReadAsStringAsync();
+            Assert.Contains("preview-start-timeout", body);
+            // Nem a URL do stream nem credenciais chegam ao cliente.
+            Assert.DoesNotContain(StreamUrl, body);
+        }
+        finally
+        {
+            WebDashboardService.SetPreviewSessionManager(_manager);
+            await timeoutManager.DisposeAsync();
+        }
+    }
+
     // ════════════════════════════════════════════════════════════════
     // GET /api/preview/<id>/<file> e POST /api/preview/<id>/stop
     // ════════════════════════════════════════════════════════════════

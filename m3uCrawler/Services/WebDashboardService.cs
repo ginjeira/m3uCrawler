@@ -5216,6 +5216,16 @@ namespace m3uCrawler.Services
                 return;
             }
 
+            // O backend espera pelo artefacto de arranque (manifest/thumbnail) e degrada
+            // para snapshot; se nem isso produzir conteúdo devolve este motivo. A UI mostra
+            // uma mensagem clara em vez de um spinner infinito.
+            if (string.Equals(result.Reason, "preview-start-timeout", StringComparison.Ordinal))
+            {
+                await WriteJsonAsync(
+                    context.Response, new { error = "preview-start-timeout" }, HttpStatusCode.BadGateway);
+                return;
+            }
+
             await WriteJsonAsync(context.Response, result);
         }
 
@@ -9104,6 +9114,11 @@ const rows = Object.entries(inv).map(([k, v]) => {
     // `/api/preview/*` com o CSRF injectado por `apiRequest`.
     var _previewSessionId = null;
     var _previewHls = null;
+    // W-PREVIEW — estado do arranque do hls.js: contadores de retry (rede/media) e
+    // timer do timeout global. Limpos em `stopReviewPreview()`.
+    var _previewNetworkRetries = 0;
+    var _previewMediaRecoveries = 0;
+    var _previewStartTimer = null;
     var _playerWhich = 'playlist';
     var _playerEntries = [];
     var _playerSelectedId = null;
@@ -9111,6 +9126,9 @@ const rows = Object.entries(inv).map(([k, v]) => {
     var _reviewPreviewCandidates = [];
 
     function stopReviewPreview() {
+      if (_previewStartTimer) { clearTimeout(_previewStartTimer); _previewStartTimer = null; }
+      _previewNetworkRetries = 0;
+      _previewMediaRecoveries = 0;
       if (_previewHls) { try { _previewHls.destroy(); } catch (e) {} _previewHls = null; }
       var video = document.getElementById('reviewPreviewVideo');
       if (video) {
@@ -9151,6 +9169,68 @@ const rows = Object.entries(inv).map(([k, v]) => {
       meta.textContent = parts.join(' \u00b7 ');
     }
 
+    // W-PREVIEW — mostra uma mensagem de falha no meta e pára o timer global.
+    function _previewFail(msg) {
+      if (_previewStartTimer) { clearTimeout(_previewStartTimer); _previewStartTimer = null; }
+      var meta = document.getElementById('reviewPreviewMeta');
+      if (meta) meta.textContent = msg;
+    }
+
+    // W-PREVIEW — arranca o hls.js com retries alargados no carregamento do
+    // manifest/níveis/fragmentos e trata erros fatais: `NETWORK_ERROR` (inclui o
+    // 404 do manifest antes do HLS arrancar) re-tenta `loadSource` com atraso,
+    // `MEDIA_ERROR` usa `recoverMediaError`. Só o `manifestUrl` interno
+    // (`/api/preview/<id>/index.m3u8`) — nunca a URL real do stream — entra aqui.
+    function _startHlsPreview(manifestUrl, video) {
+      _previewNetworkRetries = 0;
+      _previewMediaRecoveries = 0;
+      var hls = new window.Hls({
+        manifestLoadingMaxRetry: 8,
+        manifestLoadingRetryDelay: 400,
+        levelLoadingMaxRetry: 8,
+        fragLoadingMaxRetry: 8,
+      });
+      // Timeout global: sem `MANIFEST_PARSED` em ~12 s, termina o spinner infinito.
+      _previewStartTimer = setTimeout(function () {
+        _previewStartTimer = null;
+        _previewFail('não foi possível carregar o stream (tempo excedido)');
+      }, 12000);
+      hls.on(window.Hls.Events.MANIFEST_PARSED, function () {
+        if (_previewStartTimer) { clearTimeout(_previewStartTimer); _previewStartTimer = null; }
+        if (!video) return;
+        // O autoplay pode ser bloqueado pelo browser; nesse caso não forçamos
+        // `muted` — o utilizador carrega em play.
+        var played = video.play();
+        if (played && played.catch) { played.catch(function () {}); }
+      });
+      hls.on(window.Hls.Events.ERROR, function (evt, data) {
+        if (!data || !data.fatal) return;
+        if (data.type === window.Hls.ErrorTypes.NETWORK_ERROR) {
+          if (_previewNetworkRetries < 8) {
+            _previewNetworkRetries++;
+            setTimeout(function () {
+              if (_previewHls !== hls) return;
+              try { hls.loadSource(manifestUrl); } catch (e) {}
+            }, 400);
+          } else {
+            _previewFail('não foi possível carregar o stream');
+          }
+        } else if (data.type === window.Hls.ErrorTypes.MEDIA_ERROR) {
+          if (_previewMediaRecoveries < 2) {
+            _previewMediaRecoveries++;
+            try { hls.recoverMediaError(); } catch (e) { _previewFail('não foi possível carregar o stream'); }
+          } else {
+            _previewFail('não foi possível carregar o stream');
+          }
+        } else {
+          _previewFail('não foi possível carregar o stream');
+        }
+      });
+      hls.loadSource(manifestUrl);
+      hls.attachMedia(video);
+      return hls;
+    }
+
     // Núcleo comum a Reviews e playlists: arranca a sessão de preview para
     // uma referência e liga-a ao player partilhado. `ui.subject` é o texto
     // mostrado no modal.
@@ -9171,8 +9251,9 @@ const rows = Object.entries(inv).map(([k, v]) => {
       if (!res.ok) {
         var msg = res.status === 404 ? 'Referência desconhecida para pré-visualização.'
           : res.status === 429 ? 'Servidor de pré-visualização ocupado (limite de sessões). Tente novamente.'
-            : res.status === 503 ? 'Pré-visualização indisponível (ffmpeg não configurado).'
-              : 'Falha ao iniciar pré-visualização: ' + (res.error || ('HTTP ' + res.status));
+            : res.status === 502 ? 'Não foi possível preparar o stream (manifest a tempo). Tente novamente.'
+              : res.status === 503 ? 'Pré-visualização indisponível (ffmpeg não configurado).'
+                : 'Falha ao iniciar pré-visualização: ' + (res.error || ('HTTP ' + res.status));
         if (meta) meta.textContent = msg;
         return res;
       }
@@ -9198,9 +9279,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
       if (video) {
         video.style.display = 'block';
         if (window.Hls && window.Hls.isSupported()) {
-          _previewHls = new window.Hls();
-          _previewHls.loadSource(manifestUrl);
-          _previewHls.attachMedia(video);
+          _previewHls = _startHlsPreview(manifestUrl, video);
         } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
           video.src = manifestUrl;
         } else if (meta) {

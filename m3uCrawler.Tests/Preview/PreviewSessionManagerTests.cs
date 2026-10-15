@@ -37,12 +37,18 @@ public sealed class PreviewSessionManagerTests : IAsyncLifetime
         return Task.CompletedTask;
     }
 
-    private static PreviewOptions Options(TimeSpan? idle = null, TimeSpan? max = null, int concurrency = 2, bool transcode = false) => new()
+    private static PreviewOptions Options(
+        TimeSpan? idle = null,
+        TimeSpan? max = null,
+        int concurrency = 2,
+        bool transcode = false,
+        TimeSpan? ready = null) => new()
     {
         MaxConcurrentSessions = concurrency,
         IdleTimeout = idle ?? TimeSpan.FromMinutes(5),
         MaxDuration = max ?? TimeSpan.FromMinutes(5),
         TranscodeNonPlayable = transcode,
+        ReadyTimeout = ready ?? TimeSpan.FromSeconds(5),
     };
 
     private FakeProcessRunner RunnerFor(string probeJson) => new()
@@ -62,8 +68,9 @@ public sealed class PreviewSessionManagerTests : IAsyncLifetime
         FakeProcessRunner runner,
         StreamProbeService probe,
         PreviewOptions options,
-        Func<string, CancellationToken, Task<StreamReference?>> resolver) =>
-        new(options, runner, probe, resolver, _root);
+        Func<string, CancellationToken, Task<StreamReference?>> resolver,
+        Action<string>? log = null) =>
+        new(options, runner, probe, resolver, _root, log);
 
     [Fact]
     public async Task Start_playable_resolves_hls_session_with_manifest_and_thumbnail()
@@ -162,24 +169,167 @@ public sealed class PreviewSessionManagerTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Start_waits_for_manifest_created_after_a_delay()
+    {
+        var runner = RunnerFor(H264AacJson);
+        runner.ArtifactWriter = async (args, workDir) =>
+        {
+            var target = args.First(a => a.EndsWith("index.m3u8", StringComparison.Ordinal));
+            await Task.Delay(300).ConfigureAwait(false);
+            FakeProcessRunner.WriteArtifactFile(target, workDir);
+        };
+        await using var manager = CreateManager(
+            runner, ProbeFor(runner), Options(ready: TimeSpan.FromSeconds(3)), ResolverFor(StreamUrl));
+
+        var result = await manager.StartAsync("1", CancellationToken.None);
+
+        Assert.NotNull(result);
+        Assert.Equal("hls", result!.Kind);
+        Assert.Null(result.Reason);
+        Assert.Equal($"/api/preview/{result.SessionId}/index.m3u8", result.ManifestUrl);
+        Assert.Equal($"/api/preview/{result.SessionId}/thumb.jpg", result.ThumbnailUrl);
+        Assert.Single(runner.Starts);
+        Assert.True(File.Exists(Path.Combine(_root, result.SessionId, "index.m3u8")));
+    }
+
+    [Fact]
+    public async Task Start_returns_timeout_and_no_urls_when_manifest_never_appears()
+    {
+        var runner = RunnerFor(H264AacJson);
+        runner.AutoCreateArtifacts = false;
+        await using var manager = CreateManager(
+            runner, ProbeFor(runner),
+            Options(ready: TimeSpan.FromMilliseconds(250)), ResolverFor(StreamUrl));
+
+        var result = await manager.StartAsync("1", CancellationToken.None);
+
+        Assert.NotNull(result);
+        Assert.Equal("preview-start-timeout", result!.Reason);
+        Assert.Null(result.ManifestUrl);
+        Assert.Null(result.ThumbnailUrl);
+        Assert.Equal(string.Empty, result.SessionId);
+        Assert.False(manager.HasSession(result.SessionId));
+        Assert.Equal(0, manager.ActiveSessionCount);
+        // HLS falha → fallback snapshot → também falha: dois arranques, nenhuma sessão.
+        Assert.Equal(2, runner.Starts.Count);
+    }
+
+    [Fact]
+    public async Task Start_assumes_playable_and_starts_hls_when_probe_fails()
+    {
+        var runner = new FakeProcessRunner
+        {
+            RunHandler = _ => new ProcessResult(1, string.Empty, "ffprobe: 403", false),
+        };
+        await using var manager = CreateManager(runner, ProbeFor(runner), Options(), ResolverFor(StreamUrl));
+
+        var result = await manager.StartAsync("1", CancellationToken.None);
+
+        Assert.NotNull(result);
+        Assert.Equal("hls", result!.Kind);
+        Assert.True(result.Playable);
+        Assert.Null(result.Reason);
+        Assert.NotNull(result.ManifestUrl);
+        Assert.Single(runner.Starts);
+        Assert.Contains("copy", runner.Starts[0].Args);
+        // ProbeRetries default 1 → 2 tentativas de ffprobe antes de assumir playable.
+        Assert.Equal(2, runner.RunCallCount);
+    }
+
+    [Fact]
+    public async Task Start_falls_back_to_snapshot_when_hls_fails()
+    {
+        var runner = RunnerFor(H264AacJson);
+        runner.ArtifactWriter = (args, workDir) =>
+        {
+            var thumb = args.FirstOrDefault(a => a.EndsWith("thumb.jpg", StringComparison.Ordinal));
+            if (thumb is not null)
+            {
+                FakeProcessRunner.WriteArtifactFile(thumb, workDir);
+            }
+            return Task.CompletedTask;
+        };
+        await using var manager = CreateManager(
+            runner, ProbeFor(runner),
+            Options(ready: TimeSpan.FromMilliseconds(250)), ResolverFor(StreamUrl));
+
+        var result = await manager.StartAsync("1", CancellationToken.None);
+
+        Assert.NotNull(result);
+        Assert.Equal("snapshot", result!.Kind);
+        Assert.Equal("hls-failed-snapshot", result.Reason);
+        Assert.Null(result.ManifestUrl);
+        Assert.Equal($"/api/preview/{result.SessionId}/thumb.jpg", result.ThumbnailUrl);
+        Assert.Equal(2, runner.Starts.Count);
+        Assert.True(File.Exists(Path.Combine(_root, result.SessionId, "thumb.jpg")));
+    }
+
+    [Fact]
+    public async Task Start_never_logs_the_stream_url()
+    {
+        var logs = new List<string>();
+        var gate = new object();
+        var runner = RunnerFor(H264AacJson);
+        await using var manager = CreateManager(
+            runner, ProbeFor(runner), Options(), ResolverFor(StreamUrl),
+            log: message => { lock (gate) logs.Add(message); });
+
+        var result = await manager.StartAsync("1", CancellationToken.None);
+        Assert.NotNull(result);
+
+        string joined;
+        lock (gate) joined = string.Join('\n', logs);
+        Assert.Contains("🎬 preview", joined);
+        Assert.Contains("kind=hls", joined);
+        Assert.DoesNotContain("host.example.com", joined);
+        Assert.DoesNotContain("/live/u/p/1.ts", joined);
+    }
+
+    [Fact]
     public async Task Touch_renews_idle_timeout()
     {
         var runner = RunnerFor(H264AacJson);
-        var options = Options(idle: TimeSpan.FromMilliseconds(300));
+        // Idle curto o suficiente para o teste correr depressa, mas com margem ampla
+        // face ao intervalo entre Touch (50 ms): um Touch a cada 50 ms renova sempre o
+        // idle de 1 s, mesmo que o scheduling atrase um delay. Não há asserções de
+        // precisão de milissegundos.
+        var options = Options(idle: TimeSpan.FromSeconds(1));
         await using var manager = CreateManager(runner, ProbeFor(runner), options, ResolverFor(StreamUrl));
 
         var result = await manager.StartAsync("1", CancellationToken.None);
         Assert.NotNull(result);
-        Assert.True(manager.HasSession(result!.SessionId));
+        var id = result!.SessionId;
+        Assert.True(manager.HasSession(id));
 
-        await Task.Delay(200);
-        manager.Touch(result.SessionId);
-        await Task.Delay(200);
+        // Renovação: manter a sessão "tocada" durante ~2,5 s (2,5× o idle). Sem Touch,
+        // o sweeper tê-la-ia expirado ao fim de ~1 s; uma sessão tocada continua viva.
+        var touchDeadline = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(2.5);
+        while (DateTimeOffset.UtcNow < touchDeadline)
+        {
+            manager.Touch(id);
+            await Task.Delay(50);
+        }
+        Assert.True(manager.HasSession(id));
 
-        Assert.True(manager.HasSession(result.SessionId));
+        // Sem mais actividade, a sessão acaba por expirar: polling paciente em vez de
+        // depender do instante exacto em que o sweeper corre.
+        Assert.True(await WaitUntilAsync(() => !manager.HasSession(id), TimeSpan.FromSeconds(8)));
+        Assert.False(manager.HasSession(id));
+        Assert.Equal(0, manager.ActiveSessionCount);
+    }
 
-        await Task.Delay(700);
-        Assert.False(manager.HasSession(result.SessionId));
+    private static async Task<bool> WaitUntilAsync(Func<bool> condition, TimeSpan timeout)
+    {
+        var deadline = DateTimeOffset.UtcNow + timeout;
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            if (condition())
+            {
+                return true;
+            }
+            await Task.Delay(25);
+        }
+        return condition();
     }
 
     [Fact]

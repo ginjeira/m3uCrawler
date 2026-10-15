@@ -77,6 +77,21 @@ internal sealed class FakeProcessRunner : IProcessRunner
     /// <summary>Handler de <c>RunAsync</c> (ffprobe). Default: exit 0 com JSON vazio.</summary>
     public Func<IReadOnlyList<string>, ProcessResult>? RunHandler { get; set; }
 
+    /// <summary>
+    /// Quando <c>true</c> (default), <see cref="Start"/> materializa imediatamente o artefacto
+    /// esperado no dir da sessão (<c>index.m3u8</c> para HLS, <c>thumb.jpg</c> para snapshot),
+    /// simulando um ffmpeg que produz o ficheiro. Desligar para simular um processo que nunca
+    /// gera o artefacto.
+    /// </summary>
+    public bool AutoCreateArtifacts { get; set; } = true;
+
+    /// <summary>
+    /// Substitui a materialização default. Invocado (fire-and-forget) em <see cref="Start"/>
+    /// com os args e o working dir da sessão — permite simular atraso na criação do artefacto
+    /// ou criá-lo condicionalmente (ex.: só snapshot).
+    /// </summary>
+    public Func<IReadOnlyList<string>, string, Task>? ArtifactWriter { get; set; }
+
     public IProcessHandle Start(string exe, IReadOnlyList<string> args, string workingDir)
     {
         var handle = new FakeProcessHandle();
@@ -85,7 +100,46 @@ internal sealed class FakeProcessRunner : IProcessRunner
             Starts.Add((exe, args, workingDir));
             Handles.Add(handle);
         }
+
+        var writer = ArtifactWriter;
+        if (writer is not null)
+        {
+            _ = writer(args, workingDir);
+        }
+        else if (AutoCreateArtifacts)
+        {
+            WriteDefaultArtifact(args, workingDir);
+        }
+
         return handle;
+    }
+
+    /// <summary>
+    /// Escreve, no dir da sessão, o primeiro artefacto referenciado nos args
+    /// (<c>index.m3u8</c> tem prioridade sobre <c>thumb.jpg</c>).
+    /// </summary>
+    private static void WriteDefaultArtifact(IReadOnlyList<string> args, string workingDir)
+    {
+        var target = args.FirstOrDefault(a => a.EndsWith("index.m3u8", StringComparison.Ordinal))
+                     ?? args.FirstOrDefault(a => a.EndsWith("thumb.jpg", StringComparison.Ordinal));
+        if (target is not null)
+        {
+            WriteArtifactFile(target, workingDir);
+        }
+    }
+
+    /// <summary>Cria <paramref name="path"/> (relativo a <paramref name="workingDir"/> se preciso) com conteúdo não-vazio.</summary>
+    public static void WriteArtifactFile(string path, string workingDir)
+    {
+        var full = Path.IsPathRooted(path) ? path : Path.Combine(workingDir, path);
+        var dir = Path.GetDirectoryName(full);
+        if (!string.IsNullOrEmpty(dir))
+        {
+            Directory.CreateDirectory(dir);
+        }
+        File.WriteAllText(full, full.EndsWith(".m3u8", StringComparison.Ordinal)
+            ? "#EXTM3U\n#EXT-X-VERSION:3\n"
+            : "jpeg-bytes");
     }
 
     public Task<ProcessResult> RunAsync(string exe, IReadOnlyList<string> args, TimeSpan timeout, CancellationToken ct)

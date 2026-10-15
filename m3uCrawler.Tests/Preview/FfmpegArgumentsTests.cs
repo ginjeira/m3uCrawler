@@ -21,6 +21,9 @@ public class FfmpegArgumentsTests
             "-hide_banner",
             "-loglevel", "error",
             "-user_agent", UserAgent,
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5",
             "-i", Url,
             "-c", "copy",
             "-f", "hls",
@@ -34,6 +37,7 @@ public class FfmpegArgumentsTests
         Assert.Equal(expected, actual);
         Assert.Equal(Path.Combine(outDir, "index.m3u8"), actual[^1]);
         Assert.Contains("copy", actual);
+        AssertReconnectBeforeInput(actual);
     }
 
     [Fact]
@@ -48,6 +52,9 @@ public class FfmpegArgumentsTests
             "-hide_banner",
             "-loglevel", "error",
             "-user_agent", UserAgent,
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5",
             "-i", Url,
             "-c:v", "libx264",
             "-preset", "veryfast",
@@ -70,6 +77,7 @@ public class FfmpegArgumentsTests
         Assert.Equal("hls", list[list.IndexOf("-f") + 1]);
         Assert.DoesNotContain("copy", actual);
         Assert.Equal(Path.Combine(outDir, "index.m3u8"), actual[^1]);
+        AssertReconnectBeforeInput(actual);
     }
 
     [Fact]
@@ -80,13 +88,13 @@ public class FfmpegArgumentsTests
 
         var actual = FfmpegArguments.Thumbnail(Url, outPath, UserAgent, at).ToList();
 
-        Assert.Equal("-ss", actual[actual.IndexOf("-user_agent") + 2]);
         Assert.True(actual.IndexOf("-ss") < actual.IndexOf("-i"));
         Assert.Equal("1", actual[actual.IndexOf("-ss") + 1]);
         Assert.Equal("scale=480:-1", actual[actual.IndexOf("-vf") + 1]);
         Assert.Equal("1", actual[actual.IndexOf("-frames:v") + 1]);
         Assert.Equal("-y", actual[^2]);
         Assert.Equal(outPath, actual[^1]);
+        AssertReconnectBeforeInput(actual);
     }
 
     [Fact]
@@ -106,6 +114,9 @@ public class FfmpegArgumentsTests
         {
             "-v", "error",
             "-user_agent", UserAgent,
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5",
             "-print_format", "json",
             "-show_streams",
             "-show_format",
@@ -113,6 +124,30 @@ public class FfmpegArgumentsTests
         };
 
         Assert.Equal(expected, actual);
+        AssertReconnectBeforeInput(actual);
+    }
+
+    /// <summary>
+    /// As três opções de reconexão têm de aparecer (nesta ordem) antes do input URL/posicional.
+    /// </summary>
+    private static void AssertReconnectBeforeInput(IReadOnlyList<string> args)
+    {
+        var list = args.ToList();
+        var reconnect = list.IndexOf("-reconnect");
+        Assert.True(reconnect >= 0, "Faltam opções de reconexão HTTP.");
+        Assert.Equal("1", list[reconnect + 1]);
+        Assert.Equal("-reconnect_streamed", list[reconnect + 2]);
+        Assert.Equal("1", list[reconnect + 3]);
+        Assert.Equal("-reconnect_delay_max", list[reconnect + 4]);
+        Assert.Equal("5", list[reconnect + 5]);
+
+        var input = list.IndexOf("-i");
+        if (input < 0)
+        {
+            input = list.Count - 1; // ffprobe: URL posicional no fim.
+        }
+        Assert.True(reconnect < input, "As opções de reconexão devem preceder o input.");
+        Assert.True(reconnect + 5 < input, "As opções de reconexão devem preceder o input.");
     }
 
     [Fact]

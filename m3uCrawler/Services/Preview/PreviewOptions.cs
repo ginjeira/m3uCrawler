@@ -48,4 +48,19 @@ public sealed class PreviewOptions
     /// significativamente mais do que o remux.
     /// </summary>
     public bool TranscodeNonPlayable { get; init; } = false;
+
+    /// <summary>
+    /// Tempo máximo de espera pelo artefacto de arranque da sessão: <c>index.m3u8</c>
+    /// (sessões HLS) ou <c>thumb.jpg</c> (snapshot). O ffmpeg cria o manifest apenas
+    /// 1–1,4 s depois de arrancar, pelo que devolver a URL antes disso produz 404 no
+    /// <c>hls.js</c>. Default: 5 s.
+    /// </summary>
+    public TimeSpan ReadyTimeout { get; init; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// Número de retentativas de <c>ffprobe</c> após a primeira tentativa falhar
+    /// (total de tentativas = <c>ProbeRetries + 1</c>). Absorve falhas transitórias
+    /// (ex.: 403 intermitente do upstream) sem degradar para snapshot. Default: 1.
+    /// </summary>
+    public int ProbeRetries { get; init; } = 1;
 }

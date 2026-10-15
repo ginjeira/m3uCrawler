@@ -92,6 +92,40 @@ public class StreamProbeServiceTests
     }
 
     [Fact]
+    public async Task Probe_retries_on_failure_up_to_ProbeRetries()
+    {
+        var runner = new FakeProcessRunner
+        {
+            RunHandler = _ => new ProcessResult(1, string.Empty, "ffprobe: 403", false),
+        };
+        var service = new StreamProbeService(runner, new PreviewOptions { ProbeRetries = 1 });
+
+        var probe = await service.ProbeAsync("http://host/live/u/p/retry.ts", CancellationToken.None);
+
+        Assert.Null(probe);
+        Assert.Equal(2, runner.RunCallCount);
+    }
+
+    [Fact]
+    public async Task Probe_succeeds_after_a_transient_failure()
+    {
+        var attempts = 0;
+        var runner = new FakeProcessRunner
+        {
+            RunHandler = _ => ++attempts == 1
+                ? new ProcessResult(1, string.Empty, "ffprobe: 403", false)
+                : new ProcessResult(0, H264AacJson, string.Empty, false),
+        };
+        var service = new StreamProbeService(runner, new PreviewOptions { ProbeRetries = 1 });
+
+        var probe = await service.ProbeAsync("http://host/live/u/p/transient.ts", CancellationToken.None);
+
+        Assert.NotNull(probe);
+        Assert.True(probe!.PlayableByBrowser);
+        Assert.Equal(2, runner.RunCallCount);
+    }
+
+    [Fact]
     public void Parse_invalid_json_returns_null()
     {
         Assert.Null(StreamProbeService.Parse("not-json"));

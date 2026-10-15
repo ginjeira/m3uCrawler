@@ -18,6 +18,7 @@ public sealed class StreamProbeService
     private readonly string _userAgent;
     private readonly TimeSpan _timeout;
     private readonly TimeSpan _cacheTtl;
+    private readonly int _probeRetries;
     private readonly ConcurrentDictionary<string, CacheEntry> _cache = new(StringComparer.Ordinal);
 
     public StreamProbeService(IProcessRunner runner, PreviewOptions options)
@@ -28,12 +29,14 @@ public sealed class StreamProbeService
         _userAgent = options.UserAgent;
         _timeout = options.ProbeTimeout;
         _cacheTtl = options.ProbeCacheTtl;
+        _probeRetries = Math.Max(0, options.ProbeRetries);
     }
 
     /// <summary>
     /// Sonda <paramref name="url"/> e devolve o <see cref="StreamProbe"/>, ou <c>null</c>
-    /// se o ffprobe falhar / não devolver JSON válido. Nunca lança por falha de processo;
-    /// propaga apenas cancelamento.
+    /// se o ffprobe falhar / não devolver JSON válido em todas as tentativas. Tenta até
+    /// <c>ProbeRetries + 1</c> vezes para absorver falhas transitórias (ex.: 403
+    /// intermitente). Nunca lança por falha de processo; propaga apenas cancelamento.
     /// </summary>
     public async Task<StreamProbe?> ProbeAsync(string url, CancellationToken ct)
     {
@@ -46,22 +49,30 @@ public sealed class StreamProbeService
         }
 
         StreamProbe? probe = null;
-        try
+        var attempts = _probeRetries + 1;
+        for (var attempt = 0; attempt < attempts; attempt++)
         {
-            var args = FfmpegArguments.Probe(url, _userAgent);
-            var result = await _runner.RunAsync(_ffprobePath, args, _timeout, ct).ConfigureAwait(false);
-            if (!result.TimedOut && result.ExitCode == 0 && !string.IsNullOrWhiteSpace(result.StdOut))
+            try
             {
-                probe = Parse(result.StdOut);
+                var args = FfmpegArguments.Probe(url, _userAgent);
+                var result = await _runner.RunAsync(_ffprobePath, args, _timeout, ct).ConfigureAwait(false);
+                if (!result.TimedOut && result.ExitCode == 0 && !string.IsNullOrWhiteSpace(result.StdOut))
+                {
+                    probe = Parse(result.StdOut);
+                    if (probe is not null)
+                    {
+                        break;
+                    }
+                }
             }
-        }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch
-        {
-            probe = null;
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch
+            {
+                probe = null;
+            }
         }
 
         Store(key, probe);

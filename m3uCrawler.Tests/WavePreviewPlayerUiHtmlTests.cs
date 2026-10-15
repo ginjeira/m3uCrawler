@@ -92,11 +92,49 @@ public class WavePreviewPlayerUiHtmlTests
         Assert.Contains("application/vnd.apple.mpegurl", body);
         Assert.Contains("res.status === 404", body);
         Assert.Contains("res.status === 429", body);
+        Assert.Contains("res.status === 502", body);
         Assert.Contains("res.status === 503", body);
 
         // A referência nunca é composta com a URL do stream: só o id.
         Assert.Contains("'review:' + id", html);
         Assert.Contains("'playlist:' + _playerWhich + ':' + id", html);
+    }
+
+    [Fact]
+    public void Preview_player_handles_hls_events_with_retries_and_timeout()
+    {
+        var html = BuildDashboardHtml();
+        var body = Slice(
+            html, "// === W-PREVIEW / Player", "// === W-PLAYER — grelha das playlists ===");
+
+        // Retries mais generosos no arranque do HLS (manifest/níveis/fragmentos).
+        Assert.Contains("new window.Hls({", body);
+        Assert.Contains("manifestLoadingMaxRetry: 8", body);
+        Assert.Contains("manifestLoadingRetryDelay: 400", body);
+        Assert.Contains("levelLoadingMaxRetry: 8", body);
+        Assert.Contains("fragLoadingMaxRetry: 8", body);
+
+        // Fluxo de sucesso/erro do hls.js: play no MANIFEST_PARSED e recuperação
+        // por tipo de erro fatal (rede re-tenta o manifest; media usa recover).
+        Assert.Contains("Hls.Events.MANIFEST_PARSED", body);
+        Assert.Contains("Hls.Events.ERROR", body);
+        Assert.Contains("data.fatal", body);
+        Assert.Contains("Hls.ErrorTypes.NETWORK_ERROR", body);
+        Assert.Contains("Hls.ErrorTypes.MEDIA_ERROR", body);
+        Assert.Contains("recoverMediaError()", body);
+        Assert.Contains("loadSource(manifestUrl)", body);
+
+        // Timeout global (fim do spinner infinito) e limpeza no stop.
+        Assert.Contains("_previewStartTimer", body);
+        Assert.Contains("12000", body);
+        Assert.Contains("não foi possível carregar o stream", body);
+        Assert.Contains("clearTimeout(_previewStartTimer)", body);
+
+        // Sem URL/credenciais no DOM ou no console.
+        Assert.DoesNotContain("://", body);
+        Assert.DoesNotContain("?token=", body);
+        Assert.DoesNotContain("streamUrl", body);
+        Assert.DoesNotContain("console.log", body);
     }
 
     [Fact]

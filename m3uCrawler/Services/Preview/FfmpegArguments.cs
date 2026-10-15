@@ -8,6 +8,13 @@ namespace m3uCrawler.Services.Preview;
 ///
 /// O URL do stream aparece sempre como valor de <c>-i</c>/posicional e NUNCA é registado
 /// por esta classe (a sanitização de logs é responsabilidade de quem consome o resultado).
+///
+/// <para>
+/// Todos os inputs de rede incluem, antes do <c>-i &lt;url&gt;</c>, as opções de reconexão
+/// HTTP <c>-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5</c>, que tornam o
+/// ffmpeg/ffprobe resilientes a cortes transitórios do upstream (ex.: 403 intermitente)
+/// sem reiniciar o processo.
+/// </para>
 /// </summary>
 public static class FfmpegArguments
 {
@@ -20,6 +27,9 @@ public static class FfmpegArguments
         "-hide_banner",
         "-loglevel", "error",
         "-user_agent", userAgent,
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "5",
         "-i", inputUrl,
         "-c", "copy",
         "-f", "hls",
@@ -41,6 +51,9 @@ public static class FfmpegArguments
         "-hide_banner",
         "-loglevel", "error",
         "-user_agent", userAgent,
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "5",
         "-i", inputUrl,
         "-c:v", "libx264",
         "-preset", "veryfast",
@@ -64,6 +77,9 @@ public static class FfmpegArguments
         "-hide_banner",
         "-loglevel", "error",
         "-user_agent", userAgent,
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "5",
         "-ss", FormatSeconds(at),
         "-i", inputUrl,
         "-frames:v", "1",
@@ -78,6 +94,9 @@ public static class FfmpegArguments
     {
         "-v", "error",
         "-user_agent", userAgent,
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "5",
         "-print_format", "json",
         "-show_streams",
         "-show_format",

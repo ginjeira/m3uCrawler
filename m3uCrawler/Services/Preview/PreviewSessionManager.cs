@@ -1,3 +1,6 @@
+using System.Globalization;
+using m3uCrawler.Services;
+
 namespace m3uCrawler.Services.Preview;
 
 /// <summary>
@@ -8,6 +11,13 @@ namespace m3uCrawler.Services.Preview;
 /// Toda a I/O de estado é protegida por um lock. É robusto a processos que terminam sozinhos
 /// (não assume que o handle ainda está vivo) e nunca lança por sessões desconhecidas.
 ///
+/// <para>
+/// <see cref="StartAsync"/> só devolve sucesso <b>depois</b> de o artefacto de arranque
+/// (<c>index.m3u8</c> para HLS, <c>thumb.jpg</c> para snapshot) existir com conteúdo —
+/// caso contrário o <c>hls.js</c> pede o manifest cedo demais e apanha 404. Em falha de HLS
+/// tenta degradar para snapshot; se também falhar devolve <c>Reason="preview-start-timeout"</c>.
+/// </para>
+///
 /// Nenhuma implementação regista o URL/credenciais: os args são passados ao
 /// <see cref="IProcessRunner"/> e o único texto de diagnóstico é <see cref="IProcessHandle.StderrTail"/>
 /// (já sanitizado).
@@ -17,12 +27,19 @@ public sealed class PreviewSessionManager : IAsyncDisposable
     /// <summary>Instante (do início do stream) usado para capturar o frame de snapshot.</summary>
     private static readonly TimeSpan SnapshotPosition = TimeSpan.FromSeconds(1);
 
+    /// <summary>Intervalo de amostragem na espera pelo artefacto de arranque.</summary>
+    private static readonly TimeSpan ReadyPollInterval = TimeSpan.FromMilliseconds(150);
+
+    /// <summary>Limite de caracteres do stderr registado numa falha (defesa contra ruído).</summary>
+    private const int StderrLogLimit = 512;
+
     private readonly PreviewOptions _options;
     private readonly IProcessRunner _runner;
     private readonly StreamProbeService _probe;
     private readonly Func<string, CancellationToken, Task<StreamReference?>> _resolver;
     private readonly string _root;
     private readonly SemaphoreSlim _slots;
+    private readonly Action<string> _log;
     private readonly Dictionary<string, SessionState> _sessions = new(StringComparer.Ordinal);
     private readonly object _gate = new();
     private readonly CancellationTokenSource _shutdown = new();
@@ -34,12 +51,14 @@ public sealed class PreviewSessionManager : IAsyncDisposable
         IProcessRunner runner,
         StreamProbeService probe,
         Func<string, CancellationToken, Task<StreamReference?>> resolver,
-        string previewRootDir)
+        string previewRootDir,
+        Action<string>? log = null)
     {
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _runner = runner ?? throw new ArgumentNullException(nameof(runner));
         _probe = probe ?? throw new ArgumentNullException(nameof(probe));
         _resolver = resolver ?? throw new ArgumentNullException(nameof(resolver));
+        _log = log ?? Console.WriteLine;
 
         if (string.IsNullOrWhiteSpace(previewRootDir))
         {
@@ -69,6 +88,12 @@ public sealed class PreviewSessionManager : IAsyncDisposable
     /// Resolve <paramref name="reference"/> e inicia uma sessão de preview. Devolve <c>null</c>
     /// se a referência não for conhecida (a camada HTTP decide 404). Devolve um resultado com
     /// <c>Reason="busy"</c> quando o limite de sessões concorrentes está esgotado.
+    ///
+    /// <para>
+    /// Só devolve sucesso depois de o artefacto de arranque existir com conteúdo. Se o HLS
+    /// falhar, tenta degradar para snapshot (<c>Reason="hls-failed-snapshot"</c>); se também
+    /// falhar, devolve <c>Reason="preview-start-timeout"</c> sem manifest/thumbnail.
+    /// </para>
     /// </summary>
     public async Task<PreviewSessionStartResult?> StartAsync(string reference, CancellationToken ct)
     {
@@ -86,51 +111,83 @@ public sealed class PreviewSessionManager : IAsyncDisposable
         }
 
         SessionState? session = null;
+        IProcessHandle? handle = null;
+        var id = string.Empty;
+        string? dir = null;
         try
         {
-            var id = Guid.NewGuid().ToString("N");
-            var dir = Path.Combine(_root, id);
+            id = Guid.NewGuid().ToString("N");
+            dir = Path.Combine(_root, id);
             Directory.CreateDirectory(dir);
 
             var probe = await _probe.ProbeAsync(resolved.Url, ct).ConfigureAwait(false);
-            var playable = probe?.PlayableByBrowser == true;
-
-            IProcessHandle handle;
-            string? manifestUrl = null;
-            string? thumbnailUrl;
-            string kind;
-
-            if (playable)
+            if (probe is null)
             {
-                handle = _runner.Start(
-                    _options.FfmpegPath,
-                    FfmpegArguments.HlsRemux(resolved.Url, dir, _options.UserAgent),
-                    dir);
-                manifestUrl = $"/api/preview/{id}/index.m3u8";
-                thumbnailUrl = $"/api/preview/{id}/thumb.jpg";
-                kind = "hls";
+                // Sem sondagem assumimos H.264/AAC (a maioria do catálogo): é preferível
+                // tentar HLS a degradar silenciosamente para snapshot. Sem URL no log.
+                _log($"🎬 preview {id} probe indisponível; assumindo playable");
             }
-            else if (_options.TranscodeNonPlayable)
+            var playable = probe?.PlayableByBrowser ?? true;
+
+            // Caminho primário: HLS (remux se playable, transcode opt-in se não playable);
+            // caso contrário snapshot directo.
+            var primaryKind = playable || _options.TranscodeNonPlayable ? "hls" : "snapshot";
+            var primaryArgs = primaryKind == "hls"
+                ? (playable
+                    ? FfmpegArguments.HlsRemux(resolved.Url, dir, _options.UserAgent)
+                    : FfmpegArguments.HlsTranscode(resolved.Url, dir, _options.UserAgent))
+                : FfmpegArguments.Thumbnail(resolved.Url, Path.Combine(dir, "thumb.jpg"), _options.UserAgent, SnapshotPosition);
+
+            handle = _runner.Start(_options.FfmpegPath, primaryArgs, dir);
+            _log($"🎬 preview {id} kind={primaryKind} playable={playable}");
+
+            var artifactPath = primaryKind == "hls"
+                ? Path.Combine(dir, "index.m3u8")
+                : Path.Combine(dir, "thumb.jpg");
+
+            var ready = await WaitForArtifactAsync(handle, artifactPath, _options.ReadyTimeout, ct).ConfigureAwait(false);
+
+            var kind = primaryKind;
+            string? reason = null;
+
+            if (!ready && primaryKind == "hls")
             {
-                // Opt-in: o stream não é reproduzível no browser, mas o operador
-                // aceita o custo de CPU do transcode H.264/AAC para HLS.
-                handle = _runner.Start(
-                    _options.FfmpegPath,
-                    FfmpegArguments.HlsTranscode(resolved.Url, dir, _options.UserAgent),
-                    dir);
-                manifestUrl = $"/api/preview/{id}/index.m3u8";
-                thumbnailUrl = $"/api/preview/{id}/thumb.jpg";
-                kind = "hls";
-            }
-            else
-            {
+                // O HLS não produziu o manifest: registar diagnóstico e tentar snapshot
+                // no mesmo directório antes de desistir.
+                LogFailure(id, handle);
+                await StopHandleAsync(handle).ConfigureAwait(false);
+                handle = null;
+
+                kind = "snapshot";
                 handle = _runner.Start(
                     _options.FfmpegPath,
                     FfmpegArguments.Thumbnail(resolved.Url, Path.Combine(dir, "thumb.jpg"), _options.UserAgent, SnapshotPosition),
                     dir);
-                thumbnailUrl = $"/api/preview/{id}/thumb.jpg";
-                kind = "snapshot";
+                _log($"🎬 preview {id} kind=snapshot playable={playable}");
+
+                var thumbPath = Path.Combine(dir, "thumb.jpg");
+                ready = await WaitForArtifactAsync(handle, thumbPath, _options.ReadyTimeout, ct).ConfigureAwait(false);
+                if (ready)
+                {
+                    reason = "hls-failed-snapshot";
+                }
             }
+
+            if (!ready)
+            {
+                if (kind == "snapshot")
+                {
+                    LogFailure(id, handle);
+                }
+                await CleanupProcessAndDirAsync(handle, dir).ConfigureAwait(false);
+                ReleaseSlot(null);
+                _log($"🎬 preview {id} terminada (preview-start-timeout)");
+                return new PreviewSessionStartResult(
+                    string.Empty, string.Empty, null, null, probe, playable, "preview-start-timeout");
+            }
+
+            var manifestUrl = kind == "hls" ? $"/api/preview/{id}/index.m3u8" : null;
+            var thumbnailUrl = $"/api/preview/{id}/thumb.jpg";
 
             var now = DateTimeOffset.UtcNow;
             session = new SessionState
@@ -154,28 +211,22 @@ public sealed class PreviewSessionManager : IAsyncDisposable
 
             if (disposed)
             {
-                await TeardownAsync(session).ConfigureAwait(false);
+                await TeardownAsync(session, "disposed").ConfigureAwait(false);
                 return null;
             }
 
-            return new PreviewSessionStartResult(
-                id,
-                kind,
-                manifestUrl,
-                thumbnailUrl,
-                probe,
-                playable,
-                null);
+            return new PreviewSessionStartResult(id, kind, manifestUrl, thumbnailUrl, probe, playable, reason);
         }
         catch
         {
             if (session is not null)
             {
                 lock (_gate) _sessions.Remove(session.Id);
-                await TeardownAsync(session).ConfigureAwait(false);
+                await TeardownAsync(session, "start-error").ConfigureAwait(false);
             }
             else
             {
+                await CleanupProcessAndDirAsync(handle, dir).ConfigureAwait(false);
                 ReleaseSlot(null);
             }
             throw;
@@ -275,7 +326,7 @@ public sealed class PreviewSessionManager : IAsyncDisposable
             return;
         }
 
-        await TeardownAsync(session).ConfigureAwait(false);
+        await TeardownAsync(session, "stop").ConfigureAwait(false);
     }
 
     /// <summary>Mata todas as sessões, remove directorizações e para o sweeper de fundo.</summary>
@@ -298,7 +349,7 @@ public sealed class PreviewSessionManager : IAsyncDisposable
 
         foreach (var session in sessions)
         {
-            await TeardownAsync(session).ConfigureAwait(false);
+            await TeardownAsync(session, "dispose").ConfigureAwait(false);
         }
 
         _shutdown.Dispose();
@@ -334,7 +385,7 @@ public sealed class PreviewSessionManager : IAsyncDisposable
     private async Task SweepExpiredAsync()
     {
         var now = DateTimeOffset.UtcNow;
-        List<SessionState>? expired = null;
+        List<(SessionState Session, string Reason)>? expired = null;
 
         lock (_gate)
         {
@@ -344,13 +395,14 @@ public sealed class PreviewSessionManager : IAsyncDisposable
                 var ttlExpired = now - session.CreatedUtc > _options.MaxDuration;
                 if (idleExpired || ttlExpired)
                 {
-                    (expired ??= new List<SessionState>()).Add(session);
+                    var reason = ttlExpired ? "max-duration" : "idle-timeout";
+                    (expired ??= new List<(SessionState, string)>()).Add((session, reason));
                 }
             }
 
             if (expired is not null)
             {
-                foreach (var session in expired)
+                foreach (var (session, _) in expired)
                 {
                     _sessions.Remove(session.Id);
                 }
@@ -362,38 +414,98 @@ public sealed class PreviewSessionManager : IAsyncDisposable
             return;
         }
 
-        foreach (var session in expired)
+        foreach (var (session, reason) in expired)
         {
-            await TeardownAsync(session).ConfigureAwait(false);
+            await TeardownAsync(session, reason).ConfigureAwait(false);
         }
     }
 
-    private async Task TeardownAsync(SessionState session)
+    /// <summary>
+    /// Espera (com poll) até o artefacto de arranque existir com conteúdo ou o processo
+    /// terminar. Verifica o artefacto antes de <see cref="IProcessHandle.HasExited"/> para
+    /// não falhar um processo one-shot (snapshot) que já escreveu o ficheiro e saiu.
+    /// </summary>
+    private async Task<bool> WaitForArtifactAsync(IProcessHandle handle, string artifactPath, TimeSpan timeout, CancellationToken ct)
+    {
+        var deadline = DateTimeOffset.UtcNow + (timeout > TimeSpan.Zero ? timeout : TimeSpan.Zero);
+        while (true)
+        {
+            if (IsArtifactReady(artifactPath))
+            {
+                return true;
+            }
+            if (handle.HasExited)
+            {
+                return false;
+            }
+
+            var remaining = deadline - DateTimeOffset.UtcNow;
+            if (remaining <= TimeSpan.Zero)
+            {
+                return false;
+            }
+
+            var delay = remaining < ReadyPollInterval ? remaining : ReadyPollInterval;
+            await Task.Delay(delay, ct).ConfigureAwait(false);
+        }
+    }
+
+    private static bool IsArtifactReady(string path)
     {
         try
         {
-            var process = session.Process;
-            if (process is not null)
-            {
-                process.Kill();
-                try { await process.WaitForExitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false); }
-                catch { /* processo já morto */ }
-
-                try { process.Dispose(); } catch { /* nunca propagar falhas de teardown */ }
-            }
+            var info = new FileInfo(path);
+            return info.Exists && info.Length > 0;
         }
-        catch { /* nunca propagar falhas de teardown */ }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>Mata/termina o processo (se vivo), espera e liberta o handle. Nunca lança.</summary>
+    private static async Task StopHandleAsync(IProcessHandle? handle)
+    {
+        if (handle is null)
+        {
+            return;
+        }
+
+        try { handle.Kill(); } catch { /* processo já morto */ }
+        try { await handle.WaitForExitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false); } catch { /* já morto */ }
+        try { handle.Dispose(); } catch { /* nunca propagar falhas de teardown */ }
+    }
+
+    private static async Task CleanupProcessAndDirAsync(IProcessHandle? handle, string? dir)
+    {
+        await StopHandleAsync(handle).ConfigureAwait(false);
 
         try
         {
-            if (Directory.Exists(session.Dir))
+            if (!string.IsNullOrEmpty(dir) && Directory.Exists(dir))
             {
-                Directory.Delete(session.Dir, recursive: true);
+                Directory.Delete(dir, recursive: true);
             }
         }
         catch { /* directório em uso — melhor esforço */ }
+    }
 
+    private void LogFailure(string sessionId, IProcessHandle handle)
+    {
+        var exit = handle.ExitCode?.ToString(CultureInfo.InvariantCulture) ?? "?";
+        var tail = CredentialSanitizer.SanitizeSensitiveText(handle.StderrTail).Trim();
+        if (tail.Length > StderrLogLimit)
+        {
+            tail = tail[..StderrLogLimit];
+        }
+        _log($"⚠️ preview {sessionId} falhou ({exit}) {tail}");
+    }
+
+    private async Task TeardownAsync(SessionState session, string reason)
+    {
+        await CleanupProcessAndDirAsync(session.Process, session.Dir).ConfigureAwait(false);
         ReleaseSlot(session);
+        _log($"🎬 preview {session.Id} terminada ({reason})");
     }
 
     private void ReleaseSlot(SessionState? session)
