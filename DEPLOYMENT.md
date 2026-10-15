@@ -47,7 +47,7 @@
 | **Onde vive** | Clone git do repositório | Pasta no host, fora do repo e da imagem |
 | **Versionado** | Sim (git) | **Não** |
 | **Substituído em update** | Sim (`git pull`) | **Nunca é tocado** |
-| **Conteúdo** | `m3uCrawler/`, `docker-compose.yml`, `Dockerfile`, workflows, testes, docs, `m3uCrawler/runtime-data/` (placeholder) | `session.dat`, `wtelegram.config`, `countries/pt.json`, `playlists/`, `output/`, `telegram_run_report.json`, `telegram_maintain_report.json`, `import_history.json`, `channel-indicators.json` (em alguns setups) |
+| **Conteúdo** | `m3uCrawler/`, `docker-compose.yml`, `Dockerfile`, workflows, testes, docs, `m3uCrawler/runtime-data/` (placeholder) | `session.dat`, `wtelegram.config`, `countries/pt.json`, `channel-catalog.db`, `secret.key` (KEK do token cifrado), `playlists/`, `output/`, `telegram_run_report.json`, `telegram_maintain_report.json`, `import_history.json`, `channel-indicators.json` (em alguns setups) |
 | **Sobrevive a `docker compose down`** | Sim | **Sim** (está no host, não no container) |
 
 **Regra de ouro**: `/opt/m3ucrawler/runtime-data` é o único local que contém estado vivo da sessão Telegram e das playlists geradas. **Nenhuma operação de deployment deve apagar, mover ou sobrescrever este directório.**
@@ -92,9 +92,18 @@ Notas:
 - **`restart: unless-stopped`** mantém o ciclo de manutenção a correr após reboot do host.
 - **`command`** é a forma long-form do mesmo comando que era passado ao `docker run` manual, **incluindo** `--history-hours 360`.
 - **`volumes`** usa caminhos absolutos no host (não `./m3uCrawler/runtime-data`). Isto torna o `docker-compose.yml` independente do CWD.
-- **`--web-token ${M3UCRAWLER_WEB_TOKEN}`** vem do ambiente. Define o segredo no ficheiro **`.env`** ao lado do `docker-compose.yml` no servidor (`M3UCRAWLER_WEB_TOKEN=<token>`); o `.env` é ignorado pelo git e **nunca** deve ser versionado. Se a variável não existir, o compose substitui-a por vazio e o dashboard arranca **sem token** (aberto — não é uma falha de arranque).
+- **`--web-token ${M3UCRAWLER_WEB_TOKEN}`** vem do ambiente. Define o segredo no ficheiro **`.env`** ao lado do `docker-compose.yml` no servidor (`M3UCRAWLER_WEB_TOKEN=<token>`); o `.env` é ignorado pelo git e **nunca** deve ser versionado. Se a variável não existir, o compose substitui-a por vazio e o dashboard arranca **sem token** (aberto — não é uma falha de arranque). **`M3UCRAWLER_WEB_TOKEN` é um fallback opcional:** o token de máquina das playlists é gerido na vista **Setup** do dashboard e guardado **cifrado na BD** (`app_secrets`); quando existe um token definido no Setup, este sobrepõe-se ao `--web-token` de CLI (que deixa de autorizar). Sem token no Setup, aplica-se o `--web-token`; sem nenhum dos dois, em produção as playlists passam a exigir **sessão humana** (não ficam públicas).
 
-Com o token definido, o acesso directo às playlists por URL passa a ser `http://<host>:5000/api/playlist?token=<T>`; o mesmo padrão (`?token=<T>` ou `Authorization: Bearer <T>`) aplica-se a `http://<host>:5000/api/playlist_acquired`, bem como ao resto das APIs.
+Com o token definido, o acesso directo às playlists por URL passa a ser `http://<host>:5000/api/playlist?token=<T>`; o mesmo padrão (`?token=<T>` ou `Authorization: Bearer <T>`) aplica-se a `http://<host>:5000/api/playlist_temp` e a `http://<host>:5000/api/playlist_acquired` (estes três endpoints, e só estes, são autorizáveis por token).
+
+### Chave de encriptação do token (`M3UCRAWLER_ENCRYPTION_KEY`)
+
+O token de playlists guardado na BD está cifrado com **AES-256-GCM**. A chave que o cifra (KEK) é resolvida pela aplicação, por ordem:
+
+1. Variável de ambiente **`M3UCRAWLER_ENCRYPTION_KEY`** — **opcional**, contendo o valor em **base64 de 32 bytes** (ex.: gerada com `openssl rand -base64 32`). É a via recomendada quando os segredos são geridos por ambiente; tem de estar presente no **ambiente do processo do container** (declarar em `environment:`/`-e` no `docker-compose.yml`, com o valor vindo do `.env` ou secret store do servidor — **nunca** literal no ficheiro versionado; o `.env` só por si é usado para substituição, não injecta variáveis no container). Se estiver definida mas for inválida (não base64 ou tamanho ≠ 32 bytes), a aplicação **falha explicitamente** ao construir o serviço de token — **sem fallback silencioso**.
+2. Se a variável não existir, a chave é lida de **`runtime-data/secret.key`** (32 bytes, `chmod 600` em Unix), **auto-gerado na primeira utilização**.
+
+**Preservar a chave (backup).** A KEK tem de ser **estável**. Se for perdida (ficheiro `secret.key` eliminado/substituído, `runtime-data` recriado, ou env alterada), o token cifrado na BD torna-se **indecifrável** e o token "desaparece" — o card da vista Setup volta a mostrar `hasToken=false` e é necessário **definir um token novo**. Incluir a KEK (`secret.key`, ou o valor da env) no **backup**, em local seguro e separado da `channel-catalog.db`; restaurar ambos em conjunto mantém o token legível.
 
 ---
 
@@ -467,6 +476,7 @@ Se a imagem for mais antiga que o commit esperado, **parar** e:
 - **Nunca** `docker volume prune` (não usamos volumes, mas é hábito perigoso).
 - **Nunca** `docker system prune -a` sem verificar primeiro que o `m3ucrawler:rollback-pre-compose` e `m3ucrawler:previous` não serão apagados.
 - **Nunca** mover `wtelegram.config` ou `session.dat` para fora de `/opt/m3ucrawler/runtime-data/` enquanto o container está a correr.
+- **Preservar a KEK do token** (`runtime-data/secret.key`, ou o valor de `M3UCRAWLER_ENCRYPTION_KEY`): perdê-la torna o token cifrado indecifrável (o token "desaparece"; define-se de novo no Setup). Incluir a KEK no backup, separada da `channel-catalog.db`.
 - **Backups** (ver `OPERATIONS.md` § Backups): fazer **antes** de qualquer update se houver risco.
 - **Credenciais**: `wtelegram.config` e `session.dat` nunca devem aparecer em logs, commits, diffs, documentação, tickets, screenshots ou mensagens. Se aparecerem acidentalmente em logs, ver `OPERATIONS.md` § Rotação de credenciais.
 

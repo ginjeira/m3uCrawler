@@ -119,6 +119,24 @@ public class WebDashboardSetupHtmlTests
         Assert.Contains("window.loadPlaylistTokenSetup", html);
     }
 
+    /// <summary>
+    /// Wave PlaylistToken-BD — a vista "Playlist atual" expõe a área de
+    /// links prontos a copiar (botões "Copiar URL"), o handler JS
+    /// <c>loadPlaylistLinks()</c> e o respectivo export <c>window.*</c>.
+    /// </summary>
+    [Fact]
+    public void Dashboard_html_playlist_view_includes_copy_links_area()
+    {
+        var html = InvokeBuildDashboardHtml();
+
+        Assert.Contains("id='playlistLinks'", html);
+        Assert.Contains("Copiar URL", html);
+        Assert.Contains("loadPlaylistLinks", html);
+        Assert.Contains("window.loadPlaylistLinks", html);
+        Assert.Contains("/api/playlist-token/links", html);
+        Assert.Contains("Bearer <token>", html);
+    }
+
     private static string InvokeBuildDashboardHtml()
     {
         var method = typeof(WebDashboardService).GetMethod(

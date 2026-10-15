@@ -11,6 +11,7 @@ using m3uCrawler.Services.Matching;
 using m3uCrawler.Services.SourceOrdering;
 using m3uCrawler.Services.SourceSelection;
 using m3uCrawler.Services.Sync;
+using m3uCrawler.Services.Security;
 using m3uCrawler.Services.Telegram;
 using m3uCrawler.Services.Validation;
 using m3uCrawler.Models;
@@ -157,6 +158,29 @@ namespace m3uCrawler
                     // SQLite. Best-effort; nunca bloqueia a mutação.
                     WebDashboardService.SetAuditService(
                         new AuditService(webCatalogResolver.GetFactory()));
+
+                    // Wave PlaylistToken-BD — Token de máquina das playlists
+                    // guardado cifrado na BD (app_secrets), substituindo o
+                    // ficheiro legacy. A KEK é resolvida pelo SecretProtector
+                    // (env M3UCRAWLER_ENCRYPTION_KEY ou runtime-data/secret.key).
+                    // Nunca imprime o valor da chave nem do token.
+                    try
+                    {
+                        var secretProtector = new SecretProtector(appSettingsRuntimeDataDir);
+                        var appSecretStore = new AppSecretStore(
+                            new RuntimeChannelCatalogDbContextFactory(ResolveCatalogDbPath(args)),
+                            secretProtector);
+                        WebDashboardService.SetPlaylistTokenService(
+                            new PlaylistAccessTokenService(appSecretStore));
+                        Console.WriteLine(
+                            $"🔐 Token de playlists em BD cifrada (KEK: {secretProtector.KeySource}).");
+                    }
+                    catch (Exception tokenEx)
+                    {
+                        // Sem serviço de token o gate recai no --web-token de
+                        // CLI; nunca bloqueia o arranque do dashboard.
+                        Console.WriteLine($"⚠️ Token de playlists indisponível: {tokenEx.Message}");
+                    }
 
                     // Wave 4 (PHASE 9C) — Prontidão operacional. O gate do
                     // scheduler exige, além do lifecycle READY, que os

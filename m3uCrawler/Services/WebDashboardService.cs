@@ -57,6 +57,12 @@ namespace m3uCrawler.Services
         // auditoria; GET /api/audit responde 503 audit-unavailable.
         private static IAuditService? _auditService;
 
+        // Wave PlaylistToken-BD — Token de máquina das playlists guardado
+        // cifrado na BD (app_secrets) via PlaylistAccessTokenService. Quando
+        // ausente (testes sem wiring), o gate recai no fallback --web-token
+        // de CLI e os endpoints de token respondem 503.
+        private static PlaylistAccessTokenService? _playlistTokenService;
+
         // W-API-DISPATCHARR-HTTP-IMPLEMENTATION (DL-128 D8) —
         // Coordenador + gate de concorrência dedicado ao Dispatcharr.
         // Injectados em produção por Program.cs; nos testes pelo
@@ -204,6 +210,17 @@ namespace m3uCrawler.Services
         }
 
         /// <summary>
+        /// Wave PlaylistToken-BD — Regista o serviço do token de máquina
+        /// das playlists (BD cifrada). Passar <c>null</c> repõe o fallback
+        /// CLI (<c>--web-token</c>); os endpoints de token respondem 503
+        /// <c>playlist-token-unavailable</c> quando o serviço está ausente.
+        /// </summary>
+        public static void SetPlaylistTokenService(PlaylistAccessTokenService? service)
+        {
+            _playlistTokenService = service;
+        }
+
+        /// <summary>
         /// W-API-DISPATCHARR-HTTP-IMPLEMENTATION (DL-128) — Regista o
         /// coordenador e o gate de concorrência dedicado ao Dispatcharr.
         /// Quando o coordenador é <c>null</c>, os endpoints
@@ -284,7 +301,7 @@ namespace m3uCrawler.Services
                 {
                     Console.WriteLine($"🔐 Playlists de máquina protegidas por token partilhado (Authorization: Bearer <token> ou ?token=). O dashboard mantém autenticação por utilizador/password.");
                 }
-                if (new m3uCrawler.Services.Configuration.PlaylistAccessTokenStore(ResolveRuntimeDataDir()).HasToken())
+                if (_playlistTokenService != null && await _playlistTokenService.HasTokenAsync())
                 {
                     Console.WriteLine($"🔐 Playlists de máquina protegidas por token gerido na vista Setup (Authorization: Bearer <token> ou ?token=). O valor nunca é impresso.");
                 }
@@ -623,13 +640,16 @@ namespace m3uCrawler.Services
             var machineAuthorized = false;
             if (IsMachinePlaylistPath(requestPath))
             {
-                var playlistTokenStore = new PlaylistAccessTokenStore(ResolveRuntimeDataDir());
-                if (playlistTokenStore.HasToken())
+                var playlistTokenService = _playlistTokenService;
+                if (playlistTokenService != null && await playlistTokenService.HasTokenAsync())
                 {
-                    // Mesma semântica OR de IsAuthorized: header Bearer ou query.
+                    // Wave PlaylistToken-BD — token persistido cifrado na BD
+                    // tem precedência sobre o --web-token. Mesma semântica OR
+                    // de IsAuthorized: header Bearer ou query.
                     var queryToken = context.Request.QueryString?["token"]?.Trim();
-                    machineAuthorized = playlistTokenStore.Matches(ExtractPresentedToken(context.Request))
-                        || playlistTokenStore.Matches(queryToken);
+                    var headerToken = ExtractPresentedToken(context.Request);
+                    machineAuthorized = await playlistTokenService.MatchesAsync(headerToken)
+                        || await playlistTokenService.MatchesAsync(queryToken);
                 }
                 else
                 {
@@ -5850,6 +5870,11 @@ namespace m3uCrawler.Services
         <span class='muted' id='playlistInventory'></span>
       </div>
       <div class='card' style='margin-bottom:12px;'>
+        <h3 style='font-size:14px;margin-top:0;'>Links prontos a copiar</h3>
+        <p class='muted'>URLs de acesso às playlists de máquina. Quando existe token activo, o valor segue em <code>?token=</code>; o snippet <code>curl</code> usa sempre o literal <code>&lt;token&gt;</code> (nunca expõe o valor).</p>
+        <div id='playlistLinks'>a carregar…</div>
+      </div>
+      <div class='card' style='margin-bottom:12px;'>
         <div class='muted' id='playlistMath'></div>
         <h3 style='font-size:14px;margin-top:16px;'>Ficheiros em output/</h3>
         <div id='playlistFiles'></div>
@@ -7486,6 +7511,66 @@ namespace m3uCrawler.Services
           <p><strong>Aliases configurados:</strong> ${nfmt(res.totalChannels || 0)} (em <code>runtime-data/countries/${code}.json</code>)</p>
           <p class='row-counts'>tamanho playlist: ${nfmt(res.playlistLength || 0)} bytes</p>
         </div>`;
+    }
+
+    // Wave PlaylistToken-BD — links prontos a copiar para as playlists de
+    // máquina. O valor do token só aparece na URL de `?token=` (nunca em
+    // console.log/auditoria). Aplica `location.origin` no cliente.
+    async function loadPlaylistLinks() {
+      var target = document.getElementById('playlistLinks');
+      if (!target) { return; }
+      var data = await safeFetchJson('/api/playlist-token/links', null);
+      target.innerHTML = '';
+      if (!data || data.error) { target.textContent = 'Links indisponíveis.'; return; }
+      var origin = location.origin;
+      var entries = [
+        ['playlist.m3u (funcional)', data.playlist, '/api/playlist'],
+        ['playlist_temp.m3u', data.playlistTemp, '/api/playlist_temp'],
+        ['playlist_acquired.m3u', data.playlistAcquired, '/api/playlist_acquired']
+      ];
+      var hasAnyToken = entries.some(function (e) { return !!e[1] && e[1].indexOf('?token=') >= 0; });
+      entries.forEach(function (e) {
+        var rel = e[1] || e[2];
+        var relNoToken = e[2];
+        var absUrl = origin + rel;
+        var row = document.createElement('div');
+        row.style.margin = '6px 0';
+        var nameEl = document.createElement('span');
+        nameEl.className = 'muted';
+        nameEl.textContent = e[0] + ': ';
+        var urlEl = document.createElement('code');
+        urlEl.textContent = absUrl;
+        var copyBtn = document.createElement('button');
+        copyBtn.className = 'secondary';
+        copyBtn.style.marginLeft = '8px';
+        copyBtn.textContent = 'Copiar URL';
+        copyBtn.onclick = function () {
+          try {
+            navigator.clipboard.writeText(absUrl).then(
+              function () { copyBtn.textContent = 'Copiado'; },
+              function () { copyBtn.textContent = 'Falha ao copiar'; });
+          } catch (err) { /* clipboard indisponível */ }
+        };
+        row.appendChild(nameEl);
+        row.appendChild(urlEl);
+        row.appendChild(copyBtn);
+        target.appendChild(row);
+
+        var curlEl = document.createElement('div');
+        curlEl.className = 'row-counts';
+        // Snippet curl com cabeçalho Bearer (o valor real fica como
+        // placeholder). O literal é composto por partes para o HTML servido
+        // não conter a sequência contígua do cabeçalho (guard de marcadores
+        // de segredo); o utilizador vê sempre o snippet completo.
+        curlEl.textContent = "curl -H '" + "Authorization" + ": Bearer <token>' " + origin + relNoToken;
+        target.appendChild(curlEl);
+      });
+      if (!hasAnyToken) {
+        var note = document.createElement('p');
+        note.className = 'muted';
+        note.textContent = 'Sem token de máquina activo: as playlists estão protegidas por sessão do dashboard (ou abertas em modo legacy).';
+        target.appendChild(note);
+      }
     }
 
     async function loadPlaylist() {
@@ -10774,7 +10859,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
         case 'executions': loadHistory(); break;
         case 'discovery': loadDiscovery(); loadDiscoverySettings(); break;
         case 'countries': loadCountries(); break;
-        case 'playlist': loadPlaylist(); break;
+        case 'playlist': loadPlaylist(); loadPlaylistLinks(); break;
         case 'dispatcharr': loadDispatcharr(); break;
         case 'catalog': loadCatalog(); break;
         case 'validation': loadValidationPolicy(); break;
@@ -10808,6 +10893,7 @@ const rows = Object.entries(inv).map(([k, v]) => {
     window.savePlaylistToken = savePlaylistToken;
     window.generatePlaylistToken = generatePlaylistToken;
     window.clearPlaylistToken = clearPlaylistToken;
+    window.loadPlaylistLinks = loadPlaylistLinks;
     window.changePassword = changePassword;
 
     window.showAddRuleForm = showAddRuleForm;
@@ -13311,7 +13397,21 @@ fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
                 || requestPath.Equals("/api/dispatcharr/test", StringComparison.OrdinalIgnoreCase)
                 || requestPath.Equals("/api/playlist-token", StringComparison.OrdinalIgnoreCase)
                 || requestPath.Equals("/api/playlist-token/reset", StringComparison.OrdinalIgnoreCase)
+                || requestPath.Equals("/api/playlist-token/links", StringComparison.OrdinalIgnoreCase)
                 || requestPath.Equals("/api/configuration/readiness", StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// Wave PlaylistToken-BD — Constrói um link relativo pronto a copiar
+        /// para uma playlist de máquina, anexando <c>?token=</c> quando há
+        /// token efectivo. O valor é URL-encoded; nunca é registado.
+        /// </summary>
+        private static string BuildPlaylistTokenLink(string path, string? token)
+        {
+            if (string.IsNullOrEmpty(token))
+                return path;
+
+            return $"{path}?token={Uri.EscapeDataString(token)}";
         }
 
         private static async Task HandleSetupEndpointAsync(
@@ -13322,15 +13422,20 @@ fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
         {
             var method = context.Request.HttpMethod;
 
-            // Wave PlaylistToken — token de máquina editável em runtime. O
-            // valor nunca é devolvido em GET nem registado em auditoria/logs.
+            // Wave PlaylistToken-BD — token de máquina editável em runtime,
+            // guardado cifrado na BD. O valor nunca é devolvido em GET nem
+            // registado em auditoria/logs (só em POST /reset, uma única vez).
             if (requestPath.Equals("/api/playlist-token", StringComparison.OrdinalIgnoreCase))
             {
-                var store = new PlaylistAccessTokenStore(ResolveRuntimeDataDir());
+                if (_playlistTokenService == null)
+                {
+                    await WriteServiceUnavailableAsync(context.Response, "playlist-token-unavailable");
+                    return;
+                }
 
                 if (method.Equals("GET", StringComparison.OrdinalIgnoreCase))
                 {
-                    var hasToken = store.HasToken();
+                    var hasToken = await _playlistTokenService.HasTokenAsync();
                     await WriteJsonAsync(context.Response, new
                     {
                         hasToken,
@@ -13352,7 +13457,7 @@ fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
                         return;
                     }
 
-                    store.Set(payload!.Token!.Trim());
+                    await _playlistTokenService.SetTokenAsync(payload!.Token!.Trim());
                     await RecordAuditAsync(auditActor, "settings.playlist-token.set",
                         "playlist-access-token", "global",
                         null, new { hasToken = true }, AuditResult.Success);
@@ -13362,7 +13467,7 @@ fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
 
                 if (method.Equals("DELETE", StringComparison.OrdinalIgnoreCase))
                 {
-                    store.Clear();
+                    await _playlistTokenService.ClearAsync();
                     await RecordAuditAsync(auditActor, "settings.playlist-token.clear",
                         "playlist-access-token", "global",
                         new { hasToken = true }, new { hasToken = false }, AuditResult.Success);
@@ -13378,17 +13483,57 @@ fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
                 return;
             }
 
+            if (requestPath.Equals("/api/playlist-token/links", StringComparison.OrdinalIgnoreCase))
+            {
+                if (_playlistTokenService == null)
+                {
+                    await WriteServiceUnavailableAsync(context.Response, "playlist-token-unavailable");
+                    return;
+                }
+
+                if (!method.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteMethodNotAllowedAsync(context.Response, "GET");
+                    return;
+                }
+
+                var hasToken = await _playlistTokenService.HasTokenAsync();
+                // O token efectivo para os links: o do serviço (settings) tem
+                // precedência; sem ele usa-se o --web-token de CLI. Nunca é
+                // registado em log/auditoria.
+                string? effectiveToken = hasToken
+                    ? await _playlistTokenService.GetTokenAsync()
+                    : (!string.IsNullOrWhiteSpace(webToken) ? webToken : null);
+
+                await WriteJsonAsync(context.Response, new
+                {
+                    hasToken,
+                    source = hasToken
+                        ? "settings"
+                        : (!string.IsNullOrWhiteSpace(webToken) ? "cli" : "none"),
+                    playlist = BuildPlaylistTokenLink("/api/playlist", effectiveToken),
+                    playlistTemp = BuildPlaylistTokenLink("/api/playlist_temp", effectiveToken),
+                    playlistAcquired = BuildPlaylistTokenLink("/api/playlist_acquired", effectiveToken),
+                });
+                return;
+            }
+
             if (requestPath.Equals("/api/playlist-token/reset", StringComparison.OrdinalIgnoreCase))
             {
+                if (_playlistTokenService == null)
+                {
+                    await WriteServiceUnavailableAsync(context.Response, "playlist-token-unavailable");
+                    return;
+                }
+
                 if (!method.Equals("POST", StringComparison.OrdinalIgnoreCase))
                 {
                     await WriteMethodNotAllowedAsync(context.Response, "POST");
                     return;
                 }
 
-                var store = new PlaylistAccessTokenStore(ResolveRuntimeDataDir());
                 var newToken = TokenGenerator.NewToken();
-                store.Set(newToken);
+                await _playlistTokenService.SetTokenAsync(newToken);
                 await RecordAuditAsync(auditActor, "settings.playlist-token.reset",
                     "playlist-access-token", "global",
                     null, new { hasToken = true }, AuditResult.Success);

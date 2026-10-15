@@ -170,6 +170,24 @@ namespace m3uCrawler.Services.Catalog.Migrations
                     b.ToTable("affinity_members", (string)null);
                 });
 
+            modelBuilder.Entity("m3uCrawler.Services.Catalog.AppSecretEntity", b =>
+                {
+                    b.Property<string>("Key")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("UpdatedAtUtc")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Value")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Key");
+
+                    b.ToTable("app_secrets", (string)null);
+                });
+
             modelBuilder.Entity("m3uCrawler.Services.Catalog.AuditRecordEntity", b =>
                 {
                     b.Property<long>("Id")

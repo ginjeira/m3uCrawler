@@ -44,6 +44,7 @@ public sealed class ChannelCatalogDbContext : DbContext
     public DbSet<LiveRunEntity> LiveRuns => Set<LiveRunEntity>();
     public DbSet<LiveRunStepEntity> LiveRunSteps => Set<LiveRunStepEntity>();
     public DbSet<AuditRecordEntity> AuditRecords => Set<AuditRecordEntity>();
+    public DbSet<AppSecretEntity> AppSecrets => Set<AppSecretEntity>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -748,6 +749,17 @@ public sealed class ChannelCatalogDbContext : DbContext
             e.HasIndex(x => x.OccurredAtUtc);
             e.HasIndex(x => x.ObjectType);
             e.HasIndex(x => x.ObjectId);
+        });
+
+        // Segredos de aplicação cifrados (ex.: token de playlists). O
+        // Value guarda sempre o payload de SecretProtector.Protect.
+        modelBuilder.Entity<AppSecretEntity>(e =>
+        {
+            e.ToTable("app_secrets");
+            e.HasKey(x => x.Key);
+            e.Property(x => x.Key).IsRequired();
+            e.Property(x => x.Value).IsRequired();
+            e.Property(x => x.UpdatedAtUtc).IsRequired();
         });
     }
 }

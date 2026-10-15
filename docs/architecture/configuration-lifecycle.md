@@ -386,15 +386,20 @@ chaves novas no fim e escreve de forma atómica (temp + move). Em Unix aplica
 `UserRead|UserWrite` (600). `api_hash`, passwords e API keys nunca são
 devolvidos, registados nem incluídos em `Detail`.
 
-### Segredo do token de playlists (`playlist_access_token.json`)
+### Segredo do token de playlists (`app_secrets`, cifrado)
 
 O token de máquina das playlists gerido na vista **Setup** do dashboard é
-persistido em `runtime-data/playlist_access_token.json` guardando **apenas o
-hash SHA-256** (base64) e metadados — o valor em claro **nunca** é escrito nem
-registado. A escrita é atómica (temp + move) e, em Unix, o ficheiro recebe
-`chmod 600` (`UserRead|UserWrite`); ficheiro ausente ou corrompido é tratado
-como "sem token". Ver §"Modelo de segurança do dashboard" em
-`m3uCrawler/README.md`.
+persistido na tabela **`app_secrets`** da BD do catálogo (`channel-catalog.db`,
+migração EF `AddAppSecrets`), cifrado com **AES-256-GCM** — o valor em claro
+**nunca** é escrito na BD nem registado. Substitui o antigo ficheiro
+`runtime-data/playlist_access_token.json` (que guardava apenas o hash SHA-256),
+que deixou de existir/ser usado. A chave de encriptação (KEK) é resolvida pela
+aplicação por ordem: variável de ambiente **`M3UCRAWLER_ENCRYPTION_KEY`**
+(base64 de 32 bytes), senão o ficheiro **`runtime-data/secret.key`** (32 bytes,
+`chmod 600`, auto-gerado na primeira utilização). A KEK tem de ser **estável** —
+perdê-la torna o token cifrado indecifrável (o token "desaparece"; define-se de
+novo no Setup). Segredo ausente ou indecifrável é tratado como "sem token". Ver
+§"Modelo de segurança do dashboard" em `m3uCrawler/README.md`.
 
 ### Config de país — provisão explícita (Wave A)
 

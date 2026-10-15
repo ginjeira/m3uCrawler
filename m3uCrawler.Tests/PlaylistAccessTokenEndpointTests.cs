@@ -5,20 +5,23 @@ using System.Net.Http;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
+using Microsoft.EntityFrameworkCore;
 using m3uCrawler.Services;
 using m3uCrawler.Services.Auth;
 using m3uCrawler.Services.Catalog;
 using m3uCrawler.Services.Configuration;
+using m3uCrawler.Services.Security;
 using Xunit;
 
 namespace m3uCrawler.Tests;
 
 /// <summary>
-/// Wave PlaylistToken — token de máquina editável em runtime para as
+/// Wave PlaylistToken-BD — token de máquina editável em runtime para as
 /// playlists M3U (<c>/api/playlist</c>, <c>/api/playlist_temp</c>,
-/// <c>/api/playlist_acquired</c>), com precedência sobre o
-/// <c>--web-token</c>. Cobre o gate, as rotas de Setup
-/// (<c>/api/playlist-token</c> e <c>/reset</c>) e a validação.
+/// <c>/api/playlist_acquired</c>), agora guardado cifrado na BD
+/// (<c>app_secrets</c>) via <see cref="PlaylistAccessTokenService"/>, com
+/// precedência sobre o <c>--web-token</c>. Cobre o gate, as rotas de Setup
+/// (<c>/api/playlist-token</c>, <c>/reset</c> e <c>/links</c>) e a validação.
 /// </summary>
 [Collection("DashboardStaticState")]
 public class PlaylistAccessTokenEndpointTests : IAsyncLifetime
@@ -33,6 +36,8 @@ public class PlaylistAccessTokenEndpointTests : IAsyncLifetime
     private readonly string _storePath;
 
     private TestDbContextFactory _factory = null!;
+    private RuntimeChannelCatalogDbContextFactory _secretFactory = null!;
+    private PlaylistAccessTokenService _tokenService = null!;
     private CatalogResolver _resolver = null!;
     private PlaylistComposerService _composer = null!;
     private ImportHistoryService _history = null!;
@@ -60,6 +65,12 @@ public class PlaylistAccessTokenEndpointTests : IAsyncLifetime
         await TestCatalogSeed.ApplyDefaultsAsync(ctx);
         await ctx.DisposeAsync();
 
+        // Token de máquina cifrado na BD temporária — mesmo ficheiro SQLite.
+        _secretFactory = new RuntimeChannelCatalogDbContextFactory(_dbPath);
+        _tokenService = new PlaylistAccessTokenService(
+            new AppSecretStore(_secretFactory, new SecretProtector(_runtimeDataDir)));
+        WebDashboardService.SetPlaylistTokenService(_tokenService);
+
         _resolver = new CatalogResolver(_factory, _dbPath);
         _composer = new PlaylistComposerService(_factory);
         _history = new ImportHistoryService(_outputDir);
@@ -76,6 +87,7 @@ public class PlaylistAccessTokenEndpointTests : IAsyncLifetime
     public async Task DisposeAsync()
     {
         if (_harness != null) await _harness.DisposeAsync();
+        WebDashboardService.SetPlaylistTokenService(null);
         WebDashboardService.SetAuth(null, null);
         WebDashboardService.SetConfigurationLifecycle(null);
         TestTempDb.CleanupDirectory(_root);
@@ -139,6 +151,9 @@ public class PlaylistAccessTokenEndpointTests : IAsyncLifetime
         return request;
     }
 
+    private static HttpRequestMessage WithQueryToken(HttpMethod method, string path, string token)
+        => new(method, $"{path}?token={Uri.EscapeDataString(token)}");
+
     private async Task SeedPlaylistsAsync()
     {
         await File.WriteAllTextAsync(Path.Combine(_outputDir, "playlist.m3u"), "#EXTM3U\n");
@@ -167,6 +182,21 @@ public class PlaylistAccessTokenEndpointTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Get_without_settings_token_reports_cli_when_cli_token_configured()
+    {
+        var harness = StartHarness(webToken: CliToken);
+        await ReachReadyAsync(harness);
+        await LoginAsync(harness);
+
+        var response = await harness.Client.GetAsync("/api/playlist-token");
+        var body = await response.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(body);
+        Assert.False(doc.RootElement.GetProperty("hasToken").GetBoolean());
+        Assert.Equal("cli", doc.RootElement.GetProperty("source").GetString());
+        Assert.DoesNotContain(CliToken, body);
+    }
+
+    [Fact]
     public async Task Set_valid_token_overrides_cli_token_for_playlists()
     {
         const string newToken = "dashboard-machine-token-1";
@@ -186,8 +216,11 @@ public class PlaylistAccessTokenEndpointTests : IAsyncLifetime
             (await anon.SendAsync(WithBearer(HttpMethod.Get, "/api/playlist_temp", newToken))).StatusCode);
         Assert.Equal(HttpStatusCode.OK,
             (await anon.SendAsync(WithBearer(HttpMethod.Get, "/api/playlist_acquired", newToken))).StatusCode);
+        // Mesmo token via ?token=.
+        Assert.Equal(HttpStatusCode.OK,
+            (await anon.SendAsync(WithQueryToken(HttpMethod.Get, "/api/playlist", newToken))).StatusCode);
 
-        // O token CLI antigo deixa de autorizar (o store sobrepõe).
+        // O token CLI antigo deixa de autorizar (o serviço sobrepõe).
         Assert.Equal(HttpStatusCode.Unauthorized,
             (await anon.SendAsync(WithBearer(HttpMethod.Get, "/api/playlist", CliToken))).StatusCode);
     }
@@ -304,9 +337,68 @@ public class PlaylistAccessTokenEndpointTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task Previews_remain_unauthorizable_by_machine_token()
+    public async Task Links_include_token_paths_when_set_and_plain_paths_when_absent()
     {
         const string newToken = "dashboard-machine-token-6";
+        var harness = StartHarness(webToken: null);
+        await ReachReadyAsync(harness);
+        var csrf = await LoginAsync(harness);
+
+        // Sem token: caminhos sem ?token=.
+        var before = await harness.Client.GetAsync("/api/playlist-token/links");
+        Assert.Equal(HttpStatusCode.OK, before.StatusCode);
+        using (var doc = JsonDocument.Parse(await before.Content.ReadAsStringAsync()))
+        {
+            Assert.False(doc.RootElement.GetProperty("hasToken").GetBoolean());
+            Assert.Equal("none", doc.RootElement.GetProperty("source").GetString());
+            Assert.Equal("/api/playlist", doc.RootElement.GetProperty("playlist").GetString());
+            Assert.Equal("/api/playlist_temp", doc.RootElement.GetProperty("playlistTemp").GetString());
+            Assert.Equal("/api/playlist_acquired", doc.RootElement.GetProperty("playlistAcquired").GetString());
+        }
+
+        await harness.Client.SendAsync(
+            WithCsrf(HttpMethod.Post, "/api/playlist-token", csrf, SetBody(newToken)));
+
+        // Com token: caminhos com ?token=.
+        var after = await harness.Client.GetAsync("/api/playlist-token/links");
+        Assert.Equal(HttpStatusCode.OK, after.StatusCode);
+        var afterBody = await after.Content.ReadAsStringAsync();
+        using (var doc = JsonDocument.Parse(afterBody))
+        {
+            Assert.True(doc.RootElement.GetProperty("hasToken").GetBoolean());
+            Assert.Equal("settings", doc.RootElement.GetProperty("source").GetString());
+            Assert.Equal(
+                $"/api/playlist?token={Uri.EscapeDataString(newToken)}",
+                doc.RootElement.GetProperty("playlist").GetString());
+            Assert.Equal(
+                $"/api/playlist_temp?token={Uri.EscapeDataString(newToken)}",
+                doc.RootElement.GetProperty("playlistTemp").GetString());
+            Assert.Equal(
+                $"/api/playlist_acquired?token={Uri.EscapeDataString(newToken)}",
+                doc.RootElement.GetProperty("playlistAcquired").GetString());
+        }
+
+        // O valor não aparece no GET de estado.
+        var state = await harness.Client.GetAsync("/api/playlist-token");
+        Assert.DoesNotContain(newToken, await state.Content.ReadAsStringAsync());
+    }
+
+    [Fact]
+    public async Task Links_support_other_methods_with_405()
+    {
+        var harness = StartHarness(webToken: null);
+        await ReachReadyAsync(harness);
+        var csrf = await LoginAsync(harness);
+
+        var post = await harness.Client.SendAsync(
+            WithCsrf(HttpMethod.Post, "/api/playlist-token/links", csrf, "{}"));
+        Assert.Equal(HttpStatusCode.MethodNotAllowed, post.StatusCode);
+    }
+
+    [Fact]
+    public async Task Previews_remain_unauthorizable_by_machine_token()
+    {
+        const string newToken = "dashboard-machine-token-7";
         var harness = StartHarness(webToken: CliToken);
         await ReachReadyAsync(harness);
         await SeedPlaylistsAsync();
@@ -322,5 +414,22 @@ public class PlaylistAccessTokenEndpointTests : IAsyncLifetime
             (await anon.SendAsync(WithBearer(HttpMethod.Get, "/api/playlist_temp/preview", newToken))).StatusCode);
         Assert.Equal(HttpStatusCode.Unauthorized,
             (await anon.SendAsync(WithBearer(HttpMethod.Get, "/api/playlist_acquired/preview", newToken))).StatusCode);
+    }
+
+    [Fact]
+    public async Task Token_is_stored_encrypted_in_app_secrets()
+    {
+        const string newToken = "dashboard-machine-token-8-plain";
+        var harness = StartHarness(webToken: null);
+        await ReachReadyAsync(harness);
+        var csrf = await LoginAsync(harness);
+
+        await harness.Client.SendAsync(
+            WithCsrf(HttpMethod.Post, "/api/playlist-token", csrf, SetBody(newToken)));
+
+        await using var ctx = _secretFactory.CreateDbContext();
+        var row = await ctx.AppSecrets.SingleAsync(s => s.Key == PlaylistAccessTokenService.SecretKey);
+        Assert.NotEqual(newToken, row.Value);
+        Assert.DoesNotContain(newToken, row.Value);
     }
 }
