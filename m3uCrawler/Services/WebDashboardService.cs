@@ -284,6 +284,10 @@ namespace m3uCrawler.Services
                 {
                     Console.WriteLine($"🔐 Playlists de máquina protegidas por token partilhado (Authorization: Bearer <token> ou ?token=). O dashboard mantém autenticação por utilizador/password.");
                 }
+                if (new m3uCrawler.Services.Configuration.PlaylistAccessTokenStore(ResolveRuntimeDataDir()).HasToken())
+                {
+                    Console.WriteLine($"🔐 Playlists de máquina protegidas por token gerido na vista Setup (Authorization: Bearer <token> ou ?token=). O valor nunca é impresso.");
+                }
             }
             catch (Exception ex)
             {
@@ -611,9 +615,28 @@ namespace m3uCrawler.Services
             // e o pedido é a uma playlist, autoriza o pedido sem exigir sessão
             // humana, incluindo em READY + admin (UserAuth). É distinto da
             // autenticação humana e não cria utilizador nem sessão.
-            var tokenAuthorization = EvaluateTokenAuthorization(context.Request, webToken);
-            var machineAuthorized = tokenAuthorization == TokenAuthorization.Authorized
-                && IsMachinePlaylistPath(requestPath);
+            // Wave PlaylistToken — credencial de máquina com precedência:
+            // quando existe token persistido no store de runtime-data, este
+            // substitui o --web-token de CLI para as playlists de máquina. O
+            // ficheiro só é lido em paths de playlist de máquina (evita I/O em
+            // todos os pedidos). Sem token persistido, mantém-se o fallback CLI.
+            var machineAuthorized = false;
+            if (IsMachinePlaylistPath(requestPath))
+            {
+                var playlistTokenStore = new PlaylistAccessTokenStore(ResolveRuntimeDataDir());
+                if (playlistTokenStore.HasToken())
+                {
+                    // Mesma semântica OR de IsAuthorized: header Bearer ou query.
+                    var queryToken = context.Request.QueryString?["token"]?.Trim();
+                    machineAuthorized = playlistTokenStore.Matches(ExtractPresentedToken(context.Request))
+                        || playlistTokenStore.Matches(queryToken);
+                }
+                else
+                {
+                    machineAuthorized = EvaluateTokenAuthorization(context.Request, webToken)
+                        == TokenAuthorization.Authorized;
+                }
+            }
 
             // === PHASE 9C.2 — Authentication / bootstrap ===
             // Gate único, avaliado antes de qualquer rota não pública.
@@ -770,7 +793,7 @@ namespace m3uCrawler.Services
             // (sessão + CSRF para métodos mutantes). Método errado → 405.
             if (IsSetupPath(requestPath))
             {
-                await HandleSetupEndpointAsync(context, requestPath, auditActor);
+                await HandleSetupEndpointAsync(context, requestPath, auditActor, webToken);
                 return;
             }
 
@@ -6962,6 +6985,19 @@ namespace m3uCrawler.Services
         <div id='setupDispatcharrStatus' class='setup-status muted'>—</div>
       </div>
 
+      <div class='card' style='margin-top:16px;'>
+        <h3>Acesso às playlists (M3U)</h3>
+        <p class='muted'>Token de máquina usado <em>exclusivamente</em> em <code>/api/playlist</code>, <code>/api/playlist_temp</code> e <code>/api/playlist_acquired</code> (via cabeçalho <code>Authorization</code> com esquema <code>Bearer</code>, ou <code>?token=</code>). É distinto do login do dashboard e não dá acesso às restantes APIs.</p>
+        <div id='setupPlaylistTokenStatus' class='setup-status muted'>a carregar…</div>
+        <div class='toolbar' style='margin-top:12px;'>
+          <input id='setupPlaylistToken' type='password' autocomplete='off' placeholder='novo token (mín. 16 caracteres)' style='background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:6px;font:inherit;'>
+          <button onclick='savePlaylistToken()'>Guardar token</button>
+          <button class='secondary' onclick='generatePlaylistToken()'>Gerar novo token</button>
+          <button class='secondary' onclick='clearPlaylistToken()'>Remover token</button>
+        </div>
+        <div id='setupPlaylistTokenResult' class='muted'></div>
+      </div>
+
       <!-- CONTA (W10b) -->
       <div class='card' style='margin-top:16px;'>
         <h3>Alterar password</h3>
@@ -10622,8 +10658,78 @@ const rows = Object.entries(inv).map(([k, v]) => {
       await loadSetupReadiness();
     }
 
+    async function loadPlaylistTokenSetup() {
+      var el = document.getElementById('setupPlaylistTokenStatus');
+      if (!el) { return; }
+      var s = await safeFetchJson('/api/playlist-token', null);
+      if (!s || s.error) { el.textContent = 'estado indisponível'; return; }
+      var src = s.source === 'settings' ? 'definido no dashboard'
+        : (s.source === 'cli' ? 'de linha de comandos (--web-token)' : 'sem token');
+      el.textContent = (s.hasToken ? 'activo — ' : 'inactivo — ') + src;
+    }
+
+    async function savePlaylistToken() {
+      var el = document.getElementById('setupPlaylistTokenStatus');
+      var input = document.getElementById('setupPlaylistToken');
+      var token = input.value.trim();
+      if (!token) { el.textContent = 'Introduza um token (mín. 16 caracteres).'; return; }
+      var r = await setupFetch('/api/playlist-token', 'POST', { token: token });
+      var result = document.getElementById('setupPlaylistTokenResult');
+      if (r.status === 200) {
+        input.value = '';
+        result.textContent = 'Token guardado.';
+        await loadPlaylistTokenSetup();
+      } else {
+        el.textContent = (r.json && r.json.error) ? r.json.error : ('Erro ao guardar (HTTP ' + r.status + ').');
+      }
+    }
+
+    async function generatePlaylistToken() {
+      if (!window.confirm('Gerar um novo token de acesso às playlists? O token anterior deixa de funcionar.')) { return; }
+      var r = await setupFetch('/api/playlist-token/reset', 'POST', {});
+      var result = document.getElementById('setupPlaylistTokenResult');
+      if (r.status === 200 && r.json && r.json.token) {
+        result.innerHTML = '';
+        var warn = document.createElement('div');
+        warn.textContent = 'Novo token (mostrado uma única vez — copie-o agora):';
+        var line = document.createElement('div');
+        var codeEl = document.createElement('code');
+        codeEl.textContent = r.json.token;
+        var copyBtn = document.createElement('button');
+        copyBtn.className = 'secondary';
+        copyBtn.textContent = 'Copiar';
+        copyBtn.style.marginLeft = '8px';
+        copyBtn.onclick = function () {
+          try {
+            navigator.clipboard.writeText(r.json.token);
+            copyBtn.textContent = 'Copiado';
+          } catch (e) { /* clipboard indisponível */ }
+        };
+        line.appendChild(codeEl);
+        line.appendChild(copyBtn);
+        result.appendChild(warn);
+        result.appendChild(line);
+        await loadPlaylistTokenSetup();
+      } else {
+        result.textContent = (r.json && r.json.error) ? r.json.error : ('Erro ao gerar (HTTP ' + r.status + ').');
+      }
+    }
+
+    async function clearPlaylistToken() {
+      if (!window.confirm('Remover o token de acesso às playlists?')) { return; }
+      var r = await setupFetch('/api/playlist-token', 'DELETE', null);
+      var result = document.getElementById('setupPlaylistTokenResult');
+      if (r.status === 200) {
+        document.getElementById('setupPlaylistToken').value = '';
+        result.textContent = 'Token removido.';
+        await loadPlaylistTokenSetup();
+      } else {
+        result.textContent = (r.json && r.json.error) ? r.json.error : ('Erro ao remover (HTTP ' + r.status + ').');
+      }
+    }
+
     async function loadSetup() {
-      await Promise.all([loadSetupReadiness(), loadTelegramSetup(), loadDispatcharrSetup()]);
+      await Promise.all([loadSetupReadiness(), loadTelegramSetup(), loadDispatcharrSetup(), loadPlaylistTokenSetup()]);
     }
 
     // === W10b — Conta: alterar password ===
@@ -10698,6 +10804,10 @@ const rows = Object.entries(inv).map(([k, v]) => {
     window.submitTelegram2fa = submitTelegram2fa;
     window.saveDispatcharrConfig = saveDispatcharrConfig;
     window.testDispatcharrConnection = testDispatcharrConnection;
+    window.loadPlaylistTokenSetup = loadPlaylistTokenSetup;
+    window.savePlaylistToken = savePlaylistToken;
+    window.generatePlaylistToken = generatePlaylistToken;
+    window.clearPlaylistToken = clearPlaylistToken;
     window.changePassword = changePassword;
 
     window.showAddRuleForm = showAddRuleForm;
@@ -13070,6 +13180,34 @@ fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
             return false;
         }
 
+        /// <summary>
+        /// Wave PlaylistToken — Extrai o token apresentado pelo chamador,
+        /// espelhando a extracção de <see cref="IsAuthorized"/>: header
+        /// <c>Authorization: Bearer &lt;t&gt;</c> (prefixo case-insensitive,
+        /// valor <c>Trim</c>) ou, na sua ausência, a query <c>?token=&lt;t&gt;</c>
+        /// (<c>Trim</c>). Devolve <c>null</c> se nada for apresentado.
+        /// </summary>
+        private static string? ExtractPresentedToken(HttpListenerRequest request)
+        {
+            var authorizationHeader = request.Headers?["Authorization"];
+            if (!string.IsNullOrEmpty(authorizationHeader))
+            {
+                const string prefix = "Bearer ";
+                if (authorizationHeader.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    return authorizationHeader.Substring(prefix.Length).Trim();
+                }
+            }
+
+            var queryToken = request.QueryString?["token"];
+            if (!string.IsNullOrEmpty(queryToken))
+            {
+                return queryToken.Trim();
+            }
+
+            return null;
+        }
+
         private static bool FixedEquals(string a, string b)
         {
             if (a.Length != b.Length) return false;
@@ -13122,6 +13260,46 @@ fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
             public bool? AutoCreateGroups { get; set; }
         }
 
+        private sealed class PlaylistTokenPayload
+        {
+            public string? Token { get; set; }
+        }
+
+        /// <summary>
+        /// Wave PlaylistToken — valida o token definido pelo utilizador:
+        /// <c>Trim</c>, não vazio, 16–128 caracteres, sem whitespace nem
+        /// caracteres de controlo. Devolve <c>null</c> se válido, ou a
+        /// mensagem de erro (400) caso contrário. Não impõe charset restritivo.
+        /// </summary>
+        private static string? ValidatePlaylistToken(string? rawToken)
+        {
+            if (rawToken is null)
+            {
+                return "token obrigatório";
+            }
+
+            var token = rawToken.Trim();
+            if (token.Length == 0)
+            {
+                return "token não pode ser vazio";
+            }
+
+            if (token.Length < 16 || token.Length > 128)
+            {
+                return "token deve ter entre 16 e 128 caracteres";
+            }
+
+            foreach (var ch in token)
+            {
+                if (char.IsWhiteSpace(ch) || char.IsControl(ch))
+                {
+                    return "token não pode conter espaços ou caracteres de controlo";
+                }
+            }
+
+            return null;
+        }
+
         private static bool IsSetupPath(string requestPath)
         {
             return requestPath.Equals("/api/telegram/config", StringComparison.OrdinalIgnoreCase)
@@ -13131,15 +13309,98 @@ fetch('/api/session',{method:'POST',headers:{'Content-Type':'application/json'},
                 || requestPath.Equals("/api/telegram/auth/status", StringComparison.OrdinalIgnoreCase)
                 || requestPath.Equals("/api/dispatcharr/config", StringComparison.OrdinalIgnoreCase)
                 || requestPath.Equals("/api/dispatcharr/test", StringComparison.OrdinalIgnoreCase)
+                || requestPath.Equals("/api/playlist-token", StringComparison.OrdinalIgnoreCase)
+                || requestPath.Equals("/api/playlist-token/reset", StringComparison.OrdinalIgnoreCase)
                 || requestPath.Equals("/api/configuration/readiness", StringComparison.OrdinalIgnoreCase);
         }
 
         private static async Task HandleSetupEndpointAsync(
             HttpListenerContext context,
             string requestPath,
-            AuditActor auditActor)
+            AuditActor auditActor,
+            string? webToken = null)
         {
             var method = context.Request.HttpMethod;
+
+            // Wave PlaylistToken — token de máquina editável em runtime. O
+            // valor nunca é devolvido em GET nem registado em auditoria/logs.
+            if (requestPath.Equals("/api/playlist-token", StringComparison.OrdinalIgnoreCase))
+            {
+                var store = new PlaylistAccessTokenStore(ResolveRuntimeDataDir());
+
+                if (method.Equals("GET", StringComparison.OrdinalIgnoreCase))
+                {
+                    var hasToken = store.HasToken();
+                    await WriteJsonAsync(context.Response, new
+                    {
+                        hasToken,
+                        source = hasToken
+                            ? "settings"
+                            : (!string.IsNullOrWhiteSpace(webToken) ? "cli" : "none"),
+                    });
+                    return;
+                }
+
+                if (method.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    var payload = await TryReadJsonAsync<PlaylistTokenPayload>(context.Request);
+                    var validationError = ValidatePlaylistToken(payload?.Token);
+                    if (validationError != null)
+                    {
+                        await WriteJsonAsync(
+                            context.Response, new { error = validationError }, HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    store.Set(payload!.Token!.Trim());
+                    await RecordAuditAsync(auditActor, "settings.playlist-token.set",
+                        "playlist-access-token", "global",
+                        null, new { hasToken = true }, AuditResult.Success);
+                    await WriteJsonAsync(context.Response, new { hasToken = true, source = "settings" });
+                    return;
+                }
+
+                if (method.Equals("DELETE", StringComparison.OrdinalIgnoreCase))
+                {
+                    store.Clear();
+                    await RecordAuditAsync(auditActor, "settings.playlist-token.clear",
+                        "playlist-access-token", "global",
+                        new { hasToken = true }, new { hasToken = false }, AuditResult.Success);
+                    await WriteJsonAsync(context.Response, new
+                    {
+                        hasToken = false,
+                        source = !string.IsNullOrWhiteSpace(webToken) ? "cli" : "none",
+                    });
+                    return;
+                }
+
+                await WriteMethodNotAllowedAsync(context.Response, "GET, POST, DELETE");
+                return;
+            }
+
+            if (requestPath.Equals("/api/playlist-token/reset", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!method.Equals("POST", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteMethodNotAllowedAsync(context.Response, "POST");
+                    return;
+                }
+
+                var store = new PlaylistAccessTokenStore(ResolveRuntimeDataDir());
+                var newToken = TokenGenerator.NewToken();
+                store.Set(newToken);
+                await RecordAuditAsync(auditActor, "settings.playlist-token.reset",
+                    "playlist-access-token", "global",
+                    null, new { hasToken = true }, AuditResult.Success);
+                // O valor é devolvido uma única vez, para o utilizador copiar.
+                await WriteJsonAsync(context.Response, new
+                {
+                    token = newToken,
+                    hasToken = true,
+                    source = "settings",
+                });
+                return;
+            }
 
             if (requestPath.Equals("/api/telegram/config", StringComparison.OrdinalIgnoreCase))
             {

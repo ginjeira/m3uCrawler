@@ -1245,7 +1245,7 @@ namespace m3uCrawler
             Console.WriteLine("  --output-dir PATH  Diretório onde guardar playlists e relatórios (padrão: output)");
             Console.WriteLine("  --web             Ativa uma interface web para ver histórico e playlist");
             Console.WriteLine("  --web-port N      Porta do servidor web (padrão: 5000)");
-            Console.WriteLine("  --web-token TOKEN Bearer token para autorização no dashboard (protege timing-attack via FixedTimeEquals)");
+            Console.WriteLine("  --web-token TOKEN Token de máquina que autoriza apenas os endpoints de playlist; agora opcional, pois pode ser gerido/rotacionado na vista Setup do dashboard");
             Console.WriteLine("  --web-allow-trigger   Permite POST /api/run/start a partir do dashboard (opt-in; default: 503)");
             Console.WriteLine("  --bot             Modo bot Telegram (legacy M3U8-search)");
             Console.WriteLine("  --bot-token TOKEN Token do bot Telegram (também via M3U_BOT_TOKEN); obrigatorio com --bot");

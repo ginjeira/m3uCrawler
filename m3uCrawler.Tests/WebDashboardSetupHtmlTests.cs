@@ -92,6 +92,33 @@ public class WebDashboardSetupHtmlTests
         Assert.Contains("__m3uCrawlerCsrf", html);
     }
 
+    /// <summary>
+    /// Wave PlaylistToken — a vista Setup expõe o formulário de token de
+    /// máquina das playlists, os três handlers e os respectivos exports
+    /// (<c>window.*</c>) que a UI invoca.
+    /// </summary>
+    [Fact]
+    public void Dashboard_html_setup_view_includes_playlist_token_controls()
+    {
+        var html = InvokeBuildDashboardHtml();
+
+        Assert.Contains("id='setupPlaylistToken'", html);
+        Assert.Contains("id='setupPlaylistTokenStatus'", html);
+        Assert.Contains("id='setupPlaylistTokenResult'", html);
+
+        Assert.Contains("onclick='savePlaylistToken()'", html);
+        Assert.Contains("onclick='generatePlaylistToken()'", html);
+        Assert.Contains("onclick='clearPlaylistToken()'", html);
+
+        Assert.Contains("setupFetch('/api/playlist-token'", html);
+        Assert.Contains("setupFetch('/api/playlist-token/reset'", html);
+
+        Assert.Contains("window.savePlaylistToken", html);
+        Assert.Contains("window.generatePlaylistToken", html);
+        Assert.Contains("window.clearPlaylistToken", html);
+        Assert.Contains("window.loadPlaylistTokenSetup", html);
+    }
+
     private static string InvokeBuildDashboardHtml()
     {
         var method = typeof(WebDashboardService).GetMethod(

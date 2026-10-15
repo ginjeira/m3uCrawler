@@ -386,6 +386,16 @@ chaves novas no fim e escreve de forma atómica (temp + move). Em Unix aplica
 `UserRead|UserWrite` (600). `api_hash`, passwords e API keys nunca são
 devolvidos, registados nem incluídos em `Detail`.
 
+### Segredo do token de playlists (`playlist_access_token.json`)
+
+O token de máquina das playlists gerido na vista **Setup** do dashboard é
+persistido em `runtime-data/playlist_access_token.json` guardando **apenas o
+hash SHA-256** (base64) e metadados — o valor em claro **nunca** é escrito nem
+registado. A escrita é atómica (temp + move) e, em Unix, o ficheiro recebe
+`chmod 600` (`UserRead|UserWrite`); ficheiro ausente ou corrompido é tratado
+como "sem token". Ver §"Modelo de segurança do dashboard" em
+`m3uCrawler/README.md`.
+
 ### Config de país — provisão explícita (Wave A)
 
 **Nenhum processo automático cria listas de país.** O arranque (`--web` e

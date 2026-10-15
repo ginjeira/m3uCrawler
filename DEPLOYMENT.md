@@ -368,7 +368,7 @@ Lista das flags que afectam o comportamento do container, com referência ao hel
 |---|---|---|
 | `--web` | `Program.cs:37` | Activa o dashboard web. |
 | `--web-port N` | `Program.cs:39-43` | Porta do dashboard (padrão: `5000`). |
-| `--web-token TOKEN` | `Program.cs:44` | Bearer token para `Authorization` no dashboard. **Recomendado em produção.** `HttpListener` usa `CryptographicOperations.FixedTimeEquals` para timing-attack safety. |
+| `--web-token TOKEN` | `Program.cs:44` | Token de máquina que autoriza apenas os endpoints de playlist (`/api/playlist`, `/api/playlist_temp`, `/api/playlist_acquired`); agora opcional, pois pode ser gerido/rotacionado na vista **Setup** do dashboard (token aí definido sobrepõe-se à flag). `HttpListener` usa `CryptographicOperations.FixedTimeEquals` para timing-attack safety. |
 | `--telegram` | `Program.cs:73` | Activa o pipeline Telegram. |
 | `--telegram-maintain` | `Program.cs:139` | Modo manutenção (preserva `playlist.m3u`; ver `AGENTS.md`). |
 | `--history-hours N` | `Program.cs:131-137` | Limite superior (Max) da janela de pesquisa Telegram (padrão: `24`, cap `1440`h = 60 dias). |

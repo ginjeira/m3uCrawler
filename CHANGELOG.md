@@ -8,6 +8,14 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 ## [Unreleased]
 
 ### ✨ Adicionado
+- **Token de máquina das playlists gerido na vista Setup (2026-10-15).**
+  - Novo card **"Acesso às playlists (M3U)"** em `#view-setup` do dashboard (`#setupPlaylistToken`, botões Guardar/Gerar novo/Remover, estado `#setupPlaylistTokenStatus`), editável **em runtime sem reiniciar** o processo.
+  - Endpoints (atrás do gate de sessão + CSRF): `GET/POST/DELETE /api/playlist-token` e `POST /api/playlist-token/reset`.
+  - **Precedência:** o token gerido no Setup **sobrepõe** o `--web-token` de CLI para os endpoints de playlist (o token antigo deixa de autorizar); sem token no Setup aplica-se o `--web-token`, que passa a ser **fallback opcional**.
+  - **Nunca devolvido:** `GET` devolve só `{ hasToken, source }` (`source ∈ settings|cli|none`); `POST` define um token validado (16–128 chars, sem espaços/controlo); `POST /reset` gera um token aleatório e devolve-o **uma única vez**; `DELETE` volta ao fallback CLI.
+  - **Âmbito inalterado:** exclusivo de `/api/playlist`, `/api/playlist_temp` e `/api/playlist_acquired` (via `Authorization: Bearer` ou `?token=`); previews e login do dashboard não são afectados.
+  - Persistência em `runtime-data/playlist_access_token.json` guardando **apenas o hash SHA-256** (base64), com escrita atómica e `chmod 600` em Unix — nunca o valor em claro.
+  - **Documentação:** `m3uCrawler/README.md` (§ "Modelo de segurança do dashboard" e onboarding/Setup), `DEPLOYMENT.md` § 9.1 e `docs/architecture/configuration-lifecycle.md`; help de `--web-token` corrigido em `Program.cs` e log de arranque do dashboard. Sem alterações à lógica do gate/endpoints já implementados.
 - **Wave A — correcções da revisão independente: grupos deixam de ser impostos; CLI explícito e robusto (2026-10-14).**
   - **H1 — migration sem seed de grupos.** `20261007150000_AddCanonicalChannelGroupFk.Up` deixa de executar o `INSERT OR IGNORE INTO canonical_groups` (9 grupos), o backfill e o guard; mantém `AddColumn GroupId`, o índice e a FK. É a edição de uma migration já aplicada: sem efeito em BDs existentes, e BDs novas deixam de semear grupos. Nenhum grupo é criado no arranque (a migration era o último escape).
   - **H2 — o import não impõe grupos.** `CatalogBaselineImporter.ImportAsync` cria **apenas** os grupos declarados em `CatalogBaseline.Groups` (mapeando o `GroupId` dos canais pelas chaves declaradas); sem grupos declarados, nenhum é criado e os canais ficam com `GroupId = null`. Deixa de chamar `EnsureCanonicalGroupsAsync`/`CanonicalGroupDefaults`.

@@ -113,7 +113,7 @@ As opções abaixo são as efectivamente reconhecidas pelo `Program.cs`. Opçõe
 | `--user` / `--pass` | Credenciais para autenticação no scan de domínio. |
 | `--web` | Inicia o dashboard web. |
 | `--web-port PORTA` | Porta do dashboard (padrão: 5000). |
-| `--web-token TOKEN` | Token partilhado de **máquina**: autoriza **apenas** os endpoints de playlist (`/api/playlist`, `/api/playlist_temp`, `/api/playlist_acquired`). O dashboard mantém o fluxo de sessão user/password (ver secção "Modelo de segurança do dashboard"). Opcional. |
+| `--web-token TOKEN` | Token partilhado de **máquina**: autoriza **apenas** os endpoints de playlist (`/api/playlist`, `/api/playlist_temp`, `/api/playlist_acquired`). **Fallback opcional**: pode ser gerido/rotacionado na vista Setup do dashboard, e o token aí definido sobrepõe-se a esta flag (ver secção "Modelo de segurança do dashboard"). O dashboard mantém o fluxo de sessão user/password. |
 | `--web-allow-trigger` | Opt-in: permite `POST /api/run/start` (trigger manual) no dashboard. Default: desactivado ⇒ `503 web-allow-trigger-disabled`. |
 | `--admin-reset-password USERNAME` | Recuperação **host-only** da password de administrador: a password é lida interactivamente do stdin, **nunca** de argv. Ver secção "Alterar/recuperar password de administrador". |
 | `--import-epg-tvg-ids FONTE` | Importa uma EPG XMLTV (`.xml`/`.xml.gz`, URL ou ficheiro) e grava os `id` dos `<channel>` como identidade externa `tvg-id` dos canais canónicos do país. Requer catálogo. Ver secção "Importação de tvg-id a partir de EPG". |
@@ -1205,13 +1205,27 @@ O dashboard é servido por um `HttpListener` que, por defeito, escuta em **todas
 Para deployments em rede não confiável, **recomenda-se vivamente** proteger o acesso com credenciais. Há duas camadas distintas:
 
 - **Dashboard (humanos):** autenticação por **utilizador/password** com sessão e CSRF (ver "Modelo de autenticação"). É o fluxo da UI, do bootstrap e de todas as APIs de administração.
-- **Playlists de máquina (automação):** o token partilhado `--web-token <TOKEN>` autoriza **apenas** os endpoints de playlist completos — `/api/playlist`, `/api/playlist_temp` e `/api/playlist_acquired` — que servem a playlist Xtream funcional (com URLs reais). Aceita-se via:
+- **Playlists de máquina (automação):** um token partilhado autoriza **apenas** os endpoints de playlist completos — `/api/playlist`, `/api/playlist_temp` e `/api/playlist_acquired` — que servem a playlist Xtream funcional (com URLs reais). Aceita-se via:
   - Header: `Authorization: Bearer <TOKEN>`, ou
   - Query string: `?token=<TOKEN>`.
 - A comparação é feita em **tempo constante** (`CryptographicOperations.FixedTimeEquals`) para evitar timing attacks.
 - **Fora desses três endpoints o token é ignorado**: não bloqueia nem autoriza o dashboard/restantes APIs, que seguem o fluxo normal (bootstrap/login/sessão+CSRF). Um pedido a uma playlist sem token válido **e** sem sessão recebe `401 Unauthorized`.
 - Os endpoints de **pré-visualização** (`/api/playlist/preview`, `/api/playlist_temp/preview`, `/api/playlist_acquired/preview`) **não** são autorizáveis por token — ficam no fluxo de sessão humana (o seu conteúdo já é sanitizado).
 - **Sem token configurado**, o comportamento das playlists mantém-se aberto (compatibilidade com uso local).
+
+#### Token de playlists gerido na vista Setup
+
+O token de máquina pode ser gerido no card **"Acesso às playlists (M3U)"** da vista **Setup** do dashboard, editável **em runtime sem reiniciar** o processo:
+
+- **Endpoints** (atrás do gate de sessão + CSRF): `GET/POST/DELETE /api/playlist-token` e `POST /api/playlist-token/reset`.
+- **Precedência:** quando existe um token gerido no Setup, ele **sobrepõe** o `--web-token` de CLI para estes três endpoints — o antigo token de CLI **deixa de autorizar**. Sem token no Setup, aplica-se o `--web-token` (comportamento anterior). `--web-token` é, por isso, um **fallback opcional**.
+- **Rotação em runtime:** Guardar/Gerar novo/Remover altera a credencial imediatamente, sem reiniciar.
+- **O valor nunca é devolvido:** `GET /api/playlist-token` devolve apenas `{ hasToken, source }`, com `source ∈ settings|cli|none`; nunca o token.
+- **Reset devolve o token uma única vez:** `POST /api/playlist-token/reset` gera um token aleatório e devolve-o **uma única vez** (para o utilizador copiar); nunca mais é exposto.
+- **Validação:** `POST /api/playlist-token` exige 16–128 caracteres, sem espaços nem caracteres de controlo.
+- **Remoção:** `DELETE /api/playlist-token` remove o token gerido, voltando ao fallback do `--web-token` de CLI.
+- **Âmbito inalterado:** o token serve **exclusivamente** `/api/playlist`, `/api/playlist_temp` e `/api/playlist_acquired`; previews e login do dashboard não são afectados.
+- **Persistência:** `runtime-data/playlist_access_token.json` guarda **apenas o hash SHA-256** (base64) e metadados — **nunca** o valor em claro; escrita atómica (temp + move) com `chmod 600` em Unix.
 
 A playlist M3U funcional (`/api/playlist`) continua a devolver as URLs Xtream reais — o token de máquina controla **quem** pode aceder, não **o quê**.
 
@@ -1457,8 +1471,12 @@ Bootstrap → Admin → Setup Required → Telegram → Dispatcharr → Sources 
 | `/api/dispatcharr/test` | POST | Teste de ligação read-only (`GET /api/core/version/`). |
 | `/api/dispatcharr/dry-run` | POST | **W6** — Gera `MatchPlan` + `SyncReport` sem escrever no Dispatcharr. Corpo `{ "playlistPath": "playlist.m3u" }` (caminho relativo resolvido sob o output dir). O plano lê a playlist como fonte de membros/streams; com uma Ordering List activa, os canais novos recebem `channel_number` = rank 1-based (só ordem). Devolve `{status, mode:"dry-run", planPath, reportPath, counts{...}}`. |
 | `/api/dispatcharr/sync` | POST | **W6** — Aplica a sincronização (mutação real no Dispatcharr, sujeita a `dispatcharr_enabled`/`dispatcharr_dry_run`). Mesmo contrato, `mode:"sync"`; membros/streams da playlist e ordem pela Ordering List activa. |
+| `/api/playlist-token` | GET/POST/DELETE | Card **"Acesso às playlists (M3U)"**: token de máquina das playlists. `GET` devolve só `{ hasToken, source }` (`source ∈ settings\|cli\|none`); `POST` define um token (16–128 chars, sem espaços/controlo); `DELETE` remove-o e volta ao fallback `--web-token`. Nunca devolve o valor. |
+| `/api/playlist-token/reset` | POST | Gera um token aleatório e devolve-o **uma única vez** (para copiar); a partir daí só `hasToken`/`source` são expostos. |
 
 Todos os `POST` são métodos mutantes e, em `UserAuth`, exigem `X-CSRF-Token`.
+
+O card **"Acesso às playlists (M3U)"** da vista **Setup** permite definir, gerar (reset) ou remover o token de máquina que autoriza exclusivamente `/api/playlist`, `/api/playlist_temp` e `/api/playlist_acquired`. A rotação é aplicada em runtime **sem reiniciar** e o token gerido sobrepõe-se ao `--web-token` de CLI (que passa a ser **fallback opcional**). O valor nunca é devolvido no `GET`; detalhes em §"Modelo de segurança do dashboard".
 
 O separador **Dispatcharr** do Dashboard expõe dois botões: **Dry Run** (sem confirmação)
 e **Sync Dispatcharr** (confirmação forte, pois é uma mutação real), com guarda de
