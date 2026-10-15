@@ -7694,6 +7694,33 @@ namespace m3uCrawler.Services
       }
     }
 
+    // DC-2 — cópia para a área de transferência tolerante a HTTP simples.
+    // O dashboard é servido por IP em HTTP (não-secure context), onde
+    // `navigator.clipboard` é `undefined`; o caminho moderno só é usado em
+    // contexto seguro e com a API presente, com fallback para
+    // `document.execCommand('copy')` num textarea temporário.
+    function copyTextToClipboard(text) {
+      if (window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText) {
+        return navigator.clipboard.writeText(text).catch(function () { return _copyTextFallback(text); });
+      }
+      return _copyTextFallback(text);
+    }
+    function _copyTextFallback(text) {
+      return new Promise(function (resolve, reject) {
+        try {
+          var ta = document.createElement('textarea');
+          ta.value = text; ta.setAttribute('readonly', '');
+          ta.style.position = 'fixed'; ta.style.top = '-1000px'; ta.style.opacity = '0';
+          document.body.appendChild(ta);
+          ta.focus(); ta.select();
+          if (ta.setSelectionRange) { ta.setSelectionRange(0, ta.value.length); }
+          var ok = document.execCommand('copy');
+          document.body.removeChild(ta);
+          ok ? resolve() : reject(new Error('copy-failed'));
+        } catch (e) { reject(e); }
+      });
+    }
+
     // DC-2 — mensagem de erro normalizada a partir de um corpo já lido.
     // Partilhada por `apiRequest` e `readErrorBody` para uma superfície de
     // erro consistente (JSON.parse tolerante, texto cru como fallback).
@@ -8125,9 +8152,15 @@ namespace m3uCrawler.Services
         copyBtn.textContent = 'Copiar URL';
         copyBtn.onclick = function () {
           try {
-            navigator.clipboard.writeText(absUrl).then(
-              function () { copyBtn.textContent = 'Copiado'; },
-              function () { copyBtn.textContent = 'Falha ao copiar'; });
+            copyTextToClipboard(absUrl).then(
+              function () {
+                copyBtn.textContent = 'Copiado';
+                setTimeout(function () { copyBtn.textContent = 'Copiar URL'; }, 1500);
+              },
+              function () {
+                copyBtn.textContent = 'Falha ao copiar';
+                setTimeout(function () { copyBtn.textContent = 'Copiar URL'; }, 1500);
+              });
           } catch (err) { /* clipboard indisponível */ }
         };
         row.appendChild(nameEl);
@@ -11717,8 +11750,15 @@ const rows = Object.entries(inv).map(([k, v]) => {
         copyBtn.style.marginLeft = '8px';
         copyBtn.onclick = function () {
           try {
-            navigator.clipboard.writeText(r.json.token);
-            copyBtn.textContent = 'Copiado';
+            copyTextToClipboard(r.json.token).then(
+              function () {
+                copyBtn.textContent = 'Copiado';
+                setTimeout(function () { copyBtn.textContent = 'Copiar'; }, 1500);
+              },
+              function () {
+                copyBtn.textContent = 'Falha ao copiar';
+                setTimeout(function () { copyBtn.textContent = 'Copiar'; }, 1500);
+              });
           } catch (e) { /* clipboard indisponível */ }
         };
         line.appendChild(codeEl);

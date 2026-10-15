@@ -137,6 +137,56 @@ public class WebDashboardSetupHtmlTests
         Assert.Contains("Bearer <token>", html);
     }
 
+    /// <summary>
+    /// Wave PlaylistToken-BD — a cópia para a área de transferência tem de
+    /// funcionar fora de contexto seguro (dashboard servido por IP em HTTP,
+    /// onde <c>navigator.clipboard</c> é <c>undefined</c>). O HTML deve
+    /// expor o helper <c>copyTextToClipboard</c>, com fallback para
+    /// <c>document.execCommand('copy')</c>, e o caminho moderno só deve ser
+    /// usado sob guarda de contexto/API.
+    /// </summary>
+    [Fact]
+    public void Dashboard_html_copy_uses_helper_with_secure_guard_and_fallback()
+    {
+        var html = InvokeBuildDashboardHtml();
+
+        // Helper presente e fallback legacy de cópia.
+        Assert.Contains("function copyTextToClipboard(text)", html);
+        Assert.Contains("function _copyTextFallback(text)", html);
+        Assert.Contains("execCommand('copy')", html);
+
+        // O caminho moderno só é usado com guarda de contexto seguro + API.
+        Assert.Contains("window.isSecureContext", html);
+        Assert.Contains("navigator.clipboard && navigator.clipboard.writeText", html);
+
+        // Não há escrita direta no clipboard fora do helper: as duas
+        // ocorrências de `navigator.clipboard.writeText` (guarda + chamada)
+        // estão ambas dentro de `copyTextToClipboard`.
+        var helperStart = html.IndexOf("function copyTextToClipboard(text)", StringComparison.Ordinal);
+        Assert.True(helperStart >= 0, "copyTextToClipboard() não encontrado no HTML do dashboard.");
+        var helperEnd = html.IndexOf("function _copyTextFallback(text)", helperStart, StringComparison.Ordinal);
+        Assert.True(helperEnd > helperStart, "_copyTextFallback() deve seguir copyTextToClipboard().");
+        var helper = html.Substring(helperStart, helperEnd - helperStart);
+        Assert.Equal(2, CountOccurrences(html, "navigator.clipboard.writeText"));
+        Assert.Equal(2, CountOccurrences(helper, "navigator.clipboard.writeText"));
+
+        // Os dois call sites passam pelo helper.
+        Assert.Contains("copyTextToClipboard(absUrl)", html);
+        Assert.Contains("copyTextToClipboard(r.json.token)", html);
+    }
+
+    private static int CountOccurrences(string haystack, string needle)
+    {
+        var count = 0;
+        var index = 0;
+        while ((index = haystack.IndexOf(needle, index, StringComparison.Ordinal)) >= 0)
+        {
+            count++;
+            index += needle.Length;
+        }
+        return count;
+    }
+
     private static string InvokeBuildDashboardHtml()
     {
         var method = typeof(WebDashboardService).GetMethod(

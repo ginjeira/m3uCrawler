@@ -8,6 +8,12 @@ e este projeto adere ao [Semantic Versioning](https://semver.org/lang/pt-BR/).
 ## [Unreleased]
 
 ### 🐛 Corrigido
+- **Dashboard: botões "Copiar URL"/"Copiar" deixam de falhar em HTTP por IP (2026-10-15).**
+  - **Causa.** O dashboard é servido por IP em HTTP (não é *secure context*), onde `navigator.clipboard` é `undefined`. Os handlers usavam `navigator.clipboard.writeText(...)` diretamente e falhavam em silêncio: o botão "Copiar URL" (vista **Playlist atual** → "Links prontos a copiar") e o botão "Copiar" do token gerado no **Setup** não faziam nada.
+  - **Correção.** Novo helper JS `copyTextToClipboard(text)` (junto de `safeFetchJson`/`apiRequest`): só usa `navigator.clipboard.writeText` quando `window.isSecureContext` e a API existem, com *fallback* para `document.execCommand('copy')` num `<textarea>` temporário (cópia fora de contexto seguro). Os dois call sites passam a usar o helper, com feedback no botão (`Copiado` / `Falha ao copiar`, reposto após ~1,5 s) e `try/catch` externo para nunca rebentar. Os handlers continuam atribuídos via `.onclick` (não é preciso exportar para `window`).
+  - **Testes.** `WebDashboardSetupHtmlTests.Dashboard_html_copy_uses_helper_with_secure_guard_and_fallback` (helper presente, fallback `execCommand('copy')`, guarda de contexto seguro, `navigator.clipboard.writeText` apenas dentro do helper e os dois call sites a usar `copyTextToClipboard`). Sem alterações aos asserts existentes.
+  - **Ficheiros.** Só `m3uCrawler/Services/WebDashboardService.cs` e `m3uCrawler.Tests/WebDashboardSetupHtmlTests.cs` (sem tocar em `Program.cs`/`Dockerfile`/`Models/`/`Services/Preview/*`).
+
 - **Manutenção: "working" reportado deixa de confundir validados com retidos (2026-10-15).**
   - **Causa.** O contador `ExistingStillWorkingCount` do run report era preenchido com `stillWorkingMain.Count`, ou seja **preservados = working ∪ retryable**. Um stream retido (`IsWorking=false`, `Retained=true`, falha retryable) era contado como "working" apesar de não ter sido reconfirmado.
   - **Correção.** `RunTelegramMaintenanceCycle` passa a usar `filterResult.PreservedWorking` (streams com `IsWorking=true`, validados fisicamente) para `ExistingStillWorkingCount`, e os retidos (`PreservedRetryable`) são reportados em separado nos logs (`Working (validado)` vs `Retidos (não confirmados)`). `PlaylistManagerService` passa a reportar `working (validado)`, `retidos (não confirmado)` e o total de entradas via `CountPublishableStreams`.
